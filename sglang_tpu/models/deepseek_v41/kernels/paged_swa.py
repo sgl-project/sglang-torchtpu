@@ -190,3 +190,185 @@ def write_swa_pages(
         result.append(jax.freeze(owner))
         base += capacity
     return (result[0], result[1]) if isinstance(pages, tuple) else result[0]
+
+
+_WINDOW_BLOCK = 128
+
+
+@functools.partial(jax.jit, donate_argnums=(0,))
+def write_swa_pages_with_window(
+    pages: jax.Array,
+    records: jax.Array,
+    values: jax.Array,
+    history_src: jax.Array,
+    history_dst: jax.Array,
+    commit_token: jax.Array,
+    commit_dst: jax.Array,
+) -> jax.Array:
+    """Copy request-window history & commit rows on SparseCore, then write chunk kv.
+
+    Replaces the TensorCore ``swa.reshape(-1, 512)[history_src]`` gather +
+    ``torch.cat((kv, history, kv[commit_token]))`` + 17k-row sort/pack on every
+    layer during extend. Each 128-row request block is owned by one SparseCore
+    subcore so read-modify-write on packed BF16 pairs is race-free, and inactive
+    padding requests (all -1 destinations) exit immediately with zero DMA.
+    """
+    m = history_dst.shape[0]
+    page_size = pages.shape[1]
+    if m == 0 or m % _WINDOW_BLOCK != 0 or page_size != 64:
+        # Fallback for unusual test shapes.
+        flat = pages.reshape(-1, 512)
+        all_kv = jnp.concatenate((values, flat[history_src], values[commit_token]), axis=0)
+        all_rec = jnp.concatenate((records, history_dst, commit_dst), axis=0)
+        return write_swa_pages(pages, all_rec, all_kv)
+
+    info = pltpu.get_tpu_info().sparse_core
+    assert info is not None, "SWA window copy requires SparseCore"
+    lanes, cores = info.num_lanes, info.num_cores * info.num_subcores
+    num_chunks = _WINDOW_BLOCK // lanes
+    mesh = plsc.VectorSubcoreMesh(
+        num_cores=info.num_cores,
+        num_subcores=info.num_subcores,
+        core_axis_name="core",
+        subcore_axis_name="subcore",
+    )
+    num_reqs = m // _WINDOW_BLOCK
+    pad_reqs = (-num_reqs) % cores
+    pad_elems = pad_reqs * _WINDOW_BLOCK
+    if pad_elems:
+        h_src = jnp.pad(history_src, (0, pad_elems), constant_values=0)
+        h_dst = jnp.pad(history_dst, (0, pad_elems), constant_values=-1)
+        c_tok = jnp.pad(commit_token, (0, pad_elems), constant_values=0)
+        c_dst = jnp.pad(commit_dst, (0, pad_elems), constant_values=-1)
+    else:
+        h_src, h_dst, c_tok, c_dst = history_src, history_dst, commit_token, commit_dst
+
+    # Promote chunk kv BF16 bits to int32 [T, 512] so any single row can be DMA'd.
+    kv_words = jax.lax.bitcast_convert_type(values, jnp.uint16).astype(jnp.int32)
+    owner = jax.new_ref(pages)
+    capacity = pages.shape[0] * page_size
+
+    def kernel(
+        h_src_ref, h_dst_ref, c_tok_ref, c_dst_ref, kv_ref, owner_ref, buf_src, buf_dst, sem
+    ):
+        core = jax.lax.axis_index((mesh.core_axis_name, mesh.subcore_axis_name))
+        cache = owner_ref.bitcast(jnp.int32)  # [pages, 32, 512]
+        half_page = cache.shape[1]
+
+        def copy_one_req(hs_ref, hd_ref, ct_ref, cd_ref):
+            def h_chunk(c, _):
+                hd = hd_ref[pl.ds(c * lanes, lanes)]
+                hs = hs_ref[pl.ds(c * lanes, lanes)]
+                for j in range(lanes):
+                    dst = hd[j]
+                    valid = (dst >= page_size) & (dst < capacity)
+
+                    @pl.when(valid)
+                    def _move(dst=dst, src=hs[j]):
+                        s_pair = src // 2
+                        d_pair = dst // 2
+                        s_odd = (src & 1) != 0
+                        d_odd = (dst & 1) != 0
+                        s_slice = cache.at[
+                            s_pair // half_page, pl.ds(s_pair % half_page, 1), :
+                        ]
+                        d_slice = cache.at[
+                            d_pair // half_page, pl.ds(d_pair % half_page, 1), :
+                        ]
+                        r_src = pltpu.make_async_copy(s_slice, buf_src, sem.at[0])
+                        r_dst = pltpu.make_async_copy(d_slice, buf_dst, sem.at[1])
+                        r_src.start()
+                        r_dst.start()
+                        r_src.wait()
+                        r_dst.wait()
+                        s_word = buf_src[0]
+                        d_word = buf_dst[0]
+                        val16 = jnp.where(
+                            s_odd,
+                            jax.lax.shift_right_logical(s_word, jnp.int32(16)),
+                            s_word & jnp.int32(0xFFFF),
+                        )
+                        merged = jnp.where(
+                            d_odd,
+                            (d_word & jnp.int32(0xFFFF)) | (val16 << jnp.int32(16)),
+                            (d_word & jnp.int32(-65536)) | val16,
+                        )
+                        buf_dst[0] = merged
+                        w_dst = pltpu.make_async_copy(buf_dst, d_slice, sem.at[0])
+                        w_dst.start()
+                        w_dst.wait()
+
+                return None
+
+            jax.lax.fori_loop(0, num_chunks, h_chunk, None)
+
+            def c_chunk(c, _):
+                cd = cd_ref[pl.ds(c * lanes, lanes)]
+                ct = ct_ref[pl.ds(c * lanes, lanes)]
+                for j in range(lanes):
+                    dst = cd[j]
+                    valid = (dst >= page_size) & (dst < capacity)
+
+                    @pl.when(valid)
+                    def _move(dst=dst, tok=ct[j]):
+                        d_pair = dst // 2
+                        d_odd = (dst & 1) != 0
+                        k_slice = kv_ref.at[pl.ds(tok, 1), :]
+                        d_slice = cache.at[
+                            d_pair // half_page, pl.ds(d_pair % half_page, 1), :
+                        ]
+                        r_src = pltpu.make_async_copy(k_slice, buf_src, sem.at[0])
+                        r_dst = pltpu.make_async_copy(d_slice, buf_dst, sem.at[1])
+                        r_src.start()
+                        r_dst.start()
+                        r_src.wait()
+                        r_dst.wait()
+                        val16 = buf_src[0] & jnp.int32(0xFFFF)
+                        d_word = buf_dst[0]
+                        merged = jnp.where(
+                            d_odd,
+                            (d_word & jnp.int32(0xFFFF)) | (val16 << jnp.int32(16)),
+                            (d_word & jnp.int32(-65536)) | val16,
+                        )
+                        buf_dst[0] = merged
+                        w_dst = pltpu.make_async_copy(buf_dst, d_slice, sem.at[0])
+                        w_dst.start()
+                        w_dst.wait()
+
+                return None
+
+            jax.lax.fori_loop(0, num_chunks, c_chunk, None)
+
+        pltpu.emit_pipeline(
+            copy_one_req,
+            grid=((num_reqs + pad_reqs) // cores,),
+            tiling=pltpu.Tiling.SPARSE_CORE,
+            in_specs=(
+                pl.BlockSpec((_WINDOW_BLOCK,), lambda b: (b * cores + core,)),
+                pl.BlockSpec((_WINDOW_BLOCK,), lambda b: (b * cores + core,)),
+                pl.BlockSpec((_WINDOW_BLOCK,), lambda b: (b * cores + core,)),
+                pl.BlockSpec((_WINDOW_BLOCK,), lambda b: (b * cores + core,)),
+            ),
+        )(h_src_ref, h_dst_ref, c_tok_ref, c_dst_ref)
+
+    cast(
+        Callable[..., tuple[()]],
+        pl.kernel(
+            kernel,
+            mesh=mesh,
+            out_type=(),
+            scratch_types=(
+                pltpu.VMEM((1, 512), jnp.int32),
+                pltpu.VMEM((1, 512), jnp.int32),
+                pltpu.SemaphoreType.DMA((2,)),
+            ),
+            compiler_params=pltpu.CompilerParams(
+                use_tc_tiling_on_sc=True,
+                needs_layout_passes=True,
+                disable_bounds_checks=True,
+            ),
+            name="copy_swa_window_rows",
+        ),
+    )(h_src, h_dst, c_tok, c_dst, kv_words, owner)
+    updated = jax.freeze(owner)
+    return write_swa_pages(updated, records, values)

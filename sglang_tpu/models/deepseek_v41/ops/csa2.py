@@ -49,7 +49,10 @@ from sglang_tpu.models.deepseek_v41.kernels.csa2.pipeline import (
     csa2_gather_chunk_size,
     csa2_pipeline,
 )
-from sglang_tpu.models.deepseek_v41.kernels.paged_swa import write_swa_pages
+from sglang_tpu.models.deepseek_v41.kernels.paged_swa import (
+    write_swa_pages,
+    write_swa_pages_with_window,
+)
 from sglang_tpu.models.deepseek_v41.memory_pool import SWA_PAGE_TOKENS as SWA_PAGE_SIZE
 
 SWA_WINDOW = 128
@@ -102,6 +105,20 @@ def _swa_metadata_non_causal(
 
 def _publish_swa(pages: jax.Array, records: jax.Array, kv: jax.Array) -> jax.Array:
     return write_swa_pages(pages, records, kv)
+
+
+def _publish_swa_window(
+    pages: jax.Array,
+    records: jax.Array,
+    kv: jax.Array,
+    history_src: jax.Array,
+    history_dst: jax.Array,
+    commit_token: jax.Array,
+    commit_dst: jax.Array,
+) -> jax.Array:
+    return write_swa_pages_with_window(
+        pages, records, kv, history_src, history_dst, commit_token, commit_dst
+    )
 
 
 def _publish_main(
@@ -386,6 +403,10 @@ def _fake_publish_swa(pages, records, kv):
     return torch.empty_like(pages)
 
 
+def _fake_publish_swa_window(pages, *args):
+    return torch.empty_like(pages)
+
+
 def _fake_publish_main(words, scales, records, latent):
     return torch.empty_like(words), torch.empty_like(scales)
 
@@ -413,6 +434,7 @@ _DEFINITIONS = {
     "swa_metadata": (_swa_metadata, _fake_swa_metadata, ()),
     "swa_metadata_non_causal": (_swa_metadata_non_causal, _fake_swa_metadata, ()),
     "publish_swa": (_publish_swa, _fake_publish_swa, (0,)),
+    "publish_swa_window": (_publish_swa_window, _fake_publish_swa_window, (0,)),
     "publish_main": (_publish_main, _fake_publish_main, (0, 1)),
     "write_rows": (_write_rows, _fake_write_rows, (0,)),
     "attend_swa": (_attend_swa, _fake_attend, ()),
@@ -490,6 +512,27 @@ def publish_swa(
     unique. Returns the new ``pages``; the caller does ``pages.copy_(...)``.
     """
     return _op("publish_swa")(pages, _i32(records), kv.reshape(-1, HEAD_DIM))
+
+
+def publish_swa_window(
+    pages: torch.Tensor,
+    records: torch.Tensor,
+    kv: torch.Tensor,
+    history_src: torch.Tensor,
+    history_dst: torch.Tensor,
+    commit_token: torch.Tensor,
+    commit_dst: torch.Tensor,
+) -> torch.Tensor:
+    """Publish extend chunk ``kv`` plus request-window history & commit copies."""
+    return _op("publish_swa_window")(
+        pages,
+        _i32(records),
+        kv.reshape(-1, HEAD_DIM),
+        _i32(history_src),
+        _i32(history_dst),
+        _i32(commit_token),
+        _i32(commit_dst),
+    )
 
 
 def publish_main(

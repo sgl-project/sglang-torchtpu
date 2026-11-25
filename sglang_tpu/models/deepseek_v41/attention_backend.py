@@ -1436,11 +1436,12 @@ class DSV41TPUAttnBackend(AttentionBackend):
     def _register_ops():
         # Registration must precede torch.compile tracing.
         from sglang_tpu.dsv4.dsv4_attention_backend import _register_rope_op
-        from sglang_tpu.models.deepseek_v41.ops import csa2, indexer
+        from sglang_tpu.models.deepseek_v41.ops import csa2, dspark_markov, indexer
 
         _register_rope_op()  # apply_rope's Pallas RoPE op
         csa2.register_csa2_ops()
         indexer.register_indexer_ops()
+        dspark_markov.register_dspark_markov_op()
         return csa2, indexer
 
     def _prewarm_model_caches(self) -> None:
@@ -2044,12 +2045,27 @@ class DSV41TPUAttnBackend(AttentionBackend):
         records = metadata.swa_write_records
         plan = metadata.swa_window_plan
         if plan is not None:
-            # One publish also copies ring history into the workspace pages the
-            # chunk attends and the chunk's last window back into the ring.
-            history = swa.reshape(-1, kv.shape[1])[plan.history_src]
-            kv = torch.cat((kv, history, kv[plan.commit_token]))
-            records = torch.cat((records, plan.history_dst, plan.commit_dst))
-        swa.copy_(self.csa2_ops.publish_swa(swa, records, kv))
+            if hasattr(self.csa2_ops, "publish_swa_window"):
+                swa.copy_(
+                    self.csa2_ops.publish_swa_window(
+                        swa,
+                        records,
+                        kv,
+                        plan.history_src,
+                        plan.history_dst,
+                        plan.commit_token,
+                        plan.commit_dst,
+                    )
+                )
+            else:
+                # One publish also copies ring history into the workspace pages the
+                # chunk attends and the chunk's last window back into the ring.
+                history = swa.reshape(-1, kv.shape[1])[plan.history_src]
+                kv = torch.cat((kv, history, kv[plan.commit_token]))
+                records = torch.cat((records, plan.history_dst, plan.commit_dst))
+                swa.copy_(self.csa2_ops.publish_swa(swa, records, kv))
+        else:
+            swa.copy_(self.csa2_ops.publish_swa(swa, records, kv))
 
         if attn_sink is None:
             sink = torch.zeros(q.shape[1], dtype=torch.float32, device=q.device)
