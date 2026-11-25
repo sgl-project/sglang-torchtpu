@@ -828,6 +828,8 @@ class TpuEnvs:
     # EP serving: prefill runs prefill/sptp's dense path with prefill/spep's EP MoE instead of
     # prefill/spep (needs SGLANG_TPU_MUSE_MK_PREFILL_SPTP too).
     SGLANG_TPU_MUSE_MK_PREFILL_SPTP_EP = EnvBool(False)
+    # EP prefill MoE: silu(gate) * up fused into the w13 gmm on the EP layout's chunked columns.
+    SGLANG_TPU_MUSE_MK_PREFILL_EP_FUSED_SILU = EnvBool(False)
     # Kernel-sweep knobs; unset = the tuned default (dev_int).
     SGLANG_TPU_MUSE_MK_DEV_ROW_TILE = EnvInt(None)
     # Dev A/B: small TP decode steps on the row-tiled program too (ops._dev_force_tiled).

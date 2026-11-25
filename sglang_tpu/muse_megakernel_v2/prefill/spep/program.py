@@ -26,6 +26,7 @@ sp_ep_layout decode/spep's (fp4 kperm / per-chunk [gate | up]).
 import jax
 import jax.numpy as jnp
 
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.muse_megakernel_v2.common import a2a
 from sglang_tpu.muse_megakernel_v2.common.config import PFConfig
 from sglang_tpu.muse_megakernel_v2.common.consts import LANE, small_row
@@ -147,7 +148,11 @@ def ep_moe(c: PFConfig, axis: str = "model"):
     moe(l, me, xe8, xs, ids, experts) -> [Ts, top_k, He] bf16 expert outputs of own rows (e4m3
     input xe8 with row scales xs, ids [Ts, top_k]); combine(y, tw, sm) -> u [Ts, He] f32, the
     slots' post-expert-normed outputs weighted by tw."""
-    from sglang_tpu.moe.pallas.gmm_v2 import TileSizes, gmm_v2
+    from sglang_tpu.moe.pallas.gmm_v2 import INTERLEAVED, TileSizes, gmm_v2
+
+    # SGLANG_TPU_MUSE_MK_PREFILL_EP_FUSED_SILU: silu(gate) * up in the w13 gmm's epilogue on the
+    # decode EP layout's chunked columns instead of a separate pass over its output
+    fused_silu = tpu_envs.SGLANG_TPU_MUSE_MK_PREFILL_EP_FUSED_SILU.get()
 
     T, tp, K = c.rows, c.tp, c.top_k
     Ts, El = T // tp, c.n_experts // tp
@@ -194,7 +199,7 @@ def ep_moe(c: PFConfig, axis: str = "model"):
             )
         group_offset = jnp.ones((1,), jnp.int32)
 
-        def gmm(lhs, rhs, scale, fuse_act=None):
+        def gmm(lhs, rhs, scale, fuse_act=None, tiles=expert_tiles):
             return gmm_v2(
                 lhs=lhs,
                 rhs=rhs,
@@ -208,7 +213,7 @@ def ep_moe(c: PFConfig, axis: str = "model"):
                 maybe_quantize_lhs=True,
                 lhs_scale_per_row=True,
                 fuse_act=fuse_act,
-                tile_info=TileSizes(*expert_tiles),
+                tile_info=TileSizes(*tiles),
             )
 
         if s13.ndim == 3:  # [E, K / block, N] -> gmm_v2's [E, K / block, 1, N]
@@ -217,10 +222,16 @@ def ep_moe(c: PFConfig, axis: str = "model"):
             # silu(gate) * up in the w13 kernel's epilogue
             return gmm(gmm(x, w13, s13, fuse_act="silu"), w2, s2)
         # decode EP layout: w13 columns are per-chunk [gate | up] (decode/spep chunk_cols, chunk
-        # = I / tp), which the fused silu cannot read; split them after an unfused gmm. Gate /
-        # up come out in w2's row order (kperm for fp4, natural for fp8).
+        # = I / tp). Gate / up come out in w2's row order (kperm for fp4, natural for fp8).
+        chunk = w13.shape[-1] // (2 * tp)
+        if fused_silu:
+            # one chunk per output tile: gmm_v2 reads gate block 2n and up block 2n + 1
+            tiles = (expert_tiles[0], expert_tiles[1], chunk)
+            h = gmm(x, w13, s13, fuse_act="silu" + INTERLEAVED, tiles=tiles)
+            return gmm(h, w2, s2)
+        # split them after an unfused gmm
         h = gmm(x, w13, s13)
-        act = a2a.silu_mul_chunks(h, lo, hi, w13.shape[-1] // (2 * tp))
+        act = a2a.silu_mul_chunks(h, lo, hi, chunk)
         return gmm(act, w2, s2)
 
     def moe(l, me, xe8, xs, ids, experts):
