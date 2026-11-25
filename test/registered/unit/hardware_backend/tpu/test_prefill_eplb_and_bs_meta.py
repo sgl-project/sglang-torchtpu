@@ -410,6 +410,66 @@ class TestPrefillEplbAndBsMeta(CustomTestCase):
             r2g[mapped_t // 40, mapped_t % 40], col_perm[perm_ids]
         )
 
+    def test_ep16_qblock_and_muse_spark_fallback_routing(self):
+        from sglang_tpu.models.muse_spark import MuseSparkMoE
+
+        rng = np.random.default_rng(77)
+        T, E, TOPK, EP, BASE, R = 48, 256, 8, 16, 16, 2
+        E_LOC = BASE + R
+        raw_logits = rng.standard_normal((T, E)).astype(np.float32) * 0.5
+        bias = rng.standard_normal((E,)).astype(np.float32) * 0.05
+        counts = rng.integers(1, 50, size=(E,), dtype=np.int64)
+        r2g, col_perm = compute_zeroglue_eplb_perm(
+            counts, ep_size=EP, num_local_base=BASE, num_replicas=R, tile_m=16
+        )
+
+        # JAX q_block remap at EP=16 preserves exact physical expert identities.
+        scores_perm = 1.0 / (1.0 + np.exp(-raw_logits[:, col_perm]))
+        _, perm_ids = torch.topk(
+            torch.from_numpy(scores_perm + bias[col_perm][None, :]), TOPK, dim=-1
+        )
+        perm_ids_np = perm_ids.numpy().astype(np.int32)
+        v_ids, _ = remap_zeroglue_virtual_ids(
+            jnp.asarray(perm_ids_np),
+            jnp.int32(0),
+            ep_size=EP,
+            num_local_experts=E_LOC,
+            num_base_local=BASE,
+            mode="q_block",
+            quantum=16,
+        )
+        v_np = np.asarray(v_ids)
+        np.testing.assert_array_equal(
+            r2g[v_np // E_LOC, v_np % E_LOC], col_perm[perm_ids_np]
+        )
+
+        # MuseSparkMoE._route_scaled_logits passes num_base_local=self.num_experts // ep_size
+        # so EP=16 expert IDs >= 16 stay within [0, EP * (16 + R)) without corruption.
+        fake_moe = types.SimpleNamespace(
+            num_experts=E,
+            top_k=TOPK,
+            route_eps=1e-20,
+            route_scale=1.0,
+            _decode_fused_router=False,
+            _eplb_num_replicas=R,
+            _eplb_ep_size=EP,
+            e_score_correction_bias=torch.from_numpy(bias[col_perm]),
+        )
+        out_fb = MuseSparkMoE._route_scaled_logits(
+            fake_moe, torch.from_numpy(raw_logits[:, col_perm]), prerouted=False
+        )
+        fb_np = out_fb.topk_ids.numpy()
+        self.assertTrue(np.all((fb_np >= 0) & (fb_np < EP * E_LOC)))
+        np.testing.assert_array_equal(
+            r2g[fb_np // E_LOC, fb_np % E_LOC], col_perm[perm_ids_np]
+        )
+
+        packed = torch.zeros((T, E), dtype=torch.float32)
+        packed[:, :TOPK] = out_fb.topk_weights
+        packed[:, 8 : 8 + TOPK] = torch.from_numpy(perm_ids_np.astype(np.float32))
+        out_pre = MuseSparkMoE._route_scaled_logits(fake_moe, packed, prerouted=True)
+        np.testing.assert_array_equal(out_pre.topk_ids.numpy(), fb_np)
+
     def test_sp_off_bf16_split_preserves_virtual_ids_above_256(self):
         # Verify the hi/lo bf16 split in fused_moe.py preserves all virtual IDs 0..319 bit-identically
         all_ids = jnp.arange(320, dtype=jnp.int32)

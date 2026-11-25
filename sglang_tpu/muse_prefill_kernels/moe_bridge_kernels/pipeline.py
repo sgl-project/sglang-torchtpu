@@ -1820,23 +1820,25 @@ def fused_moe_full_bridge_and_ffn(
             envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_REBALANCE.get()
             and (ep_size % 2 == 0)
             and w1_l.ndim == 3
+            and (
+                not eplb_mode
+                or eplb_mode == "off"
+                or num_local_experts <= num_base_local
+            )
         )
         _req_cm_slots_pipe = (
             int(envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_SLOTS.get() or 1)
-            if (
-                eff_cm_pipe
-                and (
-                    not eplb_mode
-                    or eplb_mode == "off"
-                    or num_local_experts <= num_base_local
-                )
-            )
+            if eff_cm_pipe
             else 0
         )
         eff_cm_slots_pipe = (
             3
             if (_req_cm_slots_pipe >= 3 and ep_size == 8)
-            else (2 if _req_cm_slots_pipe >= 2 else (1 if eff_cm_pipe else 0))
+            else (
+                2
+                if _req_cm_slots_pipe >= 2
+                else (1 if _req_cm_slots_pipe >= 1 else 0)
+            )
         )
         eff_cm_mode_pipe = envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_CHIPMATE_MODE.get()
 
