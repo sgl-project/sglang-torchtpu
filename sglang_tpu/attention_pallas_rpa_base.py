@@ -1167,6 +1167,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 "supported on the TPU DCP path."
             )
 
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
         kv_len_bump = 0
         query_width = None
         query_lens = None
@@ -1182,7 +1183,32 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             kv_lens = forward_batch.seq_lens.to(torch.int32)
             query_lens = self._extend_query_lens(forward_batch, bs)
         else:
-            kv_lens = forward_batch.seq_lens.to(torch.int32)
+            if (
+                self._dcp <= 1
+                and getattr(device, "type", str(device)) == "tpu"
+                and forward_batch.forward_mode.is_decode()
+                and forward_batch.spec_info is None
+                and isinstance(seq_lens_cpu, torch.Tensor)
+                and 0 < seq_lens_cpu.numel() <= bs
+                and not torch.compiler.is_compiling()
+            ):
+                from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+                if not is_dp_attention_enabled():
+                    kv_lens_cpu = torch.zeros(bs, dtype=torch.int32)
+                    live = int(seq_lens_cpu.numel())
+                    kv_lens_cpu[:live] = seq_lens_cpu.to(torch.int32)
+                    kv_lens = self._value_metadata_fast(
+                        name="kv_lens",
+                        value=kv_lens_cpu,
+                        device=device,
+                        own_cpu=True,
+                        skip_equal=True,
+                    )
+                else:
+                    kv_lens = forward_batch.seq_lens.to(torch.int32)
+            else:
+                kv_lens = forward_batch.seq_lens.to(torch.int32)
             if (
                 forward_batch.forward_mode.is_decode()
                 and forward_batch.spec_info is not None
@@ -1193,8 +1219,6 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 kv_len_bump = self.speculative_step_id + 1
                 kv_lens = kv_lens + kv_len_bump
             query_width = 1
-
-        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
         if seq_lens_cpu is not None and bs > 0:
             if isinstance(seq_lens_cpu, list):
                 slice_cpu = seq_lens_cpu[:bs]

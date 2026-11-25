@@ -766,9 +766,12 @@ class TpuSampler(Sampler):
             envs.SGLANG_TPU_DISTRIBUTED_GREEDY_TOPK.get()
             and getattr(sampling_info, "is_all_greedy", False)
         ):
-            batch_next_token_ids = logits_output.next_token_global_top_k_token_ids[
-                :, 0
-            ].to(torch.int64)
+            tok_ids = logits_output.next_token_global_top_k_token_ids
+            batch_next_token_ids = (
+                tok_ids.view(-1) if tok_ids.shape[1] == 1 else tok_ids[:, 0]
+            )
+            if batch_next_token_ids.dtype != torch.int64:
+                batch_next_token_ids = batch_next_token_ids.to(torch.int64)
             self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
             return batch_next_token_ids
         sampled_top_k_position = sample_from_global_top_k_logits(
@@ -785,7 +788,9 @@ class TpuSampler(Sampler):
                 logits_output.next_token_global_top_k_token_ids,
                 dim=1,
                 index=sampled_top_k_position.to(torch.int64).view(-1, 1),
-            ).view(-1).to(torch.int64)
+            ).view(-1)
+            if batch_next_token_ids.dtype != torch.int64:
+                batch_next_token_ids = batch_next_token_ids.to(torch.int64)
         if fused:
             submit((batch_next_token_ids,))
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)

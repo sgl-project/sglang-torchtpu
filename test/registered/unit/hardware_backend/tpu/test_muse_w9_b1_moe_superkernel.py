@@ -1343,3 +1343,294 @@ def test_muse_spark_b1_moe_b2_superkernel_dispatch_tp8_and_tp16():
                 f"chip_b1:{r_pair}:{batch}",
                 f"chip_fn:False:{r_pair}:{batch}",
             ]
+
+
+def test_decode_4_to_1_pjrt_dispatch_collapse():
+    """Verify CPU positions/kv_lens + compiled int64 lm_head_topk avoid eager TPU ops."""
+    import types
+    from unittest import mock
+
+    import torch
+
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.model_executor.forward_batch_info import (
+        CaptureHiddenMode,
+        ForwardBatch,
+        ForwardMode,
+    )
+    from sglang_tpu.attention_pallas_rpa_base import BaseTpuPallasRpaAttnBackend
+    from sglang_tpu.host_metadata_cache import HostMetadataCache
+    from sglang_tpu.models.muse_spark import MuseSparkForConditionalGeneration
+    from sglang_tpu.sampler import TpuSampler
+
+    # 1. ForwardBatch.init_new computes CPU int64 positions when _is_tpu=True.
+    batch = types.SimpleNamespace(
+        device="cpu",
+        forward_mode=ForwardMode.DECODE,
+        is_extend_in_batch=False,
+        seq_lens=torch.tensor([1, 5, 10], dtype=torch.int64),
+        seq_lens_cpu=torch.tensor([1, 5, 10], dtype=torch.int64),
+        seq_lens_sum=16,
+        req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int64),
+        req_pool_indices_cpu=torch.tensor([0, 1, 2], dtype=torch.int64),
+        reqs=[],
+        out_cache_loc=torch.tensor([0, 1, 2], dtype=torch.int64),
+        extend_lens=None,
+        prefix_lens=None,
+        extend_num_tokens=None,
+        extend_logprob_start_lens=None,
+        extend_input_logprob_token_ids=None,
+        orig_seq_lens=None,
+        out_cache_loc_dsv4=None,
+        engram_history=None,
+        hisparse_coordinator=None,
+        decoding_reqs=None,
+        engram_staged_rows=None,
+        mamba_track_indices=None,
+        mamba_track_mask=None,
+        mamba_track_seqlens=None,
+        mamba_track_seqlens_cpu=None,
+        mamba_prefill_track_mask_cpu=None,
+        mamba_cow_src_indices=None,
+        mamba_cow_dst_indices=None,
+        mamba_clear_indices=None,
+        encoder_lens=None,
+        encoder_out_cache_loc=None,
+        input_embeds=None,
+        replace_embeds=None,
+        replace_positions=None,
+        positions=None,
+        padded_spec_info=None,
+        sampling_info=types.SimpleNamespace(
+            has_watermark_candidates=False,
+            grammars=None,
+        ),
+        return_logprob=False,
+        top_logprobs_nums=None,
+        custom_mask=None,
+        spec_info=None,
+        input_ids=torch.tensor([11, 22, 33], dtype=torch.int32),
+        has_grammar=False,
+        can_run_dp_cuda_graph=False,
+        can_run_dp_breakable_cuda_graph=False,
+        can_run_decode_cuda_graph=False,
+        can_run_dp_prefill_cuda_graph=False,
+        can_run_dp_draft_cuda_graph=False,
+        dp_prefill_cuda_graph_max_prefix_len=None,
+        return_hidden_states_mode=CaptureHiddenMode.NULL,
+        global_forward_mode=ForwardMode.DECODE,
+        is_prefill_only=False,
+        spec_algorithm=None,
+        tbo_split_seq_index=None,
+        token_ids_logprobs=None,
+        multimodal_inputs=None,
+        mm_input_ids_cpu=None,
+        encoder_cached=None,
+        encoder_lens_cpu=None,
+        dllm_config=None,
+        dp_spec_prefill_coordination_applied=False,
+        global_num_tokens=None,
+        global_num_tokens_for_logprob=None,
+        dp_cooperation_info=None,
+    )
+    runner = types.SimpleNamespace(
+        device="cpu",
+        is_draft_worker=False,
+        lora_manager=None,
+        model_config=types.SimpleNamespace(
+            model_is_mrope=False,
+            is_matryoshka=False,
+            requires_mm_token_modalities=False,
+        ),
+        ngram_embedding_manager=types.SimpleNamespace(enabled=False),
+        runner_ids=types.SimpleNamespace(
+            own_plan=lambda _fb: types.SimpleNamespace(bind=lambda *_a, **_kw: None)
+        ),
+    )
+    with (
+        mock.patch("sglang.srt.model_executor.forward_batch_info._is_tpu", True),
+        mock.patch(
+            "sglang.srt.model_executor.forward_batch_info.enable_num_token_non_padded",
+            return_value=False,
+        ),
+        mock.patch(
+            "sglang.srt.model_executor.forward_batch_info.get_parallel",
+            return_value=types.SimpleNamespace(attn_dcp_size=1),
+        ),
+        mock.patch(
+            "sglang.srt.model_executor.forward_batch_info.clamp_position",
+            side_effect=AssertionError("clamp_position must not run on device seq_lens"),
+        ),
+    ):
+        fb = ForwardBatch.init_new(
+            batch,
+            runner,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            return_hidden_states_before_norm=False,
+        )
+    assert fb.positions.device.type == "cpu"
+    assert fb.positions.dtype == torch.int64
+    assert torch.equal(fb.positions, torch.tensor([0, 4, 9], dtype=torch.int64))
+
+    # 2. BaseTpuPallasRpaAttnBackend._build_metadata_host uploads CPU kv_lens without device cast.
+    backend = object.__new__(BaseTpuPallasRpaAttnBackend)
+    backend._dcp = 1
+    backend._host_metadata_cache = HostMetadataCache()
+    backend._host_metadata_cache.get_by_value = (
+        lambda name, value, device, **_kw: value.clone()
+    )
+    backend._host_page_cols = None
+    backend._page_stride = 1
+    backend._is_hybrid_swa = False
+    backend._swa_group_pages = None
+    backend._kv_page_size = 512
+    backend._layout_metadata = lambda *, build, **_kw: build()
+    backend.supports_shared_decode_batch = lambda _bs: False
+    backend.shared_decode_group_size = lambda _bs: 0
+    backend.token_to_kv_pool = types.SimpleNamespace(full_to_swa_index_mapping=None)
+    fake_tpu_dev = types.SimpleNamespace(type="tpu")
+
+    class _NoDeviceCastSeqLens:
+        dtype = torch.int64
+
+        def to(self, *_a, **_kw):
+            raise AssertionError("forward_batch.seq_lens.to(int32) must not be called")
+
+    rpa_fb = types.SimpleNamespace(
+        forward_mode=ForwardMode.DECODE,
+        spec_info=None,
+        seq_lens=_NoDeviceCastSeqLens(),
+        seq_lens_cpu=torch.tensor([12, 40], dtype=torch.int64),
+        req_pool_indices_cpu=torch.tensor([0, 1, 0, 0], dtype=torch.int64),
+    )
+    req_to_token = torch.zeros((2, 1024), dtype=torch.int32)
+    with mock.patch(
+        "sglang.srt.layers.dp_attention.is_dp_attention_enabled", return_value=False
+    ):
+        meta = backend._build_metadata_host(
+            rpa_fb,
+            512,
+            fake_tpu_dev,
+            4,
+            req_to_token,
+            2,
+            torch.tensor([0, 0, 2], dtype=torch.int32),
+            2,
+        )
+    assert meta.kv_lens.dtype == torch.int32
+    assert meta.kv_lens.tolist() == [12, 40, 0, 0]
+
+    # 3. LogitsProcessor.forward (decode) and _forward_pruned_logits return int64 ids
+    # and TpuSampler skips .to(torch.int64).
+    from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+    from sglang.srt.model_executor.forward_batch_info import LogitsOutputMode
+
+    lp_stub = object.__new__(LogitsProcessor)
+    torch.nn.Module.__init__(lp_stub)
+    lp_stub.use_tpu_distributed_top_k = True
+    lp_stub.compute_input_logprobs = False
+    lp_stub.expected_aux_hidden_states = None
+    lp_stub.do_tensor_parallel_all_gather = True
+    lp_stub.do_tensor_parallel_all_gather_dp_attn = False
+    lp_stub.use_attn_tp_group = False
+    lp_stub.logit_scale = 1.0
+    lp_stub.final_logit_softcapping = None
+    lp_stub._get_pruned_states = (
+        lambda hs, hs_bn, aux_hs, _lm: (hs, hs_bn, aux_hs, None, None, None)
+    )
+    lp_stub._get_hidden_states_to_store = lambda *_a: None
+    lp_stub._get_last_hidden_states_to_store = lambda *_a: None
+    lp_stub._batch_vocab_shards = lambda _fb: None
+    lp_stub._get_distributed_gumbel_max = lambda *_a: (
+        torch.tensor([[1.5], [2.5]], dtype=torch.float32),
+        torch.tensor([[17], [42]], dtype=torch.int32),
+    )
+    lp_stub._get_distributed_top_k = lambda *_a: (
+        torch.tensor([[1.5], [2.5]], dtype=torch.float32),
+        torch.tensor([[99], [7]], dtype=torch.int32),
+    )
+    model_stub = types.SimpleNamespace(
+        logits_processor=lp_stub,
+        lm_head=object(),
+    )
+    dummy_meta = LogitsMetadata(
+        forward_mode=ForwardMode.DECODE,
+        capture_hidden_mode=CaptureHiddenMode.NULL,
+        extend_return_logprob=False,
+        mm_input_embeds=None,
+    )
+    for lmode, exp_ids in (
+        (LogitsOutputMode.DISTRIBUTED_GUMBEL_MAX, torch.tensor([[17], [42]], dtype=torch.int64)),
+        (LogitsOutputMode.DISTRIBUTED_GREEDY, torch.tensor([[99], [7]], dtype=torch.int64)),
+    ):
+        fb_dec = object.__new__(ForwardBatch)
+        fb_dec.logits_output_mode = lmode
+        fb_dec.gumbel_temperatures = torch.ones((2, 1), dtype=torch.float32)
+        fb_dec.multi_item_delimiter_indices = None
+        fb_dec.token_indices_to_pool = None
+        fb_dec.forward_mode = ForwardMode.DECODE
+        fb_dec.capture_hidden_mode = CaptureHiddenMode.NULL
+        fb_dec.return_logprob = False
+        fb_dec.top_logprobs_nums = None
+        fb_dec.token_ids_logprobs = None
+        fb_dec.extend_seq_lens_cpu = None
+        fb_dec.mm_inputs = None
+        fb_dec.mm_input_embeds = None
+        with (
+            mock.patch(
+                "sglang_tpu.sampler.distributed_top_k_candidate_width",
+                return_value=64,
+            ),
+            mock.patch.object(
+                LogitsMetadata, "from_forward_batch", return_value=dummy_meta
+            ),
+        ):
+            lout_lp = lp_stub.forward(
+                torch.zeros((2,), dtype=torch.int32),
+                torch.zeros((2, 64), dtype=torch.bfloat16),
+                model_stub.lm_head,
+                fb_dec,
+            )
+            lout_pruned = MuseSparkForConditionalGeneration._forward_pruned_logits(
+                model_stub,
+                torch.zeros((2, 64), dtype=torch.bfloat16),
+                fb_dec,
+            )
+        for lout in (lout_lp, lout_pruned):
+            assert lout.next_token_global_top_k_token_ids.dtype == torch.int64
+            assert torch.equal(lout.next_token_global_top_k_token_ids, exp_ids)
+
+        class _NoInt64CastTensor(torch.Tensor):
+            @staticmethod
+            def __new__(cls, data):
+                return torch.Tensor._make_subclass(cls, data)
+
+            def to(self, *args, **kwargs):
+                if args and args[0] == torch.int64:
+                    raise AssertionError("TpuSampler should not cast int64 token ids")
+                return super().to(*args, **kwargs)
+
+        sampler = types.SimpleNamespace(_sync_token_ids_across_tp=lambda *_a: None)
+        s_out = LogitsProcessorOutput(
+            next_token_logits=None,
+            next_token_global_top_k_logits=lout_lp.next_token_global_top_k_logits,
+            next_token_global_top_k_token_ids=_NoInt64CastTensor(
+                lout_lp.next_token_global_top_k_token_ids
+            ),
+        )
+        sampled = TpuSampler.forward(
+            sampler,
+            s_out,
+            types.SimpleNamespace(
+                sampling_params_on_cpu=False,
+                is_all_greedy=True,
+                sampling_seed=None,
+            ),
+            False,
+            None,
+            None,
+            None,
+        )
+        assert sampled.dtype == torch.int64
+        assert torch.equal(sampled, exp_ids.view(-1))
+

@@ -6974,7 +6974,7 @@ class MuseSparkForConditionalGeneration(nn.Module):
                     return LogitsProcessorOutput(
                         next_token_logits=None,
                         next_token_global_top_k_logits=g_logits,
-                        next_token_global_top_k_token_ids=g_ids,
+                        next_token_global_top_k_token_ids=g_ids.to(torch.int64),
                         mm_input_embeds=logits_metadata.mm_input_embeds,
                     )
         if distributed_top_k is not None:
@@ -6984,7 +6984,7 @@ class MuseSparkForConditionalGeneration(nn.Module):
             return LogitsProcessorOutput(
                 next_token_logits=None,
                 next_token_global_top_k_logits=top_logits,
-                next_token_global_top_k_token_ids=top_ids,
+                next_token_global_top_k_token_ids=top_ids.to(torch.int64),
                 mm_input_embeds=logits_metadata.mm_input_embeds,
             )
         logits = lp._get_logits(pruned_states, self.lm_head, logits_metadata)
