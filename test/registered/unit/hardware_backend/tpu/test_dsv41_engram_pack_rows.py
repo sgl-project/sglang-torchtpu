@@ -11,8 +11,11 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.models.deepseek_v41.engram_host import (
     _FP8_BLOCK_SIZE,
     _INVALID_SCALE,
+    PackedSlotViews,
     local_row_ids,
+    pack_full_table_rows,
     pack_rows,
+    packed_row_words,
     signed_sqrt,
     staged_lookup,
     unpack_rows,
@@ -172,6 +175,30 @@ def test_signed_sqrt_preserves_negative_zero():
     expected = torch.copysign(dot.abs().clamp_min(clamp).sqrt(), dot)
     assert torch.equal(got.view(torch.int32), expected.view(torch.int32))
     assert got[1].item() < 0.0 and got[2].item() > 0.0
+
+
+@pytest.mark.parametrize(
+    "heads,dim,tokens,padded",
+    [(24, 256, 8, 8), (24, 256, 5, 8), (24, 256, 0, 8), (3, 64, 4, 6)],
+)
+def test_pack_full_table_rows_is_byte_identical_to_pack_rows(
+    heads, dim, tokens, padded
+):
+    """The cached-view fast path must emit exactly pack_rows' bytes, including zeroed
+    padding payload, invalid padding scales and the scale alignment tail (heads=3)."""
+    gen = torch.Generator().manual_seed(heads * 1000 + tokens)
+    rows, blocks = 4096, dim // 32
+    weight = torch.randint(0, 256, (rows, dim), generator=gen, dtype=torch.uint8)
+    scale = torch.randint(1, 255, (rows, blocks), generator=gen, dtype=torch.uint8)
+    indices = torch.randint(0, rows, (tokens, heads), generator=gen, dtype=torch.int64)
+    words = packed_row_words(heads, dim, padded)
+    want = pack_rows(weight, scale, indices, row_start=0, padded_tokens=padded)
+    out = torch.full((words,), -1, dtype=torch.int32)
+    views = PackedSlotViews.build(out, heads=heads, dim=dim, blocks=blocks)
+    # Reused slots hold the previous step's bytes; write twice to cover stale rows.
+    pack_full_table_rows(weight.numpy(), scale.numpy(), indices.flip(0).numpy(), views)
+    pack_full_table_rows(weight.numpy(), scale.numpy(), indices.numpy(), views)
+    assert torch.equal(out, want)
 
 
 if __name__ == "__main__":
