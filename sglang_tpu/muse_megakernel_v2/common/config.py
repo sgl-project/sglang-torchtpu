@@ -454,6 +454,8 @@ POST_MOE_TILE = 128
 ROW_ALIGN = POST_MOE_TILE
 # the SP program has no post_moe tiling: rows split evenly over tp ranks, 2+ rows each
 SP_ROW_ALIGN = 16
+# prefill/sptp's post-attention kernels tile 128 own rows per rank
+SPTP_ROW_ALIGN = 128 * PREFILL_TP
 
 
 class PFConfig(MuseGeometry, frozen=True, kw_only=True):
@@ -469,13 +471,17 @@ class PFConfig(MuseGeometry, frozen=True, kw_only=True):
     expert_kinds: tuple = ()
     # SGLANG_TPU_MUSE_MK_SP_EP_LAYOUT: experts / pool / unpool in decode EP's layout
     sp_ep_layout: bool = False
+    # prefill/sptp: prefill/spep's sequence-parallel dense path, prefill/tp's expert-TP MoE
+    sptp: bool = False
 
     def validate(self) -> "PFConfig":
         if self.tp != PREFILL_TP:
             raise ValueError(
                 f"the Muse prefill program runs at TP {PREFILL_TP}, got {self.tp}"
             )
-        align = SP_ROW_ALIGN if self.sp else ROW_ALIGN
+        if self.sptp and (self.sp or self.fp8_gather):
+            raise ValueError("prefill/sptp takes prefill/tp's config without sp / fp8_gather")
+        align = SPTP_ROW_ALIGN if self.sptp else SP_ROW_ALIGN if self.sp else ROW_ALIGN
         if self.rows % align:
             raise ValueError(
                 f"{self.rows}-row extend step: the Muse prefill program needs multiples of "

@@ -822,6 +822,9 @@ class TpuEnvs:
     SGLANG_TPU_MUSE_MK_PREFILL_SP = EnvBool(False)
     # prefill/spep reads decode EP's weight layout (one shared copy).
     SGLANG_TPU_MUSE_MK_SP_EP_LAYOUT = EnvBool(False)
+    # TP experts: extend steps run prefill/sptp (sequence-parallel dense path on replicated
+    # wo / pool / unpool, expert-TP MoE) instead of prefill/tp.
+    SGLANG_TPU_MUSE_MK_PREFILL_SPTP = EnvBool(True)
     # Kernel-sweep knobs; unset = the tuned default (dev_int).
     SGLANG_TPU_MUSE_MK_DEV_ROW_TILE = EnvInt(None)
     SGLANG_TPU_MUSE_MK_DEV_TILED_PAIR_Y = EnvInt(None)
