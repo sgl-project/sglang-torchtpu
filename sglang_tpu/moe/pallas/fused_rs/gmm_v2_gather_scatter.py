@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
 import dataclasses
 import functools
 import os
@@ -259,6 +260,16 @@ def generate_block_specs(
 
 
 # Define kernels.
+def _frs_scope(name: str):
+    """Detail-trace span (MUSE_MK_TRACE >= 1, read at trace time); a no-op otherwise.
+
+    The spans fence the schedule: dequant and matmul no longer overlap inside a tile.
+    """
+    if int(os.environ.get("MUSE_MK_TRACE", "0")) >= 1:
+        return jax.named_scope(name)
+    return contextlib.nullcontext()
+
+
 def inner_kernel(
     # In
     tiled_lhs_ref: jax.Array,
@@ -474,6 +485,8 @@ def inner_kernel(
                         f"{q_block_size}. Check MUSE_FUSED_RS_W4A16_KBLOCK or unset "
                         "SGLANG_TPU_MUSE_MK_KPERM."
                     )
+                _w_scope = _frs_scope("frs_w_dequant")
+                _w_scope.__enter__()
                 block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
                 if cfgs.rhs_cfgs.has_scale and not apply_rhs_scale_after_matmul:
                     if moe_kperm and rhs_qbs == 16 and (end_k - start_k) % 256 == 0:
@@ -542,11 +555,13 @@ def inner_kernel(
                     block_lhs_for_matmul = block_lhs.astype(jnp.bfloat16)
                     block_rhs_for_matmul = block_rhs_for_quant
 
-                block_acc = jnp.matmul(
-                    block_lhs_for_matmul,
-                    block_rhs_for_matmul,
-                    preferred_element_type=jnp.float32,
-                ).astype(acc_ref.dtype)
+                _w_scope.__exit__(None, None, None)
+                with _frs_scope("frs_mxu"):
+                    block_acc = jnp.matmul(
+                        block_lhs_for_matmul,
+                        block_rhs_for_matmul,
+                        preferred_element_type=jnp.float32,
+                    ).astype(acc_ref.dtype)
 
                 if fp8_activation_quant:
                     if lhs_scale is not None:
@@ -600,6 +615,8 @@ def inner_kernel(
                                     accs[c] += _quant_col_step(
                                         block_lhs, start_k, end_k, sn, sn + mxu_size
                                     )
+                            _e_scope = _frs_scope("frs_epilogue")
+                            _e_scope.__enter__()
                             grp_outs = []
                             for acc_n in accs:
                                 acc_n = _row_rescale(acc_n)
@@ -643,9 +660,18 @@ def inner_kernel(
                                     ).astype(tiled_out_ref.dtype)
                                 )
                         g_blk = g_col // num_lanes
-                        tiled_out_ref[:, pl.ds(g_blk, sls_out), :] = jnp.concatenate(
-                            grp_outs, axis=1
-                        ).reshape(cfgs.tiles.tile_m, sls_out, num_lanes)
+                        with (
+                            contextlib.nullcontext()
+                            if share_lhs
+                            else _frs_scope("frs_epilogue")
+                        ):
+                            tiled_out_ref[:, pl.ds(g_blk, sls_out), :] = (
+                                jnp.concatenate(grp_outs, axis=1).reshape(
+                                    cfgs.tiles.tile_m, sls_out, num_lanes
+                                )
+                            )
+                        if share_lhs:
+                            _e_scope.__exit__(None, None, None)
                     return
 
             for start_n in range(0, rhs_tile_n, mxu_size):
@@ -665,6 +691,10 @@ def inner_kernel(
         if not is_first_k_step:
             acc += acc_ref[...]
 
+        _e_scope = (
+            _frs_scope("frs_epilogue") if is_last_k_step else contextlib.nullcontext()
+        )
+        _e_scope.__enter__()
         if is_last_k_step:
             if cfgs.rhs_cfgs.has_scale and gs_gate_ref is not None:
                 _gid = metadata_ref.gm_id_to_group_id[_resolved_gm_id]
@@ -745,6 +775,7 @@ def inner_kernel(
                 )
         else:
             acc_ref[...] = acc
+        _e_scope.__exit__(None, None, None)
 
     # Define matmul wrapper functions.
     @jax.named_scope("matmul_first_last")
