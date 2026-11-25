@@ -171,8 +171,9 @@ def _place_mm_rows(
 
     Args:
         masks: Per-modality host bool masks of shape [rows, 1]; None to skip.
-        embeddings: Per-modality host embeddings, row-aligned in order to their
-            mask's set positions; None to skip.
+        embeddings: Per-modality embeddings, row-aligned in order to their
+            mask's set positions; None to skip. Rows on the device are copied
+            to the host first.
         rows: Padded token count of the batch.
         hidden: Width of the destination.
         dtype: Destination dtype.
