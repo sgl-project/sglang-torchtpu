@@ -139,9 +139,7 @@ def _hot_move(rank, rank0, real, n_visit, n_pre, k):
     t = jnp.minimum(jnp.int32(k), n_visit - 1)
     up = (p_h > t) & (rank >= t) & (rank < p_h)
     down = (p_h < t) & (rank > p_h) & (rank <= t)
-    moved = jnp.where(
-        hot, t, jnp.where(up, rank + 1, jnp.where(down, rank - 1, rank))
-    )
+    moved = jnp.where(hot, t, jnp.where(up, rank + 1, jnp.where(down, rank - 1, rank)))
     return jnp.where(real & (n_visit > n_pre), moved, rank)
 
 
@@ -412,7 +410,9 @@ def _order_tag(light_prepush, visit_order, hot_visit=0):
 
 
 @functools.cache
-def _build(ep, g, n_pre, tile_m, interpret, light_prepush=0, visit_order=0, hot_visit=0):
+def _build(
+    ep, g, n_pre, tile_m, interpret, light_prepush=0, visit_order=0, hot_visit=0
+):
     def kernel(me_sm, r3_ref, seg3_ref, *outs):
         t = _tables(r3_ref[...], seg3_ref[...], me_sm[0], ep=ep, g=g, n_pre=n_pre,
                     tile_m=tile_m, light_prepush=light_prepush,
@@ -702,9 +702,7 @@ def _build_exchange_rows_tables(
             # The pair words of every source (rows [0, n_pr) of its slab),
             # while the row copies are still in flight.
             pairs_vm = rest[7]
-            cp = pltpu.make_async_copy(
-                out_hbm.at[:, pl.ds(0, n_pr), :], pairs_vm, csem
-            )
+            cp = pltpu.make_async_copy(out_hbm.at[:, pl.ds(0, n_pr), :], pairs_vm, csem)
             cp.start()
             cp.wait()
             sr = slab_rows_from_pairs(

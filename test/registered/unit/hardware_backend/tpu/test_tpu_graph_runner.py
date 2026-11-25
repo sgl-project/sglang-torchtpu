@@ -22,7 +22,7 @@ from sglang.srt.compilation.support_torch_compile import (
     support_torch_compile,
 )
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase, enter_scope

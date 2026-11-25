@@ -83,9 +83,7 @@ def owner_flags(ids, me, *, g_local, e_total):
     return owned | jnp.logical_not(valid)
 
 
-def sender_tables(
-    ids, me, *, g_local, e_total, block, block_hist=None, dedup=True
-):
+def sender_tables(ids, me, *, g_local, e_total, block, block_hist=None, dedup=True):
     """This rank's half of the tables, from its own topk ids [t, K] (mesh
     order, e_total = routes nowhere).
 

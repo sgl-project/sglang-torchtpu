@@ -10,9 +10,11 @@ exit_late_layer_tail restores it. With fused EP off it is left alone.
     PYTHONPATH=<tree>/python:<tree> python -m pytest -q <this file>
 """
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -107,3 +109,7 @@ def test_tail_leaves_the_count_alone_without_fused_ep():
     inside, _, fb = _run([True] * 2 + [False] * 6, fused_ep=False)
     assert inside.tolist() == [1000]
     assert fb.num_token_non_padded.tolist() == [1000]
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

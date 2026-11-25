@@ -455,3 +455,7 @@ def test_decode_buckets_loop_their_tall_bodies(v2):
         plan = host.k32z_build_plan(stride, ep, g_local, 5120, 2304)
         assert plan["k32z_ffn_roll"] == 0
         assert plan["k32z_rungs"] == rungs and plan["defer_push"]
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

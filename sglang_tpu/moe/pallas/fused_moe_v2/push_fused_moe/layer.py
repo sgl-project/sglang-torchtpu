@@ -72,7 +72,6 @@ from sglang_tpu.moe.pallas.fused_moe_v2.layer import (
 )
 from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe import dedup as _dedup
 from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe.host import (
-    _take_small,
     build_routing_tables_sharded,
     local_sort_activations,
     local_sort_tokens,
@@ -576,9 +575,7 @@ def fused_ep_moe_push(
         # Outside the dedup buckets the build is the default one.
         x_tables = x_dedup = False
     exchange_slab_rows = bool(
-        _host.push_slab_rows_mode(
-            k32z=k32z_gate_up_bits is not None, t_local=t_local
-        )
+        _host.push_slab_rows_mode(k32z=k32z_gate_up_bits is not None, t_local=t_local)
         and exchange_tables
         and kernel_plan_tables
         and table_kernel
@@ -1227,9 +1224,7 @@ def fused_ep_moe_push(
             if exchange_tables:
                 x_kw = {}
                 if x_tables:
-                    x_kw = dict(
-                        x_tag=x_tag, x_dedup=x_dedup, x_npre=n_pre, x_cap=x_cap
-                    )
+                    x_kw = dict(x_tag=x_tag, x_dedup=x_dedup, x_npre=n_pre, x_cap=x_cap)
                 if exchange_slab_rows:
                     # The plan's slab rows from the kernel too.
                     x_kw = dict(

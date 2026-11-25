@@ -783,7 +783,9 @@ def _build_push_moe_kernel(
             if isinstance(visit_i, int) and visit_i < sc_prepush:
                 return None
             p = visit_i * ep + me
-            n = jnp.where(visit_i >= sc_prepush, jnp.bitwise_and(dpairs_sm[p], 65535), 0)
+            n = jnp.where(
+                visit_i >= sc_prepush, jnp.bitwise_and(dpairs_sm[p], 65535), 0
+            )
             start = dpairs_sm[2 * n_segs + p] - expert_base_sm[e]
             return start, n, dpairs_sm[n_segs + p]
 
@@ -1759,11 +1761,7 @@ def _build_push_moe_kernel(
                         # tile only, so a tail tile never waits; a taller
                         # body's visit waited both slabs at its head.
                         streamed = height <= k32z_streamed
-                        waiter = (
-                            _slab_waiter(e, slot, first_tile)
-                            if streamed
-                            else None
-                        )
+                        waiter = _slab_waiter(e, slot, first_tile) if streamed else None
                         # Every tile rebuilds the column scales: a few dozen
                         # row stores, read by this tile alone.
                         k32z_fill_colscale(
