@@ -129,6 +129,17 @@ class TpuEnvs:
     # Vision: run single-sequence "tpu" vision attention through block-skipping splash
     # (attention/vision_splash.py); False keeps the segment-id flash op.
     SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION = EnvBool(False)
+    # Wan VAE decode: output channels the decoder's last convolution (96 -> 3)
+    # computes, with zero-padded weights; the real channels are kept, each the
+    # same sum of products. tpu7x ran the 3-channel convolution ~9x slower per
+    # pixel than the 96-channel ones beside it. Unset: the stock convolution.
+    SGLANG_TPU_OPT_WAN_VAE_CONV_OUT_CHANNELS = EnvInt(None)
+    # Wan VAE decode (multimodal_gen/wan_vae.py): XLA compiler options for the
+    # decode's programs only, comma-separated "name=value"
+    # (torch.tpu.compiler.custom_compiler_options), e.g.
+    # "xla_tpu_enable_offloading_copy_to_sparsecore=false": the relayout copies
+    # around each convolution on the TensorCores (bitwise, faster). Unset: none.
+    SGLANG_TPU_OPT_WAN_VAE_XLA_OPTIONS = EnvStr(None)
     # Launch-time xprof capture (see profile_auto.py): each stage once, without
     # /start_profile. Keep the step count small: each chip's trace is hundreds
     # of MB.
