@@ -275,9 +275,7 @@ def _csa2_kernel_impl(
             for owner, source in enumerate(swa_hbm):
                 first = swa_hbm[0].shape[0] if owner else 0
                 page = jnp.clip(physical - first, 0, source.shape[0] - 1)
-                sources.append(
-                    source.at[pl.ds(page, 1), pl.ds(offset, page_size)]
-                )
+                sources.append(source.at[pl.ds(page, 1), pl.ds(offset, page_size)])
             owner = (physical >= swa_hbm[0].shape[0]).astype(jnp.int32)
             copies.append(
                 _PageCopy(
