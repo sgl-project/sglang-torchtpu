@@ -5,9 +5,10 @@ state of one native transfer."""
 from __future__ import annotations
 
 import hashlib
-from types import SimpleNamespace
-from typing import Any, Sequence
+from types import MappingProxyType, SimpleNamespace
+from typing import Any, Mapping, Sequence
 
+from sglang_tpu.disaggregation.raiden import pp_mxint8
 from sglang_tpu.disaggregation.raiden.reshard_schedule import (
     ReshardGeometry,
     head_bytes,
@@ -21,19 +22,40 @@ from sglang_tpu.disaggregation.raiden.reshard_schedule import (
 # index on the lane axis, so one kv-head is a single contiguous run of a page.
 # A block-major bundle (rank 6) holds every layer of a page in one row:
 #   [num_blocks, layer_num, page_size, kv_heads_packed, kv_packing, head_dim]
+# An MXINT8 pool (rank 3) folds kv-heads and exponents into int8 rows (pp_mxint8):
+#   [num_blocks, rows, page_size or 128]
 _FUSED_KV_RANK = 5
 _HEAD_MAJOR_KV_RANK = 4
 _BLOCK_MAJOR_KV_RANK = 6
+_MXINT8_KV_RANK = 3
+_NO_PAGE_FORMATS: Mapping[str, pp_mxint8.Mxint8PageFormat] = MappingProxyType({})
 
 
 def _kv_rank(tensor) -> int:
     rank = len(tensor.shape)
-    if rank not in (_FUSED_KV_RANK, _HEAD_MAJOR_KV_RANK, _BLOCK_MAJOR_KV_RANK):
+    if rank not in (
+        _FUSED_KV_RANK,
+        _HEAD_MAJOR_KV_RANK,
+        _BLOCK_MAJOR_KV_RANK,
+        _MXINT8_KV_RANK,
+    ):
         raise ValueError(
-            "Raiden pipeline transfer requires rank-5 fused or rank-4 RPA-seq KV, "
-            "or a rank-6 block-major bundle"
+            "Raiden pipeline transfer requires rank-5 fused, rank-4 head-major or "
+            "rank-3 MXINT8 KV, or a rank-6 block-major bundle"
         )
     return rank
+
+
+def mxint8_format(
+    page_formats: Mapping[str, pp_mxint8.Mxint8PageFormat], tag: str
+) -> pp_mxint8.Mxint8PageFormat:
+    """The MXINT8 page format of a rank-3 pool, by its pool kind."""
+    fmt = page_formats.get(pool_kind(tag))
+    if fmt is None:
+        raise ValueError(
+            f"Raiden pipeline rank-3 KV pool {tag} needs an MXINT8 page format"
+        )
+    return fmt
 
 
 def pool_kind(tag: str) -> str:
@@ -48,9 +70,13 @@ def is_draft_pool(tag: str) -> bool:
     return pool_kind(tag).startswith("draft.")
 
 
-def _producer_tensor_kv_heads(tensor: Any) -> int:
+def _producer_tensor_kv_heads(
+    tensor: Any, fmt: pp_mxint8.Mxint8PageFormat | None
+) -> int:
     """KV head count of a TP=1 producer page tensor when the pool omitted head_num."""
     rank = _kv_rank(tensor)
+    if rank == _MXINT8_KV_RANK:
+        return fmt.heads(tensor)
     if rank == _HEAD_MAJOR_KV_RANK:
         return int(tensor.shape[1]) // 2
     if rank == _FUSED_KV_RANK:
@@ -99,6 +125,7 @@ def head_slice_spans(
     *,
     draft_total_kv_heads: int | None = None,
     draft_swa_total_kv_heads: int | None = None,
+    page_formats: Mapping[str, pp_mxint8.Mxint8PageFormat] = _NO_PAGE_FORMATS,
 ) -> list[Any]:
     """Describe each destination rank's kv-head slice of every locally owned
     page: one strided span per page and rank, routed to that rank only."""
@@ -106,7 +133,9 @@ def head_slice_spans(
     for pool, tensor in zip(pools, tensors):
         tag = pool["tag"]
         blocks = swa if is_swa_pool(tag) else full
-        if _kv_rank(tensor) == _BLOCK_MAJOR_KV_RANK:
+        kv_rank = _kv_rank(tensor)
+        fmt = mxint8_format(page_formats, tag) if kv_rank == _MXINT8_KV_RANK else None
+        if kv_rank == _BLOCK_MAJOR_KV_RANK:
             raise ValueError(
                 "A block-major KV bundle moves whole page rows; a "
                 "tensor-parallel consumer needs per-layer KV pools"
@@ -123,11 +152,25 @@ def head_slice_spans(
             pool_kv_heads = (
                 int(draft_heads)
                 if draft_heads is not None
-                else _producer_tensor_kv_heads(tensor)
+                else _producer_tensor_kv_heads(tensor, fmt)
             )
         else:
             pool_kv_heads = total_kv_heads
-        if _kv_rank(tensor) == _HEAD_MAJOR_KV_RANK:
+        if fmt is not None:
+            # A TP=1 producer's page holds every kv-head of its pool; a hybrid
+            # model's sliding-window layers can have a count of their own.
+            result.append(
+                pp_mxint8.head_slice_part(
+                    fmt,
+                    tag=tag,
+                    tensor=tensor,
+                    blocks=blocks,
+                    dst_attn_tp=dst_attn_tp,
+                    total_kv_heads=fmt.heads(tensor),
+                )
+            )
+            continue
+        if kv_rank == _HEAD_MAJOR_KV_RANK:
             result.append(
                 _head_major_slice_spans(
                     pool=pool,
@@ -279,6 +322,7 @@ def part_spans(
     *,
     draft_total_kv_heads: int | None = None,
     draft_swa_total_kv_heads: int | None = None,
+    page_formats: Mapping[str, pp_mxint8.Mxint8PageFormat] = _NO_PAGE_FORMATS,
     with_swa: bool,
 ) -> list[Any]:
     """Spans of one transfer over the full-attention pools and, when with_swa,
@@ -301,6 +345,7 @@ def part_spans(
         total_kv_heads,
         draft_total_kv_heads=draft_total_kv_heads,
         draft_swa_total_kv_heads=draft_swa_total_kv_heads,
+        page_formats=page_formats,
     )
 
 

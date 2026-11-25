@@ -26,6 +26,7 @@ def _groups(full, swa, full_ids, swa_ids):
         swa_layer_ids=swa_ids,
         num_draft_full=0,
         num_hidden_full=0,
+        page_formats={},
         num_draft_swa=0,
     )
 
@@ -101,7 +102,9 @@ def test_unsupported_or_mixed_kv_layouts_are_rejected():
     seq = torch.zeros((4, 32, 128, 512), dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="share one page layout"):
         pl.pool_manifest(_groups([fused], [seq], [1], [0]))
-    with pytest.raises(ValueError, match="rank-5 fused or rank-4"):
+    with pytest.raises(ValueError, match="rank-5 fused, rank-4 head-major"):
+        pl.pool_manifest(_groups([torch.zeros((4, 8))], [], [1], []))
+    with pytest.raises(ValueError, match="MXINT8 pages must be int8"):
         pl.pool_manifest(_groups([torch.zeros((4, 8, 8))], [], [1], []))
 
 

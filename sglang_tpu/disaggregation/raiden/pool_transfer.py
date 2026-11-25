@@ -12,7 +12,7 @@ import os
 import threading
 import time
 from types import SimpleNamespace
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import msgspec
 
@@ -20,7 +20,7 @@ from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import NetworkAddress
-from sglang_tpu.disaggregation.raiden import pool_side_engine
+from sglang_tpu.disaggregation.raiden import pool_side_engine, pp_mxint8
 from sglang_tpu.disaggregation.raiden.host_pool import (
     StagingAdmission,
     ranks_per_node,
@@ -29,10 +29,13 @@ from sglang_tpu.disaggregation.raiden.pipeline_final_chunks import FinalChunks
 from sglang_tpu.disaggregation.raiden.pool_spans import (
     _BLOCK_MAJOR_KV_RANK,
     _HEAD_MAJOR_KV_RANK,
+    _MXINT8_KV_RANK,
+    _NO_PAGE_FORMATS,
     _kv_rank,
     _new_transfer_state,
     group_ranks,
     is_swa_pool,
+    mxint8_format,
     parse_req_id,
     part_destination_blocks,
     part_req_id,
@@ -90,6 +93,8 @@ def pool_manifest(groups: Any) -> list[dict]:
             tag = f"{tag_kind}.l{int(layer)}"
             if _kv_rank(tensor) == _BLOCK_MAJOR_KV_RANK:
                 tag += f"+{int(tensor.shape[1])}"
+            if _kv_rank(tensor) == _MXINT8_KV_RANK:
+                pp_mxint8.check_page_shape(tensor)
             size = math.prod(int(n) for n in tensor.shape[1:]) * tensor.element_size()
             pools.append(
                 dict(
@@ -138,7 +143,12 @@ def materialized_storage_layout(tensor, getter):
 
 
 def layout_fingerprint(
-    pools: Sequence[dict], tensors: Sequence[Any], getter, *, ships_pd_hidden: bool
+    pools: Sequence[dict],
+    tensors: Sequence[Any],
+    getter,
+    *,
+    ships_pd_hidden: bool,
+    page_formats: Mapping[str, pp_mxint8.Mxint8PageFormat] = _NO_PAGE_FORMATS,
 ) -> str:
     """Compare per-class page geometry and materialized layout across layer
     subsets; the per-rank head count is left out so a tensor-parallel consumer
@@ -155,7 +165,16 @@ def layout_fingerprint(
         if layout is None:
             raise ValueError("Raiden pipeline KV must have a materialized TPU layout")
         major, tiles, bits = layout
-        if _kv_rank(tensor) == _HEAD_MAJOR_KV_RANK:
+        mxint8 = None
+        if _kv_rank(tensor) == _MXINT8_KV_RANK:
+            # Axis 1, the rows of this rank's kv-heads, is left out; the format
+            # fixes the rest of the page.
+            fmt = mxint8_format(page_formats, pool["tag"])
+            pp_mxint8.check_tiling(layout)
+            schema = "sglang-mxint8-kv-v1"
+            page_shape = [int(tensor.shape[2])]
+            mxint8 = msgspec.structs.asdict(fmt)
+        elif _kv_rank(tensor) == _HEAD_MAJOR_KV_RANK:
             # Axis 1, the per-rank 2 * kv_heads, is left out.
             schema = "sglang-rpa-seq-kv-v1"
             page_shape = [int(tensor.shape[2]), int(tensor.shape[3])]
@@ -176,6 +195,8 @@ def layout_fingerprint(
             tiles=[[int(n) for n in tile] for tile in tiles],
             element_bits=int(bits or tensor.element_size() * 8),
         )
+        if mxint8 is not None:
+            signature["mxint8"] = mxint8
         # A draft page matches its target class, so a stage without the draft
         # fingerprints like one with it.
         kind = pool_kind(pool["tag"]).removeprefix("draft.")
@@ -349,6 +370,8 @@ class RaidenPoolTransfer:
     side: pool_side_engine.SideLink | None = None
     draft_kv_heads: int | None = None
     draft_swa_kv_heads: int | None = None
+    # MXINT8 page formats by pool kind (fa, swa, draft.fa, draft.swa).
+    page_formats: Mapping[str, pp_mxint8.Mxint8PageFormat] = _NO_PAGE_FORMATS
 
     def __init__(self, manager, groups):
         from tpu_sync.api.torch.reshard_client import ReshardClient
@@ -356,11 +379,12 @@ class RaidenPoolTransfer:
 
         self.manager = manager
         self.producer = manager.disaggregation_mode == DisaggregationMode.PREFILL
-        self._check_support(raiden_service_pb2)
+        self._check_support(raiden_service_pb2, page_formats=groups.page_formats)
         self.hbm_mem_type = raiden_service_pb2.MEMORY_TYPE_HBM
         self.lock = threading.RLock()
         self.draft_kv_heads = getattr(groups, "draft_kv_head_num", None)
         self.draft_swa_kv_heads = getattr(groups, "draft_swa_kv_head_num", None)
+        self.page_formats = groups.page_formats
         # A pool family with another block count gets an engine of its own.
         self.pools, side_pools = pool_side_engine.split_manifest(pool_manifest(groups))
         family = pool_side_engine.family_of(side_pools)
@@ -484,7 +508,12 @@ class RaidenPoolTransfer:
             else None
         )
 
-    def _check_support(self, raiden_service_pb2) -> None:
+    def _check_support(
+        self,
+        raiden_service_pb2,
+        *,
+        page_formats: Mapping[str, pp_mxint8.Mxint8PageFormat],
+    ) -> None:
         """Reject topologies and native builds the pipeline transfer cannot serve."""
         manager = self.manager
         if manager.attn_cp_size != 1:
@@ -499,6 +528,10 @@ class RaidenPoolTransfer:
                 "Raiden pipeline transfer takes attention TP>1 only on a decode "
                 "without pipeline stages"
             )
+        if not self.producer and manager.attn_tp_size > 1:
+            # The producer slices every page's kv-heads for this decode.
+            for fmt in page_formats.values():
+                fmt.check_head_slices()
         if (
             "wire_pool_indices"
             not in raiden_service_pb2.StartTransferRequest.DESCRIPTOR.fields_by_name
@@ -666,6 +699,7 @@ class RaidenPoolTransfer:
             tensors,
             tpu_torch_compile.get_device_layout_if_materialized,
             ships_pd_hidden=_ships_pd_hidden(),
+            page_formats=self.page_formats,
         )
         client.register_work_unit(
             unit=unit,
@@ -789,6 +823,7 @@ class RaidenPoolTransfer:
                 int(self.manager.kv_args.total_kv_head_num),
                 draft_total_kv_heads=self.draft_kv_heads,
                 draft_swa_total_kv_heads=self.draft_swa_kv_heads,
+                page_formats=self.page_formats,
                 with_swa=with_side,
             )
             self.client.register_request_blocks(

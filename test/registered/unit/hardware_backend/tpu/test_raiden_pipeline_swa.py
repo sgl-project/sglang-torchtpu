@@ -207,6 +207,7 @@ def make(mode, rank, world, name, *, pp_size, tp_size=1, stage_parts=False):
         swa_layer_ids=swa_ids,
         num_draft_full=0,
         num_hidden_full=0,
+        page_formats={},
         num_draft_swa=0,
     )
     side = "p" if producer else "d"
@@ -422,6 +423,7 @@ def test_split_manifest_rebases_storage_indices():
         swa_layer_ids=[3],
         num_draft_full=0,
         num_hidden_full=0,
+        page_formats={},
         num_draft_swa=0,
     )
     full, swa = ps.split_manifest(pl.pool_manifest(groups))
@@ -444,6 +446,7 @@ def test_split_manifest_puts_draft_window_layers_on_the_window_engine():
         swa_layer_ids=[3, 1],
         num_draft_full=1,
         num_hidden_full=0,
+        page_formats={},
         num_draft_swa=1,
     )
     full, swa = ps.split_manifest(pl.pool_manifest(groups))
@@ -1119,6 +1122,7 @@ def hybrid_groups():
         swa_layer_ids=[0, 1, 2],
         num_draft_full=0,
         num_hidden_full=0,
+        page_formats={},
         num_draft_swa=0,
     )
 
@@ -1198,6 +1202,7 @@ def test_full_attention_only_stage_is_unchanged():
         swa_layer_ids=[],
         num_draft_full=0,
         num_hidden_full=0,
+        page_formats={},
         num_draft_swa=0,
     )
     r = _initialize(groups)
