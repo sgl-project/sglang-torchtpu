@@ -5,8 +5,8 @@ applies its _Patch: KV layout (bf16 at c4/c8, fp8 1M-context elsewhere), running
 requests, prefill/decode interval and megakernel row cap. The mode picks the engine:
 
 - mixed: one TP8 server, prefill and decode together.
-- prefill / decode: one Raiden P/D engine each, a PP2 x TP4 prefill host feeding a TP8
-  megakernel decode host.
+- prefill / decode: one Raiden P/D engine each, a PP8 prefill host (one stage per core)
+  feeding a TP8 megakernel decode host.
 
 Every mode serves DFlash on the experimental spec worker, the only one that runs it on
 a PP prefill.
@@ -209,15 +209,14 @@ _ROLES: dict[str, dict[str, dict]] = {
     "prefill": {
         "server_args": {
             "disaggregation_mode": "prefill",
-            # Raiden's pipeline producer needs attention TP=1 (DP attention), while NVFP4
-            # MoE needs fused-RS expert TP > 1; PP rejects the overlap schedule.
-            "tp_size": 4,
-            "dp_size": 4,
-            "enable_dp_attention": True,
-            # The DFlash draft shares the target head, sharded over attention TP under DP.
-            "enable_dp_lm_head": True,
+            # Raiden's pipeline producer needs attention TP=1, and PP on TPU admits TP=1 or a
+            # TP2 pair without DP attention, so the prefill is pure PP over the host's 8 cores.
+            "tp_size": 1,
             "ep_size": 1,
-            "pp_size": 2,
+            "pp_size": 8,
+            # fused-RS MoE needs TP > 1 inside the engine; a TP=1 stage runs NVFP4 on stock gmm_v2.
+            "moe_runner_backend": "auto",
+            # PP rejects the overlap schedule.
             "disable_overlap_schedule": True,
         },
         # The megakernel runs the whole decoder in one kernel, so it cannot be staged.
@@ -226,6 +225,10 @@ _ROLES: dict[str, dict[str, dict]] = {
     "decode": {
         "server_args": {
             "disaggregation_mode": "decode",
+            # _BASE turns HiCache on, and a decode without its radix cache is forced to chunk
+            # cache, which HiCache rejects; the radix cache also keeps a session's prefix so
+            # the prefill sends only the new pages.
+            "disaggregation_decode_enable_radix_cache": True,
             # The decode HiCache (pd_decode_swa_hicache) rejects host_pool retraction.
             "disaggregation_decode_retraction_backup": "cpu_tensor",
         },
