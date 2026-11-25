@@ -14,40 +14,6 @@ class NVMLUnavailableError(Exception):
     pass
 
 
-CUDA_QUALNAME = "sglang.multimodal_gen.runtime.platforms.cuda.CudaPlatform"
-TPU_QUALNAME = "sglang.multimodal_gen.runtime.platforms.tpu.TpuPlatform"
-CPU_QUALNAME = "sglang.multimodal_gen.runtime.platforms.cpu.CpuPlatform"
-
-
-class TestPlatformPriority(unittest.TestCase):
-    def _resolve(self, **results):
-        # Keep the real detection order; only the detector results are faked.
-        detectors = {
-            name: MagicMock(return_value=results.get(name))
-            for name in platforms.builtin_platform_plugins
-        }
-        with (
-            patch.dict(os.environ, {"SGLANG_DIFFUSION_PLATFORM_OVERRIDE": ""}),
-            patch.object(platforms, "entry_points", return_value=[]),
-            patch.object(platforms, "builtin_platform_plugins", detectors),
-        ):
-            return platforms.resolve_current_platform_cls_qualname()
-
-    def test_cuda_wins_when_torch_tpu_is_also_installed(self):
-        self.assertEqual(
-            self._resolve(cuda=CUDA_QUALNAME, tpu=TPU_QUALNAME, cpu=CPU_QUALNAME),
-            CUDA_QUALNAME,
-        )
-
-    def test_installed_torch_tpu_wins_over_cpu(self):
-        self.assertEqual(
-            self._resolve(tpu=TPU_QUALNAME, cpu=CPU_QUALNAME), TPU_QUALNAME
-        )
-
-    def test_cpu_when_torch_tpu_is_absent(self):
-        self.assertEqual(self._resolve(cpu=CPU_QUALNAME), CPU_QUALNAME)
-
-
 def _entry_point(name: str, result: str | None, dist: str | None = None):
     entry_point = MagicMock(name=f"entry_point_{name}")
     entry_point.name = name
@@ -212,7 +178,6 @@ class TestDiffusionPlatformPlugins(unittest.TestCase):
             "npu": "sglang.multimodal_gen.runtime.platforms.npu.NPUPlatformBase",
             "musa": "sglang.multimodal_gen.runtime.platforms.musa.MusaPlatform",
             "xpu": "sglang.multimodal_gen.runtime.platforms.xpu.XpuPlatform",
-            "tpu": "sglang.multimodal_gen.runtime.platforms.tpu.TpuPlatform",
         }
 
         for name, qualname in expected.items():

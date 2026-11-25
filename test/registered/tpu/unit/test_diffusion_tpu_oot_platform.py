@@ -5,6 +5,7 @@ from sglang.test.ci.ci_register import register_tpu_ci
 register_tpu_ci(est_time=20, suite="stage-a-test-tpu-unit", chips=1)
 
 import importlib.util
+import os
 import sys
 import unittest
 from importlib.metadata import entry_points
@@ -18,6 +19,7 @@ from sglang.multimodal_gen.runtime.layers.attention import selector
 from sglang.multimodal_gen.runtime.platforms import (
     PLATFORM_PLUGINS_GROUP,
     _load_platform_class,
+    resolve_current_platform_cls_qualname,
 )
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
@@ -51,6 +53,27 @@ class TestActivation(CustomTestCase):
         self.assertIs(
             _load_platform_class(PLATFORM_CLASS_PATH, external=True), TpuOOTPlatform
         )
+
+    def test_core_selects_it_through_the_installed_entry_point(self):
+        # The plugin is the only TPU platform: core has no built-in "tpu".
+        cases = (
+            ("", PLATFORM_CLASS_PATH),
+            ("tpu_oot", PLATFORM_CLASS_PATH),
+            ("tpu", ValueError),
+        )
+        for override, expected in cases:
+            with (
+                self.subTest(override=override),
+                patch.dict(
+                    os.environ, {"SGLANG_DIFFUSION_PLATFORM_OVERRIDE": override}
+                ),
+                patch.object(torch, "tpu", object(), create=True),
+            ):
+                if expected is ValueError:
+                    with self.assertRaisesRegex(ValueError, "'tpu_oot'"):
+                        resolve_current_platform_cls_qualname()
+                else:
+                    self.assertEqual(resolve_current_platform_cls_qualname(), expected)
 
 
 class TestOutOfTreeContract(CustomTestCase):
@@ -181,17 +204,16 @@ class TestCompileDefaults(CustomTestCase):
     def test_worker_init_keeps_recompiles_static_and_patches_the_worker(self):
         import torch._dynamo
 
-        from sglang.multimodal_gen.runtime.platforms.tpu import TpuPlatform
-        from sglang_tpu.multimodal_gen import worker
+        from sglang_tpu.multimodal_gen import platform, worker
 
         with (
             torch._dynamo.config.patch(automatic_dynamic_shapes=True),
-            patch.object(TpuPlatform, "_init_worker_process") as base_init,
+            patch.object(platform, "_init_torch_tpu_runtime") as runtime_init,
             patch.object(worker, "install_runtime_patches") as install,
         ):
             TpuOOTPlatform._init_worker_process()
             self.assertFalse(torch._dynamo.config.automatic_dynamic_shapes)
-        base_init.assert_called_once_with()
+        runtime_init.assert_called_once_with()
         install.assert_called_once_with()
 
 

@@ -33,7 +33,6 @@ _BUILTIN_PLATFORM_QUALNAMES = {
     "mps": "sglang.multimodal_gen.runtime.platforms.mps.MpsPlatform",
     "npu": "sglang.multimodal_gen.runtime.platforms.npu.NPUPlatformBase",
     "musa": "sglang.multimodal_gen.runtime.platforms.musa.MusaPlatform",
-    "tpu": "sglang.multimodal_gen.runtime.platforms.tpu.TpuPlatform",
 }
 BUILTIN_PLATFORM_NAMES = frozenset(_BUILTIN_PLATFORM_QUALNAMES)
 
@@ -149,18 +148,6 @@ def npu_platform_plugin() -> str | None:
     return _BUILTIN_PLATFORM_QUALNAMES["npu"] if is_npu else None
 
 
-def tpu_platform_plugin() -> str | None:
-    # torch_tpu autoloads at ``import torch`` and registers ``torch.tpu`` (and
-    # the ``tpu`` dynamo backend) only when it finds hardware; an installed
-    # wheel alone must not select this platform.
-    import torch
-
-    if getattr(torch, "tpu", None) is not None:
-        logger.debug("torch.tpu is registered; selecting TPU platform")
-        return _BUILTIN_PLATFORM_QUALNAMES["tpu"]
-    return None
-
-
 def musa_platform_plugin() -> str | None:
     is_musa = False
 
@@ -206,7 +193,6 @@ builtin_platform_plugins = {
     "cuda": cuda_platform_plugin,
     "npu": npu_platform_plugin,
     "musa": musa_platform_plugin,
-    "tpu": tpu_platform_plugin,
     "cpu": cpu_platform_plugin,
 }
 
