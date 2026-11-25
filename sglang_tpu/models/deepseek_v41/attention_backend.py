@@ -463,8 +463,11 @@ def _full_page_table(
     if rows is not None:
         unique, inverse = rows
         return _full_page_table(req_to_token, unique, columns)[inverse]
-    starts = req_to_token[req_pool_indices.to(req_to_token.device), ::FULL_PAGE_TOKENS]
-    starts = _host_int64(starts[:, :columns])
+    starts = req_to_token[
+        req_pool_indices.to(req_to_token.device),
+        : columns * FULL_PAGE_TOKENS : FULL_PAGE_TOKENS,
+    ]
+    starts = _host_int64(starts)
     if starts.shape[1] < columns:
         starts = F.pad(starts, (0, columns - starts.shape[1]))
     return starts // FULL_PAGE_TOKENS
@@ -599,6 +602,29 @@ def _device_ring_table() -> bool:
     return tpu_envs.SGLANG_TPU_DSV41_DEVICE_RING_TABLE.get()
 
 
+def _bounded_slot_tables() -> bool:
+    from sglang_tpu.envs import envs as tpu_envs
+
+    return tpu_envs.SGLANG_TPU_DSV41_BOUNDED_SLOT_TABLES.get()
+
+
+def _forward_kv_len_bound(
+    forward_batch: ForwardBatch,
+    slot_tables: Optional["SlotTables"],
+    positions: Optional[torch.Tensor] = None,
+) -> Optional[int]:
+    """Host upper bound on the forward's KV lengths after its rows, needed only to
+    check bounded slot tables; None when there is none."""
+    if slot_tables is None or slot_tables.bound_tokens is None:
+        return None
+    bound = forward_batch.seq_lens_cpu
+    if not isinstance(bound, torch.Tensor) or bound.numel() == 0:
+        return None
+    if positions is not None and positions.numel():
+        return max(int(bound.max()), int(positions.max()) + 1)
+    return int(bound.max())
+
+
 def _packed_row_upload() -> bool:
     from sglang_tpu.envs import envs as tpu_envs
 
@@ -622,6 +648,9 @@ class SlotTables(msgspec.Struct, frozen=True):
     swa_pages: Optional[torch.Tensor]
     # Uploaded LowRatioMetadata.index_pages per ratio.
     index_pages: Dict[int, torch.Tensor]
+    # Positions the page columns were gathered for (SGLANG_TPU_DSV41_BOUNDED_SLOT_TABLES);
+    # columns past it hold the null page 0. None: every column.
+    bound_tokens: Optional[int] = None
 
 
 def build_slot_tables(
@@ -634,11 +663,24 @@ def build_slot_tables(
     max_context_len: int,
     low_ratios: Sequence[int],
     device: torch.device,
+    kv_len_bound: Optional[int] = None,
 ) -> SlotTables:
-    """The slot-only tables of a forward over host ``req_pool_indices``; reads no device."""
+    """The slot-only tables of a forward over host ``req_pool_indices``; reads no device.
+
+    ``kv_len_bound``: with SGLANG_TPU_DSV41_BOUNDED_SLOT_TABLES, an upper bound on
+    every row's KV length; only the page columns below it (plus one page) are
+    gathered, the rest stay the null page. The table shape is unchanged."""
     columns = _full_page_columns(max_context_len)
-    full_pages = _full_page_table(req_to_token, req_pool_indices, columns)
-    return _slot_tables(
+    bound_tokens = None
+    gathered = columns
+    if kv_len_bound is not None and _bounded_slot_tables():
+        gathered = min(columns, _full_page_columns(kv_len_bound) + 1)
+        # Every column gathered: the table is the full one and carries no bound.
+        bound_tokens = gathered * FULL_PAGE_TOKENS if gathered < columns else None
+    full_pages = _full_page_table(req_to_token, req_pool_indices, gathered)
+    if gathered < columns:
+        full_pages = F.pad(full_pages, (0, columns - gathered))
+    tables = _slot_tables(
         req_pool_indices=req_pool_indices,
         full_pages=full_pages,
         full_pages_device=None,
@@ -647,6 +689,20 @@ def build_slot_tables(
         ring=swa_ring_valid_from is not None,
         low_ratios=low_ratios,
         device=device,
+    )
+    if bound_tokens is None:
+        return tables
+    return msgspec.structs.replace(tables, bound_tokens=bound_tokens)
+
+
+def _bounded_reference_tables(tables: SlotTables, **kwargs) -> Optional[SlotTables]:
+    """Host tables gathered to the same bound as ``tables`` (None if unbounded)."""
+    if tables.bound_tokens is None:
+        return None
+    return build_slot_tables(
+        req_pool_indices=tables.req_pool_indices,
+        kv_len_bound=tables.bound_tokens - FULL_PAGE_TOKENS,
+        **kwargs,
     )
 
 
@@ -705,8 +761,12 @@ def _matching_slot_tables(
     req_pool_indices: torch.Tensor,
     columns: int,
     low_ratios: Sequence[int],
+    kv_len_bound: Optional[int] = None,
 ) -> Optional[SlotTables]:
-    """``slot_tables`` if built for these slots and this table shape, else None."""
+    """``slot_tables`` if built for these slots and this table shape, else None.
+
+    Tables gathered for fewer positions than the forward's ``kv_len_bound`` (or
+    with no bound to compare) are rebuilt in full."""
     if slot_tables is None:
         return None
     ok = (
@@ -714,6 +774,17 @@ def _matching_slot_tables(
         and tuple(slot_tables.index_pages) == tuple(low_ratios)
         and torch.equal(slot_tables.req_pool_indices, req_pool_indices)
     )
+    bound = slot_tables.bound_tokens
+    if ok and bound is not None and (kv_len_bound is None or kv_len_bound > bound):
+        from sglang_tpu.envs import envs as tpu_envs
+
+        if tpu_envs.SGLANG_TPU_DSV41_BOUNDED_SLOT_TABLES_CHECK.get():
+            raise AssertionError(
+                f"slot tables gathered for {bound} positions, the forward needs "
+                f"{kv_len_bound}"
+            )
+        _SLOT_TABLE_USE["short"] += 1
+        ok = False
     _SLOT_TABLE_USE["hit" if ok else "miss"] += 1
     total = _SLOT_TABLE_USE["hit"] + _SLOT_TABLE_USE["miss"]
     if total == 1 or total % 1000 == 0 or (not ok and _SLOT_TABLE_USE["miss"] == 1):
@@ -722,7 +793,7 @@ def _matching_slot_tables(
 
 
 # Prebuilt slot tables used / rebuilt (slots changed between prebuild and forward).
-_SLOT_TABLE_USE: Dict[str, int] = {"hit": 0, "miss": 0}
+_SLOT_TABLE_USE: Dict[str, int] = {"hit": 0, "miss": 0, "short": 0}
 
 
 def _device_rows_req_pool(
@@ -1011,34 +1082,47 @@ def build_forward_metadata(
     bs = int(forward_batch.batch_size)
     device_slots = None if decoder_replay else _device_rows_req_pool(forward_batch, bs)
     if device_slots is not None:
+        tables = _matching_slot_tables(
+            slot_tables,
+            req_pool_indices=device_slots,
+            columns=_full_page_columns(max_context_len),
+            low_ratios=low_ratios,
+            kv_len_bound=_forward_kv_len_bound(forward_batch, slot_tables),
+        ) or build_slot_tables(
+            req_to_token=req_to_token,
+            req_pool_indices=device_slots,
+            full_to_swa_index_mapping=full_to_swa_index_mapping,
+            request_window=request_window,
+            swa_ring_valid_from=swa_ring_valid_from,
+            max_context_len=max_context_len,
+            low_ratios=low_ratios,
+            device=device,
+        )
         metadata = _device_row_metadata(
             forward_batch,
             req_pool_indices=device_slots,
-            tables=_matching_slot_tables(
-                slot_tables,
-                req_pool_indices=device_slots,
-                columns=_full_page_columns(max_context_len),
-                low_ratios=low_ratios,
-            )
-            or build_slot_tables(
-                req_to_token=req_to_token,
-                req_pool_indices=device_slots,
-                full_to_swa_index_mapping=full_to_swa_index_mapping,
-                request_window=request_window,
-                swa_ring_valid_from=swa_ring_valid_from,
-                max_context_len=max_context_len,
-                low_ratios=low_ratios,
-                device=device,
-            ),
+            tables=tables,
             request_window=request_window,
             swa_ring_valid_from=swa_ring_valid_from,
             device=device,
         )
         if metadata is not None:
             if tpu_envs.SGLANG_TPU_SPEC_DEVICE_ROWS_CHECK.get():
+                # Bounded tables hold the null page past their bound (never read),
+                # so the host reference is built on equally bounded tables.
                 _check_device_rows(
                     metadata,
                     forward_batch,
+                    slot_tables=_bounded_reference_tables(
+                        tables,
+                        req_to_token=req_to_token,
+                        full_to_swa_index_mapping=full_to_swa_index_mapping,
+                        request_window=request_window,
+                        swa_ring_valid_from=swa_ring_valid_from,
+                        max_context_len=max_context_len,
+                        low_ratios=low_ratios,
+                        device=device,
+                    ),
                     req_to_token=req_to_token,
                     full_to_swa_index_mapping=full_to_swa_index_mapping,
                     request_window=request_window,
@@ -1074,6 +1158,7 @@ def build_forward_metadata(
         req_pool_indices=req_pool_indices,
         columns=_full_page_columns(max_context_len),
         low_ratios=low_ratios,
+        kv_len_bound=_forward_kv_len_bound(forward_batch, slot_tables, positions),
     ) or build_slot_tables(
         req_to_token=req_to_token,
         req_pool_indices=req_pool_indices,
@@ -1654,7 +1739,11 @@ class DSV41TPUAttnBackend(AttentionBackend):
         return self.forward_metadata
 
     def prepare_slot_tables(
-        self, req_pool_indices: torch.Tensor, *, reuse: bool = False
+        self,
+        req_pool_indices: torch.Tensor,
+        *,
+        reuse: bool = False,
+        kv_len_bound: Optional[int] = None,
     ) -> None:
         """Build the next forward's slot tables now, ahead of its rows.
 
@@ -1669,6 +1758,10 @@ class DSV41TPUAttnBackend(AttentionBackend):
             reuse
             and held is not None
             and torch.equal(held.req_pool_indices, req_pool_indices)
+            and (
+                held.bound_tokens is None
+                or (kv_len_bound is not None and kv_len_bound <= held.bound_tokens)
+            )
         ):
             return
         self._slot_tables = build_slot_tables(
@@ -1680,6 +1773,7 @@ class DSV41TPUAttnBackend(AttentionBackend):
             max_context_len=self.max_context_len,
             low_ratios=self.low_ratios,
             device=self.device,
+            kv_len_bound=kv_len_bound,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):

@@ -20,12 +20,17 @@ def register(backend_cls: type, prepare: Callable[..., None]) -> None:
 
 
 def prepare(
-    attn_backend: Any, req_pool_indices_cpu: torch.Tensor, *, reuse: bool = False
+    attn_backend: Any,
+    req_pool_indices_cpu: torch.Tensor,
+    *,
+    reuse: bool = False,
+    kv_len_bound: int | None = None,
 ) -> None:
     """Let ``attn_backend`` build its next forward's slot tables for these host slots.
 
     The backend's next metadata build consumes them, or rebuilds if its slots differ.
     ``reuse``: keep tables built earlier in the same step for the same slots.
+    ``kv_len_bound``: host upper bound on every row's KV length after the forward.
     No-op unless SGLANG_TPU_SPEC_PREBUILD_SLOT_METADATA and the backend registered.
     """
     from sglang_tpu.envs import envs as tpu_envs
@@ -35,5 +40,6 @@ def prepare(
     for cls in type(attn_backend).__mro__:
         preparer = _PREPARERS.get(cls)
         if preparer is not None:
-            preparer(attn_backend, req_pool_indices_cpu, reuse=reuse)
+            extra = {} if kv_len_bound is None else {"kv_len_bound": kv_len_bound}
+            preparer(attn_backend, req_pool_indices_cpu, reuse=reuse, **extra)
             return

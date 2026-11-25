@@ -731,6 +731,7 @@ class TpuSpecWorker(BaseSpecWorker):
             self.target_worker.model_runner.attn_backend,
             verify_input.req_pool_indices_cpu,
             reuse=True,
+            kv_len_bound=self._slot_kv_len_bound(verify_input),
         )
         verify_tokens = draft_result.verify_tokens
         if verify_tokens is None:
@@ -994,6 +995,13 @@ class TpuSpecWorker(BaseSpecWorker):
             batch, bucket.state, rows, verify_input, logits_output, accept
         )
         return committed, logits_output, accept
+
+    def _slot_kv_len_bound(self, verify_input: TpuSpecVerifyInput) -> int:
+        # The committed base may trail the device by a commit; the verify writes
+        # up to its candidate window past it. An idle DP rank has no requests.
+        seq = verify_input.seq_lens_cpu
+        committed = int(seq.max()) if seq.numel() else 0
+        return committed + 2 * self.verify_window_rows
 
     def _commit_linear_attn_states(
         self,

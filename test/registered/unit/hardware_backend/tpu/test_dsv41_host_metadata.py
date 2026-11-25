@@ -219,7 +219,9 @@ def test_slot_tables_are_reused_only_when_asked():
 
     def build(**kw):
         builds.append(kw["req_pool_indices"])
-        return SimpleNamespace(req_pool_indices=kw["req_pool_indices"])
+        return SimpleNamespace(
+            req_pool_indices=kw["req_pool_indices"], bound_tokens=kw["kv_len_bound"]
+        )
 
     backend = SimpleNamespace(
         _slot_tables=None,
@@ -240,7 +242,13 @@ def test_slot_tables_are_reused_only_when_asked():
         assert len(builds) == 1
         prepare(backend, torch.tensor([3, 2]), reuse=True)
         prepare(backend, torch.tensor([3, 2]))
-    assert len(builds) == 3
+        assert len(builds) == 3
+        # Bounded tables are reused only for a bound they cover.
+        prepare(backend, slots, kv_len_bound=512)
+        prepare(backend, slots, reuse=True, kv_len_bound=512)
+        assert len(builds) == 4
+        prepare(backend, slots, reuse=True, kv_len_bound=513)
+    assert len(builds) == 5
 
 
 @pytest.mark.parametrize("mode", [ForwardMode.DECODE, ForwardMode.EXTEND])
@@ -451,6 +459,92 @@ def test_device_ring_table_matches_the_uploaded_one():
             builds[device_table] = ab.build_forward_metadata(fb, **kw)
     assert builds[True].swa_window_plan is None
     _assert_same(builds[False], builds[True])
+
+
+def test_bounded_slot_tables_keep_every_readable_page():
+    """Slot tables gathered up to a KV-length bound keep their shape and every
+    page column below the bound (plus one page); past it they hold the null
+    page. A forward that needs more positions than were gathered gets full
+    tables (or, in check mode, an error), never a short table."""
+    slots = torch.tensor([1, 2, 3])
+    kw = dict(
+        req_to_token=_req_to_token(),
+        req_pool_indices=slots,
+        full_to_swa_index_mapping=None,
+        request_window=SimpleNamespace(
+            workspace_first_page=4 + 4 * SLOTS, workspace_pages=64
+        ),
+        swa_ring_valid_from=None,
+        max_context_len=MAX_CONTEXT,
+        low_ratios=ab.LOW_RATIOS,
+        device=torch.device("cpu"),
+    )
+    on = SimpleNamespace(get=lambda: True)
+    full = ab.build_slot_tables(**kw)
+    with patch.object(tpu_envs, "SGLANG_TPU_DSV41_BOUNDED_SLOT_TABLES", on):
+        bounded = ab.build_slot_tables(**kw, kv_len_bound=1000)
+    gathered = bounded.bound_tokens // 256
+    assert gathered == 5 and full.bound_tokens is None
+    assert bounded.full_pages.shape == full.full_pages.shape
+    assert torch.equal(bounded.full_pages[:, :gathered], full.full_pages[:, :gathered])
+    assert not bounded.full_pages[:, gathered:].any()
+    for ratio, pages in full.index_pages.items():
+        cols = gathered * 256 // ratio // 128
+        assert torch.equal(bounded.index_pages[ratio][:, :cols], pages[:, :cols])
+    match = dict(req_pool_indices=slots, columns=full.full_pages.shape[1])
+    match["low_ratios"] = ab.LOW_RATIOS
+    assert ab._matching_slot_tables(bounded, **match, kv_len_bound=1280) is bounded
+    assert ab._matching_slot_tables(bounded, **match, kv_len_bound=1281) is None
+    assert ab._matching_slot_tables(bounded, **match, kv_len_bound=None) is None
+    with patch.object(tpu_envs, "SGLANG_TPU_DSV41_BOUNDED_SLOT_TABLES_CHECK", on):
+        with pytest.raises(AssertionError, match="gathered for 1280 positions"):
+            ab._matching_slot_tables(bounded, **match, kv_len_bound=1281)
+    # A bound past the context gathers every column: the full table, no bound.
+    with patch.object(tpu_envs, "SGLANG_TPU_DSV41_BOUNDED_SLOT_TABLES", on):
+        near = ab.build_slot_tables(**kw, kv_len_bound=MAX_CONTEXT + 3)
+    assert near.bound_tokens is None
+    assert torch.equal(near.full_pages, full.full_pages)
+
+
+def test_device_rows_check_accepts_bounded_slot_tables():
+    """The device-rows check builds its host reference on equally bounded tables:
+    slots whose req_to_token rows still map pages past the bound (a reused slot)
+    are not a mismatch, since those columns are never read."""
+    slots = torch.tensor([1, 2, 3])
+    fb = _verify_batch([4096, 98310, 17], [1, 2, 3])
+    fb.req_pool_indices_cpu = slots.clone()
+    kw = dict(
+        req_to_token=_req_to_token(),
+        full_to_swa_index_mapping=None,
+        request_window=None,
+        swa_ring_valid_from=None,
+        max_context_len=MAX_CONTEXT,
+        low_ratios=ab.LOW_RATIOS,
+        device=torch.device("cpu"),
+    )
+    on = SimpleNamespace(get=lambda: True)
+    with (
+        patch.object(tpu_envs, "SGLANG_TPU_SPEC_DEVICE_ROWS", on),
+        patch.object(tpu_envs, "SGLANG_TPU_SPEC_DEVICE_ROWS_CHECK", on),
+        patch.object(tpu_envs, "SGLANG_TPU_DSV41_BOUNDED_SLOT_TABLES", on),
+    ):
+        bounded = ab.build_slot_tables(
+            **kw, req_pool_indices=slots, kv_len_bound=98310 + 12
+        )
+        assert bounded.bound_tokens is not None
+        ab.build_forward_metadata(fb, **kw, slot_tables=bounded)
+
+
+def test_slot_table_bound_of_an_idle_dp_rank():
+    """An idle DP rank's spec step has no requests: the slot-table KV bound must
+    still be defined (it crashed every rank's scheduler on an empty max)."""
+    from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
+
+    bound = TpuSpecWorker._slot_kv_len_bound
+    worker = SimpleNamespace(verify_window_rows=6)
+    empty = SimpleNamespace(seq_lens_cpu=torch.empty(0, dtype=torch.int64))
+    assert bound(worker, empty) == 12
+    assert bound(worker, SimpleNamespace(seq_lens_cpu=torch.tensor([5, 300]))) == 312
 
 
 def test_device_window_declines_rows_that_may_pass_the_swa_table():

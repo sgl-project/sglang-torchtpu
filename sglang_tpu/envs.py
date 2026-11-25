@@ -482,6 +482,11 @@ class TpuEnvs:
     # DSV4.1 spec device rows: build the verify SWA ring table on the device
     # instead of on the host plus an upload ([B, context / 64] int32).
     SGLANG_TPU_DSV41_DEVICE_RING_TABLE = EnvBool(False)
+    # DSV4.1 spec slot tables: gather page columns only up to the batch's KV-length
+    # bound (plus a page); the rest stay the null page. _CHECK raises instead of
+    # rebuilding when a forward needs more positions than were gathered.
+    SGLANG_TPU_DSV41_BOUNDED_SLOT_TABLES = EnvBool(False)
+    SGLANG_TPU_DSV41_BOUNDED_SLOT_TABLES_CHECK = EnvBool(False)
     # Spec step: build the slot-only attention metadata of the draft and verify
     # forwards before the blocking length read / draft-token read (slot_metadata.py).
     SGLANG_TPU_SPEC_PREBUILD_SLOT_METADATA = EnvBool(False)

@@ -523,9 +523,12 @@ class TpuBlockSpecWorker(TpuSpecWorker):
         )
         # Before the read below, which waits for the whole previous verify: the
         # slot tables of this step's draft and verify need no device value.
+        kv_len_bound = self._slot_kv_len_bound(verify_input)
         for runner in (self._draft_runner, self.target_worker.model_runner):
             slot_metadata.prepare(
-                runner.attn_backend, verify_input.req_pool_indices_cpu
+                runner.attn_backend,
+                verify_input.req_pool_indices_cpu,
+                kv_len_bound=kv_len_bound,
             )
         # Read here, after the inputs are queued: the read waits for the previous verify.
         host_rows = (
