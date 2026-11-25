@@ -191,6 +191,10 @@ def build_forward(c: PFConfig, axis: str = "model"):
     )
     ogate_kernel = ogate_k is not None
     o_gate = ogate_k
+    # SPTP_XAG_QSTRIDED=1: q written as [Hkv, T * G, 128] by strided stores (same HBM bytes)
+    xag_q_strided = (
+        xag_fused and q_rpa and os.environ.get("SPTP_XAG_QSTRIDED", "0") == "1"
+    )
     xag_norm_dbg = xag_norm and os.environ.get("SPTP_XAG_NORM_DBG", "0") == "1"  # debug
     # debug: 2 / 3 / 4 take only q / kv / gate from the fused-norm kernel, the rest from the
     # unfused-norm kernel on XLA's rows
@@ -217,6 +221,9 @@ def build_forward(c: PFConfig, axis: str = "model"):
             m_split=int(os.environ.get("SPTP_XAG_MSPLIT", "1")),
             dma_split=int(os.environ.get("SPTP_XAG_DSPLIT", "1")),
             n_tail=os.environ.get("SPTP_XAG_NTAIL", "0") == "1",
+            route=int(os.environ.get("SPTP_XAG_ROUTE", "0")),
+            own_first=os.environ.get("SPTP_XAG_OWNFIRST", "0") == "1",
+            q_strided=xag_q_strided,
         )
         for r in (True, False)
     }
