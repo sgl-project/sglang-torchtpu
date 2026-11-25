@@ -275,9 +275,15 @@ def build_forward(c: PFConfig, axis: str = "model"):
         raise ValueError(
             "SPTP_PA_OGATE_TOK reads the token-major gate: no XAG_GATE4 / OGATE_KERNEL"
         )
-    # SPTP_PA_TMAJ=1: that kernel takes the o gate output as [qd, T] (rows in lanes), the
-    # gate fusion's own layout
-    pa_tmaj = pa_a2a and not pa_gtok and os.environ.get("SPTP_PA_TMAJ", "0") == "1"
+    # the in-kernel a2a takes the o gate output as [qd, T] (the gate fusion's T-minor layout, no
+    # relayout copy); SPTP_PA_TMAJ=0: the [Hkv, T, G * d] head layout (SPTP_PA_HEAD). The Pallas
+    # o-gate card writes token-major rows, which neither reads.
+    pa_tmaj = (
+        pa_a2a
+        and not pa_gtok
+        and not ogate_kernel
+        and os.environ.get("SPTP_PA_TMAJ", "1") == "1"
+    )
     pa_head = pa_head and not pa_gtok and not pa_tmaj
     pa_pool = pool_call(c, pa_tp, pa_rc, pa_head, pa_tmaj) if pa else None
     # SPTP_PA_A2A_LA=n: its sends in flight ahead of use (7: all at the start)
