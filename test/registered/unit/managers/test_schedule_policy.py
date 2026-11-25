@@ -29,7 +29,7 @@ def _make_req(rid, origin_input_text, origin_input_ids, sampling_params=None, **
 
 
 class TestPrefillChunkShare(CustomTestCase):
-    def make_policy(self, share_min_tokens, schedule_policy="fcfs"):
+    def make_policy(self, share_min_tokens, *, schedule_policy="fcfs"):
         return SchedulePolicy(
             policy=schedule_policy,
             tree_cache=RadixCache.create_simulated(),
@@ -127,7 +127,7 @@ class TestPrefillChunkShare(CustomTestCase):
         ]:
             with self.subTest(policy=schedule_policy, share=share_min_tokens):
                 with self.assertRaises(ValueError):
-                    self.make_policy(share_min_tokens, schedule_policy)
+                    self.make_policy(share_min_tokens, schedule_policy=schedule_policy)
 
 
 class TestSchedulePolicyHRRN(CustomTestCase):
