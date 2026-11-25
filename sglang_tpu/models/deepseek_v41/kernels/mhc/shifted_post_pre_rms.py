@@ -4,8 +4,9 @@
 
 import functools
 import math
+from collections.abc import Callable
 from enum import StrEnum
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -18,6 +19,28 @@ class PostPreTuning(NamedTuple):
     mix_group: int
     collapse_columns: int
     vmem_limit_bytes: int
+
+
+class PostPreEpilogue(NamedTuple):
+    """Work fused into the same call after the boundary's single token tile.
+
+    ``start(in_refs, out_refs, scratch_refs)`` runs at kernel entry (issue the
+    epilogue's DMAs so they overlap the boundary); ``run(value_ref, in_refs,
+    out_refs, scratch_refs)`` runs after the tile, with ``value_ref`` the VMEM
+    [T, D] bf16 collapsed value, RMS-normed only when ``norm_weight`` is given.
+    The ``*_refs`` are tuples in the order of ``inputs`` / ``out_shapes`` /
+    ``scratch_shapes``. ``start`` may touch only the epilogue's own refs, never
+    the boundary's buffers. Single tile means T <= 128 (``_token_tile``); larger
+    batches (extend chunks, replay tails) must call without an epilogue.
+    """
+
+    inputs: tuple
+    in_specs: tuple
+    out_shapes: tuple
+    out_specs: tuple
+    scratch_shapes: tuple
+    start: Callable[..., Any]
+    run: Callable[..., Any]
 
 
 class GateInputMode(StrEnum):
@@ -75,7 +98,8 @@ def shifted_post_pre_rms(
     norm_eps: float = 1e-06,
     unpadded_gates: bool = False,
     early_prep: bool = False,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    epilogue: PostPreEpilogue | None = None,
+) -> tuple[jax.Array, ...]:
     """Update residuals and collapse with incoming pre; predict gates separately.
 
     TPU7x: M=4, D=5120, positive local T divisible by 16 (by 32 uses 32-token
@@ -93,6 +117,8 @@ def shifted_post_pre_rms(
         are transposes of the next call's [M,T] gate inputs, not slices.
         ``early_prep`` builds tile 0's gate coefficients while the first
         activation tiles are still in flight instead of after they land.
+        ``epilogue`` (single-tile T only) fuses more work after the tile; its
+        outputs follow the five above.
     """
     t, d = x.shape
     token_tile = _token_tile(t)
@@ -126,6 +152,7 @@ def shifted_post_pre_rms(
     assert scale.dtype == base.dtype == jnp.float32
     gate_input_mode = GateInputMode(gate_input_mode)
     norm_args = () if norm_weight is None else (norm_weight,)
+    assert epilogue is None or num_tiles == 1, "an epilogue needs a single tile"
     if norm_weight is not None:
         assert norm_weight.shape == (d,)
         assert norm_weight.dtype in (jnp.bfloat16, jnp.float32)
@@ -138,10 +165,12 @@ def shifted_post_pre_rms(
         ph,
         wh,
         norm_refs,
+        epilogue_in,
         yh,
         vh,
         mh,
         sh,
+        epilogue_out,
         output_y,
         output_v,
         output_sems,
@@ -157,7 +186,10 @@ def shifted_post_pre_rms(
         norm_square,
         sems,
         projection_buf,
+        epilogue_scratch,
     ):
+        if epilogue is not None:
+            epilogue.start(epilogue_in, epilogue_out, epilogue_scratch)
         if gate_input_mode == GateInputMode.HBM:
             por, cr, pr = gate_scratch
             copy_pairs = [(poh, por), (ch, cr), (ph, pr), (wh, wr)]
@@ -403,6 +435,8 @@ def shifted_post_pre_rms(
             return unused
 
         jax.lax.fori_loop(0, num_tiles, body, None)
+        if epilogue is not None:
+            epilogue.run(output_v.at[0], epilogue_in, epilogue_out, epilogue_scratch)
         for index in range(num_tiles - output_buffers, num_tiles):
             for copy in output_copies(index):
                 copy.wait()
@@ -428,13 +462,18 @@ def shifted_post_pre_rms(
     else:
         gate_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
         gate_scratch_shapes = ()
-    residual, value, mix_values, square = pl.pallas_call(
+    epilogue_in = () if epilogue is None else tuple(epilogue.inputs)
+    residual, value, mix_values, square, epilogue_results = pl.pallas_call(
         kernel,
         in_specs=[hbm, hbm, gate_spec, gate_spec, gate_spec, hbm]
-        + [tuple(pl.BlockSpec(memory_space=pltpu.HBM) for _ in norm_args)],
-        out_specs=[hbm, hbm] + [pl.BlockSpec(memory_space=pltpu.VMEM)] * 2,
+        + [tuple(pl.BlockSpec(memory_space=pltpu.HBM) for _ in norm_args)]
+        + [() if epilogue is None else tuple(epilogue.in_specs)],
+        out_specs=[hbm, hbm]
+        + [pl.BlockSpec(memory_space=pltpu.VMEM)] * 2
+        + [() if epilogue is None else tuple(epilogue.out_specs)],
         out_shape=[jax.ShapeDtypeStruct((t, k), flat.dtype) for k in (width, d)]
-        + [jax.ShapeDtypeStruct((k, gate_tokens), jnp.float32) for k in (mixes, 1)],
+        + [jax.ShapeDtypeStruct((k, gate_tokens), jnp.float32) for k in (mixes, 1)]
+        + [() if epilogue is None else tuple(epilogue.out_shapes)],
         scratch_shapes=[
             pltpu.VMEM((output_buffers, tile, width), jnp.bfloat16),
             pltpu.VMEM((output_buffers, tile, d), jnp.bfloat16),
@@ -455,11 +494,13 @@ def shifted_post_pre_rms(
                 (len(gate_scratch_shapes) + 1 + int(norm_weight is not None),)
             ),
             pltpu.VMEM((tile, 128), jnp.float32),
+            () if epilogue is None else tuple(epilogue.scratch_shapes),
         ],
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=tuning.vmem_limit_bytes,
             allow_input_fusion=(False, False, False, False, False, False)
-            + (False,) * len(norm_args),
+            + (False,) * len(norm_args)
+            + (False,) * len(epilogue_in),
         ),
     )(
         pltpu.with_memory_space_constraint(x, pltpu.HBM)
@@ -471,6 +512,7 @@ def shifted_post_pre_rms(
         *gate_args,
         pltpu.with_memory_space_constraint(weight, pltpu.HBM),
         tuple(pltpu.with_memory_space_constraint(arg, pltpu.HBM) for arg in norm_args),
+        epilogue_in,
     )
     new_pre, new_post, new_comb = _pre_gates(
         mix_values,
@@ -485,7 +527,14 @@ def shifted_post_pre_rms(
         sinkhorn_repeat=sinkhorn_repeat,
         tokens=t if unpadded_gates and gate_tokens <= 1024 else None,
     )
-    return (residual, new_post[:t, :, None], new_comb[:t], value, new_pre[:t])
+    return (
+        residual,
+        new_post[:t, :, None],
+        new_comb[:t],
+        value,
+        new_pre[:t],
+        *epilogue_results,
+    )
 
 
 def _rms_norm_inplace(value_ref, weight_ref, square, *, columns: int, eps: float):
@@ -596,7 +645,15 @@ def _shifted_jax(
     sinkhorn_iters: int,
     norm_eps: float,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    return shifted_post_pre_rms(
+    t = residual.shape[0]
+    rows = -(-t // 16) * 16
+    if rows != t:
+        # Zero rows stay finite (rsqrt(0 + eps) * 0) and are sliced off.
+        y, residual, post, comb, pre = (
+            jnp.pad(a, ((0, rows - t),) + ((0, 0),) * (a.ndim - 1))
+            for a in (y, residual, post, comb, pre)
+        )
+    outs = shifted_post_pre_rms(
         y,
         residual,
         post,
@@ -615,3 +672,4 @@ def _shifted_jax(
         unpadded_gates=True,
         early_prep=True,
     )
+    return outs if rows == t else tuple(o[:t] for o in outs)

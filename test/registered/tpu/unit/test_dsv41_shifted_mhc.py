@@ -204,6 +204,20 @@ def test_fused_boundary_matches_unfused_torch(tpu, tokens, check_elements):
     _check_outputs(_outputs(state), ref, check_elements=check_elements)
 
 
+@pytest.mark.parametrize("tokens", [6, 12, 40])
+def test_lower_row_floor_pads_small_seams(tpu, tokens, monkeypatch):
+    monkeypatch.setenv("SGLANG_TPU_DSV41_SHIFTED_MHC_MIN_ROWS", "1")
+    y, residual, pre, post, comb, fn, scale, base, norm = _case(
+        tokens, noncancelling=True
+    )
+    ref = _unfused(y, residual, pre, post, comb, fn, scale, base, norm)
+    hc, boundary = _boundary(fn, scale, base, norm, tpu)
+    coeffs = tuple(tensor.to(tpu) for tensor in (pre, post, comb))
+    state = ops.fused_boundary(hc, y.to(tpu), residual.to(tpu), coeffs, boundary, hc)
+    assert state is not None and state.pre is coeffs[0]
+    _check_outputs(_outputs(state), ref, check_elements=True)
+
+
 def test_direct_trace_chains_boundaries_and_reuses_updated_packed_buffer(tpu):
     from sglang_tpu.compilation.direct_compile import direct_compile
 

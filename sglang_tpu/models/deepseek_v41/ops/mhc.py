@@ -9,6 +9,23 @@ _PACKED = "_tpu_shifted_mhc_mix_weight"
 _shifted_op = None
 _OWNER = "_tpu_shifted_mhc_owner"
 _MIX_SUBLAYERS = {"hc_attn_fn": "attn_hc", "hc_ffn_fn": "ffn_hc"}
+# Seams of at least this many rows serve unpadded, as the kernel requires.
+_DEFAULT_MIN_ROWS = 96
+
+
+def _min_rows() -> int:
+    from sglang_tpu.envs import envs as tpu_envs
+
+    return tpu_envs.SGLANG_TPU_DSV41_SHIFTED_MHC_MIN_ROWS.get()
+
+
+def seam_rows(rows: int) -> int:
+    """Rows the kernel runs for a seam. Below the default floor, an opt-in lower
+    SGLANG_TPU_DSV41_SHIFTED_MHC_MIN_ROWS pads to the 16-row granularity
+    (_shifted_jax); otherwise the seam must already be a multiple of 16."""
+    if rows < _DEFAULT_MIN_ROWS and _min_rows() < _DEFAULT_MIN_ROWS:
+        return -(-rows // 16) * 16
+    return rows
 
 
 def _fake(y, residual, post, comb, packed, scale, base, pre, norm_weight, *args):
@@ -132,7 +149,7 @@ def fused_boundary(hc, y, residual, coefficients, next_boundary, next_hc):
         is_supported_shape,
     )
 
-    if not is_supported_shape(y.shape[0], hc.cfg.mult, hc.cfg.hidden):
+    if not is_supported_shape(seam_rows(y.shape[0]), hc.cfg.mult, hc.cfg.hidden):
         return None
 
     if (
@@ -181,7 +198,9 @@ def fused_boundary(hc, y, residual, coefficients, next_boundary, next_hc):
 def _use_shifted_mhc_for_rows(tokens: int) -> bool:
     # Small buckets have mixed speedups with the TorchTPU bridge. Serve the
     # measured range where both attention and FFN boundaries consistently win.
-    return 96 <= tokens <= 8192
+    from sglang_tpu.envs import envs as tpu_envs
+
+    return _min_rows() <= tokens <= 8192 and tpu_envs.SGLANG_TPU_DSV41_SHIFTED_MHC.get()
 
 
 def fused_target_boundary(hc, y, residual, coefficients, boundary):
@@ -216,7 +235,7 @@ def can_run_draft(model, rows, *, has_input_embeds):
 
     hidden_size = rows.shape[-1] if has_input_embeds else ffn.cfg.hidden
     return (
-        is_supported_shape(rows.shape[0], model.hc_mult, hidden_size)
+        is_supported_shape(seam_rows(rows.shape[0]), model.hc_mult, hidden_size)
         and not is_batch_invariant_mode_enabled()
     )
 

@@ -52,7 +52,9 @@ tpu_dsv41_hc_combine
        model's final hc_head) calls the Triton hc_combine with no device
        guard; Dynamo cannot trace a Triton launch on TPU.
   How: AROUND sglang.kernels.ops.layernorm.mhc.mhc_combine computes the same
-       fp32 weighted sum of the hc_mult copies in torch for non-CUDA tensors.
+       fp32 weighted sum of the hc_mult copies in torch for non-CUDA tensors;
+       under SGLANG_TPU_DSV41_MHC_FLAT_COLLAPSE it sums the column slices in
+       XLA's reduce order instead of reducing a [T,4,D] fp32 view.
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: hc_combine dispatches on device like the other mHC kernels.
 
@@ -715,7 +717,22 @@ def tpu_dsv41_hc_combine(original, x_flat, pre, hc, out_dtype):
     """y[m, h] = sum_k pre[m, k] * x_flat[m, k*H + h], accumulated in fp32."""
     if x_flat.is_cuda:
         return original(x_flat, pre, hc, out_dtype)
+    from sglang_tpu.envs import envs
+
     m = x_flat.shape[0]
+    if (
+        hc == 4
+        and x_flat.dtype == torch.bfloat16
+        and envs.SGLANG_TPU_DSV41_MHC_FLAT_COLLAPSE.get()
+    ):
+        # Slices in the view reduce's order, (s0 + s2) + (s1 + s3): no relayout.
+        d = x_flat.shape[1] // hc
+        weights = pre.float()
+        t = [
+            weights[:, k : k + 1] * x_flat[:, k * d : (k + 1) * d].float()
+            for k in range(4)
+        ]
+        return ((t[0] + t[2]) + (t[1] + t[3])).to(out_dtype)
     copies = x_flat.reshape(m, hc, -1).float()
     return (pre.float().unsqueeze(-1) * copies).sum(1).to(out_dtype)
 
@@ -779,7 +796,18 @@ def tpu_dsv41_refresh_shifted_mhc_after_weight_reset(result, checker, *args, **k
 
 
 def tpu_dsv41_shifted_mhc(original, hc, y, residual, coefficients, next):
+    """One dispatch on the mHC boundary seams: the G-B-lite boundary + next
+    attention chain for small single-tile rows (opt-in), the shifted mHC kernel
+    for its row range, else the original."""
     if next is not None and y.device.type == "tpu":
+        from sglang_tpu.envs import envs as tpu_envs
+
+        if int(y.shape[0]) <= tpu_envs.SGLANG_TPU_DSV41_MHC_GBLITE_MAX_ROWS.get():
+            from sglang_tpu.models.deepseek_v41.qa_chain_op import try_boundary_qa
+
+            state = try_boundary_qa(hc, y, residual, coefficients, next)
+            if state is not None:
+                return state
         from sglang_tpu.models.deepseek_v41.ops.mhc import fused_target_boundary
 
         state = fused_target_boundary(hc, y, residual, coefficients, next)

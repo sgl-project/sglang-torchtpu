@@ -480,6 +480,26 @@ class TpuEnvs:
     # by a gather over a host-built inverse map (default) rather than a scatter.
     # 0 keeps the scatter (for A/B only).
     SGLANG_TPU_DSV41_TAIL_GATHER_SCATTER = EnvBool(True)
+    # G-B-lite (models/deepseek_v41/qa_chain_op.py): MoE -> attention mHC seams of
+    # single-tile batches (<= 128 rows) also run the next layer's wqkv_a + q/kv
+    # RMSNorm in the boundary kernel; the mHC dispatch calls it before #2411's
+    # shifted boundary. Off keeps the dispatch on #2411 / the original path.
+    SGLANG_TPU_DSV41_MHC_QA_EPILOGUE = EnvBool(False)
+    # mHC boundary dispatch: rows up to this go to the G-B-lite chain (when it
+    # applies), larger rows to the shifted mHC kernel (96..8192), else the original.
+    SGLANG_TPU_DSV41_MHC_GBLITE_MAX_ROWS = EnvInt(128)
+    # Shifted mHC boundary kernel (ops/mhc.py) for 96..8192-row seams, target and
+    # DSpark draft. On by default; a recipe can turn it off per concurrency. The
+    # packed mix weight is still built at load (the G-B-lite chain reads it).
+    SGLANG_TPU_DSV41_SHIFTED_MHC = EnvBool(True)
+    # Smallest seam the shifted mHC boundary takes. 96 is upstream's measured floor
+    # (#2411/#2475). A lower floor is opt-in: seams under 96 rows are then padded
+    # to a multiple of 16 inside the op; seams of 96+ rows must be multiples of 16.
+    SGLANG_TPU_DSV41_SHIFTED_MHC_MIN_ROWS = EnvInt(96)
+    # The TPU mhc_combine (hc_mult 4, BF16 streams) sums the four D-wide column
+    # slices in XLA's reduce order instead of reducing an FP32 [T,4,D] view, which
+    # costs a relayout of the whole residual.
+    SGLANG_TPU_DSV41_MHC_FLAT_COLLAPSE = EnvBool(False)
     # Cut the eager input-logprob chunks of a forward holding one request at every
     # multiple of this many rows from the request's first row (hooks/logprob_grid.py),
     # so a prefill chunk larger than the grid hands the epilogue the same row sets as

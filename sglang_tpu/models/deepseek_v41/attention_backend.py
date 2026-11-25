@@ -68,6 +68,7 @@ from sglang_tpu.models.deepseek_v41.ops.qb_rope import (
     register_qb_rope_op,
     supports_qb_rope,
 )
+from sglang_tpu.models.deepseek_v41.qa_chain_op import take_precomputed
 from sglang_tpu.models.deepseek_v41.request_window import (
     WINDOW_TOKENS,
     DSV41TPURequestWindow,
@@ -1457,6 +1458,9 @@ class DSV41TPUAttnBackend(AttentionBackend):
         _register_rope_op()  # apply_rope's Pallas RoPE op
         csa2.register_csa2_ops()
         indexer.register_indexer_ops()
+        from sglang_tpu.models.deepseek_v41.qa_chain_op import register_boundary_qa_op
+
+        register_boundary_qa_op()
         return csa2, indexer
 
     def _prewarm_model_caches(self) -> None:
@@ -1734,7 +1738,12 @@ class DSV41TPUAttnBackend(AttentionBackend):
         assert not layer.q_head_norm, "DeepSeek-V4.1 has no per-head q norm"
         # A module reference, never a tensor: safe to keep across traces.
         self.rope_owners.setdefault(layer.layer_id, layer)
-        q_lora = layer.q_norm(q_lora)
+        # G-B-lite: the mHC boundary already ran this layer's wqkv_a and norms.
+        precomputed = take_precomputed(x_linear)
+        if precomputed is not None:
+            q_lora, kv = precomputed
+        else:
+            q_lora = layer.q_norm(q_lora)
         table = rope_table(layer.freqs_cis)
         if (
             self.qb_rope_op is not None
@@ -1753,11 +1762,13 @@ class DSV41TPUAttnBackend(AttentionBackend):
             q = apply_rope(
                 q.view(-1, layer.n_local_heads, layer.head_dim), positions, table
             )
-        if qkv_a is not None:
-            kv = qkv_a[..., layer.q_lora_rank :]
-        else:
-            kv, _ = layer.wkv(x_linear)
-        kv = apply_rope(layer.kv_norm(kv), positions, layer.freqs_cis)
+        if precomputed is None:
+            if qkv_a is not None:
+                kv = qkv_a[..., layer.q_lora_rank :]
+            else:
+                kv, _ = layer.wkv(x_linear)
+            kv = layer.kv_norm(kv)
+        kv = apply_rope(kv, positions, layer.freqs_cis)
         if q_out is not None:
             q_out.copy_(q)
             q = q_out
