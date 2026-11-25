@@ -41,7 +41,7 @@ CI pools today:
 
 | Node pool | `ci-tpu-pool` | Shape | Hosts |
 |---|---|---|---|
-| `ci-tpu7x-2x2x1` | `pr-gate` | 2x2x1 | 5 |
+| `ci-tpu7x-2x2x1` | `pr-gate` | 2x2x1 | 5 (autoscaled; at least 3 kept warm) |
 | `ci-tpu7x-2x2x1-nightly` | `nightly-1h` | 2x2x1 | 3 |
 | `ci-tpu7x-2x2x2` | `nightly` | 2x2x2 | 2 (one slice) |
 
@@ -214,8 +214,14 @@ the JobSet deadlines above remain separate safeguards.
 - **Admission:** a JobSet waits suspended until its ClusterQueue has quota for every pod.
   A PodSet gets exactly one flavor, which is what keeps a multi-host job on one slice.
   Queues are `BestEffortFIFO`.
-- **Gangs:** `waitForPodsReady` (5 min, `blockAdmission: true`) evicts and requeues a job
-  whose pods cannot all start. While it waits, Kueue admits nothing else cluster-wide.
+- **Gangs:** `waitForPodsReady` (15 min, `blockAdmission: false`) evicts and requeues a job
+  whose pods cannot all start. Other jobs keep being admitted meanwhile. Two multi-host jobs
+  never share a slice because of quota, not blocking: each multi-host shape's cohort holds
+  exactly one slice of quota per pool. Keep it that way; more quota than slices on a
+  multi-host pool lets two gangs split one slice and hang until the timeout.
+  - The 15 min covers a cold host: scale-up p90 is ~7 min and ~14 min when the reservation is full.
+  - `blockAdmission: true` froze all admission behind every job waiting for its node, which
+    caused most of the PR queue time.
 - **Quota follows the pools** through `reconcile_quota.py`, before every CI job. Quota for
   chips that do not exist admits jobs that hang; missing quota leaves live hosts idle.
 - **Sharing:** every shape's queues form one cohort, `ci-<shape>`, and may use each
@@ -449,8 +455,8 @@ integrations:
     - "jobset.x-k8s.io/jobset"      # only jobset -- nothing else is ever managed
 waitForPodsReady:                   # evict + requeue a gang that cannot fully place
   enable: true
-  timeout: 5m
-  blockAdmission: true
+  timeout: 15m                      # > cold-host scale-up (p90 ~7 min, ~14 min at full reservation)
+  blockAdmission: false             # gangs are kept apart by one-slice quota (see Gangs)
 managedJobsNamespaceSelector:       # inert today; scopes the setting below if ever enabled
   matchLabels:
     kubernetes.io/metadata.name: tpu-ci
