@@ -248,6 +248,8 @@ def test_xor1_xyz_torus_ag_schedule_simulation_and_lowering():
     assert xor1_ag_min_row_align(2) == 16
     assert xor1_ag_min_row_align(1) == 32
     assert xor1_ag_schedule_spec(16, 512, 1, xy_torus=True)[0] == "xyz"
+    assert xor1_ag_schedule_spec(16, 512, 1, xy_torus=True)[2] == (1, 9, 9, 10, 10)
+    assert sum(xor1_ag_schedule_spec(16, 512, 1, xy_torus=True)[2]) + 6 <= 64
     assert xor1_ag_schedule_spec(16, 512, 2, xy_torus=True)[:2] == ("xyz", (176, 176, 160))
     assert xor1_ag_schedule_spec(16, 128, 2, xy_torus=True)[:2] == ("xyz", (48, 48, 32))
     assert xor1_ag_schedule_spec(8, 512, 1, xy_torus=True)[0] == "xy"
