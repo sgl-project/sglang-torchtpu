@@ -42,7 +42,7 @@ from sglang_tpu.muse_megakernel_v2.prefill.spep.program import (
     route,
     to_owner,
 )
-from sglang_tpu.muse_megakernel_v2.prefill.sptp.ogate import o_gate_call
+from sglang_tpu.muse_megakernel_v2.prefill.sptp.ogate import o_gate_call, o_gate_pk_call
 from sglang_tpu.muse_megakernel_v2.prefill.sptp.post_ffn import post_ffn_call
 from sglang_tpu.muse_megakernel_v2.prefill.sptp.postattn import (
     oproj_a2a_call,
@@ -56,6 +56,7 @@ from sglang_tpu.muse_megakernel_v2.prefill.sptp.qkvg import (
 )
 from sglang_tpu.muse_megakernel_v2.prefill.sptp.rpa import rpa_prepared
 from sglang_tpu.muse_megakernel_v2.prefill.sptp.xag_qkvg import xag_qkvg_call
+from sglang_tpu.muse_megakernel_v2.prefill.sptp.xe_ag import xe_ag_dequant_call
 from sglang_tpu.muse_megakernel_v2.prefill.tp.program import (
     _layer_experts,
     fused_rs_moe,
@@ -186,6 +187,17 @@ def build_forward(c: PFConfig, axis: str = "model"):
         and os.environ.get("SPTP_XE_PALLAS_DEQUANT", "0") == "1"
     )
     dequant = dequant_rows_call(T, He)
+    # SPTP_XE_AG_CHUNKS=n (with SPTP_POSTATTN=1): xe AG in n row chunks, each dequantized by
+    # Pallas as it lands (sptp/xe_ag.py)
+    xe_n = int(os.environ.get("SPTP_XE_AG_CHUNKS", "0"))
+    # SPTP_XE_TILED=1: write it in the MoE's [T, He / 128, 128] lhs layout
+    xe_ag_k = (
+        xe_ag_dequant_call(
+            T, He, tp, xe_n, axis, int(os.environ.get("SPTP_XE_TILED", "0"))
+        )
+        if xe_n
+        else None
+    )
     # SPTP_XAG_FUSED=1: the x_norm AG by in-kernel remote DMA inside the qkvg kernel, one row
     # tile of SPTP_XAG_SEG rows per rank at a time (sptp/xag_qkvg.py)
     xag_fused = not xla_qkvg and os.environ.get("SPTP_XAG_FUSED", "0") == "1"
@@ -293,6 +305,17 @@ def build_forward(c: PFConfig, axis: str = "model"):
         and not pa_gtok
         and not ogate_kernel
         and os.environ.get("SPTP_PA_TMAJ", "1") == "1"
+    )
+    # SPTP_OGATE_PK=n (with SPTP_PA_OGATE_TOK=1): that o gate as one Pallas pass over the raw RPA
+    # output (u32 head pairs), not XLA's slice / transpose copies and four passes
+    ogate_pk = (
+        o_gate_pk_call(
+            c,
+            int(os.environ.get("SPTP_OGATE_PK_TM", "256")),
+            int(os.environ.get("SPTP_OGATE_PK", "0")),
+        )
+        if pa_gtok and os.environ.get("SPTP_OGATE_PK", "0") != "0"
+        else None
     )
     pa_head = pa_head and not pa_gtok and not pa_tmaj
     pa_pool = pool_call(c, pa_tp, pa_rc, pa_head, pa_tmaj) if pa else None
@@ -511,23 +534,31 @@ def build_forward(c: PFConfig, axis: str = "model"):
                     sliding_window=None if is_global else c.window,
                 )
                 if pa_gtok:
-                    with _scope("sp_o_gate"):
-                        # the same per-element math as below, laid out token major (o moved
-                        # instead of gate): the in-kernel a2a reads it without a relayout
-                        o4 = o.reshape(c.kv_heads, T, gq, 128)[..., :hd].astype(_F32)
-                        o4 = o4.transpose(1, 0, 2, 3)
-                        o4 = o4 * jax.lax.rsqrt(
-                            jnp.mean(o4 * o4, axis=-1, keepdims=True) + c.rms_eps
-                        )
-                        g4 = gate.reshape(T, c.kv_heads, gq, hd)
-                        a4 = jax.nn.sigmoid(g4.astype(_F32)) * o4
-                        g_s = (
-                            jnp.maximum(
-                                jnp.max(jnp.abs(a4), axis=(1, 2, 3)), 1e-30
-                            ).reshape(T, 1)
-                            / 448.0
-                        )
-                        g8 = (a4 / g_s.reshape(T, 1, 1, 1)).astype(jnp.float8_e4m3fn)
+                    if ogate_pk is not None:
+                        with _scope("sp_o_gate"):
+                            g8, g_s = ogate_pk(o, gate)
+                    else:
+                        with _scope("sp_o_gate"):
+                            # the same per-element math as below, laid out token major (o moved
+                            # instead of gate): the in-kernel a2a reads it without a relayout
+                            o4 = o.reshape(c.kv_heads, T, gq, 128)[..., :hd].astype(
+                                _F32
+                            )
+                            o4 = o4.transpose(1, 0, 2, 3)
+                            o4 = o4 * jax.lax.rsqrt(
+                                jnp.mean(o4 * o4, axis=-1, keepdims=True) + c.rms_eps
+                            )
+                            g4 = gate.reshape(T, c.kv_heads, gq, hd)
+                            a4 = jax.nn.sigmoid(g4.astype(_F32)) * o4
+                            g_s = (
+                                jnp.maximum(
+                                    jnp.max(jnp.abs(a4), axis=(1, 2, 3)), 1e-30
+                                ).reshape(T, 1)
+                                / 448.0
+                            )
+                            g8 = (a4 / g_s.reshape(T, 1, 1, 1)).astype(
+                                jnp.float8_e4m3fn
+                            )
                     with _scope("sp_postattn"):
                         pa_o = oproj_a2a_call(
                             c,
@@ -712,7 +743,9 @@ def build_forward(c: PFConfig, axis: str = "model"):
                     xs_all = ag1(xs).reshape(T, 1)
                     ids_all, tw_all = ag1(ids).T, ag1(tw).T
                     ids_own = ids.T
-                    if xe_pallas:
+                    if xe_ag_k is not None:
+                        xe = xe_ag_k(xe8, xs_all)
+                    elif xe_pallas:
                         xe = dequant(ag(xe8, axis), xs_all)
                     else:
                         xe = (ag(xe8, axis).astype(_F32) * xs_all).astype(_BF16)
