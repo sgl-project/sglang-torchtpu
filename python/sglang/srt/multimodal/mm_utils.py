@@ -522,6 +522,71 @@ def _pad_mrope_vision_embeddings_for_tp_gather(
     return padded
 
 
+def gather_dp_encoder_rank_embeddings(
+    image_embeds_local: torch.Tensor, grouped_output_lengths: list[int]
+) -> list[torch.Tensor]:
+    """Collect every attention-TP rank's DP-encoder output on all ranks.
+
+    ``grouped_output_lengths[r]`` is the number of embedding rows rank ``r``
+    produced; every rank computes the same list. Returns one unpadded tensor
+    per rank, in rank order. Out-of-tree platforms may replace this function
+    to use a different collective; the result must stay the same.
+    """
+    if not grouped_output_lengths:
+        return []
+
+    tail_shape = image_embeds_local.shape[1:]
+    max_len_per_rank = max(grouped_output_lengths)
+    if max_len_per_rank == 0 or math.prod(tail_shape) == 0:
+        return [
+            image_embeds_local.new_empty((output_length, *tail_shape))
+            for output_length in grouped_output_lengths
+        ]
+
+    if len(grouped_output_lengths) == 1:
+        return [image_embeds_local[: grouped_output_lengths[0]]]
+
+    parallel = get_parallel()
+    non_empty_ranks = [
+        rank
+        for rank, output_length in enumerate(grouped_output_lengths)
+        if output_length > 0
+    ]
+    if len(non_empty_ranks) == 1:
+        owner_rank = non_empty_ranks[0]
+        owner_len = grouped_output_lengths[owner_rank]
+        if parallel.attn_tp_rank == owner_rank:
+            owner_embed = image_embeds_local[:owner_len].contiguous()
+        else:
+            owner_embed = image_embeds_local.new_empty((owner_len, *tail_shape))
+        parallel.attn_tp_group.broadcast(owner_embed, src=owner_rank)
+        empty = (0, *tail_shape)
+        return [
+            owner_embed if rank == owner_rank else image_embeds_local.new_empty(empty)
+            for rank in range(len(grouped_output_lengths))
+        ]
+
+    # The TP all-gather needs a common first dimension. Allocate that final
+    # shape directly instead of materializing a padding fragment and catting it.
+    image_embeds_local_padded = _pad_mrope_vision_embeddings_for_tp_gather(
+        image_embeds_local, max_len_per_rank
+    )
+    gathered_embeds = parallel.attn_tp_group.all_gather(
+        image_embeds_local_padded, dim=0
+    )
+
+    rank_embeddings = list[torch.Tensor]()
+    for rank, output_length in enumerate(grouped_output_lengths):
+        if output_length == 0:
+            rank_embeddings.append(image_embeds_local.new_empty((0, *tail_shape)))
+        else:
+            start_idx = rank * max_len_per_rank
+            rank_embeddings.append(
+                gathered_embeds[start_idx : start_idx + output_length]
+            )
+    return rank_embeddings
+
+
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/vision.py
 def run_dp_sharded_vision_model(
     image_input: torch.Tensor, vision_model: torch.nn.Module
@@ -723,11 +788,6 @@ def run_dp_sharded_mrope_vision_model(
         )
         assignment_offset += sample_count
 
-    # Find the max length across all ranks
-    # The output embedding of every DP rank has to be
-    # padded to this length for tensor_model_parallel_all_gather
-    # to work
-    max_len_per_rank = max(grouped_output_lengths)
     local_grid_thw_list = [grid_thw_list[i] for i in image_idxs_local]
 
     # Run the vision model on the local pixel_values_local
@@ -777,39 +837,9 @@ def run_dp_sharded_mrope_vision_model(
                 dtype=input_dtype,
             )
 
-    # Single-image fast path. Bit-identical to the all-gather below, which for
-    # one image just pads the owner's rows and slices them back out.
-    if len(grid_thw_list) == 1:
-        owner_local = image_to_tp_rank[0]
-        n_tok = output_tokens_per_image[0]
-        if tp_rank_local == owner_local:
-            out_embeddings = image_embeds_local.contiguous()
-        else:
-            out_embeddings = torch.empty(
-                (n_tok, *image_embeds_local.shape[1:]),
-                dtype=input_dtype,
-                device=input_device,
-            )
-        get_parallel().attn_tp_group.broadcast(out_embeddings, src=owner_local)
-        return out_embeddings
-
-    # The TP all-gather needs a common first dimension. Allocate that final
-    # shape directly instead of materializing a padding fragment and catting it.
-    image_embeds_local_padded = _pad_mrope_vision_embeddings_for_tp_gather(
-        image_embeds_local, max_len_per_rank
+    rank_embeddings = gather_dp_encoder_rank_embeddings(
+        image_embeds_local, grouped_output_lengths
     )
-
-    # Do all_gather to collect embeddings from all ranks
-    gathered_embeds = get_parallel().attn_tp_group.all_gather(
-        image_embeds_local_padded, dim=0
-    )
-
-    # Remove padding and reconstruct per-rank embeddings
-    rank_embeddings = list[torch.Tensor]()
-    for rank in range(tp_size):
-        start_idx = rank * max_len_per_rank
-        end_idx = start_idx + grouped_output_lengths[rank]
-        rank_embeddings.append(gathered_embeds[start_idx:end_idx])
 
     # Reconstruct embeddings in the original order
     original_order_embeddings = [None] * len(grid_thw_list)
@@ -827,12 +857,14 @@ def run_dp_sharded_mrope_vision_model(
             embed_start = 0
             for img_idx in rank_images:
                 img_patches = output_tokens_per_image[img_idx]
-                original_order_embeddings[img_idx] = rank_embed[
-                    embed_start : embed_start + img_patches
-                ]
+                original_order_embeddings[img_idx] = (
+                    rank_embed
+                    if embed_start == 0 and img_patches == rank_embed.shape[0]
+                    else rank_embed[embed_start : embed_start + img_patches]
+                )
                 embed_start += img_patches
             current_idx += count
-    out_embeddings = torch.cat(original_order_embeddings, dim=0)
+    out_embeddings = concat_or_single(original_order_embeddings, dim=0)
     return out_embeddings
 
 
@@ -858,7 +890,6 @@ def run_dp_presharded_mrope_vision_model(
     grouped_output_lengths = [
         patch_count // merge_factor for patch_count in grouped_patch_counts
     ]
-    max_output_length = max(grouped_output_lengths)
     try:
         model_device = vision_model.device
         model_dtype = vision_model.dtype
@@ -881,20 +912,6 @@ def run_dp_presharded_mrope_vision_model(
             dtype=model_dtype,
         )
 
-    if local_embeddings.shape[0] < max_output_length:
-        padding = torch.empty(
-            (
-                max_output_length - local_embeddings.shape[0],
-                local_embeddings.shape[1],
-            ),
-            device=local_embeddings.device,
-            dtype=local_embeddings.dtype,
-        )
-        local_embeddings = torch.cat([local_embeddings, padding], dim=0)
-
-    gathered = parallel.attn_tp_group.all_gather(local_embeddings, dim=0)
-    pieces = []
-    for rank, output_length in enumerate(grouped_output_lengths):
-        start = rank * max_output_length
-        pieces.append(gathered[start : start + output_length])
-    return torch.cat(pieces, dim=0)
+    pieces = gather_dp_encoder_rank_embeddings(local_embeddings, grouped_output_lengths)
+    non_empty_pieces = [piece for piece in pieces if piece.shape[0] > 0]
+    return concat_or_single(non_empty_pieces or pieces[:1], dim=0)

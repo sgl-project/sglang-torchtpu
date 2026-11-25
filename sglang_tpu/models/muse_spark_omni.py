@@ -21,6 +21,11 @@ from sglang.srt.multimodal.mm_utils import (
     get_dp_encoder_lb_assignment,
 )
 from sglang.srt.runtime_context import get_mm, get_parallel
+from sglang_tpu.hooks.dp_encoder_gather import (
+    _pad_dp_encoder_embeddings_tpu,
+    broadcast_dp_encoder_embedding_tpu,
+    gather_dp_encoder_rank_embeddings_tpu,
+)
 from sglang_tpu.mm_embed_tpu import embed_mm_inputs_tpu
 from sglang_tpu.mm_embedding import PaddedEmbedding
 from sglang_tpu.models.muse_spark import MuseSparkForConditionalGeneration as TextModel
@@ -36,16 +41,7 @@ _QKV_RE = re.compile(r"\.(?:self_attn|attn)\.([qkv])_proj\.(?:weight|bias)$")
 
 
 def _pad_dp_embeddings(local: torch.Tensor, rows: int) -> torch.Tensor:
-    # Give every rank an initialized exchange buffer, including full owners.
-    # Uninitialized padding produced invalid gathered rows and stalled D2H in
-    # TPU32 image prefill; this allocation/copy contract passes the same-size
-    # and unequal-size multihost reproduction.
-    padded = torch.zeros(
-        (rows, *local.shape[1:]), device=local.device, dtype=local.dtype
-    )
-    if local.shape[0]:
-        padded[: local.shape[0]].copy_(local)
-    return padded
+    return _pad_dp_encoder_embeddings_tpu(local, rows)
 
 
 def _run_dp_sharded_encode(
@@ -58,6 +54,9 @@ def _run_dp_sharded_encode(
     dtype: torch.dtype,
 ) -> torch.Tensor:
     # Mirrors run_dp_sharded_mrope_vision_model in sglang.srt.multimodal.mm_utils.
+    if not features:
+        return torch.empty((0, out_hidden_size), device=device, dtype=dtype)
+
     parallel = get_parallel()
     tp_size = parallel.attn_tp_size
     tp_rank = parallel.attn_tp_rank
@@ -78,12 +77,12 @@ def _run_dp_sharded_encode(
 
     # Single-item fast path: bit-identical to the all-gather below.
     if len(features) == 1:
-        if tp_rank != 0:
-            local_embeds = torch.empty(
-                (tokens_per_item[0], out_hidden_size), device=device, dtype=dtype
-            )
-        get_parallel().attn_tp_group.broadcast(local_embeds, src=0)
-        return local_embeds
+        owner = gpu_sample_counts.index(1)
+        return broadcast_dp_encoder_embedding_tpu(
+            local_embeds,
+            output_length=tokens_per_item[0],
+            src=owner,
+        )
 
     grouped_out_lengths = []
     offset = 0
@@ -92,15 +91,8 @@ def _run_dp_sharded_encode(
             sum(tokens_per_item[i] for i in image_to_tp_rank[offset : offset + count])
         )
         offset += count
-    max_len_per_rank = max(grouped_out_lengths)
 
-    padded = _pad_dp_embeddings(local_embeds, max_len_per_rank)
-    gathered = parallel.attn_tp_group.all_gather(padded, dim=0)
-
-    per_rank = []
-    for rank in range(tp_size):
-        start = rank * max_len_per_rank
-        per_rank.append(gathered[start : start + grouped_out_lengths[rank]])
+    per_rank = gather_dp_encoder_rank_embeddings_tpu(local_embeds, grouped_out_lengths)
 
     ordered = [None] * len(features)
     offset = 0
