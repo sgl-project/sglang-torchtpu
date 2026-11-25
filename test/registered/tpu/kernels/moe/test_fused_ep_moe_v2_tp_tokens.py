@@ -11,11 +11,18 @@ queries happen during fixture setup, never during pytest collection.
 import sys
 
 from sglang.test.ci.ci_register import register_tpu_ci
+from sglang.test.ci.gate_matrix import sweep
 
 register_tpu_ci(
-    est_time=240,
+    est_time=120,
     suite="stage-a-test-tpu-unit",
     chips=4,
+    labels=["singlehost", "infra"],
+)
+register_tpu_ci(
+    est_time=240,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
     labels=["singlehost", "infra"],
 )
 
@@ -226,7 +233,11 @@ def test_single_host_replicas_match_original_layer(
 @pytest.mark.parametrize(
     "weight_format", [WeightFormat.FP8, WeightFormat.FP4], ids=["fp8", "fp4"]
 )
-@pytest.mark.parametrize("sharded_plan", [False, True], ids=["full", "sharded"])
+@pytest.mark.parametrize(
+    "sharded_plan",
+    sweep((False, True), (True,)),
+    ids=lambda v: "sharded" if v else "full",
+)
 @pytest.mark.parametrize(
     "scoring_fn,renormalize,scale",
     [

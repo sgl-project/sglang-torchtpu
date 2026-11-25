@@ -16,7 +16,7 @@ from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.compilation import direct_compile, lowered_graph, spmd_compiler
 from sglang_tpu.compilation.graph_identity import graph_name
 
-register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit", chips=1)
 
 _SERIALIZED = b"serialized-executable"
 

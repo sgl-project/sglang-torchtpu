@@ -1,7 +1,9 @@
 """Tests for the Muse megakernel's per-step config selection (host-only; needs jax)."""
 
 import unittest
+from contextlib import ExitStack, contextmanager, nullcontext
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -193,6 +195,115 @@ class TestMuseMegakernelConfig(CustomTestCase):
         groups = ops.expert_groups_of(_KINDS, 15)
         self.assertEqual(groups, ((1, 16), (16, 31), (31, 46), (46, 61)))
         self.assertEqual(ops.expert_groups_of(_KINDS, 0), ())
+
+
+@contextmanager
+def _mock_tpu7x():
+    """Host-side pool construction asks jax for the TPU generation; answer TPU7x."""
+    from jax._src.pallas.mosaic import tpu_info
+    from jax.experimental.pallas import tpu as pltpu
+
+    import sglang_tpu.pallas_export as pallas_export
+
+    try:
+        from jax._src import tpu_info as core_tpu_info
+
+        modules = (tpu_info, core_tpu_info)
+    except ImportError:
+        modules = (tpu_info,)
+    info = tpu_info.get_tpu_info_for_chip(
+        tpu_info.chip_version_from_device_kind("TPU7x"), 1
+    )
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(pltpu, "get_tpu_info", lambda: info))
+        for mod in modules:
+            stack.enter_context(patch.object(mod, "get_tpu_info", lambda: info))
+            stack.enter_context(patch.object(mod, "get_device_kind", lambda: "TPU7x"))
+            stack.enter_context(patch.object(mod, "is_tpu_device", lambda: True))
+        stack.enter_context(
+            patch.object(pallas_export, "get_pallas_tpu_device_kind", lambda: "TPU7x")
+        )
+        if len(modules) == 1:
+            stack.enter_context(
+                patch.object(pallas_export, "tpu_info_for_cpu_export", nullcontext)
+            )
+        yield
+
+
+class TestMuseMegakernelUnifiedKV(CustomTestCase):
+    """TpuUnifiedSWAKVPool: the programs read the pool's shared buffers through kv_buf_map and
+    the SWA groups' page tables back to back through swa_group_map."""
+
+    def test_maps_match_the_unified_pool_layer_assignment(self):
+
+        gl = _GEOMETRY.global_layers
+        swa_ids = [i for i in range(_LAYERS) if i not in set(gl)]
+        buf_map, grp_map = ops.unified_kv_maps(_LAYERS, gl)
+        self.assertEqual((max(buf_map) + 1, max(grp_map) + 1), (16, 3))
+        with _mock_tpu7x():
+            self._check_pools(gl, swa_ids, buf_map, grp_map)
+
+    def _check_pools(self, gl, swa_ids, buf_map, grp_map):
+        import torch
+
+        from sglang_tpu.kv_pool import TpuSeqAlongLaneKVPool
+        from sglang_tpu.unified_kv_pool import AttnLayerSpec, TpuUnifiedSWAKVPool
+
+        pool = TpuUnifiedSWAKVPool(
+            size=512,
+            page_size=256,
+            dtype=torch.float8_e4m3fn,
+            full=AttnLayerSpec(2, 64, gl),
+            swa=AttnLayerSpec(2, 64, swa_ids),
+            device="cpu",
+            token_to_kv_pool_class=TpuSeqAlongLaneKVPool,
+        )
+        self.assertEqual(buf_map, tuple(pool._buffer_idx(i) for i in range(_LAYERS)))
+        self.assertEqual(grp_map, tuple(pool.swa_page_group(i) for i in range(_LAYERS)))
+        self.assertEqual(ops._layout_pools(pool, _GEOMETRY), (pool.kv_pool,))
+        # a pool whose layer assignment differs from the kernel geometry is refused
+        moved = TpuUnifiedSWAKVPool(
+            size=512,
+            page_size=256,
+            dtype=torch.float8_e4m3fn,
+            full=AttnLayerSpec(2, 64, gl[:-1]),
+            swa=AttnLayerSpec(2, 64, [*swa_ids, gl[-1]]),
+            device="cpu",
+            token_to_kv_pool_class=TpuSeqAlongLaneKVPool,
+        )
+        with self.assertRaises(ValueError):
+            ops._layout_pools(moved, _GEOMETRY)
+
+    def test_config_carries_the_maps_and_sizes_the_window_tables(self):
+        cfg = _config(_megakernel(), 8, 2, unified_kv=True, **_FP8_SAL)
+        self.assertEqual((cfg.n_kv_buffers, cfg.n_swa_groups), (16, 3))
+        self.assertEqual(cfg.layer_kv_buf(0), 0)
+        last_swa = max(i for i in range(_LAYERS) if i not in _GEOMETRY.global_layers)
+        self.assertEqual(cfg.layer_swa_group(last_swa), 2)
+        plain = _config(_megakernel(), 8, 2, **_FP8_SAL)
+        self.assertEqual((plain.n_kv_buffers, plain.n_swa_groups), (_LAYERS, 1))
+        # three SWA tables plus the full table outgrow SMEM sooner than one SWA table
+        self.assertFalse(ops._swa_window_table(True, 40000, n_swa_groups=1))
+        self.assertTrue(ops._swa_window_table(True, 40000, n_swa_groups=3))
+
+    def test_swa_tables_concatenate_the_groups(self):
+        import torch
+
+        base = torch.tensor([3, 4], dtype=torch.int32)
+        groups = torch.tensor([[7, 8], [9, 10]], dtype=torch.int32)
+        md = SimpleNamespace(
+            page_indices=None, swa_page_indices=base, swa_group_page_indices=groups
+        )
+        self.assertEqual(ops._swa_tables(md).tolist(), [3, 4, 7, 8, 9, 10])
+        md.swa_group_page_indices = None
+        self.assertIs(ops._swa_tables(md), base)
+
+    def test_ep_decode_refuses_the_unified_pool(self):
+        with self.assertRaises(NotImplementedError):
+            ops.MuseMegakernel.check_kv_pools(
+                SimpleNamespace(moe_mode="ep", geo=_GEOMETRY, kv_packed=False),
+                object.__new__(ops.TpuUnifiedSWAKVPool),
+            )
 
 
 if __name__ == "__main__":
