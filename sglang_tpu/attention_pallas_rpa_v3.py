@@ -472,11 +472,27 @@ def _invoke_v3_kernel(
         all_prefill_toks = w7_prefill_toks | scoped_lc_toks
         use_w8_preset = ("w8" in all_prefill_toks) and not use_w9_preset
         use_w7_preset = ("w7" in all_prefill_toks) or use_w8_preset or use_w9_preset
+        is_tp16_sq_target = bool(allow_tp16_sq and is_tp16_sq_shape)
         eff_lc_toks = set(lc_prefill_toks)
-        if use_w9_preset and is_lc_full and not (
-            eff_lc_toks & {"bq1024", "bq2048", "bq4096", "bq8192"}
-        ):
-            eff_lc_toks.update(("bq4096", "bkv8192", "s2", "prefix_fast", "staged_qo"))
+        if use_w9_preset and is_lc_full:
+            if not (eff_lc_toks & {"bq1024", "bq2048", "bq4096", "bq8192"}):
+                eff_lc_toks.add("bq4096")
+            tp8_bq8k = (
+                not is_tp16_sq_target
+                and "bq8192" in eff_lc_toks
+                and num_q_tokens >= 8192
+            )
+            if not (
+                eff_lc_toks
+                & {"bkv4096", "bkv8192", "bkv16384", "bkv16k", "nobkv8192"}
+            ) and not tp8_bq8k:
+                eff_lc_toks.add("bkv8192")
+            if not (eff_lc_toks & {"s3", "mixed_s3"}):
+                eff_lc_toks.add("s2")
+            if "noprefix_fast" not in eff_lc_toks:
+                eff_lc_toks.add("prefix_fast")
+            if "nostaged_qo" not in eff_lc_toks:
+                eff_lc_toks.add("staged_qo")
         if stationary_q_blocks:
             bq_sz = stationary_q_blocks[0]
             extra["m_block_sizes"] = stationary_q_blocks
@@ -531,27 +547,35 @@ def _invoke_v3_kernel(
                     or "bq8192" in eff_lc_toks
                 ) and num_q_tokens >= 1024:
                     bq_sz = 1024
-            bkv_sz = (
-                8192
-                if (is_lc_full and "bkv8192" in eff_lc_toks and num_q_tokens >= 512)
-                else (
-                    4096
-                    if (
-                        sliding_window is None
-                        and prefill_mode in _STATIONARY_Q_M0_MODES
-                        and num_q_tokens >= 512
-                        and (
-                            num_q_tokens >= 16384
-                            or per_seq_kv_capacity > 18432
-                            or "full_bkv4k" in all_prefill_toks
-                            or use_w7_preset
-                        )
-                    )
-                    else 2048
+            if (
+                is_lc_full
+                and ("bkv16384" in eff_lc_toks or "bkv16k" in eff_lc_toks)
+                and num_q_tokens >= 512
+            ):
+                bkv_sz = 16384
+            elif is_lc_full and "bkv8192" in eff_lc_toks and num_q_tokens >= 512:
+                bkv_sz = 8192
+            elif (
+                sliding_window is None
+                and prefill_mode in _STATIONARY_Q_M0_MODES
+                and num_q_tokens >= 512
+                and (
+                    num_q_tokens >= 16384
+                    or per_seq_kv_capacity > 18432
+                    or "full_bkv4k" in all_prefill_toks
+                    or use_w7_preset
                 )
-            )
+            ):
+                bkv_sz = 4096
+            else:
+                bkv_sz = 2048
             bkv_csz = max(256, logical_page_size)
             bkv_sz = max(bkv_sz, bkv_csz)
+            if is_lc_full and not is_tp16_sq_target and bq_sz >= 8192 and bkv_sz >= 8192:
+                raise ValueError(
+                    f"TP=8 LC RPAm (bq_sz={bq_sz}, bkv_sz={bkv_sz}) exceeds 64 MiB VMEM; "
+                    "use bq4096 or bkv4096 on TP=8."
+                )
             extra["m_block_sizes"] = (bq_sz, bkv_sz, 256, bkv_csz)
         prefill_opts = {
             f"stationary_q_{prefill_mode}",

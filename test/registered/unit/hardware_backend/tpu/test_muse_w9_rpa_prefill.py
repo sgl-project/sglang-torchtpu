@@ -1864,6 +1864,177 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
                     )
                     self.assertIn("RPAm", exp.mlir_module())
 
+    def test_cand13_lc_routing_bkv16k_and_tq_loop_parity(self):
+        """Verify LC_OPTS partial override preservation, bkv16k routing, exact tq_loop parity, and TPU7x exports."""
+        from jax.experimental.pallas import tpu as pltpu
+        from sglang_tpu.attention.pallas import ragged_paged_attention_v3 as rpa_v3_mod
+        from sglang_tpu import attention_pallas_rpa_v3 as rpa_wrap_mod
+
+        class _FakeRng:
+            def __init__(self, sh, dtype="bfloat16"):
+                self.shape = sh
+                self.ndim = len(sh)
+                self.dtype = dtype
+
+        def _capture_lc(lc_opts, *, t_tok, qh, sw, pps):
+            captured = {}
+
+            def _stub(*args, **kwargs):
+                captured.update(kwargs)
+                return ("out", "kvc")
+
+            env = {
+                "SGLANG_TPU_RPA_V3_PREFILL_KERNEL_MODE": "m0_ring_fuse",
+                "SGLANG_TPU_RPA_V3_PREFILL_W9": "1",
+                "SGLANG_TPU_RPA_V3_PREFILL_LC_OPTS": lc_opts,
+                "SGLANG_TPU_RPA_V3_PREFILL_A3_LAYOUT": "1",
+                "SGLANG_TPU_RPA_V3_SKIP_EMPTY_DECODE": "1",
+                "SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT": "1",
+                "SGLANG_TPU_KV_PACK_HEADS": "2",
+            }
+            with patch.dict(os.environ, env, clear=False):
+                rpa_wrap_mod._invoke_v3_kernel(
+                    _stub,
+                    queries=_FakeRng((1, t_tok, qh, 2, 128)),
+                    keys=_FakeRng((t_tok, 1, 4, 128), "float8_e4m3fn"),
+                    values=None,
+                    kv_cache_fused=_FakeRng((2048, 512, 1, 4, 128), "float8_e4m3fn"),
+                    kv_lens=_FakeRng((64,)),
+                    page_indices=_FakeRng((64 * pps,)),
+                    cu_q_lens=_FakeRng((65,)),
+                    cu_kv_lens=_FakeRng((65,)),
+                    distribution=_FakeRng((3,)),
+                    attention_sink=None,
+                    sm_scale=0.125,
+                    sliding_window=sw,
+                    soft_cap=None,
+                    k_scale=1.0,
+                    v_scale=1.0,
+                    prepared_inputs=True,
+                    skip_decode=True,
+                    a3_out_layout=-2,
+                )
+            return captured
+
+        # Partial LC_OPTS="bq8192" on TP=16 preserves bkv8192, s2 (no mixed_s3), prefix_fast, staged_qo, and mk128.
+        c_bq8k = _capture_lc("bq8192", t_tok=16384, qh=4, sw=None, pps=540)
+        self.assertEqual(c_bq8k["m_block_sizes"], (8192, 8192, 256, 512))
+        self.assertIn("mk128", c_bq8k["_prefill_opts"])
+        self.assertIn("prefix_fast", c_bq8k["_prefill_opts"])
+        self.assertIn("staged_qo", c_bq8k["_prefill_opts"])
+        self.assertNotIn("mixed_s3", c_bq8k["_prefill_opts"])
+
+        # On TP=8, LC_OPTS="bq8192" avoids injecting bkv8192 (caps to 4096), while explicit bq8192,bkv8192 raises.
+        c_tp8_bq8k = _capture_lc("bq8192", t_tok=16384, qh=8, sw=None, pps=540)
+        self.assertEqual(c_tp8_bq8k["m_block_sizes"], (8192, 4096, 256, 512))
+        self.assertNotIn("mixed_s3", c_tp8_bq8k["_prefill_opts"])
+        with self.assertRaises(ValueError):
+            _capture_lc("bq8192,bkv8192", t_tok=16384, qh=8, sw=None, pps=540)
+
+        # Opt-in bkv16384 routes cleanly on >32K Full without affecting <=32K Full or SWA.
+        c_bkv16k = _capture_lc("bkv16384", t_tok=16384, qh=8, sw=None, pps=540)
+        self.assertEqual(c_bkv16k["m_block_sizes"], (4096, 16384, 256, 512))
+        self.assertNotIn("mixed_s3", c_bkv16k["_prefill_opts"])
+
+        c_short = _capture_lc("bkv16384", t_tok=16384, qh=8, sw=None, pps=48)
+        self.assertEqual(c_short["m_block_sizes"], (512, 4096, 256, 512))
+        self.assertIn("mixed_s3", c_short["_prefill_opts"])
+
+        # CPU InterpretParams(detect_races=True, uninitialized_memory="nan") + 0x7F KV poison
+        # verifying exact tq_loop bound cdiv(valid_bq_rows, tq_sz) on partial bq=512 (ql=128 -> 1 iter).
+        rng = np.random.default_rng(1313)
+        page_size = 512
+        interp = pltpu.InterpretParams(detect_races=True, uninitialized_memory="nan")
+        for tp_mode in ("tp8", "tp16"):
+            qh = 8 if tp_mode == "tp8" else 4
+            fused_pack = 2 if tp_mode == "tp8" else -2
+            tp_opt = set() if tp_mode == "tp8" else {"tp16_sq"}
+            q_np = rng.normal(0.0, 0.35, (1, 512, qh, 2, 128)).astype(np.float32)
+            if tp_mode == "tp16":
+                q_np[..., 64:] = 0.0
+            q_jax = jnp.asarray(q_np, dtype=jnp.bfloat16)
+            kv_jax = jnp.asarray(rng.normal(0.0, 0.35, (512, 1, 4, 128)), dtype=jnp.float8_e4m3fn)
+            cache_u8 = np.full((6, page_size, 1, 4, 128), 0x7F, dtype=np.uint8)
+            cache_u8[0, :, 0, :4, :] = 0x30
+            if tp_mode == "tp16":
+                cache_u8[0, :, 0, :, 64:] = 0
+            kv_cache = _u8_to_fp8(cache_u8)
+            ql = 128  # < 256 so cdiv(valid_bq_rows, 256) == 1 inside bq=512 (2 tq slots)
+            kl = jnp.array([512 + ql, 0, 0, 0], dtype=jnp.int32)
+            cq = jnp.array([0, ql, ql, ql, ql], dtype=jnp.int32)
+            ckv = jnp.array([0, 512 + ql, 512 + ql, 512 + ql, 512 + ql], dtype=jnp.int32)
+            pi = jnp.array([0, 1, 2, 3] * 4, dtype=jnp.int32)
+            dist = jnp.array([0, 0, 1], dtype=jnp.int32)
+            opts = frozenset({
+                "stationary_q_m0_ring_fuse", "skip_empty_cdma", "bkv_full_unroll",
+                "mixed_s3", "prefix_fast", "fp8_qk", "mk128", "la2", "sub8_l",
+                "bf16_pop", "unroll_up",
+            } | tp_opt)
+            with patch.object(rpa_v3_mod, "get_tpu_version", return_value=7):
+                out_loop, _ = rpa_v3_mod.ragged_paged_attention(
+                    jnp.array(q_jax), jnp.array(kv_jax), None, jnp.array(kv_cache),
+                    kl, pi, cq, ckv, dist, None, None,
+                    sm_scale=0.125, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                    m_block_sizes=(512, 1024, 256, 512), _prefill_opts=opts,
+                    _fused_out_pack=fused_pack, _prepared_inputs=True,
+                    _skip_decode=True, _a3_out_layout=True, _interpret=interp,
+                )
+                out_unroll, _ = rpa_v3_mod.ragged_paged_attention(
+                    jnp.array(q_jax), jnp.array(kv_jax), None, jnp.array(kv_cache),
+                    kl, pi, cq, ckv, dist, None, None,
+                    sm_scale=0.125, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                    m_block_sizes=(512, 1024, 256, 512), _prefill_opts=opts | {"tq_unroll"},
+                    _fused_out_pack=fused_pack, _prepared_inputs=True,
+                    _skip_decode=True, _a3_out_layout=True, _interpret=interp,
+                )
+            a = np.asarray(out_loop[:ql], dtype=np.float32)
+            b = np.asarray(out_unroll[:ql], dtype=np.float32)
+            self.assertTrue(np.all(np.isfinite(a)), f"{tp_mode} tq_loop non-finite")
+            self.assertEqual(float(np.max(np.abs(a - b))), 0.0)
+
+        try:
+            from jax._src import tpu_info as _tpu_info  # noqa: F401
+        except ImportError:
+            self.skipTest("jax._src.tpu_info not available in lightweight CPU venv")
+        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+        lc_mk_opts = frozenset({
+            "stationary_q_m0_ring_fuse", "skip_empty_cdma", "bkv_full_unroll",
+            "prefix_fast", "fp8_qk", "mk128", "la2", "sub8_l",
+            "bf16_pop", "unroll_up", "staged_qo",
+        })
+        export_cases = (
+            ("tp8_lc_mk128_bkv16k", 8, 2, 16384, 540, (4096, 16384, 256, 512), lc_mk_opts),
+            ("tp16_lc_mk128_bkv16k", 4, -2, 16384, 540, (4096, 16384, 256, 512), lc_mk_opts | {"tp16_sq"}),
+        )
+        with (
+            patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+            tpu_info_for_cpu_export(),
+        ):
+            for tag, qh, fpack, t_tok, pps, mb, opts in export_cases:
+                with self.subTest(export=tag):
+                    exp = jax_export.export(
+                        jax.jit(
+                            lambda q, kv, c, kl, pi, cq, ckv, d, _mb=mb, _op=opts, _fp=fpack: rpa_v3_mod.ragged_paged_attention(
+                                q, kv, None, c, kl, pi, cq, ckv, d, None, None,
+                                sm_scale=0.125, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                                m_block_sizes=_mb, _prefill_opts=_op, _fused_out_pack=_fp,
+                                _prepared_inputs=True, _skip_decode=True, _a3_out_layout=True,
+                            )
+                        ),
+                        platforms=["tpu"],
+                    )(
+                        jax.ShapeDtypeStruct((1, t_tok, qh, 2, 128), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((t_tok, 1, 4, 128), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((2048, 512, 1, 4, 128), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((64,), jnp.int32),
+                        jax.ShapeDtypeStruct((64 * pps,), jnp.int32),
+                        jax.ShapeDtypeStruct((65,), jnp.int32),
+                        jax.ShapeDtypeStruct((65,), jnp.int32),
+                        jax.ShapeDtypeStruct((3,), jnp.int32),
+                    )
+                    self.assertIn("RPAm", exp.mlir_module())
+
 
 if __name__ == "__main__":
     unittest.main()
