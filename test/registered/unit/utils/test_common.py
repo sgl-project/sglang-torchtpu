@@ -2,6 +2,7 @@ import gc
 import io
 import sys
 import unittest
+import weakref
 from array import array
 from unittest import mock
 
@@ -296,6 +297,10 @@ class TestHipProbes(CustomTestCase):
             self.assertTrue(is_hip())
 
 
+class _Node:
+    ref = None
+
+
 class TestFreezeGc(CustomTestCase):
     def setUp(self):
         self.addCleanup(gc.set_threshold, *gc.get_threshold())
@@ -304,6 +309,29 @@ class TestFreezeGc(CustomTestCase):
     def test_applies_configured_threshold(self):
         freeze_gc("test", [700, 10, 1000])
         self.assertEqual(gc.get_threshold(), (700, 10, 1000))
+
+    def test_full_collections_resume_after_the_freeze(self):
+        """Cyclic garbage in the oldest generation must not outlive the next
+        automatic full collection once a large heap is frozen."""
+        enabled = gc.isenabled()
+        self.addCleanup(lambda: gc.enable() if enabled else gc.disable())
+        heap = [[i] for i in range(200_000)]
+        gc.collect()
+        freeze_gc("test")
+        del heap
+        gc.disable()
+        node = _Node()
+        node.ref = node
+        alive = weakref.ref(node)
+        gc.collect(1)  # promote the cycle to the oldest generation
+        del node
+        gc.set_threshold(1, 1, 1)
+        gc.enable()
+        # Net allocations drive the automatic collections. Don't call alive()
+        # in between: a collection can run while its result is on the stack.
+        keep = [[] for _ in range(1_000)]
+        del keep
+        self.assertIsNone(alive())
 
 
 if __name__ == "__main__":
