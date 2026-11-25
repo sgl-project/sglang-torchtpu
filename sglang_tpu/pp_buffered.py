@@ -597,21 +597,53 @@ class PPBufferedHandoff:
     ) -> tuple[torch.Tensor, ...]:
         """The outgoing tensors of a forward: its hidden states plus the
         residual when it returns one, then the aux slots; each its own
-        storage."""
+        storage. The send takes the same tensors in their wire shapes."""
+        return tuple(x for _, x in self._outgoing(tensors, wire=False))
+
+    def _outgoing(
+        self, tensors: dict[str, torch.Tensor | None], *, wire: bool
+    ) -> list[tuple[int, torch.Tensor]]:
+        """``merge``'s tensors with their row counts; ``wire``: each in its
+        wire shape, as the send takes it.
+
+        On the wire path the hidden states and residual are summed in the
+        wire shape, so one program does the sum and the relayout instead of
+        a sum and then a wire copy of it. The values are the same: the sum is
+        elementwise, and the reshapes move no value.
+        """
         aux = {AUX_HIDDEN_STATES_PROXY_KEY} if self.num_aux else set()
         if set(tensors) not in ({HIDDEN_STATES} | aux, set(self.KEYS) | aux):
             raise ValueError(
                 f"the buffered hand-off requires {sorted({HIDDEN_STATES} | aux)} "
                 f"and an optional {RESIDUAL}, got {sorted(tensors)}"
             )
-        total = tensors[HIDDEN_STATES]
-        if tensors.get(RESIDUAL) is not None:
-            total = total + tensors[RESIDUAL]
+        hidden = tensors[HIDDEN_STATES]
+        residual = tensors.get(RESIDUAL)
+        # Fuse only where reshaping the inputs is free: equal 2-D shapes (no
+        # broadcast) and contiguous inputs (a reshape of a strided view would
+        # copy it first).
+        fuse = (
+            wire
+            and residual is not None
+            and hidden.dim() == 2
+            and residual.shape == hidden.shape
+            and hidden.is_contiguous()
+            and residual.is_contiguous()
+        )
+        if fuse:
+            rows = int(hidden.shape[0])
+            shape = self._wire_shape(rows, int(hidden.shape[1]))
+            # A program's output in the wire shape: it owns its storage.
+            total = hidden.reshape(shape) + residual.reshape(shape)
+        else:
+            total = hidden if residual is None else hidden + residual
+            rows = int(total.shape[0])
+            total = self._as_outgoing(total, wire)
         if total.dtype != self.dtype:
             raise ValueError(
                 f"the buffered hand-off carries {self.dtype}, got {total.dtype}"
             )
-        outgoing = [total]
+        outgoing = [(rows, total)]
         if self.num_aux:
             aux = tensors[AUX_HIDDEN_STATES_PROXY_KEY]
             if int(aux.shape[-1]) != self.widths[1]:
@@ -624,11 +656,17 @@ class PPBufferedHandoff:
                     f"the buffered hand-off carries {self.aux_dtype} aux activations, "
                     f"got {aux.dtype}"
                 )
-            outgoing.append(aux)
-        # Sending a view would make its copy on the send thread; copy here,
-        # on the thread that traces the forward.
-        # (A program's output, not clone(): see _to_wire.)
-        return tuple(x if x._base is None else x * self._one(x.dtype) for x in outgoing)
+            outgoing.append((int(aux.shape[0]), self._as_outgoing(aux, wire)))
+        return outgoing
+
+    def _as_outgoing(self, x: torch.Tensor, wire: bool) -> torch.Tensor:
+        """``x`` as a tensor of its own (in its wire shape when ``wire``).
+        Sending a view would make its copy on the send thread; copy here, on
+        the thread that traces the forward (a program's output, not clone():
+        see ``_to_wire``, whose copy already owns its storage)."""
+        if wire:
+            x = self._to_wire(x)
+        return x if x._base is None else x * self._one(x.dtype)
 
     def end_iteration(self, tensors: dict[str, torch.Tensor] | None) -> None:
         """After the forward (``tensors`` = its outgoing activations; None
@@ -654,15 +692,15 @@ class PPBufferedHandoff:
                 f"buffered hand-off stage {self.rank}: forward {self._current} "
                 "produced nothing to hand on"
             )
-        outgoing = self.merge(tensors)
-        rows = int(outgoing[0].shape[0])
+        merged = self._outgoing(tensors, wire=True)
+        rows = merged[0][0]
         self._check_rows(self._current, rows)
-        if any(int(x.shape[0]) != rows for x in outgoing):
+        if any(n != rows for n, _ in merged):
             raise RuntimeError(
                 f"buffered hand-off stage {self.rank}: forward {self._current} hands "
-                f"on tensors of different row counts {[tuple(x.shape) for x in outgoing]}"
+                f"on tensors of different row counts {[n for n, _ in merged]}"
             )
-        outgoing = tuple(self._to_wire(x) for x in outgoing)
+        outgoing = tuple(x for _, x in merged)
         self._transport.flush(outgoing)
         self._queue_send(self._current, outgoing)
 
@@ -776,9 +814,10 @@ class PPBufferedHandoff:
     # -- warmup and self-test -------------------------------------------------
     def warmup_merge(self, row_buckets: Iterable[int]) -> None:
         """Compile, for every bucket a forward hands on, the programs a
-        transfer runs around the forward: the outgoing sum and its wire copy
-        on a sending stage, and the copy back from the wire on a receiving
-        one. Otherwise each compiles at the first request of its bucket."""
+        transfer runs around the forward: the outgoing tensors in their wire
+        shapes, with and without a residual, on a sending stage, and the copy
+        back from the wire on a receiving one. Otherwise each compiles at the
+        first request of its bucket."""
         for rows in row_buckets:
             if rows > self.max_rows:
                 continue
@@ -794,14 +833,23 @@ class PPBufferedHandoff:
                     zeros[AUX_HIDDEN_STATES_PROXY_KEY] = torch.zeros(
                         (rows, self.widths[1]), dtype=self.aux_dtype, device=self.device
                     )
-                programs.extend(self._to_wire(x) for x in self.merge(zeros))
+                self._transport.materialize(zeros.values())
+                # With and without the residual: the send's two programs, each
+                # flushed alone as end_iteration flushes it, so a deferring
+                # eager mode compiles the same executables the send runs.
+                without = {k: v for k, v in zeros.items() if k != RESIDUAL}
+                for outgoing in (zeros, without):
+                    self._transport.flush(
+                        [x for _, x in self._outgoing(outgoing, wire=True)]
+                    )
             if self.rank > 0:
                 for width, dtype in zip(self.widths, self.dtypes):
                     wire = self._transport.landing_buffer(
                         self._wire_shape(rows, width), dtype, self.device
                     )
                     programs.append(self._from_wire(wire, rows, width))
-            self._transport.flush(programs)
+            if programs:
+                self._transport.flush(programs)
 
     def _probe_pattern(
         self, global_rank: int, rows: int, width: int, dtype: torch.dtype
@@ -831,16 +879,26 @@ class PPBufferedHandoff:
             if self.prev is not None:
                 received = self._post(self.transfers, rows)
             if self.next is not None:
-                # Made on the device by a program, as a forward's output is.
-                sent = tuple(
-                    self._to_wire(
-                        self._probe_pattern(self.global_rank, rows, width, dtype).to(
-                            self.device
-                        )
-                        * self._one(dtype)
+                # Made on the device by programs, as a forward's outputs are.
+                made = [
+                    self._probe_pattern(self.global_rank, rows, width, dtype).to(
+                        self.device
                     )
+                    * self._one(dtype)
                     for width, dtype in zip(self.widths, self.dtypes)
-                )
+                ]
+                # The hidden states go as (pattern - 1) + 1, exact in any float dtype,
+                # so the self-test sends what the send's own sum makes.
+                tensors = {
+                    HIDDEN_STATES: made[0] - 1,
+                    RESIDUAL: torch.ones_like(made[0]),
+                }
+                if self.num_aux:
+                    tensors[AUX_HIDDEN_STATES_PROXY_KEY] = made[1]
+                # Inputs first, so a deferring eager mode compiles the sum alone,
+                # as the send does after a forward.
+                self._transport.materialize(tensors.values())
+                sent = tuple(x for _, x in self._outgoing(tensors, wire=True))
                 self._transport.materialize(sent)
                 self._transport.send_list(
                     list(sent), dst=self.next, tag=self._tag(self.transfers)

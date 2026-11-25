@@ -432,6 +432,70 @@ class TestWireShape(unittest.TestCase):
         self.assertTrue(torch.equal(back, x))
         self.assertIsNone(back._base)
 
+    def test_send_sums_in_the_wire_shape_with_the_same_bits(self):
+        """The send path's tensors are the bits of the sum's wire copy, each its
+        own storage: with and without a residual, aligned and unaligned sizes,
+        and views of wider tensors (which take the unfused path)."""
+        handoff = make_handoff(0, 2, FakeNet(), num_aux=1)
+        g = torch.Generator().manual_seed(0)
+        for rows, wire in ((64, (2, 128)), (1, (1, HIDDEN))):
+            hidden = torch.randn(rows, HIDDEN, generator=g)
+            residual = torch.randn(rows, HIDDEN, generator=g)
+            residual[0] = torch.tensor([-0.0, float("inf"), float("-inf"), 1e-40])
+            hidden[0] = torch.tensor([-0.0, 1.0, -1.0, 0.0])
+            aux = torch.randn(rows, HIDDEN, generator=g)
+            whole = (hidden, residual, aux)
+            # Row slices stay contiguous and take the fused sum; column slices
+            # of more than one row are strided and take the sum and wire copy.
+            row_views = tuple(torch.cat([x, x])[:rows] for x in whole)
+            col_views = tuple(torch.cat([x, x], dim=1)[:, :HIDDEN] for x in whole)
+            for name, (h, r, a) in (
+                ("whole", whole),
+                ("row views", row_views),
+                ("column views", col_views),
+            ):
+                for with_residual in (True, False):
+                    with self.subTest(rows=rows, case=name, residual=with_residual):
+                        tensors = {
+                            "hidden_states": h,
+                            "residual": r if with_residual else None,
+                            AUX_HIDDEN_STATES_PROXY_KEY: a,
+                        }
+                        with patch.object(
+                            handoff, "_as_outgoing", wraps=handoff._as_outgoing
+                        ) as unfused:
+                            sent = handoff._outgoing(tensors, wire=True)
+                        fused = (
+                            with_residual and h.is_contiguous() and r.is_contiguous()
+                        )
+                        # The aux slot always takes _as_outgoing; the sum only unfused.
+                        self.assertEqual(unfused.call_count, 1 if fused else 2)
+                        want = [handoff._to_wire(x) for x in handoff.merge(tensors)]
+                        self.assertEqual([n for n, _ in sent], [rows, rows])
+                        for (_, got), expected in zip(sent, want):
+                            self.assertEqual(tuple(got.shape), wire)
+                            self.assertIsNone(got._base)
+                            self.assertTrue(
+                                torch.equal(
+                                    got.view(torch.int32), expected.view(torch.int32)
+                                )
+                            )
+
+    def test_send_counts_the_rows_of_the_sum(self):
+        """A residual that broadcasts over the hidden states' rows sends the
+        sum's rows, as the sum is what travels."""
+        handoff = make_handoff(0, 2, FakeNet(), num_aux=1)
+        sent = handoff._outgoing(
+            {
+                "hidden_states": torch.ones(1, HIDDEN),
+                "residual": torch.ones(64, HIDDEN),
+                AUX_HIDDEN_STATES_PROXY_KEY: torch.ones(64, HIDDEN),
+            },
+            wire=True,
+        )
+        self.assertEqual([n for n, _ in sent], [64, 64])
+        self.assertTrue(torch.equal(sent[0][1], torch.full((2, 128), 2.0)))
+
 
 class TestWarmup(unittest.TestCase):
     def _programs(self, rank, size):
@@ -444,13 +508,22 @@ class TestWarmup(unittest.TestCase):
         return flushed
 
     def test_every_bucket_compiles_its_wire_programs(self):
-        """A middle stage warms the outgoing sum and wire copy and the copy
-        back from the wire for each bucket up to its buffer (64 rows)."""
+        """A middle stage warms the outgoing tensors in their wire shapes, with
+        and without a residual, and the copy back from the wire for each
+        bucket up to its buffer (64 rows)."""
         shapes = self._programs(1, 3)
-        # Send side: hidden [rows, 4] and aux [rows, 4]; 16 x 4 is not a whole
-        # number of 128-wide rows and travels as it is.
-        self.assertEqual(shapes.count((16, 4)), 4)
-        self.assertEqual(shapes.count((2, 128)), 2)
+        handoff = make_handoff(1, 3, FakeNet(), num_aux=1)
+        calls = []
+        handoff._transport.flush = lambda tensors: calls.append(
+            [tuple(x.shape) for x in tensors]
+        )
+        handoff.warmup_merge([64])
+        # Each send variant is flushed alone, as end_iteration flushes it.
+        self.assertEqual(calls[:2], [[(2, 128), (2, 128)], [(2, 128), (2, 128)]])
+        # Send side, twice: hidden [rows, 4] and aux [rows, 4]; 16 x 4 is not a
+        # whole number of 128-wide rows and travels as it is.
+        self.assertEqual(shapes.count((16, 4)), 6)
+        self.assertEqual(shapes.count((2, 128)), 4)
         # Receive side rebuilds [64, 4] from the wire for both tensors.
         self.assertEqual(shapes.count((64, 4)), 2)
         self.assertNotIn((128, 4), shapes)
