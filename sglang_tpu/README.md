@@ -302,7 +302,13 @@ built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and adds:
   `minimax_h3.py` (MiniMax-H3 packed sequences padded to a multiple of 512
   rows, only the 50 DiT blocks compiled, the breakable-CUDA-graph break point
   skipped, regionally compiled blocks marked spmd-safe, the embedding built
-  with shapes that do not move with the prompt length); worker init also
+  with shapes that do not move with the prompt length) and
+  `minimax_h3_qk_norm_rope.py` (MiniMax-H3 QK RMSNorm + partial RoPE as one
+  Pallas kernel on eligible TPU calls) and `minimax_h3_ulysses_overlap.py`
+  (MiniMax-H3's two Ulysses all-to-alls per block pipelined per head group
+  behind attention, with QK-norm + RoPE writing the exchange buffers; on when
+  the worker set the async all-to-all libtpu flags, which it does only for an
+  H3 pipeline with Ulysses > 1 and no ring); worker init also
   registers srt's ATen fallbacks (`patches._register_aten_fallbacks`, e.g.
   `logaddexp`).
 

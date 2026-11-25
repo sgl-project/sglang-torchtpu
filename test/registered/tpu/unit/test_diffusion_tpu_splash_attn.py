@@ -15,7 +15,7 @@ SDPA.
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=170, suite="stage-a-test-tpu-unit", chips=1)
+register_tpu_ci(est_time=300, suite="stage-a-test-tpu-unit", chips=1)
 
 import importlib.util
 import math
@@ -640,6 +640,122 @@ class TestTpuSplashAttentionNumerics(CustomTestCase):
             err = (got[live].float() - want).abs().max().item()
             self.assertLess(err, 2e-2, (total, used))
 
+    def _live_length_run(self, tsa, impl, q, k, v, used):
+        """``forward_varlen`` over ``[S, 7, 128]`` rows with ``used`` live
+        rows; asserts one live-length kernel call."""
+        total = q.shape[0]
+        cu = torch.tensor([0, used, total], dtype=torch.int32)
+        with patch.object(
+            tsa, "_FLASH_LIVE_LENGTH_OP", wraps=tsa._FLASH_LIVE_LENGTH_OP
+        ) as kernel:
+            got = impl.forward_varlen(
+                q.to("tpu"),
+                k.to("tpu"),
+                v.to("tpu"),
+                cu_seqlens=cu.to("tpu"),
+                max_seqlen=total,
+            ).to("cpu")
+        self.assertEqual(kernel.call_count, 1, (total, used))
+        self.assertEqual(got.shape, q.shape)
+        return got
+
+    def _check_live_length(
+        self, total, used, *, nan_padding=False, large_logits=False, max_abs=2e-2
+    ):
+        """Live rows against float32 attention over the live rows; padding
+        rows exactly zero."""
+        tsa, impl = self._live_length_impl()
+        gen = torch.Generator().manual_seed(total * 7919 + used)
+        q, k, v = (torch.randn(total, 7, 128, generator=gen) for _ in range(3))
+        if large_logits:
+            # MiniMax-H3's q_norm / k_norm weights reach ~37: query rows scaled
+            # log-uniformly in [1.25, 10] and keys ramped 4 -> 8 over the rows
+            # put the row max of the scaled logits at ~50-400 (log2 units),
+            # still growing in the block that holds the last live key.
+            gain = torch.empty(total, 1, 1).uniform_(
+                math.log(1.25), math.log(10.0), generator=gen
+            )
+            q = q * gain.exp()
+            k = k * torch.linspace(4.0, 8.0, total)[:, None, None]
+        q, k, v = (t.bfloat16() for t in (q, k, v))
+        if nan_padding:
+            for t in (q, k, v):
+                t[used:] = float("nan")
+        got = self._live_length_run(tsa, impl, q, k, v, used)
+        self.assertTrue((got[used:] == 0).all(), (total, used))
+        live = got[:used]
+        self.assertFalse(torch.isnan(live).any().item(), (total, used))
+        q_live, k_live, v_live = (t[None, :used].transpose(1, 2) for t in (q, k, v))
+        want = _reference(q_live, k_live, v_live, 128**-0.5, False).transpose(1, 2)[0]
+        rel, err = _rel_l2(live, want), (live.float() - want).abs().max().item()
+        # The running-max flash kernel on the live rows, for comparison.
+        flash = tsa.tpu_attention(q_live.to("tpu"), k_live.to("tpu"), v_live.to("tpu"))
+        flash_err = (flash.to("cpu").transpose(1, 2)[0].float() - want).abs().max()
+        print(
+            f"live length {total}/{used}: rel-L2 {rel:.3e}, max abs {err:.3e} "
+            f"(running-max flash kernel {flash_err.item():.3e})"
+        )
+        self.assertLess(rel, 1e-2, (total, used))
+        self.assertLess(err, max_abs, (total, used))
+
+    def test_live_length_block_layouts(self):
+        # (rows, live rows): the last live key in a full KV block and at a
+        # block end, a ragged last query block (5120 at 1792-row blocks),
+        # S % 2048 = 1536 with the last live key in the ragged last KV block,
+        # a sequence zero-padded to whole blocks (9728), one live row, and
+        # sequences up to one 2048 block.
+        for total, used in (
+            (4608, 4388),
+            (4608, 4096),
+            (5120, 4900),
+            (5120, 5120),
+            (5632, 5412),
+            (5632, 4932),
+            (6144, 6144),
+            (9728, 9508),
+            (4608, 1),
+            (2048, 1828),
+            (1536, 1400),
+            (1024, 1024),
+        ):
+            with self.subTest(total=total, used=used):
+                self._check_live_length(total, used)
+
+    def test_live_length_nan_padding(self):
+        # Padding rows of q, k and v hold NaN, including the rest of the
+        # block that holds the last live key.
+        for total, used in ((5120, 4609), (5632, 5121), (512, 389)):
+            with self.subTest(total=total, used=used):
+                self._check_live_length(total, used, nan_padding=True)
+
+    def test_live_length_large_logits(self):
+        # Outputs reach ~4 here and a peaked softmax amplifies the bf16
+        # rounding of the probabilities: the running-max kernel lands at
+        # max abs 1.5e-2 on these inputs, this kernel at up to 2.4e-2.
+        for total, used in ((4608, 4500), (5632, 5412), (6144, 6144)):
+            with self.subTest(total=total, used=used):
+                self._check_live_length(total, used, large_logits=True, max_abs=5e-2)
+
+    def test_live_length_ragged_query_block_ignores_rows_past_the_sequence(self):
+        # 5120 rows run as three 1792-row query blocks; the last one holds
+        # 1536 rows, and the VMEM rows past them still hold an earlier block's
+        # query rows. Those rows must not change the real rows' result: here
+        # they are huge, against keys whose scale ramps up over the sequence,
+        # so their probability sums overflow chunk after chunk.
+        tsa, impl = self._live_length_impl()
+        total, block_q, tail = 5120, 1792, 1536
+        gen = torch.Generator().manual_seed(5120)
+        q, k, v = (torch.randn(total, 7, 128, generator=gen) for _ in range(3))
+        k = k * torch.linspace(1.0, 8.0, total)[:, None, None]
+        q_huge = q.clone()
+        for start in range(0, total - tail, block_q):
+            q_huge[start + tail : start + block_q] *= 40.0
+        q, q_huge, k, v = (t.bfloat16() for t in (q, q_huge, k, v))
+        last = slice(total - tail, total)
+        got = self._live_length_run(tsa, impl, q, k, v, total)
+        got_huge = self._live_length_run(tsa, impl, q_huge, k, v, total)
+        self.assertTrue(torch.equal(got[last], got_huge[last]))
+
     def test_live_length_varlen_with_host_bounds_uses_sdpa(self):
         # A caller that passes host bounds (H3's token refiner) keeps SDPA.
         tsa, impl = self._live_length_impl()
@@ -789,6 +905,46 @@ class TestTpuSplashDispatch(CustomTestCase):
                 ),
                 (4608, 2048, 2048),
             )
+
+    def test_live_length_kernel_selection(self):
+        from sglang_tpu.multimodal_gen.tpu_splash_attn import _live_length_kernel
+
+        # (S, block_q, block_kv, rows run): the lazy-offset kernel above 2048
+        # rows, query blocks of at most 2048 rows split evenly. The last KV
+        # block holds at most one 512-key edge chunk past whole blocks:
+        # S % 2048 = 512 keeps 2048-key blocks; S % 2048 in (1024, 1536) takes
+        # 1024-key blocks up to 8192 rows and is zero-padded to whole 2048
+        # blocks above; up to 4096 rows the blocks are 1024 keys.
+        for seq, block_q, block_kv, rows in (
+            (32768, 2048, 2048, 32768),
+            (33280, 2048, 2048, 33280),
+            (16896, 1920, 2048, 16896),
+            (109056, 2048, 2048, 109056),
+            (8192, 2048, 2048, 8192),
+            (6656, 1664, 2048, 6656),
+            (37888, 2048, 2048, 38912),
+            (17920, 2048, 2048, 18432),
+            (9728, 2048, 2048, 10240),
+            (7680, 1920, 1024, 7680),
+            (5632, 1920, 1024, 5632),
+            (5120, 1792, 1024, 5120),
+            (4608, 1536, 2048, 4608),
+            (4096, 2048, 1024, 4096),
+            (2560, 1280, 1024, 2560),
+        ):
+            blocks, lazy, got_rows = _live_length_kernel(seq, seq)
+            self.assertEqual(
+                (blocks, lazy, got_rows),
+                ((block_q, block_kv, block_kv), True, rows),
+                seq,
+            )
+            self.assertLessEqual(rows % block_kv, 512, seq)
+        # Up to one 2048-row block the running-max kernel keeps its blocks.
+        self.assertEqual(
+            _live_length_kernel(2048, 2048), ((2048, 1024, 1024), False, 2048)
+        )
+        for seq in (512, 1024, 1536):
+            self.assertEqual(_live_length_kernel(seq, seq), (None, False, seq))
 
     def test_rejects_non_positive_scale_and_ragged_causal(self):
         from sglang_tpu.multimodal_gen import tpu_splash_attn as tsa
