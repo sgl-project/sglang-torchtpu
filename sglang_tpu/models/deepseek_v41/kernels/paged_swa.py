@@ -19,6 +19,7 @@ def write_swa_pages(
     values: jax.Array,
     *,
     prepared: tuple | None = None,
+    plan: tuple | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Write physical token records, preserving adjacent BF16 rows and null page.
 
@@ -56,7 +57,7 @@ def write_swa_pages(
         core_axis_name="core",
         subcore_axis_name="subcore",
     )
-    if prepared is None:
+    if prepared is None and plan is None:
         from sglang_tpu.models.deepseek_v41.kernels import decode_preparation as prep
 
         if prep.admit(
@@ -71,39 +72,19 @@ def write_swa_pages(
         capacity = bank.shape[0] * page_size
         if prepared is not None:
             destinations, masks, words = prepared[len(result)]
+        elif plan is not None:
+            destinations, masks, words = _planned_prepare(
+                plan[len(result)], values, lanes_cores=lanes * cores
+            )
         else:
-            valid = (records >= max(base, page_size)) & (records < base + capacity)
-            local = jnp.where(valid, records - base, capacity)
-            order = jnp.argsort(local, stable=True)
-            ids = local[order]
-            next_ids = jnp.concatenate((ids[1:], jnp.array([capacity], jnp.int32)))
-            # TC BF16 tiles pack adjacent token rows into one physical word row.
-            pairs = ids // 2
-            boundary = (ids < capacity) & jnp.concatenate(
-                (jnp.ones(1, jnp.bool_), pairs[1:] != pairs[:-1])
+            destinations, masks, words = _native_prepare(
+                records,
+                values,
+                base=base,
+                capacity=capacity,
+                page_size=page_size,
+                lanes_cores=lanes * cores,
             )
-            even = ids % 2 == 0
-            has_odd = (~even) | (next_ids // 2 == pairs)
-            bits = jax.lax.bitcast_convert_type(values[order], jnp.uint16).astype(
-                jnp.uint32
-            )
-            next_bits = jnp.concatenate((bits[1:], jnp.zeros((1, 512), jnp.uint32)))
-            low = jnp.where(even[:, None], bits, jnp.uint32(0))
-            high = jnp.where(even[:, None], next_bits, bits)
-            high = jnp.where(has_odd[:, None], high, jnp.uint32(0))
-            words = jax.lax.bitcast_convert_type(low | (high << 16), jnp.int32)
-            masks = jnp.where(even, jnp.int32(65535), jnp.int32(0)) | jnp.where(
-                has_odd, jnp.int32(-65536), jnp.int32(0)
-            )
-            padding = -records.size % (lanes * cores)
-            destinations = jnp.pad(
-                jnp.where(boundary, pairs, -1), (0, padding), constant_values=-1
-            )
-            # SC cannot reshape a lane vector for a column broadcast in the kernel.
-            masks = jnp.broadcast_to(
-                jnp.pad(masks, (0, padding))[:, None], (records.size + padding, 512)
-            )
-            words = jnp.pad(words, ((0, padding), (0, 0)))
         # Keep the page-shaped owner: reshaping the whole pool can break aliasing.
         owner = jax.new_ref(bank)
 
@@ -190,3 +171,64 @@ def write_swa_pages(
         result.append(jax.freeze(owner))
         base += capacity
     return (result[0], result[1]) if isinstance(pages, tuple) else result[0]
+
+
+def _native_prepare(records, values, *, base, capacity, page_size, lanes_cores):
+    """One bank's (destinations, masks, words) for the SparseCore writer."""
+    plan = _plan_bank(records, base=base, capacity=capacity, page_size=page_size)
+    return _planned_prepare(plan, values, lanes_cores=lanes_cores)
+
+
+def _plan_bank(records, *, base, capacity, page_size):
+    """The value-independent part of one bank's publish: sort, pairs, row masks."""
+    valid = (records >= max(base, page_size)) & (records < base + capacity)
+    local = jnp.where(valid, records - base, capacity)
+    order = jnp.argsort(local, stable=True)
+    ids = local[order]
+    next_ids = jnp.concatenate((ids[1:], jnp.array([capacity], jnp.int32)))
+    # TC BF16 tiles pack adjacent token rows into one physical word row.
+    pairs = ids // 2
+    boundary = (ids < capacity) & jnp.concatenate(
+        (jnp.ones(1, jnp.bool_), pairs[1:] != pairs[:-1])
+    )
+    even = ids % 2 == 0
+    has_odd = (~even) | (next_ids // 2 == pairs)
+    masks = jnp.where(even, jnp.int32(65535), jnp.int32(0)) | jnp.where(
+        has_odd, jnp.int32(-65536), jnp.int32(0)
+    )
+    return order, even, has_odd, jnp.where(boundary, pairs, -1), masks
+
+
+def _planned_prepare(bank_plan, values, *, lanes_cores):
+    """(destinations, masks, words) of one bank from its plan and this call's values."""
+    order, even, has_odd, destinations, masks = bank_plan
+    padding = -order.shape[0] % lanes_cores
+    destinations = jnp.pad(destinations, (0, padding), constant_values=-1)
+    masks = jnp.pad(masks, (0, padding))
+    bits = jax.lax.bitcast_convert_type(values[order], jnp.uint16).astype(jnp.uint32)
+    next_bits = jnp.concatenate((bits[1:], jnp.zeros((1, 512), jnp.uint32)))
+    low = jnp.where(even[:, None], bits, jnp.uint32(0))
+    high = jnp.where(even[:, None], next_bits, bits)
+    high = jnp.where(has_odd[:, None], high, jnp.uint32(0))
+    words = jax.lax.bitcast_convert_type(low | (high << 16), jnp.int32)
+    # SC cannot reshape a lane vector for a column broadcast in the kernel.
+    masks = jnp.broadcast_to(masks[:, None], (destinations.shape[0], 512))
+    return destinations, masks, jnp.pad(words, ((0, padding), (0, 0)))
+
+
+def swa_publish_plan(pages, records):
+    """Per bank, the value-independent publish plan of ``records`` into ``pages``.
+
+    Every layer of a forward writes the same records into its own same-shaped
+    pages, so the plan is built once and ``write_swa_pages(plan=...)`` packs
+    each layer's values against it; the writer's inputs are unchanged."""
+    banks = pages if isinstance(pages, tuple) else (pages,)
+    page_size = banks[0].shape[1]
+    plan, base = [], 0
+    for bank in banks:
+        capacity = bank.shape[0] * page_size
+        plan.append(
+            _plan_bank(records, base=base, capacity=capacity, page_size=page_size)
+        )
+        base += capacity
+    return tuple(plan)

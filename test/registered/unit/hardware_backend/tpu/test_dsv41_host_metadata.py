@@ -445,6 +445,30 @@ def test_device_window_declines_rows_that_may_pass_the_swa_table():
     assert host_read.called
 
 
+def test_ring_verify_keeps_the_swa_table_bound():
+    """A verify near the context limit has rows past the SWA table; on the ring
+    their position would alias an earlier visible one. With
+    SGLANG_TPU_DSV41_VERIFY_SWA_RING the build still refuses them, as the
+    workspace build does, while an in-table verify attends the ring."""
+    kw = dict(
+        req_to_token=_req_to_token(),
+        full_to_swa_index_mapping=None,
+        request_window=SimpleNamespace(
+            workspace_first_page=4 + 4 * SLOTS, workspace_pages=64
+        ),
+        swa_ring_valid_from=None,
+        max_context_len=4096,
+        low_ratios=ab.LOW_RATIOS,
+        device=torch.device("cpu"),
+    )
+    on = SimpleNamespace(get=lambda: True)
+    with patch.object(tpu_envs, "SGLANG_TPU_DSV41_VERIFY_SWA_RING", on):
+        meta = ab.build_forward_metadata(_verify_batch([100, 17], [1, 2]), **kw)
+        assert meta.swa_window_plan is None
+        with pytest.raises(RuntimeError, match="past the SWA table"):
+            ab.build_forward_metadata(_verify_batch([4093, 17], [1, 2]), **kw)
+
+
 def test_device_rows_check_mode_catches_a_wrong_field():
     """SGLANG_TPU_SPEC_DEVICE_ROWS_CHECK passes matching device rows and raises,
     naming the field, when a device-built field differs from the host build."""
@@ -577,7 +601,7 @@ def test_only_mirrored_cpu_fields_are_recorded():
 
 
 def test_stale_length_lists_do_not_matter():
-    # Codex review: a missing prefix list zero-filled by padding must not change
+    # A missing prefix list zero-filled by padding must not change
     # positions; the metadata no longer reads the length lists at all.
     fb = BATCHES["long_prefix"]()
     reference = _metadata(BATCHES["long_prefix"]())

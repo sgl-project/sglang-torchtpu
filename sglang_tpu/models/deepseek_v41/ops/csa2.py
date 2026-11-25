@@ -49,7 +49,12 @@ from sglang_tpu.models.deepseek_v41.kernels.csa2.pipeline import (
     csa2_gather_chunk_size,
     csa2_pipeline,
 )
-from sglang_tpu.models.deepseek_v41.kernels.paged_swa import write_swa_pages
+from sglang_tpu.models.deepseek_v41.kernels.paged_swa import (
+    swa_publish_plan as _jax_swa_publish_plan,
+)
+from sglang_tpu.models.deepseek_v41.kernels.paged_swa import (
+    write_swa_pages,
+)
 from sglang_tpu.models.deepseek_v41.memory_pool import SWA_PAGE_TOKENS as SWA_PAGE_SIZE
 
 SWA_WINDOW = 128
@@ -102,6 +107,30 @@ def _swa_metadata_non_causal(
 
 def _publish_swa(pages: jax.Array, records: jax.Array, kv: jax.Array) -> jax.Array:
     return write_swa_pages(pages, records, kv)
+
+
+def _swa_plan(
+    pages: jax.Array, records: jax.Array
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    (plan,) = _jax_swa_publish_plan(pages, records)
+    return plan
+
+
+def _publish_swa_planned(
+    pages: jax.Array,
+    kv: jax.Array,
+    order: jax.Array,
+    even: jax.Array,
+    has_odd: jax.Array,
+    destinations: jax.Array,
+    masks: jax.Array,
+) -> jax.Array:
+    return write_swa_pages(
+        pages,
+        jnp.zeros(order.shape, jnp.int32),
+        kv,
+        plan=((order, even, has_odd, destinations, masks),),
+    )
 
 
 def _publish_main(
@@ -386,6 +415,21 @@ def _fake_publish_swa(pages, records, kv):
     return torch.empty_like(pages)
 
 
+def _fake_swa_plan(pages, records):
+    n = records.shape[0]
+    return (
+        records.new_empty((n,)),
+        records.new_empty((n,), dtype=torch.bool),
+        records.new_empty((n,), dtype=torch.bool),
+        records.new_empty((n,)),
+        records.new_empty((n,)),
+    )
+
+
+def _fake_publish_swa_planned(pages, *args):
+    return torch.empty_like(pages)
+
+
 def _fake_publish_main(words, scales, records, latent):
     return torch.empty_like(words), torch.empty_like(scales)
 
@@ -413,6 +457,8 @@ _DEFINITIONS = {
     "swa_metadata": (_swa_metadata, _fake_swa_metadata, ()),
     "swa_metadata_non_causal": (_swa_metadata_non_causal, _fake_swa_metadata, ()),
     "publish_swa": (_publish_swa, _fake_publish_swa, (0,)),
+    "swa_plan": (_swa_plan, _fake_swa_plan, ()),
+    "publish_swa_planned": (_publish_swa_planned, _fake_publish_swa_planned, (0,)),
     "publish_main": (_publish_main, _fake_publish_main, (0, 1)),
     "write_rows": (_write_rows, _fake_write_rows, (0,)),
     "attend_swa": (_attend_swa, _fake_attend, ()),
@@ -490,6 +536,21 @@ def publish_swa(
     unique. Returns the new ``pages``; the caller does ``pages.copy_(...)``.
     """
     return _op("publish_swa")(pages, _i32(records), kv.reshape(-1, HEAD_DIM))
+
+
+def swa_plan(pages: torch.Tensor, records: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    """The value-independent part of ``publish_swa(pages, records, ...)``.
+
+    Only ``pages``' shape is read. Valid for every same-shaped pages buffer the
+    same ``records`` are published into (the layers of one forward)."""
+    return tuple(_op("swa_plan")(pages, _i32(records)))
+
+
+def publish_swa_planned(
+    pages: torch.Tensor, plan: tuple[torch.Tensor, ...], kv: torch.Tensor
+) -> torch.Tensor:
+    """``publish_swa`` with the records' ``swa_plan``; writes the same pool."""
+    return _op("publish_swa_planned")(pages, kv.reshape(-1, HEAD_DIM), *plan)
 
 
 def publish_main(

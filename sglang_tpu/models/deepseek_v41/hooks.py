@@ -354,6 +354,20 @@ tpu_dsv41_defer_engram_commit, tpu_dsv41_flush_engram_before_prebuilt
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR2).
   Remove when: the Engram history lives on the device and commits in-graph.
 
+tpu_dsv41_dspark_prepare_markov_after_load (markov_shard.py)
+  (registered only with SGLANG_TPU_DSV41_DSPARK_MARKOV_SHARD=1)
+  Why: the TPU greedy Markov drafts read both ~66 MB Markov tables at every
+       draft step (one-hot w1 lookup over the whole vocab, full w2 bias),
+       ~0.3 ms a cycle at c4/c32 (drafter audit); core's TP-sharded path assumes
+       TP rows and NCCL, not attention DP with a vocab-parallel head.
+  How: AFTER the draft's post_load_weights: slice this rank's vocab rows of
+       w1/w2 into buffers and build the SPMD op greedy_markov_drafts calls.
+       AFTER _model_load_weights_direct (tpu_dsv41_dspark_refresh_markov_after_
+       direct_update): the raw update API bypasses post_load_weights, so copy
+       the updated rows into the same buffers in place.
+  Upstream PR or issue: not filed.
+  Remove when: core shards the Markov drafts under attention DP.
+
 prepare_tpu_dsv41_fused_ep
   (registered only with SGLANG_TPU_DSV41_FUSED_EP=1, see fused_ep_hook_specs)
   Why: the fused EP kernel (fused_ep_moe_v2) needs its own expert layout,
@@ -1266,6 +1280,34 @@ def fused_oproj_hook_specs():
     ]
 
 
+def dspark_markov_shard_hook_specs():
+    """The vocab-split Markov drafts, only with SGLANG_TPU_DSV41_DSPARK_MARKOV_SHARD=1."""
+    from sglang.srt.plugins.hook_registry import HookType
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if not tpu_envs.SGLANG_TPU_DSV41_DSPARK_MARKOV_SHARD.get():
+        return []
+    from sglang_tpu.models.deepseek_v41.markov_shard import (
+        tpu_dsv41_dspark_prepare_markov_after_load,
+        tpu_dsv41_dspark_refresh_markov_after_direct_update,
+    )
+
+    return [
+        (
+            "sglang.srt.models.deepseek_v4_dspark.DeepseekV4ForCausalLMDSpark."
+            "post_load_weights",
+            tpu_dsv41_dspark_prepare_markov_after_load,
+            HookType.AFTER,
+        ),
+        (
+            "sglang.srt.model_executor.model_runner_components.weight_updater."
+            "_model_load_weights_direct",
+            tpu_dsv41_dspark_refresh_markov_after_direct_update,
+            HookType.AFTER,
+        ),
+    ]
+
+
 def engram_flush_hook_specs():
     """The early Engram commit flush, only with SGLANG_TPU_DSV41_FLUSH_ENGRAM_AT_LENGTH_READ=1."""
     from sglang.srt.plugins.hook_registry import HookType
@@ -1484,4 +1526,5 @@ def hook_specs():
         *decoder_replay_sync.hook_specs(),
         *engram_flush_hook_specs(),
         *fused_oproj_hook_specs(),
+        *dspark_markov_shard_hook_specs(),
     ] + fused_ep_hook_specs()

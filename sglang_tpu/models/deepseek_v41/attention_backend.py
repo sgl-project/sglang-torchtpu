@@ -202,6 +202,10 @@ class DSV41TPUForwardMetadata:
     swa_meta: Optional[torch.Tensor] = None
     swa_bounds: Optional[torch.Tensor] = None
     swa_write_records: Optional[torch.Tensor] = None
+    # csa2.swa_plan of this forward's SWA publish records and the pages shape it
+    # was built for; every layer writes the same records into same-shaped pages.
+    swa_publish_plan: Optional[tuple] = None
+    swa_publish_plan_shape: Optional[tuple] = None
     # Latest index_source selection per ratio, read by every later layer of that
     # ratio (core sparse_page_indices(ratio)); [T, 512] int32, valid prefix.
     selected: Dict[int, torch.Tensor] = field(default_factory=dict)
@@ -505,6 +509,13 @@ def _window_swa_table(
     """[B, columns] int64 SWA table of a request-window forward and its row moves."""
     if not forward_batch.forward_mode.is_extend():
         return decode_window_pages(req_pool_indices, columns), None
+    # A row past the table would alias the ring page of an earlier position;
+    # the workspace build raises on it instead.
+    if (
+        _attends_ring(forward_batch)
+        and int(positions.max()) < columns * SWA_PAGE_TOKENS
+    ):
+        return decode_window_pages(req_pool_indices, columns), None
     counts = query_start_loc[1:] - query_start_loc[:-1]
     last = max(positions.shape[0] - 1, 0)
     first = torch.where(counts > 0, positions[query_start_loc[:-1].clamp(max=last)], 0)
@@ -517,6 +528,20 @@ def _window_swa_table(
         base_page=window.workspace_first_page,
         capacity_pages=window.workspace_pages,
     )
+
+
+def _attends_ring(forward_batch: ForwardBatch) -> bool:
+    """Whether a request-window forward reads and writes the slot rings directly.
+
+    Decode does. A verify does too under SGLANG_TPU_DSV41_VERIFY_SWA_RING: its
+    rows sit at most gamma + 1 past the window and the ring holds 256 positions,
+    so it needs no workspace copy of the history."""
+    from sglang_tpu.envs import envs as tpu_envs
+
+    mode = forward_batch.forward_mode
+    if not mode.is_extend():
+        return True
+    return mode.is_target_verify() and tpu_envs.SGLANG_TPU_DSV41_VERIFY_SWA_RING.get()
 
 
 class SlotTables(msgspec.Struct, frozen=True):
@@ -688,8 +713,14 @@ def _device_row_metadata(
         "req_pool_indices": req_pool_indices,
     }
     window = tables.swa_pages is None
+    columns = tables.full_pages.shape[1] * (FULL_PAGE_TOKENS // SWA_PAGE_TOKENS)
+    if window and _attends_ring(forward_batch):
+        bound = forward_batch.seq_lens_cpu
+        if bound is None or int(bound.max()) > columns * SWA_PAGE_TOKENS:
+            return None  # a row may pass the SWA table: the host build checks it
+        host["swa_pages"] = decode_window_pages(req_pool_indices, columns)
+        window = False
     if window:
-        columns = tables.full_pages.shape[1] * (FULL_PAGE_TOKENS // SWA_PAGE_TOKENS)
         if not _window_fits(
             counts,
             kv_lens_bound=forward_batch.seq_lens_cpu,
@@ -746,7 +777,7 @@ def _device_row_fields(
         out_cache_loc=out_cache_loc,
         req_pool_indices=dev["req_pool_indices"],
     )
-    swa_pages, window_plan = tables.swa_pages, None
+    swa_pages, window_plan = dev.get("swa_pages", tables.swa_pages), None
     if window:
         swa_pages, window_plan = device_rows.window_pages(
             first=positions.index_select(0, dev["first_row"]),
@@ -2082,6 +2113,25 @@ class DSV41TPUAttnBackend(AttentionBackend):
         metadata.swa_bounds = bounds if self.is_dspark_draft else None
         metadata.swa_write_records = records.masked_fill(~metadata.valid, -1)
 
+    def _publish_swa(self, metadata, swa, records, kv):
+        """csa2 publish_swa; under SGLANG_TPU_DSV41_SWA_PUBLISH_PLAN the records'
+        sort and pairing are planned by the forward's first layer and reused."""
+        from sglang_tpu.envs import envs as tpu_envs
+        from sglang_tpu.models.deepseek_v41.kernels.decode_preparation import (
+            SWA_PACK_TOKENS,
+        )
+
+        if (
+            not tpu_envs.SGLANG_TPU_DSV41_SWA_PUBLISH_PLAN.get()
+            or records.shape[0] in SWA_PACK_TOKENS
+        ):
+            return self.csa2_ops.publish_swa(swa, records, kv)
+        shape = tuple(swa.shape)
+        if metadata.swa_publish_plan_shape != shape:
+            metadata.swa_publish_plan = self.csa2_ops.swa_plan(swa, records)
+            metadata.swa_publish_plan_shape = shape
+        return self.csa2_ops.publish_swa_planned(swa, metadata.swa_publish_plan, kv)
+
     def _attention(
         self,
         *,
@@ -2115,7 +2165,7 @@ class DSV41TPUAttnBackend(AttentionBackend):
             history = swa.reshape(-1, kv.shape[1])[plan.history_src]
             kv = torch.cat((kv, history, kv[plan.commit_token]))
             records = torch.cat((records, plan.history_dst, plan.commit_dst))
-        swa.copy_(self.csa2_ops.publish_swa(swa, records, kv))
+        swa.copy_(self._publish_swa(metadata, swa, records, kv))
 
         if attn_sink is None:
             sink = torch.zeros(q.shape[1], dtype=torch.float32, device=q.device)

@@ -459,6 +459,12 @@ class TpuEnvs:
     # Upload the DSV4.1 per-forward attention metadata as one buffer per dtype
     # (fields become device views) instead of one copy per field.
     SGLANG_TPU_DSV41_PACKED_METADATA = EnvBool(False)
+    # A DSpark verify reads and writes the request-window SWA rings directly, as
+    # decode does, instead of copying history into extend workspace pages.
+    SGLANG_TPU_DSV41_VERIFY_SWA_RING = EnvBool(False)
+    # DeepSeek-V4.1 SWA publish: sort and pair a forward's write records once,
+    # in its first layer, instead of in every layer.
+    SGLANG_TPU_DSV41_SWA_PUBLISH_PLAN = EnvBool(False)
     # Spec step: build the slot-only attention metadata of the draft and verify
     # forwards before the blocking length read / draft-token read (slot_metadata.py).
     SGLANG_TPU_SPEC_PREBUILD_SLOT_METADATA = EnvBool(False)
@@ -507,6 +513,11 @@ class TpuEnvs:
     # slices in XLA's reduce order instead of reducing an FP32 [T,4,D] view, which
     # costs a relayout of the whole residual.
     SGLANG_TPU_DSV41_MHC_FLAT_COLLAPSE = EnvBool(False)
+    # DSpark greedy Markov drafts with the head, w1 and w2 split over the vocab
+    # across the attention-DP ranks (models/deepseek_v41/markov_shard.py): each
+    # rank reads 1/W of the tables per step instead of all of them. Needs the
+    # vocab-parallel LM head.
+    SGLANG_TPU_DSV41_DSPARK_MARKOV_SHARD = EnvBool(False)
     # Cut the eager input-logprob chunks of a forward holding one request at every
     # multiple of this many rows from the request's first row (hooks/logprob_grid.py),
     # so a prefill chunk larger than the grid hands the epilogue the same row sets as

@@ -109,12 +109,18 @@ def greedy_markov_drafts(
     draft_hidden = hidden if model.sample_from_anchor else hidden[:, 1:]
     head = model.markov_head
     vocab = head.vocab_size
-    base_logits, _ = model.compute_base_logits(draft_hidden.reshape(bs * gamma, -1))
+    prev = input_ids.view(bs, width)[:, 0].to(torch.int32)
+    from sglang_tpu.models.deepseek_v41 import markov_shard
+
+    rows = draft_hidden.reshape(bs * gamma, -1)
+    if markov_shard.applies(model, bs):
+        normed = model.stages[-1].norm(model.collapse_hc_head(rows))
+        return markov_shard.sharded_drafts(model, normed, prev)
+    base_logits, _ = model.compute_base_logits(rows)
     base_logits = base_logits[..., :vocab].float().view(bs, gamma, vocab)
     w1 = head.markov_w1.weight[:vocab]
     w2 = head.markov_w2.weight[:vocab]
     ids = torch.arange(vocab, device=hidden.device, dtype=torch.int32)
-    prev = input_ids.view(bs, width)[:, 0].to(torch.int32)
     drafts = []
     for step in range(gamma):
         one_hot = (prev.unsqueeze(-1) == ids).to(w1.dtype)
