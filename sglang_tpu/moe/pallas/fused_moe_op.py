@@ -52,7 +52,7 @@ mxfp4 path. ``"swiglu_oai"`` is supported for GPT-OSS, and
 
 import logging
 import math
-from typing import TYPE_CHECKING, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 
 import torch
 from torch_tpu._internal.pallas import jax_op
@@ -613,6 +613,81 @@ def _ep_counting_route(
     )
 
 
+# Effective TPU7x throughput (GB/s = bytes/ns) and extra launch overhead (us)
+# from per-stage benchmarks across H in {2048, 4096, 7168}. Using TPU7x rates
+# is conservative on slower-HBM SparseCore generations (v5p).
+_RG2_EFF_GBPS = 1400.0  # ragged_gather_v2 (bf16, 4*H B/row, VPU-bound)
+_RG_DATA_EFF_GBPS = 2650.0  # row_gather on fp8 data (2*H B/row, pure DMA)
+_RG_SCALE_EFF_GBPS = 1500.0  # row_gather on f32 scales (1024 B/row)
+_PREQUANT_EFF_GBPS = 1350.0  # prequantize_lhs_fp8 (3*H B/token)
+_PREQUANT_LAUNCH_OVERHEAD_US = 10.6
+_PREQUANT_MIN_GAIN_US = 3.0
+
+
+def _prequant_dispatch_beneficial(
+    num_tokens: int, owned_rows: float, hidden_size: int
+) -> bool:
+    """Cost model for prequantize_lhs_fp8 + 2 row_gathers vs ragged_gather_v2."""
+    rg2_us = (4 * hidden_size * owned_rows) / (_RG2_EFF_GBPS * 1e3)
+    rg_data_us = (2 * hidden_size * owned_rows) / (_RG_DATA_EFF_GBPS * 1e3)
+    rg_scale_us = (1024 * owned_rows) / (_RG_SCALE_EFF_GBPS * 1e3)
+    prequant_us = (3 * hidden_size * num_tokens) / (_PREQUANT_EFF_GBPS * 1e3)
+    gain_us = rg2_us - (prequant_us + rg_data_us + rg_scale_us)
+    return gain_us > _PREQUANT_LAUNCH_OVERHEAD_US + _PREQUANT_MIN_GAIN_US
+
+
+def _prequant_dispatch_ok(
+    hidden_states: "jax.Array",
+    w1: "jax.Array",
+    w1_scale: Optional["jax.Array"],
+    w1_bias: Optional["jax.Array"],
+    w1_channel_scale: Optional["jax.Array"],
+    *,
+    num_rows: int,
+    num_lhs_groups: int,
+    tile_info: Any,
+    fuse_act: Optional[str],
+    out_dtype: Any,
+) -> bool:
+    """Whether GMM1 can take a ``prequantize_lhs_fp8`` lhs.
+
+    Args:
+        hidden_states: Token activations ``[m, k]``.
+        w1: First-layer expert weights ``[g, k, 2*n]``.
+        w1_scale: Optional weight scales (must be full, non-compact).
+        w1_bias: Optional weight bias (unsupported by prequant path).
+        w1_channel_scale: Optional channel scale (unsupported by prequant path).
+        num_rows: Total routed rows passed to GMM1 (``m * topk``).
+        num_lhs_groups: Number of expert groups in ``group_sizes``.
+        tile_info: Resolved GMM1 ``TileSizes`` or tiling callable.
+        fuse_act: Fused activation name for GMM1, or None.
+        out_dtype: Preferred output dtype for GMM1.
+    """
+    import jax.numpy as jnp
+
+    from sglang_tpu.moe.pallas.gmm_v2 import prequant_supported
+
+    if (
+        w1_scale is None
+        or w1_bias is not None
+        or w1_channel_scale is not None
+        or w1.dtype != jnp.float8_e4m3fn
+        or hidden_states.dtype != jnp.bfloat16
+        or w1.shape[1] != hidden_states.shape[1]
+        or w1_scale.shape[-1] != w1.shape[-1]
+    ):
+        return False
+    return prequant_supported(
+        num_rows,
+        w1,
+        w1_scale,
+        num_lhs_groups,
+        tile_info=tile_info,
+        fuse_act=fuse_act,
+        out_dtype=out_dtype,
+    )
+
+
 def _fused_moe_jax(
     hidden_states,  # [m, k]
     w1,  # [g,k,2*n] bf16 | [g,k/2,2*n] uint8 (packed FP4) | [g,k/8,2*n] int32 (packed int4)
@@ -864,8 +939,89 @@ def _fused_moe_jax(
                 topk_ids_flat, expert_group_offset, num_experts
             )
 
+    # GMM1: gate/up projection. For per-column/per-tensor scales (and MXFP4), the
+    # gated activation is fused in-kernel: ``fuse_act`` makes gmm_v2 split the
+    # [.., 2*n] accumulator and write only [.., n] = act(gate) * up, avoiding a
+    # full materialize of the 2*n tensor to HBM plus a separate activation pass.
+    # Compact block-FP8 scales need different scale offsets for the gate and up
+    # halves, so run an unfused GMM1 and apply the activation in JAX for
+    # correctness.
+    compact_block_scales = w1_scale is not None and w1_scale.shape[-1] != w1.shape[-1]
+    # W4A16 runs GMM1 unfused: the fused gate/up split mis-applies multi-block
+    # rhs scales, so the activation is applied in JAX below.
+    # Packed FP4 keeps the clamped SiLU in JAX: fusing it is not measured there.
+    unfused_gmm1 = (
+        compact_block_scales
+        or bool(w_quant_bits)
+        or (w1_packed and activation_name.startswith("silu_and_mul_clamp:"))
+    )
+    gmm1_fuse_act = None if unfused_gmm1 else _fuse_act_name(activation_name)
+
+    gmm1_tile_info = None
+    if compact_block_scales:
+        gmm1_tile_info = TileSizes(
+            tile_m=min(128, m * topk),
+            tile_k=int(w1.shape[1]),
+            tile_n=min(896, int(w1.shape[2])),
+        )
+
+    def _build_gmm1_tiling(lhs_like):
+        return _dividing_tile_k(
+            _vmem_safe_packed_tile_n(
+                gmm1_tile_info
+                or (
+                    calculate_tiling
+                    if w1_packed
+                    else _tuned_or_calculated(lhs_like, w1, w1_scale, num_experts)
+                )
+            )
+        )
+
+    expected_owned_rows = (
+        m * topk * num_experts / global_num_experts
+        if ep_route is not None
+        else m * topk
+    )
+    gmm1_tiling = None
+    x_scale_sorted = None
+    prequant_dispatch = False
+    if (
+        use_sc_gather
+        and not use_dense_permute
+        and not single_token
+        and maybe_quantize_lhs
+        and w1_scale is not None
+        and not w_quant_bits
+        and not w1_packed
+        and (not use_group_offset or ep_route is not None)
+        and _prequant_dispatch_beneficial(m, expected_owned_rows, hidden_size)
+    ):
+        gmm1_tiling = _build_gmm1_tiling(
+            jax.ShapeDtypeStruct((m * topk, hidden_size), hidden_states.dtype)
+        )
+        prequant_dispatch = _prequant_dispatch_ok(
+            hidden_states,
+            w1,
+            w1_scale,
+            w1_bias,
+            w1_channel_scale,
+            num_rows=m * topk,
+            num_lhs_groups=num_experts,
+            tile_info=gmm1_tiling,
+            fuse_act=gmm1_fuse_act,
+            out_dtype=out_dtype,
+        )
+
     if single_token:
         x_sorted = jnp.broadcast_to(hidden_states[:1], (m * topk, hidden_size))
+    elif prequant_dispatch:
+        from sglang_tpu.moe.pallas.gmm_v2 import prequantize_lhs_fp8
+        from sglang_tpu.moe.pallas.sparse_core.row_gather import row_gather
+
+        gather_end = ep_route.num_owned.reshape(1) if ep_route is not None else None
+        x_q, x_q_scale = prequantize_lhs_fp8(hidden_states)
+        x_sorted = row_gather(x_q, sorted_token_ids, gather_end=gather_end)
+        x_scale_sorted = row_gather(x_q_scale, sorted_token_ids, gather_end=gather_end)
     elif use_dense_permute:
         permute_matrix = jax.nn.one_hot(sorted_token_ids, m, dtype=hidden_states.dtype)
         x_sorted = jax.lax.dot_general(
@@ -932,44 +1088,9 @@ def _fused_moe_jax(
             (((1,), (0,)), ((), ())),
             preferred_element_type=hidden_states.dtype,
         )
-    # GMM1: gate/up projection. For per-column/per-tensor scales (and MXFP4), the
-    # gated activation is fused in-kernel: ``fuse_act`` makes gmm_v2 split the
-    # [.., 2*n] accumulator and write only [.., n] = act(gate) * up, avoiding a
-    # full materialize of the 2*n tensor to HBM plus a separate activation pass.
-    # Compact block-FP8 scales need different scale offsets for the gate and up
-    # halves, so run an unfused GMM1 and apply the activation in JAX for
-    # correctness.
-    compact_block_scales = w1_scale is not None and w1_scale.shape[-1] != w1.shape[-1]
-    # W4A16 runs GMM1 unfused: the fused gate/up split mis-applies multi-block
-    # rhs scales, so the activation is applied in JAX below.
-    # Packed FP4 keeps the clamped SiLU in JAX: fusing it is not measured there.
-    unfused_gmm1 = (
-        compact_block_scales
-        or bool(w_quant_bits)
-        or (w1_packed and activation_name.startswith("silu_and_mul_clamp:"))
-    )
-    gmm1_fuse_act = None if unfused_gmm1 else _fuse_act_name(activation_name)
-
-    gmm1_tile_info = None
-    if compact_block_scales:
-        gmm1_tile_info = TileSizes(
-            tile_m=min(128, int(x_sorted.shape[0])),
-            tile_k=int(w1.shape[1]),
-            tile_n=min(896, int(w1.shape[2])),
-        )
 
     # Weights arrive lane-aligned from the loader (bf16: pad activations to
     # match; quantized: unpadded-at-load dims are unsupported)
-    gmm1_tiling = _dividing_tile_k(
-        _vmem_safe_packed_tile_n(
-            gmm1_tile_info
-            or (
-                calculate_tiling
-                if w1_packed
-                else _tuned_or_calculated(x_sorted, w1, w1_scale, num_experts)
-            )
-        )
-    )
     if w1_scale is None:
         assert w1.shape[1] % 128 == 0, (
             f"gmm_v2 w1 K={w1.shape[1]} is not lane-aligned; pad the weight K "
@@ -1022,6 +1143,8 @@ def _fused_moe_jax(
         # the SparseCore combine masks the rest (zero_init is already False).
         group_sizes, group_offset = ep_route.group_sizes, None
 
+    if gmm1_tiling is None:
+        gmm1_tiling = _build_gmm1_tiling(x_sorted)
     gmm1_out = gmm_v2(
         lhs=x_sorted,
         rhs=w1,
@@ -1040,6 +1163,7 @@ def _fused_moe_jax(
         maybe_quantize_lhs=maybe_quantize_lhs,
         rhs_quant_dtype=rhs_quant_dtype,
         dequantize_rhs=dequantize_int4_in_vmem,
+        lhs_scale=x_scale_sorted,
     )
     if unfused_gmm1:
         gmm1_out = apply_act_fn(
