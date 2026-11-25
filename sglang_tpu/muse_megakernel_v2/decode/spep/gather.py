@@ -22,7 +22,6 @@ from jax.experimental.pallas import tpu as pltpu
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.muse_megakernel_v2.common.coll import (
     _count_wait,
-    direct_all_gather_fold_start,
     direct_all_gather_start,
     pair_all_gather_fold_start,
     pair_all_gather_start,
@@ -198,17 +197,16 @@ def _all_gather_start(c: MKConfig, S: dict, me, buf, ph: int) -> Callable[[], No
 
 
 def _unpool_fold(c: MKConfig) -> bool:
-    return tpu_envs.SGLANG_TPU_MUSE_MK_EP_UNPOOL_FOLD.get()
+    return _pair_ag(c) and tpu_envs.SGLANG_TPU_MUSE_MK_EP_UNPOOL_FOLD.get()
 
 
 def _all_gather_fold_start(c: MKConfig, S: dict, me, buf, ph: int):
-    """_all_gather_start whose wait takes consume(k) per arrived block."""
-    ssem, psem = S["eg_ssems"].at[ph], S["eg_psems"].at[ph]
+    """_all_gather_start whose wait takes consume(k) per arrived block (pair collectives)."""
+    assert _pair_ag(c)
     with _phase(_PH_NAMES[ph]):
-        if _pair_ag(c):
-            fold = pair_all_gather_fold_start(buf, me, ssem, psem)
-        else:
-            fold = direct_all_gather_fold_start(buf, me, c.tp, ssem, psem)
+        fold = pair_all_gather_fold_start(
+            buf, me, S["eg_ssems"].at[ph], S["eg_psems"].at[ph]
+        )
 
     def waited(consume) -> None:
         with _phase(_PH_NAMES[ph] + "_fold"):
@@ -679,10 +677,7 @@ def _u_reduce(step: EPLayerStep):
         uag.at[me][rows, :] = _pack_bf16x2(sum(partial(src, rows) for src in range(tp)))
 
     _for_tiles(c, u_sum)
-    if _unpool_fold(c):
-        return _all_gather_fold_start(c, S, me, uag, PH_UAG)
     _all_gather(c, S, me, uag, PH_UAG)
-    return None
 
 
 def _unpool_folded(step: EPLayerStep, uag_fold) -> None:
