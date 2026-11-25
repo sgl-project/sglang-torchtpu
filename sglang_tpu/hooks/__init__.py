@@ -19,6 +19,7 @@ from sglang_tpu.hooks.all_gather_via_all_reduce import (
 )
 from sglang_tpu.hooks.attn_residual import register_attn_residual_ops
 from sglang_tpu.hooks.attn_tp import device_supports_input_scattered
+from sglang_tpu.hooks.attn_work_cap import hook_specs as attn_work_cap_hooks
 from sglang_tpu.hooks.cpu_pinning import bind_rank_cpu_set, pin_scheduler_main_thread
 from sglang_tpu.hooks.dflash_mla import (
     dflash_mla_head_dims,
@@ -493,6 +494,9 @@ HOOKS.extend(replay_chunk_fit_hooks())
 # SGLANG_TPU_DP_PROMPT_BACKLOG_MARGIN > 0).
 HOOKS.extend(dp_prompt_backlog_hooks())
 HOOKS.extend(server_prompt_ids_hooks())
+# Prefill attention-work cap while any DP rank decodes, and shortest-prefill-first
+# (pass-through unless SGLANG_DP_ATTN_WORK_CAP > 0 / SGLANG_PREFILL_SPF=1).
+HOOKS.extend(attn_work_cap_hooks())
 # Shared-memory DP MLP-sync exchange (pass-through unless SGLANG_TPU_DP_SYNC_SHM).
 HOOKS.extend(dp_sync_shm_hooks())
 # After dsv4_hooks: the V4.1 pool hooks must be the outer wrapper.

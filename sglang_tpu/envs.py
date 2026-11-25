@@ -887,6 +887,14 @@ class TpuEnvs:
     # gloo when every DP rank runs on one x86 host (dp_sync_shm.py).
     SGLANG_TPU_DP_SYNC_SHM = EnvBool(False)
 
+    # Prefill attention-work cap per DP rank (attn_work_cap.py,
+    # hooks/attn_work_cap.py), in token pairs: while any DP rank decodes, a
+    # rank's prefill chunks keep sum n * (ctx + n / 2) <= W. 0 disables.
+    SGLANG_DP_ATTN_WORK_CAP = EnvInt(0)
+    # Turn --schedule-policy fcfs into shortest-prefill-first (fewest uncached
+    # prompt tokens first, ties by arrival). Other policies are left alone.
+    SGLANG_PREFILL_SPF = EnvBool(False)
+
     @classmethod
     def names(cls) -> list[str]:
         return sorted(
