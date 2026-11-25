@@ -700,7 +700,9 @@ def _route_vertical_lane_parallel(
         else:
             lg0 = logits_ref[pl.ds(t0, 64), :].astype(jnp.float32)
             v0 = 1.0 / (1.0 + jnp.exp(-jnp.where(jnp.isnan(lg0), neg_inf, lg0)))
-            lg1 = logits_ref[pl.ds(t0 + 64, 64), :].astype(jnp.float32)
+            lg1 = logits_ref[pl.ds(pl.multiple_of(t0 + 64, 64), 64), :].astype(
+                jnp.float32
+            )
             v1 = 1.0 / (1.0 + jnp.exp(-jnp.where(jnp.isnan(lg1), neg_inf, lg1)))
             if add_bias:
                 v0 = v0 + bias_row
@@ -931,25 +933,96 @@ def _route_vertical_lane_parallel(
             if free_max_rows > 0
             else None
         )
-        for t0, c_rows in chunks:
-            s_bests, s_ws, k_flags, _, tot_c, drp_c = _score_vertical_chunk(
-                t0, c_rows
+        can_cache_vmem = (
+            free_max_rows > 0
+            and ((2 * topk) % 8 == 0)
+            and all(c_rows >= 2 * topk for _, c_rows in chunks)
+        )
+        def _stash_chunk_to_vmem(t0, s_bests, s_ws, k_flags, d_flags):
+            # Stash packed chunk routing in unused route_pack_vmem[t0:t0+2*topk, :]
+            # so Pass 2 avoids re-reading logits/bias or re-running sigmoid/top-k.
+            b_rows = [
+                s_bests[s]
+                | (k_flags[s].astype(jnp.int32) << 10)
+                | (d_flags[s].astype(jnp.int32) << 11)
+                for s in range(topk)
+            ]
+            w_rows = [
+                lax.bitcast_convert_type(s_ws[s], jnp.int32) for s in range(topk)
+            ]
+            scratch.route_pack_vmem[pl.ds(t0, 2 * topk), :] = jnp.concatenate(
+                b_rows + w_rows, axis=0
             )
-            tot_all = tot_all + tot_c
-            if free_max_rows > 0:
-                drp_all = drp_all + drp_c
-            else:
-                _pack_vertical_chunk(t0, c_rows, s_bests, s_ws, k_flags)
-        if free_max_rows > 0:
+
+        def _load_chunk_from_vmem(t0):
+            st = scratch.route_pack_vmem[pl.ds(t0, 2 * topk), :]
+            s_bests = [st[s : s + 1, :] & jnp.int32(0x3FF) for s in range(topk)]
+            k_flags = [
+                ((st[s : s + 1, :] >> 10) & jnp.int32(1)) != 0 for s in range(topk)
+            ]
+            d_flags = [
+                ((st[s : s + 1, :] >> 11) & jnp.int32(1)) != 0 for s in range(topk)
+            ]
+            s_ws = [
+                lax.bitcast_convert_type(
+                    st[topk + s : topk + s + 1, :], jnp.float32
+                )
+                for s in range(topk)
+            ]
+            return s_bests, s_ws, k_flags, d_flags
+
+        if can_cache_vmem and batch_size % 128 == 0:
+            # Emit 1 loop body instead of 4 unrolled _score_vertical_chunk copies so
+            # B>=256 FREE keeps compiled IMEM/HBM compact across all 62 layers (#3513).
+            n_chunks = batch_size // 128
+
+            def _pass1_loop(ci, carry):
+                tot_acc, drp_acc = carry
+                t0 = pl.multiple_of(ci * 128, 128)
+                s_bests, s_ws, k_flags, d_flags, tot_c, drp_c = _score_vertical_chunk(
+                    t0, 128
+                )
+                _stash_chunk_to_vmem(t0, s_bests, s_ws, k_flags, d_flags)
+                return tot_acc + tot_c, drp_acc + drp_c
+
+            tot_all, drp_all = lax.fori_loop(
+                0, n_chunks, _pass1_loop, (tot_all, drp_all)
+            )
             counts_acc, fm_lo, fm_hi = _compute_free_masks(tot_all, drp_all)
+
+            def _pass2_loop(ci, _):
+                t0 = pl.multiple_of(ci * 128, 128)
+                s_bests, s_ws, k_flags, d_flags = _load_chunk_from_vmem(t0)
+                _apply_fmask_to_chunk(s_bests, k_flags, d_flags, fm_lo, fm_hi)
+                _pack_vertical_chunk(t0, 128, s_bests, s_ws, k_flags)
+                return _
+
+            lax.fori_loop(0, n_chunks, _pass2_loop, jnp.int32(0))
+        else:
             for t0, c_rows in chunks:
-                s_bests, s_ws, k_flags, d_flags, _, _ = _score_vertical_chunk(
+                s_bests, s_ws, k_flags, d_flags, tot_c, drp_c = _score_vertical_chunk(
                     t0, c_rows
                 )
-                _apply_fmask_to_chunk(s_bests, k_flags, d_flags, fm_lo, fm_hi)
-                _pack_vertical_chunk(t0, c_rows, s_bests, s_ws, k_flags)
-        else:
-            counts_acc = tot_all
+                tot_all = tot_all + tot_c
+                if free_max_rows > 0:
+                    drp_all = drp_all + drp_c
+                    if can_cache_vmem:
+                        _stash_chunk_to_vmem(t0, s_bests, s_ws, k_flags, d_flags)
+                else:
+                    _pack_vertical_chunk(t0, c_rows, s_bests, s_ws, k_flags)
+            if free_max_rows > 0:
+                counts_acc, fm_lo, fm_hi = _compute_free_masks(tot_all, drp_all)
+                for t0, c_rows in chunks:
+                    if can_cache_vmem:
+                        s_bests, s_ws, k_flags, d_flags = _load_chunk_from_vmem(t0)
+                    else:
+                        s_bests, s_ws, k_flags, d_flags, _, _ = _score_vertical_chunk(
+                            t0, c_rows
+                        )
+                    _apply_fmask_to_chunk(s_bests, k_flags, d_flags, fm_lo, fm_hi)
+                    _pack_vertical_chunk(t0, c_rows, s_bests, s_ws, k_flags)
+            else:
+                counts_acc = tot_all
 
     if precompute_owner_loads:
         from sglang_tpu.moe.pallas.fused_rs_muse.moe_imbalance_planner import (
