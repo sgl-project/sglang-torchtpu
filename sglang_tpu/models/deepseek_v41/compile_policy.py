@@ -332,12 +332,37 @@ class DeepseekV4DecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         )
         with torch.no_grad():
             ids = forward_batch.input_ids
-            safe_ids = torch.where(
-                (ids < 0) | (ids >= engram_host._MM_PAD_SHIFT_VALUE),
-                fallback_id,
-                ids,
+            model = self.model_runner.model
+            embed_mod = (
+                model.embed_tokens
+                if isinstance(model, DeepseekV4ForCausalLMDSpark)
+                else model.get_input_embeddings()
             )
-            forward_batch.input_embeds = self._embed(safe_ids)
+            if (
+                ids.device.type == "tpu"
+                and getattr(embed_mod, "tp_size", 0) == 1
+                and getattr(embed_mod, "output_dtype", None) is None
+                and hasattr(embed_mod, "weight")
+            ):
+                from sglang_tpu.models.deepseek_v41.engram_device import (
+                    fused_safe_embed_tpu,
+                )
+
+                hc_mult = (
+                    int(model.hc_mult)
+                    if isinstance(model, DeepseekV4ForCausalLMDSpark)
+                    else 1
+                )
+                forward_batch.input_embeds = fused_safe_embed_tpu(
+                    ids, embed_mod.weight, fallback_id=fallback_id, hc_mult=hc_mult
+                )
+            else:
+                safe_ids = torch.where(
+                    (ids < 0) | (ids >= engram_host._MM_PAD_SHIFT_VALUE),
+                    fallback_id,
+                    ids,
+                )
+                forward_batch.input_embeds = self._embed(safe_ids)
 
     # ------------------------------------------------------------------ #
     # Decoder SWA bounded replay: one shared decoder row bucket per forward

@@ -369,6 +369,21 @@ class DeviceEngramVerify:
         if int(input_ids.shape[0]) != int(req_slots.shape[0]) * block:
             return None
         self.sync_cpu_to_device_if_needed()
+        # Reuse int32 positions from attention metadata if already built on TPU.
+        positions = forward_batch.positions
+        if positions.dtype != torch.int32:
+            attn_backend = getattr(forward_batch, "attn_backend", None)
+            meta = getattr(attn_backend, "forward_metadata", None)
+            meta_pos = getattr(meta, "positions", None)
+            if (
+                isinstance(meta_pos, torch.Tensor)
+                and meta_pos.dtype == torch.int32
+                and meta_pos.shape == positions.shape
+                and meta_pos.device == positions.device
+            ):
+                positions = meta_pos
+            else:
+                positions = positions.to(torch.int32)
         op = _get_verify_stage_op(
             block,
             self.ngram,
@@ -382,7 +397,7 @@ class DeviceEngramVerify:
         )
         staged = op(
             input_ids.to(torch.int32).contiguous(),
-            forward_batch.positions.to(torch.int32).contiguous(),
+            positions.contiguous(),
             req_slots.to(torch.int32).contiguous(),
             self.history_dev,
             self._token_map_dev,
@@ -392,3 +407,47 @@ class DeviceEngramVerify:
             self._s_devs[1],
         )
         return staged, self.num_cols
+
+
+@lru_cache(maxsize=16)
+def _get_safe_embed_op(fallback_id: int, hc_mult: int):
+    import jax
+    import jax.numpy as jnp
+
+    from sglang_tpu.pallas_jax_op import cpu_export_jax_op
+
+    def _safe_embed(ids: jax.Array, weight: jax.Array) -> jax.Array:
+        ids_i32 = ids.astype(jnp.int32)
+        oob = (ids_i32 < 0) | (ids_i32 >= _MM_PAD_SHIFT_VALUE)
+        safe = jnp.where(oob, jnp.int32(fallback_id), ids_i32)
+        safe = jnp.clip(safe, 0, weight.shape[0] - 1)
+        out = weight[safe]
+        if hc_mult > 1:
+            out = jnp.broadcast_to(
+                out[:, None, :], (out.shape[0], hc_mult, out.shape[1])
+            )
+        return out
+
+    op = cpu_export_jax_op(
+        f"sglang_tpu_pallas::dsv41_safe_embed_fb{fallback_id}_hc{hc_mult}",
+        _safe_embed,
+    )
+    if hc_mult > 1:
+        op.register_fake(
+            lambda ids, weight: weight.new_empty(
+                (ids.shape[0], hc_mult, weight.shape[1])
+            )
+        )
+    else:
+        op.register_fake(
+            lambda ids, weight: weight.new_empty((ids.shape[0], weight.shape[1]))
+        )
+    return op
+
+
+def fused_safe_embed_tpu(
+    ids: torch.Tensor, weight: torch.Tensor, *, fallback_id: int, hc_mult: int = 1
+) -> torch.Tensor:
+    """Single-op TPU bounds-checked embedding gather (replaces 8 eager ops)."""
+    op = _get_safe_embed_op(int(fallback_id), int(hc_mult))
+    return op(ids.to(torch.int32).contiguous(), weight)
