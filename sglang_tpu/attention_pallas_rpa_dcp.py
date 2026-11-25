@@ -20,23 +20,28 @@ step's K/V itself in every mode; nothing stages K/V outside it.
 # NOTE: do *not* add ``from __future__ import annotations`` here (see
 # attention_pallas_rpa_base for why torch_tpu's jax_op needs real annotations).
 
-import os
-
 import torch
 
 from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
-# How ``gather_heads`` collects the group's query heads. The default is the
-# zero-padded all-reduce; ``SGLANG_TPU_DCP_GATHER=all_gather`` selects
-# ``all_gather_into_tensor``, which returns a wrong buffer inside the compiled
-# decode forward at some batch sizes (see ``gather_heads``).
-_GATHER_VIA_ALL_GATHER = os.environ.get("SGLANG_TPU_DCP_GATHER", "") == "all_gather"
+
+def _use_native_all_gather() -> bool:
+    """Use native ``all_gather_into_tensor`` under eager and direct compile.
+
+    Under Dynamo (`torch.compiler.is_dynamo_compiling()`),
+    `all_gather_into_tensor` into a fresh buffer on `torch_tpu 0.2.0 /
+    libtpu 0.0.50` can return wrong gathered queries next to a donated Pallas
+    op (e.g. gpt-oss-120b dcp=2 at bs=16), so Dynamo falls back to the
+    zero-padded all-reduce (``_all_reduce_gather``).
+    """
+    return not torch.compiler.is_dynamo_compiling()
+
 
 __all__ = [
     "DCP_OP_NAME",
     "build_dcp_kernel_op",
+    "cp_lse_ag_out_rs",
     "gather_heads",
-    "merge_across_ranks",
     "merge_lse",
     "own_heads",
     "sink_fold",
@@ -294,26 +299,22 @@ def merge_lse(
 
 
 def _all_reduce_gather(
-    x: torch.Tensor, group, world_size: int, rank_mask: torch.Tensor, dim: int
+    x: torch.Tensor, group, world_size: int, dcp_rank: torch.Tensor, dim: int
 ) -> torch.Tensor:
     """``x`` of every rank concatenated along ``dim`` in rank order.
 
     Implemented as an in-place all-reduce over a zero-padded copy: every rank
     contributes its own block and zeros elsewhere, so the sum is exact.
-    Used instead of the torch_tpu all-gather, which inside a compiled graph
-    returns a wrong (uninitialised or stale) output for some shapes; see
-    ``gather_heads``.
 
-    ``rank_mask`` is ``arange(world_size) == rank`` as a device tensor: the rank
-    enters the graph as data, not as structure, so every rank compiles the same
-    program and issues the same collective sequence. A rank baked into the
-    graph (which blocks are zero, which slice is taken) gives each rank its own
-    program, and rank-divergent programs can return wrong merges on some ranks.
     """
     if world_size == 1:
         return x
     shape = list(x.shape)
     expanded = x.unsqueeze(dim).expand(shape[:dim] + [world_size] + shape[dim:])
+    rank_mask = (
+        torch.arange(world_size, device=dcp_rank.device, dtype=dcp_rank.dtype)
+        == dcp_rank
+    )
     mask = rank_mask.view([1] * dim + [world_size] + [1] * (x.dim() - dim))
     padded = torch.where(mask, expanded, x.new_zeros(()))
     padded = padded.reshape(shape[:dim] + [world_size * shape[dim]] + shape[dim + 1 :])
@@ -324,46 +325,22 @@ def gather_heads(
     x: torch.Tensor,
     group,
     world_size: int,
-    rank_mask: torch.Tensor | None = None,
+    dcp_rank: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """``[T, H, D]`` of every rank as ``[T, H * world_size, D]``, rank-major.
-
-    Gathered with the zero-padded all-reduce (``_all_reduce_gather``), as on
-    main. ``all_gather_into_tensor`` into a fresh buffer is not used: inside
-    the compiled decode forward on torch_tpu 0.2.0 / libtpu 0.0.50 it hands
-    the kernel wrong gathered queries at the bs=16 bucket (gpt-oss-120b,
-    dcp 2: gsm8k 98% -> ~5% as soon as a decode batch has more than 8 rows,
-    with one live request as well as with many; swapping only this gather for
-    the all-reduce restores 98.5% at 64-way concurrency). The same op compiled
-    on its own, over the same 2-rank groups and shapes, returns the right
-    data, so the fault lies in its interaction with the rest of the graph
-    (the mutated ``new_empty`` output next to the donated Pallas op) and is
-    not isolated yet. The all-gather form is kept behind
-    ``SGLANG_TPU_DCP_GATHER=all_gather`` for experiments.
-    """
+    """`[T, H, D]` of every rank as `[T, H * world_size, D]`, rank-major."""
     if world_size == 1:
         return x
-    if _GATHER_VIA_ALL_GATHER and hasattr(group, "all_gather_into_tensor"):
-        num_tokens, heads, head_dim = x.shape
-        gathered = x.new_empty((world_size * num_tokens * heads, head_dim))
-        group.all_gather_into_tensor(gathered, x.contiguous().view(-1, head_dim))
-        return (
-            gathered.view(world_size, num_tokens, heads, head_dim)
-            .permute(1, 0, 2, 3)
-            .reshape(num_tokens, world_size * heads, head_dim)
-            .contiguous()
-        )
-    return _all_reduce_gather(x, group, world_size, rank_mask, dim=1)
+    if _use_native_all_gather():
+        return group.all_gather(x.contiguous(), dim=1).contiguous()
+    return _all_reduce_gather(x, group, world_size, dcp_rank, dim=1)
 
 
-def own_heads(
-    x: torch.Tensor, world_size: int, rank_index: torch.Tensor
-) -> torch.Tensor:
+def own_heads(x: torch.Tensor, world_size: int, dcp_rank: torch.Tensor) -> torch.Tensor:
     """This rank's head block of a rank-major gathered-head tensor.
 
     ``x`` is ``[T, H * world_size, ...]`` as produced by :func:`gather_heads`
     (or by the kernel run on such queries); the result is ``[T, H, ...]``.
-    ``rank_index`` is the rank as an ``i64[1]`` device tensor so the slice is
+    ``dcp_rank`` is the rank as an ``i32[1]`` device tensor so the slice is
     data, not program structure (see ``_all_reduce_gather``).
     """
     if world_size == 1:
@@ -371,6 +348,7 @@ def own_heads(
     num_tokens, heads_all = x.shape[:2]
     heads = heads_all // world_size
     trailing = x.shape[2:]
+    rank_index = dcp_rank.to(torch.int64)
     return (
         x.view(num_tokens, world_size, heads, *trailing)
         .index_select(1, rank_index)
@@ -379,38 +357,40 @@ def own_heads(
     )
 
 
-def merge_across_ranks(
+def cp_lse_ag_out_rs(
     out: torch.Tensor,
     lse: torch.Tensor,
     group,
     world_size: int,
-    rank_mask: torch.Tensor,
+    dcp_rank: torch.Tensor,
+    *,
+    scatter_heads: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Merge one partial ``(out [T, H, D] fp32, lse [T, H])`` per rank into the
-    group-wide result, with the same ``H`` heads.
+    group-wide result.
 
-    Same protocol as ``layers.dcp.comm.cp_lse_ag_out_rs_mha``: gather the
-    LSEs, rescale the local output to the group-wide softmax and all-reduce.
-    A caller whose ``H`` spans the whole group's heads keeps its own block
-    with :func:`own_heads`. The log-sum-exp over ranks is written with
-    elementwise ops (pairwise max, exp, log) because torch_tpu implements
-    neither ``logsumexp`` nor ``logaddexp``. ``rank_mask`` is the rank as a
-    ``bool[world_size]`` one-hot device tensor.
+    Same protocol as ``layers.dcp.comm.cp_lse_ag_out_rs_mha``: all-gather the
+    LSEs, rescale the local output to the group-wide softmax, and reduce-scatter
+    across ranks (or all-reduce keeping all heads when ``scatter_heads=False``,
+    used by ring-mode PCP where every rank holds every head).
     """
     if world_size == 1:
         return out, lse
     lse = lse.contiguous()
-    lses = _all_reduce_gather(lse, group, world_size, rank_mask, dim=0).view(
-        world_size, *lse.shape
-    )
-    m = lses[0]
-    for i in range(1, world_size):
-        m = torch.maximum(m, lses[i])
+    if _use_native_all_gather():
+        lses = group.all_gather(lse.unsqueeze(0), dim=0)
+    else:
+        lses = _all_reduce_gather(lse, group, world_size, dcp_rank, dim=0).view(
+            world_size, *lse.shape
+        )
+    m = lses.amax(dim=0)
     m_safe = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
-    total = torch.exp(lses[0] - m_safe)
-    for i in range(1, world_size):
-        total = total + torch.exp(lses[i] - m_safe)
+    total = torch.exp(lses - m_safe).sum(dim=0)
     global_lse = torch.where(torch.isfinite(m), m_safe + torch.log(total), m)
-    scale = _zero_non_finite(torch.exp(lse - global_lse))
-    out = _zero_non_finite(out) * scale[..., None]
-    return group.all_reduce(out), global_lse
+
+    weight = torch.exp(lse - global_lse).unsqueeze(-1)
+    weighted = torch.where(weight > 0, out * weight, torch.zeros_like(out))
+    if not scatter_heads:
+        return group.all_reduce(weighted), global_lse
+    out_own = group.reduce_scatter_along_dim(weighted, dim=1).contiguous()
+    return out_own, own_heads(global_lse, world_size, dcp_rank)
