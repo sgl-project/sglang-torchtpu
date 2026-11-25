@@ -1694,22 +1694,25 @@ def flush_engram_commits(
 
 
 def _read_to_host(tensors: Sequence[torch.Tensor]) -> list[torch.Tensor]:
-    """``tensors`` on the host; the int32 device ones in one read (concatenated on
-    the device), others one by one. Only int32 joins the batch: casting a 64-bit
-    integer on the TPU does not lower."""
+    """Read device tensors to host, batching per integer dtype (int32 / int64).
+
+    Concatenating same-dtype device tensors avoids serial CopyTpuToCpu
+    round-trips without introducing unsupported int64<->int32 TPU casts.
+    """
     out: list = list(tensors)
-    batch = [
-        i
-        for i, t in enumerate(tensors)
-        if t.device.type != "cpu" and t.dtype == torch.int32
-    ]
-    if len(batch) > 1:
-        flat = torch.cat([tensors[i].reshape(-1) for i in batch]).cpu()
-        offset = 0
-        for i in batch:
-            n = tensors[i].numel()
-            out[i] = flat[offset : offset + n].view(tensors[i].shape)
-            offset += n
+    for dtype in (torch.int32, torch.int64):
+        batch = [
+            i
+            for i, t in enumerate(out)
+            if t.device.type != "cpu" and t.dtype == dtype
+        ]
+        if len(batch) > 1:
+            flat = torch.cat([out[i].reshape(-1) for i in batch]).cpu()
+            offset = 0
+            for i in batch:
+                n = out[i].numel()
+                out[i] = flat[offset : offset + n].view(out[i].shape)
+                offset += n
     for i, t in enumerate(out):
         if t.device.type != "cpu":
             out[i] = t.cpu()
