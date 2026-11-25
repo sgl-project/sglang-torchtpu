@@ -498,6 +498,9 @@ class _InsertWalkState(msgspec.Struct):
     priority: int
     result: InsertResult
     total_prefix_length: int = 0
+    # Logical units of ``key`` already walked (SGLANG_OPT_RADIX_INSERT_KEY_OFFSET);
+    # 0 when the walk slices ``key`` instead.
+    key_offset: int = 0
     is_new_leaf: bool = False
     target_node: Optional[UnifiedTreeNode] = None
     overlap_node: Optional[UnifiedTreeNode] = None
@@ -1528,7 +1531,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def _insert_walk_step(self, state: _InsertWalkState) -> None:
         """Process one walked node, appending its barrier actions to the state."""
         key = state.key
-        child_key = key.child_key(self.page_size) if len(key) else None
+        offset = state.key_offset
+        child_key = (
+            key.child_key_at(offset, self.page_size) if len(key) > offset else None
+        )
         if child_key not in state.node.children:
             state.phase = _InsertPhase.COMMIT
             return
@@ -1537,7 +1543,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # Under joint_lru an access to only the prefix keeps the suffix's recency.
         suffix_time = node.last_access_time if self.joint_lru is not None else None
         self._touch_node(node)
-        prefix_len = node.key.match(key, page_size=self.page_size)
+        prefix_len = node.key.match_at(key, offset, page_size=self.page_size)
         if prefix_len < len(node.key):
             suffix = node
             node, action = self._split_node(node.key, node, prefix_len)
@@ -1646,7 +1652,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             state.pending_actions.append(self._insert_backup_action(state, node))
         state.node = node
         state.total_prefix_length += prefix_len
-        state.key = state.key[prefix_len:]
+        if envs.SGLANG_OPT_RADIX_INSERT_KEY_OFFSET.get():
+            state.key_offset += prefix_len
+        else:
+            state.key = state.key[prefix_len:]
         state.value = state.value[prefix_len:]
         state.overlap_node = None
         state.overlap_prefix_len = 0
@@ -1658,6 +1667,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # value alone; auxiliary components (SWA, Mamba) may legitimately hold
         # only a tombstone for this span (e.g. the whole leaf is outside the SWA
         # window). Materialize it anyway so the Full KV stays cacheable.
+        if state.key_offset:
+            # The one slice of the walk: the new leaf's own key.
+            state.key = state.key[state.key_offset :]
+            state.key_offset = 0
         if len(state.key):
             state.result.record_adopted_range(
                 BASE_COMPONENT_TYPE,
