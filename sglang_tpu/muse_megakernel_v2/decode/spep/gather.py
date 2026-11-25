@@ -197,7 +197,7 @@ def _all_gather_start(c: MKConfig, S: dict, me, buf, ph: int) -> Callable[[], No
 
 
 def _unpool_fold(c: MKConfig) -> bool:
-    return _pair_ag(c) and tpu_envs.SGLANG_TPU_MUSE_MK_EP_UNPOOL_FOLD.get() > 0
+    return _pair_ag(c) and tpu_envs.SGLANG_TPU_MUSE_MK_EP_UNPOOL_FOLD.get()
 
 
 def _all_gather_fold_start(c: MKConfig, S: dict, me, buf, ph: int):
@@ -707,12 +707,7 @@ def _unpool_folded(step: EPLayerStep, uag_fold) -> None:
         part = jnp.dot(x, w, preferred_element_type=f32)
         acc.append(part if not acc else acc.pop() + part)
 
-    if tpu_envs.SGLANG_TPU_MUSE_MK_EP_UNPOOL_FOLD.get() == 2:  # DIAG: whole AG, block order
-        uag_fold(None)
-        for d in range(c.tp):
-            consume(jnp.int32(d))
-    else:
-        uag_fold(consume)
+    uag_fold(consume)
     S["eg_fag"].at[me][...] = _pack_bf16x2(acc[0] * S["eg_sc"][pl.ds(1, 1), :])
 
 
