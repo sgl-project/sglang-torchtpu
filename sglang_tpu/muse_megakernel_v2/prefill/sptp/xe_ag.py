@@ -128,7 +128,57 @@ def xe_ag_dequant_call(
             name=f"muse_sptp_xe_dequant3d_t{rows}",
         )(g, xs_all)
 
+    def pack_kernel(x_ref, o_ref):
+        # u32 (r, s, lane) = bytes of e4m3 rows 4s .. 4s + 3 of row r's [nk, 128] tile (byte i =
+        # row 4s + i): the tile's own bytes, typed 32-bit
+        ws = []
+        for sb in range(nk // 4):
+            w = None
+            for i in range(4):
+                j = 4 * sb + i
+                b = pltpu.bitcast(x_ref[:, j * 128 : (j + 1) * 128], jnp.uint8).astype(
+                    jnp.uint32
+                )
+                w = b if w is None else w | (b << (8 * i))
+            ws.append(w)
+        o_ref[...] = pltpu.einshape("srl->rsl", jnp.stack(ws))
+
+    def unpack_kernel(x_ref, s_ref, o_ref):
+        x8 = x_ref.bitcast(jnp.float8_e4m3fn)  # [tm, nk, 128]
+        o_ref[...] = (x8[...].astype(jnp.float32) * s_ref[...][:, :, None]).astype(
+            jnp.bfloat16
+        )
+
+    def call_u32(xe8, xs_all):
+        # tiled 5: tiled 4 with the gathered tiles typed u32 [rows, nk / 4, 128] (an e4m3
+        # [*, nk, 128] AG measured ~23 us slower than XLA's e4m3 [T, He] one)
+        pk = pl.pallas_call(
+            pack_kernel,
+            grid=(Ts // 128,),
+            in_specs=[pl.BlockSpec((128, cols), lambda i: (i, 0))],
+            out_specs=pl.BlockSpec((128, nk // 4, 128), lambda i: (i, 0, 0)),
+            out_shape=jax.ShapeDtypeStruct((Ts, nk // 4, 128), jnp.uint32),
+            compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+            name=f"muse_sptp_xe_pack_t{Ts}",
+        )(xe8)
+        g = jax.lax.all_gather(pk, axis, axis=0, tiled=True)
+        tm = 256
+        return pl.pallas_call(
+            unpack_kernel,
+            grid=(rows // tm,),
+            in_specs=[
+                pl.BlockSpec((tm, nk // 4, 128), lambda i: (i, 0, 0)),
+                pl.BlockSpec((tm, 1), lambda i: (i, 0)),
+            ],
+            out_specs=pl.BlockSpec((tm, nk, 128), lambda i: (i, 0, 0)),
+            out_shape=jax.ShapeDtypeStruct((rows, nk, 128), jnp.bfloat16),
+            compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+            name=f"muse_sptp_xe_unpack_t{rows}",
+        )(g, xs_all)
+
     def call(xe8, xs_all):
+        if tiled == 5:
+            return call_u32(xe8, xs_all)
         if tiled == 4:
             return call3d(xe8, xs_all)
         out = None
