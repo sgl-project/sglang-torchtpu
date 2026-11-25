@@ -306,7 +306,15 @@ def test_dispatch_is_chosen_by_rows_per_rank():
 
 def test_push_recipes(v2):
     recipes = v2.push_layer.K32Z_PUSH_RECIPES
-    assert sorted(recipes) == [512, 1024]
+    assert sorted(recipes) == [96, 192, 384, 512, 1024]
+    assert recipes[96] == {"decode_loop": ((9, 10), 256)}
+    assert recipes[192] == {"decode_loop": (0, 0)}
+    # V4.1's expert shape divides the 96 loop step; the layer falls back to
+    # host.k32z_roll_plan for a shape that does not.
+    assert v2.host.k32z_step_applies((9, 10), 5120, 2304)
+    assert not v2.host.k32z_step_applies((9, 10), 1536, 512)
+    assert recipes[384] == recipes[512]
+    assert v2.push_layer._dedup.x_applies(384)  # the recipe's x_tables take effect
     assert recipes[512] == {
         "x_tables": True,
         "fold_select": True,
@@ -440,7 +448,7 @@ def test_decode_buckets_loop_their_tall_bodies(v2):
     host, ep, g_local = v2.host, 8, 48
     # DeepSeek-V4.1-Flash's expert shape (hidden 5120, intermediate 2304),
     # whose chunk counts the (3, 4) step divides.
-    for rows in (8, 16, 32, 64):
+    for rows in (8, 16, 32, 48, 64):
         stride = host.ragged_stride_bound(ep * rows, 6, ep * g_local, 256)
         roll, roll_from = host.k32z_roll_plan(stride, ep, g_local, 5120, 2304)
         assert roll == (3, 4) and roll_from == 128, rows
