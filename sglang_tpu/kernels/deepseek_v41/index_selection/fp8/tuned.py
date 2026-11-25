@@ -10,6 +10,8 @@ from dataclasses import astuple, dataclass
 import jax
 from jax.experimental.pallas import tpu as pltpu
 
+from sglang_tpu.pallas_export import get_tpu_info_or_none
+
 from .cache import PAGE_RECORDS, PAGE_ROWS
 
 
@@ -63,11 +65,14 @@ def paged_mqa_query_tile(query_size: int, heads: int) -> int:
     return min(query_size, info.num_sublanes, max(1, info.mxu_column_size // heads))
 
 
-def indexer_query_rows(tokens: int, query_tile: int) -> int:
+def indexer_query_rows(
+    tokens: int, query_tile: int, *, cpu_export: bool = False
+) -> int:
     """Derive query chunks from query tiles and the SparseCore wave size."""
-    if jax.default_backend() != "tpu":
+    if not cpu_export and jax.default_backend() != "tpu":
         return tokens
-    sc = pltpu.get_tpu_info().sparse_core
+    info = get_tpu_info_or_none()
+    sc = info.sparse_core if info is not None else None
     if sc is None:
         return tokens
     wave = math.lcm(query_tile, sc.num_cores * sc.num_subcores)

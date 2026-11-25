@@ -5,7 +5,10 @@
 """Block-maximum top-k: ties, masked keys, short rows, forced and published blocks."""
 
 import os
+import subprocess
 import sys
+from functools import partial
+from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
@@ -96,5 +99,54 @@ def test_block_topk(rows, width, distribution, publish):
             np.testing.assert_array_equal(np.asarray(result[1])[row], expected)
 
 
+def _export_candidate_source():
+    from jax import export
+
+    from sglang_tpu.models.deepseek_v41.ops.indexer import _select
+    from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+    assert jax.default_backend() == "cpu"
+    rows, pages = 6, 512
+    select = partial(
+        _select,
+        pages=pages,
+        page_stride=33,
+        page_offset=0,
+        page_size=128,
+        topk=K,
+        block_size=BLOCK,
+        publish=True,
+        consume=False,
+    )
+    shape = jax.ShapeDtypeStruct
+    with (
+        patch(
+            "sglang_tpu.pallas_export.get_pallas_tpu_device_kind", return_value="TPU7x"
+        ),
+        tpu_info_for_cpu_export(),
+    ):
+        ir = export.export(jax.jit(select), platforms=("tpu",))(
+            shape((rows, 32, 128), jnp.bfloat16),
+            shape((rows, 32), jnp.float32),
+            shape((pages * 33, 128), jnp.int32),
+            shape((1, pages), jnp.int32),
+            shape((rows,), jnp.int32),
+            shape((rows,), jnp.int32),
+            shape((rows, PUBLISH), jnp.int32),
+        ).mlir_module()
+    assert 'kernel_name = "block_topk"' in ir
+
+
+def test_candidate_source_export():
+    subprocess.run(
+        [sys.executable, __file__, "--export-source"],
+        env={**os.environ, "JAX_PLATFORMS": "cpu"},
+        check=True,
+    )
+
+
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v", "-p", "no:cacheprovider"]))
+    if "--export-source" in sys.argv:
+        _export_candidate_source()
+    else:
+        sys.exit(pytest.main([__file__, "-v", "-p", "no:cacheprovider"]))
