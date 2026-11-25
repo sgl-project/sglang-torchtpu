@@ -125,6 +125,28 @@ def greedy_markov_drafts(
     return torch.stack(drafts, dim=1).to(torch.int64)
 
 
+def shifted_draft_forward(model, input_ids, positions, forward_batch, input_embeds):
+    """Run the eligible TPU draft path with mHC state shared between stages."""
+    from sglang.kernels.ops.layernorm.mhc import mhc_combine
+    from sglang.srt.eplb.expert_distribution import (
+        get_global_expert_distribution_recorder,
+    )
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang_tpu.models.deepseek_v41.ops.mhc import run_draft_stages
+
+    if input_embeds is None:
+        x = model.forward_embed(input_ids)
+    elif input_embeds.dim() == 2:
+        x = model._expand_hc(input_embeds)
+    else:
+        x = input_embeds
+
+    with get_global_expert_distribution_recorder().disable_this_region():
+        residual, pre = run_draft_stages(model.stages, positions, x, forward_batch)
+    hidden = mhc_combine(residual.flatten(1), pre, model.hc_mult, residual.dtype)
+    return LogitsProcessorOutput(next_token_logits=None, hidden_states=hidden)
+
+
 def dspark_forward(original, model, input_ids, positions, forward_batch, *args, **kw):
     """``DeepseekV4ForCausalLMDSpark.forward`` plus the in-graph greedy drafts
     TpuBlockSpecWorker reads from ``next_draft_tokens``."""

@@ -56,6 +56,48 @@ tpu_dsv41_hc_combine
   Upstream PR or issue: not filed (V4.1 TPU bring-up, PR1).
   Remove when: hc_combine dispatches on device like the other mHC kernels.
 
+tpu_dsv41_prepare_shifted_mhc, tpu_dsv41_prepare_dspark_shifted_mhc
+  Why: the fused shifted mHC boundary needs a device-resident packed mix weight.
+  How: AFTER DeepseekV4ForCausalLM.post_load_weights, pack the loaded mix
+       weights into nonpersistent buffers while preserving the FP32 parameters.
+       Refresh initialized buffers only for the names affected by a partial load.
+       Apply the same hook to DeepseekV4ForCausalLMDSpark.post_load_weights
+       for draft stages. The startup-only seam misses online model loads.
+  Upstream PR or issue: https://github.com/sgl-project/sglang-torchtpu/pull/2383
+  Remove when: the model exposes a backend-specific post-load weight preparation
+       entry point for startup and online loads.
+
+tpu_dsv41_refresh_shifted_mhc_after_direct_update
+  Why: the raw weight-update endpoint bypasses model.post_load_weights.
+  How: AFTER _model_load_weights_direct, refresh any packed mix weight whose
+       FP32 parameter the update wrote.
+  Upstream PR or issue: https://github.com/sgl-project/sglang-torchtpu/pull/2383
+  Remove when: raw weight updates notify the same weight preparation entry
+       point as model.post_load_weights.
+
+tpu_dsv41_guard_shifted_mhc_custom_loader,
+tpu_dsv41_exclude_packed_mhc_from_weight_checks,
+tpu_dsv41_refresh_shifted_mhc_after_weight_reset
+  Why: custom loaders can bypass repacking, and weight checks must expose
+       checkpoint tensors while keeping the derived copies coherent on reset.
+  How: AROUND WeightUpdater.update_weights_from_tensor rejects custom loaders
+       on models with packed mHC. AROUND WeightChecker._model_state omits packed
+       buffers from all actions. AFTER _reset_tensors rebuilds them in place.
+  Upstream PR or issue: https://github.com/sgl-project/sglang-torchtpu/pull/2411
+  Remove when: derived buffers can declare update and weight-check behavior
+       through a shared API.
+
+tpu_dsv41_shifted_mhc, tpu_dsv41_shifted_draft_forward
+  Why: the TPU kernel completes both sides of an mHC boundary and carries
+       the next sublayer's gates and normalized input in HcState.
+  How: AROUND deepseek_v4_mhc._post_fusion for target and
+       DeepseekV4ForCausalLMDSpark._forward_impl for draft. The TPU draft
+       path reuses the model's embedding methods and the existing mHC head
+       operation. Unsupported shapes and configurations call original.
+  Upstream PR or issue: https://github.com/sgl-project/sglang-torchtpu/pull/2411
+  Remove when: the target boundary and draft stage runner dispatch through
+       upstream platform interfaces.
+
 tpu_dsv41_engram_gate
   Why: the torch fallback of sglang.srt.layers.engram.engram_gate uses
        torch.copysign, which TorchTPU does not implement (aten::copysign.out).
@@ -664,6 +706,90 @@ def tpu_dsv41_hc_combine(original, x_flat, pre, hc, out_dtype):
     return (pre.float().unsqueeze(-1) * copies).sum(1).to(out_dtype)
 
 
+def tpu_dsv41_prepare_shifted_mhc(result, model, is_nextn=False, weight_names=None):
+    if not is_nextn:
+        from sglang_tpu.models.deepseek_v41.ops.mhc import prepare_shifted_mhc
+
+        prepare_shifted_mhc(model.model.layers, weight_names=weight_names)
+
+
+def tpu_dsv41_prepare_dspark_shifted_mhc(
+    result, model, is_nextn=False, weight_names=None
+):
+    from sglang_tpu.models.deepseek_v41.ops.mhc import prepare_shifted_mhc
+
+    prepare_shifted_mhc(model.stages, draft=True, weight_names=weight_names)
+
+
+def tpu_dsv41_refresh_shifted_mhc_after_direct_update(result, model, named_tensors):
+    from sglang_tpu.models.deepseek_v41.ops.mhc import (
+        refresh_shifted_mhc_after_direct_update,
+    )
+
+    refresh_shifted_mhc_after_direct_update(model, named_tensors)
+
+
+def tpu_dsv41_guard_shifted_mhc_custom_loader(
+    original, updater, named_tensors, load_format=None
+):
+    if (
+        load_format not in (None, "direct", "flattened_bucket")
+        and load_format in updater.custom_weight_loaders
+    ):
+        from sglang_tpu.models.deepseek_v41.ops.mhc import packed_mhc_sublayers
+
+        if next(packed_mhc_sublayers(updater.get_model()), None) is not None:
+            return (
+                False,
+                "Custom weight loaders cannot refresh TPU shifted mHC weights.",
+            )
+    return original(updater, named_tensors, load_format)
+
+
+def tpu_dsv41_exclude_packed_mhc_from_weight_checks(original, checker):
+    from sglang_tpu.models.deepseek_v41.ops.mhc import _PACKED
+
+    for name, tensor in original(checker):
+        if name.rsplit(".", 1)[-1] != _PACKED:
+            yield name, tensor
+
+
+def tpu_dsv41_refresh_shifted_mhc_after_weight_reset(result, checker, *args, **kwargs):
+    from sglang_tpu.models.deepseek_v41.ops.mhc import (
+        _refresh_packed_buffer,
+        packed_mhc_sublayers,
+    )
+
+    for hc in packed_mhc_sublayers(checker._get_model()):
+        _refresh_packed_buffer(hc)
+
+
+def tpu_dsv41_shifted_mhc(original, hc, y, residual, coefficients, next):
+    if next is not None and y.device.type == "tpu":
+        from sglang_tpu.models.deepseek_v41.ops.mhc import fused_target_boundary
+
+        state = fused_target_boundary(hc, y, residual, coefficients, next)
+        if state is not None:
+            return state
+    return original(hc, y, residual, coefficients, next)
+
+
+def tpu_dsv41_shifted_draft_forward(
+    original, model, input_ids, positions, forward_batch, input_embeds
+):
+    rows = input_ids if input_embeds is None else input_embeds
+    if rows.device.type == "tpu":
+        from sglang_tpu.models.deepseek_v41.ops.mhc import can_run_draft
+
+        if can_run_draft(model, rows, has_input_embeds=input_embeds is not None):
+            from sglang_tpu.models.deepseek_v41.dspark import shifted_draft_forward
+
+            return shifted_draft_forward(
+                model, input_ids, positions, forward_batch, input_embeds
+            )
+    return original(model, input_ids, positions, forward_batch, input_embeds)
+
+
 def tpu_dsv41_engram_gate(
     original,
     x,
@@ -794,10 +920,7 @@ def tpu_dsv41_engram_embed_forward(
     """AROUND EngramEmbedding.forward: dequantize the host-staged rows."""
     if indices.is_cuda or embedding.host_table is None:
         return original(embedding, indices, forward_batch, **kwargs)
-    from sglang_tpu.models.deepseek_v41.engram_host import (
-        staged_inputs,
-        staged_lookup,
-    )
+    from sglang_tpu.models.deepseek_v41.engram_host import staged_inputs, staged_lookup
 
     # The core host-table lookup reads a raw host pointer from the device.
     _, staged = staged_inputs(forward_batch)
@@ -1101,6 +1224,46 @@ def hook_specs():
         (
             "sglang.srt.layers.engram.engram_gate",
             tpu_dsv41_engram_gate,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.models.deepseek_v4.DeepseekV4ForCausalLM.post_load_weights",
+            tpu_dsv41_prepare_shifted_mhc,
+            HookType.AFTER,
+        ),
+        (
+            f"{dspark}.post_load_weights",
+            tpu_dsv41_prepare_dspark_shifted_mhc,
+            HookType.AFTER,
+        ),
+        (
+            "sglang.srt.model_executor.model_runner_components.weight_updater._model_load_weights_direct",
+            tpu_dsv41_refresh_shifted_mhc_after_direct_update,
+            HookType.AFTER,
+        ),
+        (
+            "sglang.srt.model_executor.model_runner_components.weight_updater.WeightUpdater.update_weights_from_tensor",
+            tpu_dsv41_guard_shifted_mhc_custom_loader,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.model_executor.weight_checker.WeightChecker._model_state",
+            tpu_dsv41_exclude_packed_mhc_from_weight_checks,
+            HookType.AROUND,
+        ),
+        (
+            "sglang.srt.model_executor.weight_checker.WeightChecker._reset_tensors",
+            tpu_dsv41_refresh_shifted_mhc_after_weight_reset,
+            HookType.AFTER,
+        ),
+        (
+            "sglang.srt.models.deepseek_v4_mhc._post_fusion",
+            tpu_dsv41_shifted_mhc,
+            HookType.AROUND,
+        ),
+        (
+            f"{dspark}._forward_impl",
+            tpu_dsv41_shifted_draft_forward,
             HookType.AROUND,
         ),
         (
