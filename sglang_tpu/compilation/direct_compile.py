@@ -948,7 +948,7 @@ class CompiledFunction:
             # Compute liveness after collecting all three kinds of graph roots.
             with dynamo_timed("direct_compile_prune_model_inputs"):
                 live_model_indices = _live_model_input_indices(
-                    result_tensors, graph_inputs, model_input_count
+                    result_tensors, graph_inputs, model_input_count, model_inputs
                 )
             retained_indices = (
                 *live_model_indices,
@@ -1631,6 +1631,7 @@ def _live_model_input_indices(
     result_tensors: list[torch.Tensor],
     graph_inputs: list[torch.Tensor],
     model_input_count: int,
+    model_inputs: Sequence[torch.Tensor] | None = None,
 ) -> tuple[int, ...]:
     """Find model arguments used by the deferred graph, once per specialization.
 
@@ -1681,12 +1682,22 @@ def _live_model_input_indices(
     except RuntimeError as error:
         if "identified an argument that was not provided" not in str(error):
             raise
+        fallback = (
+            tuple(
+                index
+                for index in range(model_input_count)
+                if _is_tpu_tensor(model_inputs[index])
+            )
+            if model_inputs is not None
+            else tuple(range(model_input_count))
+        )
         logger.info(
-            "[direct_compile] retaining all %d model inputs: deferred traversal "
+            "[direct_compile] retaining %d/%d TPU model inputs: deferred traversal "
             "requires an input discarded by MLIR lowering",
+            len(fallback),
             model_input_count,
         )
-        return tuple(range(model_input_count))
+        return fallback
     del lowered
     return live_model_indices
 

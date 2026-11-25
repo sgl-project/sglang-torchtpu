@@ -757,6 +757,26 @@ class HostEngramCoordinator:
         )
         self._prepared_extend_ranges: tuple[list[int], list[int]] | None = None
         self._prefetch: _EngramPrefetch | None = None
+        self._device_verify: Any = None
+        self._device_verify_checked = False
+
+    def get_device_verify(self) -> Any:
+        """Lazily initialize on-device TPU Engram verify when tables fit in HBM."""
+        if not self._device_verify_checked:
+            self._device_verify_checked = True
+            from sglang_tpu.models.deepseek_v41.engram_device import DeviceEngramVerify
+
+            if DeviceEngramVerify.can_enable(self, self._hasher, self.device):
+                dev = DeviceEngramVerify(self, self._hasher, self.device)
+                self._device_verify = dev
+                _DEVICE_VERIFY[self._hasher] = dev
+                logger.info(
+                    "[TPU] DeepSeek-V4.1 on-device Engram verify enabled "
+                    "(%d layers, dim=%d, zero verify D2H/H2D)",
+                    dev.n_layers,
+                    dev.dim,
+                )
+        return self._device_verify
 
     def _next_prompt_prediction(
         self,
@@ -888,6 +908,8 @@ class HostEngramCoordinator:
         )
         slot_tensor = torch.tensor(slots, dtype=torch.int64, device=history.device)
         history[slot_tensor] = tail_tensor
+        if self._device_verify is not None:
+            self._device_verify.mark_cpu_history_updated()
         self._history_commit = []
 
     def prepare(
@@ -1165,12 +1187,27 @@ class HostEngramCoordinator:
         self, input_ids: torch.Tensor, forward_batch
     ) -> tuple[tuple[torch.Tensor, ...], list[PreparedEngramUpload], int] | None:
         """Hash and stage a ``TARGET_VERIFY`` step on CPU in single-threaded NumPy."""
-        # The draft tokens come back with the queued commits, in one read.
-        (input_ids_cpu,) = flush_engram_commits(self._hasher, also_read=(input_ids,))
+        spec_info = getattr(forward_batch, "spec_info", None)
+        live_seq_lens_cpu = getattr(spec_info, "live_seq_lens_cpu", None)
+        # Batch input_ids (and positions when SGLANG_TPU_SPEC_DEVICE_ROWS skips
+        # live_seq_lens_cpu) with any queued Engram commits in a single D2H read.
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and live_seq_lens_cpu is None
+            and isinstance(forward_batch.positions, torch.Tensor)
+            and forward_batch.positions.device.type != "cpu"
+        ):
+            input_ids_cpu, positions_for_host = flush_engram_commits(
+                self._hasher, also_read=(input_ids, forward_batch.positions)
+            )
+        else:
+            (input_ids_cpu,) = flush_engram_commits(
+                self._hasher, also_read=(input_ids,)
+            )
+            positions_for_host = forward_batch.positions
         if not forward_batch.forward_mode.is_target_verify():
             return None
         history = self._hasher.history
-        spec_info = getattr(forward_batch, "spec_info", None)
         # Upstream keeps the ragged layout on the forward batch, not spec_info.
         assert getattr(forward_batch, "ragged_verify_layout", None) is None, (
             "Host Engram stage_verify assumes uniform draft_token_num per request "
@@ -1200,11 +1237,11 @@ class HostEngramCoordinator:
             inputs = verify_inputs_from_host(
                 history,
                 input_ids_cpu,
-                forward_batch.positions,
+                positions_for_host,
                 req_slots,
                 block=block,
                 ngram=self.ngram,
-                live_seq_lens_cpu=getattr(spec_info, "live_seq_lens_cpu", None),
+                live_seq_lens_cpu=live_seq_lens_cpu,
             )
         except (ValueError, IndexError):
             return None
@@ -1539,7 +1576,11 @@ def host_hash_ids(hasher, input_ids: torch.Tensor, forward_batch) -> torch.Tenso
         # Engram.forward reads it in target-verify mode; None is equal blocks.
         ragged_verify_layout=getattr(forward_batch, "ragged_verify_layout", None),
     )
-    return hasher(_cpu(input_ids), batch)
+    out = hasher(_cpu(input_ids), batch)
+    dev = _DEVICE_VERIFY.get(hasher)
+    if dev is not None:
+        dev.mark_cpu_history_updated()
+    return out
 
 
 def _padded_history(history, req_pool_indices):
@@ -1589,6 +1630,8 @@ def host_table_without_cuda():
 
 # hasher -> verify commits not yet applied to its host history, oldest first.
 _PENDING_COMMITS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+# hasher -> active on-device TPU verify handler (process-lifetime per hasher).
+_DEVICE_VERIFY: dict[Any, Any] = {}
 
 
 def commit_engram_history(
@@ -1639,21 +1682,34 @@ def defer_engram_commit(
     blocks it until the verify finishes; the next reader of the history runs
     after the next draft is dispatched.
     """
+    dev = _DEVICE_VERIFY.get(hasher) if hasher is not None else None
+    if dev is not None:
+        dev.commit_after_verify(
+            verify_ids_2d=verify_ids_2d,
+            req_pool_indices=req_pool_indices,
+            commit_lens=commit_lens,
+        )
+        return
     commit = (verify_ids_2d, req_pool_indices, commit_lens)
     _PENDING_COMMITS.setdefault(hasher, []).append(commit)
 
 
 def has_pending_engram_commits(hasher) -> bool:
     # Only DSpark verify queues; without a queue the hasher is never weak-referenced.
-    return bool(
-        hasher is not None and _PENDING_COMMITS and _PENDING_COMMITS.get(hasher)
-    )
+    if hasher is None:
+        return False
+    dev = _DEVICE_VERIFY.get(hasher)
+    if dev is not None and dev.has_pending_commits:
+        return True
+    return bool(_PENDING_COMMITS and _PENDING_COMMITS.get(hasher))
 
 
 def flush_all_engram_commits() -> None:
     """Apply every hasher's queued verify commits (flush_engram_commits for each)."""
     for hasher in list(_PENDING_COMMITS.keys()):
         flush_engram_commits(hasher)
+    for dev in list(_DEVICE_VERIFY.values()):
+        dev.sync_device_to_cpu_if_needed()
 
 
 def flush_engram_commits(
@@ -1663,6 +1719,9 @@ def flush_engram_commits(
 
     Returns host copies of ``also_read``, read back in the same transfer as the
     commits' device tensors (each separate read waits for the device queue)."""
+    dev = _DEVICE_VERIFY.get(hasher) if hasher is not None else None
+    if dev is not None:
+        dev.sync_device_to_cpu_if_needed()
     pending = []
     if hasher is not None and _PENDING_COMMITS:
         pending = list(_PENDING_COMMITS.pop(hasher, ()))
@@ -1679,22 +1738,25 @@ def flush_engram_commits(
 
 
 def _read_to_host(tensors: Sequence[torch.Tensor]) -> list[torch.Tensor]:
-    """``tensors`` on the host; the int32 device ones in one read (concatenated on
-    the device), others one by one. Only int32 joins the batch: casting a 64-bit
-    integer on the TPU does not lower."""
+    """Read device tensors to host, batching per integer dtype (int32 / int64).
+
+    Concatenating same-dtype device tensors avoids serial CopyTpuToCpu
+    round-trips without introducing unsupported int64<->int32 TPU casts.
+    """
     out: list = list(tensors)
-    batch = [
-        i
-        for i, t in enumerate(tensors)
-        if t.device.type != "cpu" and t.dtype == torch.int32
-    ]
-    if len(batch) > 1:
-        flat = torch.cat([tensors[i].reshape(-1) for i in batch]).cpu()
-        offset = 0
-        for i in batch:
-            n = tensors[i].numel()
-            out[i] = flat[offset : offset + n].view(tensors[i].shape)
-            offset += n
+    for dtype in (torch.int32, torch.int64):
+        batch = [
+            i
+            for i, t in enumerate(out)
+            if t.device.type != "cpu" and t.dtype == dtype
+        ]
+        if len(batch) > 1:
+            flat = torch.cat([out[i].reshape(-1) for i in batch]).cpu()
+            offset = 0
+            for i in batch:
+                n = out[i].numel()
+                out[i] = flat[offset : offset + n].view(out[i].shape)
+                offset += n
     for i, t in enumerate(out):
         if t.device.type != "cpu":
             out[i] = t.cpu()

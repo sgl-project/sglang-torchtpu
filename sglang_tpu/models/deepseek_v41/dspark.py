@@ -52,8 +52,14 @@ def dspark_attention_forward(attn, positions, hidden_states, forward_batch):
     num_tokens = o.shape[0]
     groups = attn.n_local_groups
     o = o.reshape(num_tokens, groups, -1)
-    wo_a = attn.wo_a.weight.view(groups, attn.o_lora_rank, -1)
-    o = torch.einsum("tgd,grd->tgr", o, wo_a)
+    wo_a_scale = getattr(attn.wo_a, "_tpu_wo_a_fp8_scale", None)
+    if wo_a_scale is not None:
+        from sglang_tpu.models.deepseek_v41.ops.wo_a_fp8 import wo_a_fp8_matmul
+
+        o = wo_a_fp8_matmul(o, attn.wo_a.weight, wo_a_scale)
+    else:
+        wo_a = attn.wo_a.weight.view(groups, attn.o_lora_rank, -1)
+        o = torch.einsum("tgd,grd->tgr", o, wo_a)
     out, _ = attn.wo_b(o.reshape(num_tokens, -1))
     return out
 
@@ -109,12 +115,48 @@ def greedy_markov_drafts(
     draft_hidden = hidden if model.sample_from_anchor else hidden[:, 1:]
     head = model.markov_head
     vocab = head.vocab_size
+    prev = input_ids.view(bs, width)[:, 0].to(torch.int32)
+    if (
+        hidden.device.type == "tpu"
+        and getattr(head, "_tpu_sharded_markov_w2", False)
+    ):
+        from sglang_tpu.models.deepseek_v41.ops.dspark_markov import (
+            sharded_greedy_markov_pallas,
+        )
+
+        x_post_hc = model.collapse_hc_head(draft_hidden.reshape(bs * gamma, -1))
+        x = model.stages[-1].norm(x_post_hc)
+        return sharded_greedy_markov_pallas(
+            x,
+            model.lm_head.weight,
+            head.markov_w1.weight,
+            getattr(head, "_tpu_sharded_markov_w2_weight"),
+            prev,
+            world=int(getattr(head, "_tpu_sharded_markov_world")),
+            vocab=vocab,
+            gamma=gamma,
+        )
     base_logits, _ = model.compute_base_logits(draft_hidden.reshape(bs * gamma, -1))
-    base_logits = base_logits[..., :vocab].float().view(bs, gamma, vocab)
     w1 = head.markov_w1.weight[:vocab]
     w2 = head.markov_w2.weight[:vocab]
+    if (
+        hidden.device.type == "tpu"
+        and vocab >= 8
+        and vocab % 8 == 0
+        and w1.shape[1] % 128 == 0
+    ):
+        from sglang_tpu.models.deepseek_v41.ops.dspark_markov import (
+            greedy_markov_pallas,
+        )
+
+        return greedy_markov_pallas(
+            base_logits[..., :vocab].view(bs, gamma, vocab),
+            w1,
+            w2,
+            prev,
+        )
+    base_logits = base_logits[..., :vocab].float().view(bs, gamma, vocab)
     ids = torch.arange(vocab, device=hidden.device, dtype=torch.int32)
-    prev = input_ids.view(bs, width)[:, 0].to(torch.int32)
     drafts = []
     for step in range(gamma):
         one_hot = (prev.unsqueeze(-1) == ids).to(w1.dtype)

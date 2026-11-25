@@ -113,6 +113,7 @@ logger = logging.getLogger(__name__)
 READY_ATTR = "_tpu_dsv41_fused_ep_ready"
 _KEY_ATTR = "_tpu_dsv41_fused_ep_key"
 _RANK_ATTR = "_tpu_dsv41_fused_ep_ep_rank"
+_SHARED_ATTR = "_tpu_dsv41_fused_ep_shared"
 
 # Buffers registered on the FusedMoE (``moe.experts``).
 W1, W2, W1_SCALE, W2_SCALE, RANK = (
@@ -223,6 +224,7 @@ def _op_name(
     gate_up_bits: int = k32z.GATE_UP_SHIFT_BITS,
     dispatch: str = fe.DISPATCH,
     push_max_rows: int = fe.PUSH_MAX_ROWS,
+    fuse_shared: bool = False,
 ) -> str:
     """One torch custom-op name per closure configuration (the kernel's other
     settings are module constants of fused_ep and part of the name too)."""
@@ -234,7 +236,8 @@ def _op_name(
         head = f"{head}_k32z_g{gate_up_bits}_c{fe.K32Z_CAPACITY}"
     else:
         head = f"{head}_c{fe.CAPACITY}_q{fe.RHS_QB}"
-    return f"{head}{_dispatch_tag(dispatch, push_max_rows)}_{axis_name}"
+    sh = "_sh" if fuse_shared else ""
+    return f"{head}{_dispatch_tag(dispatch, push_max_rows)}{sh}_{axis_name}"
 
 
 def _op_key(
@@ -248,6 +251,7 @@ def _op_key(
     gate_up_bits: int = k32z.GATE_UP_SHIFT_BITS,
     dispatch: str = fe.DISPATCH,
     push_max_rows: int = fe.PUSH_MAX_ROWS,
+    fuse_shared: bool = False,
 ) -> tuple:
     """``_build_op``'s arguments, normalized: one key per op (and op name)."""
     if dispatch not in fe.DISPATCHES:
@@ -263,15 +267,18 @@ def _op_key(
     # A K512 all-gather key is these six fields and a K32Z one adds its format
     # and width; a push or auto key adds both (width 0 for K512) and its
     # dispatch with auto's bound (0 for push, which has none).
-    if expert_format == fe.EXPERT_FORMAT_K512 and dispatch == fe.DISPATCH:
+    if expert_format == fe.EXPERT_FORMAT_K512 and dispatch == fe.DISPATCH and not fuse_shared:
         return key
     if expert_format == fe.EXPERT_FORMAT_K512:
         gate_up_bits = 0
     key += (str(expert_format), int(gate_up_bits))
-    if dispatch == fe.DISPATCH:
+    if dispatch == fe.DISPATCH and not fuse_shared:
         return key
     bound = int(push_max_rows) if dispatch == fe.DISPATCH_AUTO else 0
-    return key + (str(dispatch), bound)
+    key += (str(dispatch), bound)
+    if fuse_shared:
+        key += (True,)
+    return key
 
 
 def _make_jax_fn(
@@ -285,13 +292,14 @@ def _make_jax_fn(
     expert_format: str = fe.EXPERT_FORMAT_K512,
     dispatch: str = fe.DISPATCH,
     push_max_rows: int = fe.PUSH_MAX_ROWS,
+    fuse_shared: bool = False,
 ):
     """The exported JAX body, its input and its output partition specs.
 
     Arguments arrive as global arrays: rows of x/gating, experts of the
     weights and scales, and the rank vector are sharded on the EP axis (each
-    rank's torch tensor is its shard); the correction bias is replicated, as
-    it is indexed by global expert id.
+    rank's torch tensor is its shard); the correction bias and (when fused)
+    replicated shared expert weights/scales are replicated.
     """
     import jax
     from jax.sharding import PartitionSpec as P
@@ -308,7 +316,32 @@ def _make_jax_fn(
         expert_format=expert_format,
         dispatch=dispatch,
         push_max_rows=push_max_rows,
+        fuse_shared=fuse_shared,
     )
+
+    rows = P(axis_name)
+    if fuse_shared:
+        def dsv41_fused_ep_shared(
+            x: jax.Array,
+            gating: jax.Array,
+            w1: jax.Array,
+            w2: jax.Array,
+            w1_scale: jax.Array,
+            w2_scale: jax.Array,
+            score_bias: jax.Array,
+            rank: jax.Array,
+            sw13: jax.Array,
+            ss13: jax.Array,
+            sw2: jax.Array,
+            ss2: jax.Array,
+        ) -> jax.Array:
+            return moe(
+                x, gating, w1, w2, w1_scale, w2_scale, score_bias, rank,
+                sw13, ss13, sw2, ss2,
+            )
+
+        in_specs = (rows,) * 6 + (P(), rows) + (P(),) * 4
+        return dsv41_fused_ep_shared, in_specs, (rows,)
 
     def dsv41_fused_ep(
         x: jax.Array,
@@ -322,7 +355,6 @@ def _make_jax_fn(
     ) -> jax.Array:
         return moe(x, gating, w1, w2, w1_scale, w2_scale, score_bias, rank)
 
-    rows = P(axis_name)
     in_specs = (rows,) * 6 + (P(), rows)
     return dsv41_fused_ep, in_specs, (rows,)
 
@@ -345,6 +377,7 @@ def _build_op(
     gate_up_bits: int = k32z.GATE_UP_SHIFT_BITS,
     dispatch: str = fe.DISPATCH,
     push_max_rows: int = fe.PUSH_MAX_ROWS,
+    fuse_shared: bool = False,
 ) -> Callable:
     mesh = _get_mesh(ep, axis_name)
     fn, in_specs, out_specs = _make_jax_fn(
@@ -358,6 +391,7 @@ def _build_op(
         expert_format,
         dispatch,
         push_max_rows,
+        fuse_shared,
     )
     op = _export_op(
         _op_name(
@@ -371,6 +405,7 @@ def _build_op(
             gate_up_bits,
             dispatch,
             push_max_rows,
+            fuse_shared,
         ),
         fn,
         mesh=mesh,
@@ -393,6 +428,7 @@ def _get_op(
     gate_up_bits: int = k32z.GATE_UP_SHIFT_BITS,
     dispatch: str = fe.DISPATCH,
     push_max_rows: int = fe.PUSH_MAX_ROWS,
+    fuse_shared: bool = False,
 ) -> Callable:
     key = _op_key(
         ep,
@@ -405,6 +441,7 @@ def _get_op(
         gate_up_bits,
         dispatch,
         push_max_rows,
+        fuse_shared,
     )
     op = _OPS.get(key)
     if op is not None:
@@ -577,8 +614,6 @@ def is_dsv41_moe(module: torch.nn.Module) -> bool:
 def layer_skip_reason(moe: torch.nn.Module) -> Optional[str]:
     """Why a V4.1 MoE layer keeps the gmm_v2 path although the switch is on.
     The decision depends only on the model config, so all ranks agree."""
-    if moe.is_nextn:
-        return "NextN/MTP draft layer"
     if moe.is_hash:
         return "hash-routed layer (token-id top-k)"
     return None
@@ -737,6 +772,41 @@ def _resolve_traced_rank() -> Optional[Callable]:
 # --------------------------------------------------------------------------- #
 # Preparation (after weight loading, before precompile).
 # --------------------------------------------------------------------------- #
+def _shared_expert_fp8_operands(
+    moe: torch.nn.Module,
+) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Extract channelwise FP8 ``(w13, s13, w2, s2)`` from ``moe.shared_experts``
+    in the layout ``push_fused_moe`` / ``fp8_swiglu_mlp`` expects, or None."""
+    shared = getattr(moe, "shared_experts", None)
+    if shared is None:
+        return None
+    gate_up = getattr(shared, "gate_up_proj", None)
+    down = getattr(shared, "down_proj", None)
+    if gate_up is None or down is None:
+        return None
+    w13 = getattr(gate_up, "weight", None)
+    s13 = getattr(gate_up, "weight_scale", None)
+    w2 = getattr(down, "weight", None)
+    s2 = getattr(down, "weight_scale", None)
+    if any(t is None for t in (w13, s13, w2, s2)):
+        return None
+    if getattr(gate_up, "bias", None) is not None or getattr(down, "bias", None) is not None:
+        return None
+    if getattr(gate_up, "input_scale", None) is not None or getattr(down, "input_scale", None) is not None:
+        return None
+    if w13.dtype != torch.float8_e4m3fn or w2.dtype != torch.float8_e4m3fn:
+        return None
+    if s13.dtype != torch.float32 or s2.dtype != torch.float32:
+        return None
+    hidden = int(moe.config.hidden_size)
+    inter = int(w2.shape[0])
+    if tuple(w13.shape) != (hidden, 2 * inter) or tuple(w2.shape) != (inter, hidden):
+        return None
+    if s13.numel() != 2 * inter or s2.numel() != hidden:
+        return None
+    return (w13, s13, w2, s2)
+
+
 def prepare_moe_layer_for_fused_ep(
     moe: torch.nn.Module,
     *,
@@ -774,6 +844,12 @@ def prepare_moe_layer_for_fused_ep(
     to_k32z = k32z.is_deferred(experts)
     gate_up_bits = k32z.SERVING_GATE_UP_BITS if to_k32z else 0
     dispatch, push_max_rows = selected_dispatch(), fe.PUSH_MAX_ROWS
+    shared_ops = (
+        _shared_expert_fp8_operands(moe)
+        if dispatch in (fe.DISPATCH_PUSH, fe.DISPATCH_AUTO)
+        else None
+    )
+    fuse_shared = shared_ops is not None
     key = _op_key(
         ep,
         config.num_experts_per_tok,
@@ -785,6 +861,7 @@ def prepare_moe_layer_for_fused_ep(
         gate_up_bits,
         dispatch,
         push_max_rows,
+        fuse_shared,
     )
     # Build the op first (outside Dynamo): a failure leaves the weights as loaded.
     _get_op(*key)
@@ -803,6 +880,8 @@ def prepare_moe_layer_for_fused_ep(
     for name, tensor in ((W1, w1), (W2, w2), (W1_SCALE, s1), (W2_SCALE, s2)):
         experts.register_buffer(name, tensor, persistent=False)
     experts.register_buffer(RANK, rank, persistent=False)
+    if shared_ops is not None:
+        setattr(moe, _SHARED_ATTR, True)
 
     setattr(moe, _KEY_ATTR, key)
     setattr(moe, _RANK_ATTR, int(ep_rank))
@@ -966,11 +1045,11 @@ def _rank_operand(experts: torch.nn.Module, ep_rank: int, ep: int) -> torch.Tens
 def apply_fused_ep(
     moe: torch.nn.Module, hidden_states: torch.Tensor, gating: torch.Tensor
 ) -> torch.Tensor:
-    """The routed experts of this rank's rows, routed scale included."""
+    """The routed experts (plus overlapped shared expert when fused) of this rank's rows."""
     key = getattr(moe, _KEY_ATTR)
     experts = moe.experts
     op = _get_op(*key)
-    return op(
+    args = (
         hidden_states,
         gating,
         getattr(experts, W1),
@@ -980,6 +1059,16 @@ def apply_fused_ep(
         moe.gate.e_score_correction_bias,
         _rank_operand(experts, getattr(moe, _RANK_ATTR), key[0]),
     )
+    if getattr(moe, _SHARED_ATTR, False):
+        se = moe.shared_experts
+        return op(
+            *args,
+            se.gate_up_proj.weight,
+            se.gate_up_proj.weight_scale,
+            se.down_proj.weight,
+            se.down_proj.weight_scale,
+        )
+    return op(*args)
 
 
 def forward_fused_ep_moe(
@@ -1003,7 +1092,8 @@ def forward_fused_ep_moe(
         return hidden_states.new_zeros(hidden_states.shape)
     gating = local_gating_logits(moe, hidden_states, real_row_count(forward_batch))
     out = apply_fused_ep(moe, hidden_states, gating)
-    shared = moe._forward_shared_experts(hidden_states)
-    if shared is not None:
-        out = out + shared
+    if not getattr(moe, _SHARED_ATTR, False):
+        shared = moe._forward_shared_experts(hidden_states)
+        if shared is not None:
+            out = out + shared
     return out

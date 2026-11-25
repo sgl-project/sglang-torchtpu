@@ -26,6 +26,7 @@ from jax.experimental.pallas import tpu_sc as plsc
 from sglang_tpu.kernels.deepseek_v41.index_selection.tuned_block_sizes import (
     STREAMING_TOPK_CONFIG,
     StreamingTopKConfig,
+    streaming_topk_config,
 )
 
 # Byte-wise radix passes over IEEE FP32 keys. These describe the representation,
@@ -88,9 +89,7 @@ def _block_visit_order(num_blocks: int) -> tuple[int, int, int]:
 
 
 def _buffer_sizes(k, width, block_size, threshold, mapping_width, info, sc):
-    config = STREAMING_TOPK_CONFIG.get(
-        (info.generation, width, k), StreamingTopKConfig()
-    )
+    config = streaming_topk_config(info.generation, width, k)
     output_width = pl.cdiv(k, info.num_lanes) * info.num_lanes
     bootstrap_width = min(block_size, config.bootstrap_multiplier * k)
     chunk_size = math.gcd(block_size, bootstrap_width)
@@ -236,9 +235,7 @@ def streaming_topk(
         )
         width += padding
     info = plsc.get_sparse_core_info()
-    config = STREAMING_TOPK_CONFIG.get(
-        (pltpu.get_tpu_info().generation, valid_width, k), StreamingTopKConfig()
-    )
+    config = streaming_topk_config(pltpu.get_tpu_info().generation, valid_width, k)
     loop_unroll = config.loop_unroll
     lanes = info.num_lanes
     if any(n % lanes for n in (k, block_size, reconstruct_threshold)):

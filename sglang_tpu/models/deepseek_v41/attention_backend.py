@@ -702,10 +702,10 @@ def _device_row_metadata(
     host_input_mirror.release(forward_batch)
     dev = _upload_metadata(host, device=device, pack=False)
 
-    # One program, not ~60: past PJRT's 32 in-flight executions each small op
-    # would block dispatch until the running forward ends (fused_eager.py).
-    with fused_eager_ops(forward_batch.positions.device.type == "tpu") as fused:
-        fields = _device_row_fields(
+    # One program, not ~25+: TorchTPU's DEFER_AND_FUSE does not fuse masked_fill
+    # / index / arange, so on TPU use the single compiled JAX op instead.
+    if forward_batch.positions.device.type == "tpu":
+        fields = _device_row_fields_tpu(
             forward_batch,
             dev=dev,
             tables=tables,
@@ -713,13 +713,85 @@ def _device_row_metadata(
             columns=columns if window else 0,
             base_page=request_window.workspace_first_page if window else 0,
         )
-    if fused:
-        submit(_metadata_leaves(fields))
+    else:
+        with fused_eager_ops(False) as fused:
+            fields = _device_row_fields(
+                forward_batch,
+                dev=dev,
+                tables=tables,
+                window=window,
+                columns=columns if window else 0,
+                base_page=request_window.workspace_first_page if window else 0,
+            )
+        if fused:
+            submit(_metadata_leaves(fields))
     return DSV41TPUForwardMetadata(
         query_start_loc=dev["query_start_loc"],
         full_pages=tables.full_pages_device,
         swa_minimum=dev["swa_minimum"],
         **fields,
+    )
+
+
+def _device_row_fields_tpu(
+    forward_batch: ForwardBatch,
+    *,
+    dev: Dict[str, torch.Tensor],
+    tables: SlotTables,
+    window: bool,
+    columns: int,
+    base_page: int,
+) -> Dict[str, object]:
+    """Fused TPU version of ``_device_row_fields`` (replaces ~55 eager ops with 1 op
+    plus 3 distinct-buffer copies so graph inputs never alias ``forward_batch`` or ``valid``)."""
+    from sglang_tpu.models.deepseek_v41 import device_rows
+
+    ratio_items = tuple(tables.index_pages.items())
+    ratios = tuple(r for r, _ in ratio_items)
+    # Distinct-buffer copies: the host build's fields are separate graph inputs,
+    # not aliases of forward_batch.positions / out_cache_loc or valid.
+    positions = forward_batch.positions.to(torch.int32, copy=True)
+    out_cache_loc = forward_batch.out_cache_loc.to(torch.int32, copy=True)
+    outs = device_rows.fused_device_row_fields(
+        positions=positions,
+        out_cache_loc=out_cache_loc,
+        host_rows=dev["host_rows"],
+        req_pool_indices=dev["req_pool_indices"],
+        window=window,
+        counts=dev.get("counts"),
+        live=dev.get("live"),
+        first_row=dev.get("first_row"),
+        swa_minimum=dev.get("swa_minimum"),
+        columns=columns,
+        base_page=base_page,
+        ratios=ratios,
+    )
+    token_rows, valid, token_req_pool = outs[:3]
+    compress_valid = valid.clone()
+    idx = 3
+    if window:
+        swa_pages = outs[idx]
+        window_plan = WindowPlan(*outs[idx + 1 : idx + 5])
+        idx += 5
+    else:
+        swa_pages = tables.swa_pages
+        window_plan = None
+    low_ratio = {}
+    for ratio, index_pages in ratio_items:
+        low_ratio[ratio] = LowRatioMetadata(
+            out_loc=outs[idx], lengths=outs[idx + 1], index_pages=index_pages
+        )
+        idx += 2
+    return dict(
+        positions=positions,
+        token_rows=token_rows,
+        token_req_pool=token_req_pool,
+        valid=valid,
+        compress_valid=compress_valid,
+        out_cache_loc=out_cache_loc,
+        swa_pages=swa_pages,
+        low_ratio=low_ratio,
+        swa_window_plan=window_plan,
     )
 
 
@@ -1452,11 +1524,18 @@ class DSV41TPUAttnBackend(AttentionBackend):
     def _register_ops():
         # Registration must precede torch.compile tracing.
         from sglang_tpu.dsv4.dsv4_attention_backend import _register_rope_op
-        from sglang_tpu.models.deepseek_v41.ops import csa2, indexer
+        from sglang_tpu.models.deepseek_v41.ops import (
+            csa2,
+            dspark_markov,
+            indexer,
+            wo_a_fp8,
+        )
 
         _register_rope_op()  # apply_rope's Pallas RoPE op
         csa2.register_csa2_ops()
         indexer.register_indexer_ops()
+        dspark_markov.register_dspark_markov_op()
+        wo_a_fp8.register_wo_a_fp8_op()
         return csa2, indexer
 
     def _prewarm_model_caches(self) -> None:
@@ -2074,12 +2153,19 @@ class DSV41TPUAttnBackend(AttentionBackend):
         records = metadata.swa_write_records
         plan = metadata.swa_window_plan
         if plan is not None:
-            # One publish also copies ring history into the workspace pages the
-            # chunk attends and the chunk's last window back into the ring.
-            history = swa.reshape(-1, kv.shape[1])[plan.history_src]
-            kv = torch.cat((kv, history, kv[plan.commit_token]))
-            records = torch.cat((records, plan.history_dst, plan.commit_dst))
-        swa.copy_(self.csa2_ops.publish_swa(swa, records, kv))
+            swa.copy_(
+                self.csa2_ops.publish_swa_window(
+                    swa,
+                    records,
+                    kv,
+                    plan.history_src,
+                    plan.history_dst,
+                    plan.commit_token,
+                    plan.commit_dst,
+                )
+            )
+        else:
+            swa.copy_(self.csa2_ops.publish_swa(swa, records, kv))
 
         if attn_sink is None:
             sink = torch.zeros(q.shape[1], dtype=torch.float32, device=q.device)

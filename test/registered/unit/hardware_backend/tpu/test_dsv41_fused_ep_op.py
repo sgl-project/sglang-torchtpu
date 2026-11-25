@@ -733,7 +733,7 @@ def test_global_requirements():
     ]
 
 
-def test_layer_requirements_and_skips():
+def test_layer_requirements_and_skips(monkeypatch):
     gate, shared = _parts(torch.bfloat16)
     gmm = _gmm_prepared(E, H, I)
     check = op_mod.unmet_layer_requirements
@@ -766,15 +766,14 @@ def test_layer_requirements_and_skips():
         "fp32 correction bias over every routed expert"
     ]
 
-    # Hash and draft layers keep gmm_v2; a refused layer raises.
-    for attr in ("is_hash", "is_nextn"):
-        moe = _moe(gmm, gate, shared)
-        setattr(moe, attr, True)
-        assert not op_mod.prepare_moe_layer_for_fused_ep(
-            moe, ep=1, ep_rank=0, multimodal_enabled=False
-        )
-        assert moe.experts.w13_weight.numel() > 0
-        assert moe.dp_local_forward is None
+    # Hash layers always keep gmm_v2; a refused layer raises.
+    moe = _moe(gmm, gate, shared)
+    moe.is_hash = True
+    assert not op_mod.prepare_moe_layer_for_fused_ep(
+        moe, ep=1, ep_rank=0, multimodal_enabled=False
+    )
+    assert moe.experts.w13_weight.numel() > 0
+    assert moe.dp_local_forward is None
     with pytest.raises(ValueError, match="SGLANG_SHARED_EXPERT_TP1"):
         op_mod.prepare_moe_layer_for_fused_ep(
             _moe(gmm, gate, shared, tp1=False),
@@ -828,19 +827,19 @@ def test_prepare_model_checks_and_counts(monkeypatch):
 
     monkeypatch.setattr(rc, "get_exec", lambda: _exec())
     with op_mod.kernel_override(None):
-        assert op_mod.prepare_model_for_dsv41_fused_ep(model) == 2
+        assert op_mod.prepare_model_for_dsv41_fused_ep(model) == 3
     assert [getattr(m, op_mod.READY_ATTR, False) for m in layers] == [
         False,
         True,
         True,
-        False,
+        True,
     ]
     # Only prepared layers take the seam in _run_moe_ffn_dp_sync; hash-routed
-    # and draft layers keep their gmm_v2 experts.
-    for m in (hashed, draft):
-        assert m.experts.w13_weight.numel() > 0
-        assert m.dp_local_forward is None
-    for m in layers[1:3]:
+    # layers keep their gmm_v2 experts while DSpark draft layers (is_nextn)
+    # are prepared alongside target layers.
+    assert hashed.experts.w13_weight.numel() > 0
+    assert hashed.dp_local_forward is None
+    for m in layers[1:]:
         assert m.dp_local_forward.func is op_mod.forward_fused_ep_moe
         assert m.dp_local_forward.args == (m,)
     # A model without V4.1 MoE layers (e.g. a draft) is left alone.

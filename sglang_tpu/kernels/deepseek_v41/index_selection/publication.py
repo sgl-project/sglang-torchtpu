@@ -160,14 +160,10 @@ def candidate_block_scores(
     if (
         scores.dtype == jnp.float32
         and lengths.dtype == jnp.int32
-        and any(
-            key[1:] == (rows, width, block_size)
-            for key in tuned_block_sizes.PUBLISH_BLOCK_MAX_CONFIG
-        )
         and jax.default_backend() == "tpu"
     ):
-        config = tuned_block_sizes.PUBLISH_BLOCK_MAX_CONFIG.get(
-            (pltpu.get_tpu_info().generation, rows, width, block_size)
+        config = tuned_block_sizes.publish_block_max_config(
+            pltpu.get_tpu_info().generation, rows, width, block_size
         )
     if config is not None:
         return _candidate_block_scores(scores, lengths, block_size, config)
@@ -190,6 +186,12 @@ def _candidate_block_scores(scores, lengths, block_size, config):
     row_tile, block_tile = config
     lanes = pltpu.get_tpu_info().num_lanes
     blocks = pl.cdiv(width, block_size)
+    padded_rows = pl.cdiv(rows, row_tile) * row_tile
+    if padded_rows > rows:
+        # Pad only the tiny 1D lengths vector with 0; the final row tile of
+        # `scores` is a partial BlockSpec window whose invisible rows are masked
+        # via `columns < limits`, avoiding a full [rows, width] scores copy.
+        lengths = jnp.pad(lengths, (0, padded_rows - rows), constant_values=0)
     padded_blocks = pl.cdiv(blocks, block_tile) * block_tile
     token_tile = block_tile * block_size
 
@@ -219,10 +221,10 @@ def _candidate_block_scores(scores, lengths, block_size, config):
     # in the kernel, avoiding a full score-buffer copy to pad the DMA tile.
     result = pl.pallas_call(
         kernel,
-        out_shape=jax.ShapeDtypeStruct((rows, padded_blocks), scores.dtype),
+        out_shape=jax.ShapeDtypeStruct((padded_rows, padded_blocks), scores.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
-            grid=(rows // row_tile, padded_blocks // block_tile),
+            grid=(padded_rows // row_tile, padded_blocks // block_tile),
             in_specs=(pl.BlockSpec((row_tile, token_tile), lambda i, j, _: (i, j)),),
             out_specs=pl.BlockSpec((row_tile, block_tile), lambda i, j, _: (i, j)),
         ),
@@ -231,4 +233,4 @@ def _candidate_block_scores(scores, lengths, block_size, config):
         ),
         name="indexer_candidate_block_max",
     )(lengths, scores)
-    return result[:, :blocks]
+    return result[:rows, :blocks]

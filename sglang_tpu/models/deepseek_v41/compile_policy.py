@@ -61,6 +61,17 @@ def _stage_host_engram(coordinator, hasher, input_ids, forward_batch):
     # paths below read or write hasher.history. A verify flushes in stage_verify,
     # where its draft tokens come back in the same read.
     verify = forward_batch.forward_mode.is_target_verify() and not coordinator.started
+    if verify:
+        dev_verify = coordinator.get_device_verify()
+        if dev_verify is not None:
+            dev_res = dev_verify.stage_verify(input_ids, forward_batch)
+            if dev_res is not None:
+                staged, num_cols = dev_res
+                forward_batch.tpu_engram_staged = staged
+                forward_batch.tpu_engram_local_ids = engram_host.local_row_ids(
+                    padded_tokens, len(staged), num_cols, device
+                )
+                return None
     if not verify:
         engram_host.flush_engram_commits(hasher)
     staged_result = None
@@ -119,9 +130,32 @@ class _EngramCompiledForwardShim(CompiledForwardShim):
                 coordinator, hasher, input_ids, forward_batch
             )
             if not active_uploads:
-                return super()._forward(
+                out = super()._forward(
                     fn, input_ids, positions, forward_batch, *args, **kwargs
                 )
+                if (
+                    isinstance(out, PendingCall)
+                    and forward_batch.tpu_engram_staged is not None
+                ):
+                    # On-device Engram verify stages tensors without host DMA
+                    # uploads; re-pin them when the deferred warmup executes so
+                    # the traced graph never falls back to CPU Engram weights.
+                    staged_ids = forward_batch.tpu_engram_local_ids
+                    staged_rows = forward_batch.tpu_engram_staged
+
+                    def _run_pending_device():
+                        prev_ids = forward_batch.tpu_engram_local_ids
+                        prev_staged = forward_batch.tpu_engram_staged
+                        forward_batch.tpu_engram_local_ids = staged_ids
+                        forward_batch.tpu_engram_staged = staged_rows
+                        try:
+                            return out.wait()
+                        finally:
+                            forward_batch.tpu_engram_local_ids = prev_ids
+                            forward_batch.tpu_engram_staged = prev_staged
+
+                    return PendingCall(_run_pending_device)
+                return out
             raw_consumers: list[torch.Tensor] = []
             recorded_events: list[Any] = []
 
@@ -321,12 +355,37 @@ class DeepseekV4DecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         )
         with torch.no_grad():
             ids = forward_batch.input_ids
-            safe_ids = torch.where(
-                (ids < 0) | (ids >= engram_host._MM_PAD_SHIFT_VALUE),
-                fallback_id,
-                ids,
+            model = self.model_runner.model
+            embed_mod = (
+                model.embed_tokens
+                if isinstance(model, DeepseekV4ForCausalLMDSpark)
+                else model.get_input_embeddings()
             )
-            forward_batch.input_embeds = self._embed(safe_ids)
+            if (
+                ids.device.type == "tpu"
+                and getattr(embed_mod, "tp_size", 0) == 1
+                and getattr(embed_mod, "output_dtype", None) is None
+                and hasattr(embed_mod, "weight")
+            ):
+                from sglang_tpu.models.deepseek_v41.engram_device import (
+                    fused_safe_embed_tpu,
+                )
+
+                hc_mult = (
+                    int(model.hc_mult)
+                    if isinstance(model, DeepseekV4ForCausalLMDSpark)
+                    else 1
+                )
+                forward_batch.input_embeds = fused_safe_embed_tpu(
+                    ids, embed_mod.weight, fallback_id=fallback_id, hc_mult=hc_mult
+                )
+            else:
+                safe_ids = torch.where(
+                    (ids < 0) | (ids >= engram_host._MM_PAD_SHIFT_VALUE),
+                    fallback_id,
+                    ids,
+                )
+                forward_batch.input_embeds = self._embed(safe_ids)
 
     # ------------------------------------------------------------------ #
     # Decoder SWA bounded replay: one shared decoder row bucket per forward

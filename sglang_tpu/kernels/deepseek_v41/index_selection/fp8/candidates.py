@@ -602,6 +602,9 @@ def _bitmap_candidate_blocks(
     return candidate_block_ids, physical_block_ids, owners[:, :3]
 
 
+_MAX_HIST_TILE_BLOCKS = 16384
+
+
 def _metadata_scratch_words(
     queries: int,
     per_query: int,
@@ -622,8 +625,12 @@ def _metadata_scratch_words(
     control = (
         alignment + aligned(offsets) + aligned(requests) if requests else sc.num_lanes
     )
+    if per_query % sc.num_lanes == 0:
+        hist_words = aligned(min(blocks, _MAX_HIST_TILE_BLOCKS))
+    else:
+        hist_words = queries * aligned(blocks)
     return (
-        queries * aligned(blocks)
+        hist_words
         + aligned(table_columns)
         + 4 * (aligned(queries * per_query) + sc.num_lanes)
         + control
@@ -723,6 +730,14 @@ def canonical_candidate_blocks(
             )
         )
     per_page, parts = max(1, page_size // block), max(1, block // page_size)
+    bitmask_hist = per_query % lanes == 0
+    hist_tile = (
+        pl.cdiv(min(blocks, _MAX_HIST_TILE_BLOCKS), alignment) * alignment
+        if bitmask_hist
+        else histogram_width
+    )
+    hist_num_tiles = pl.cdiv(blocks, hist_tile) if bitmask_hist else 1
+    hist_size = hist_tile if bitmask_hist else queries * histogram_width
     mesh = plsc.VectorSubcoreMesh(core_axis_name="core", subcore_axis_name="subcore")
 
     @pl.kernel(
@@ -732,7 +747,7 @@ def canonical_candidate_blocks(
             jax.ShapeDtypeStruct((rows, alignment), jnp.int32),
         ),
         scratch_types=(
-            pltpu.VMEM((queries * histogram_width,), jnp.int32),
+            pltpu.VMEM((hist_size,), jnp.int32),
             pltpu.VMEM((columns + lanes,), jnp.int32),
             pltpu.VMEM((table.shape[1],), jnp.int32),
             pltpu.VMEM((columns + lanes,), jnp.int32),
@@ -794,12 +809,6 @@ def canonical_candidate_blocks(
                 page_row = row_id
             read_pages = pltpu.async_copy(pages.at[page_row], page_ids, sem.at[1])
 
-            @plsc.parallel_loop(
-                0, queries * histogram_width, lanes, unroll=alignment // lanes
-            )
-            def clear_hist(i):
-                hist[pl.ds(i, lanes)] = jnp.zeros(lanes, jnp.int32)
-
             @plsc.parallel_loop(0, columns + lanes, lanes)
             def clear_result(i):
                 logical_ids[pl.ds(i, lanes)] = jnp.full(lanes, -1, jnp.int32)
@@ -809,75 +818,162 @@ def canonical_candidate_blocks(
                 copy.wait()
             read_pages.wait()
 
-            # One presence histogram per query; a block's owner bit is set when
-            # that query lists it. ``scan_count`` dedupes repeats within a query.
-            @plsc.parallel_loop(0, columns, lanes, unroll=alignment // lanes)
-            def scatter(i):
-                keys = ids[pl.ds(i, lanes)]
-                query = (i + jnp.arange(lanes)) // per_query
-                base = query * histogram_width
-                inc, mask = plsc.scan_count(
-                    keys,
-                    mask=(keys >= 0)
-                    & (keys < blocks)
-                    & (query < row_queries)
-                    & row_valid,
-                )
-                plsc.addupdate_scatter(
-                    hist,
-                    [base + jnp.clip(keys, 0, histogram_width - 1)],
-                    inc,
-                    mask=mask,
-                )
+            if bitmask_hist:
+                # Tile the single bitmask histogram to <= _MAX_HIST_TILE_BLOCKS
+                # (<= 64 KB VMEM) so 1M-context block=16 tables fit on SparseCore.
+                # Processing one query at a time makes load_gather | (1 << q) ->
+                # store_scatter idempotent and race-free even with duplicate keys.
+                def tile_step(tile_idx, union_count):
+                    t0 = tile_idx * hist_tile
+                    t1 = jnp.minimum(t0 + hist_tile, blocks)
 
-            def compact(i, count):
-                logical = i + jnp.arange(lanes)
-                owner = jnp.zeros(lanes, jnp.int32)
-                for query in range(queries):
-                    present = hist[pl.ds(query * histogram_width + i, lanes)] != 0
-                    owner = owner | (present.astype(jnp.int32) << query)
-                page = plsc.load_gather(
-                    page_ids,
-                    [jnp.minimum(logical // per_page * parts, table.shape[1] - 1)],
-                )
-                valid = (
-                    (owner != 0)
-                    & (logical < blocks)
-                    & (logical * block < table.shape[1] * page_size)
-                    & (page >= 0)
-                    & (page < cache_pages)
-                )
-                for part in range(1, parts):
-                    column = logical * parts + part
-                    following = plsc.load_gather(
-                        page_ids, [jnp.minimum(column, table.shape[1] - 1)]
-                    )
-                    valid &= (logical * block + part * page_size >= width) | (
-                        (column < table.shape[1])
-                        & (following >= 0)
-                        & (following < cache_pages)
-                    )
-                plsc.store_compressed(
-                    logical_ids.at[pl.ds(count, lanes)], logical, mask=valid
-                )
-                plsc.store_compressed(
-                    owner_ids.at[pl.ds(count, lanes)], owner, mask=valid
-                )
-                return count + plsc.all_reduce_population_count(valid)[0]
+                    @plsc.parallel_loop(0, hist_tile, lanes, unroll=alignment // lanes)
+                    def clear_tile(i):
+                        hist[pl.ds(i, lanes)] = jnp.zeros(lanes, jnp.int32)
 
-            loop = cast(
-                Callable[[Callable[[jax.Array, jax.Array], jax.Array]], jax.Array],
-                plsc.parallel_loop(
-                    0,
-                    histogram_width,
-                    lanes,
-                    # Fully unrolling one histogram vector miscompiles the
-                    # page-ID gather in libtpu 0.0.50.
-                    unroll=1 if histogram_width == alignment else alignment // lanes,
-                    carry=jnp.int32(0),
-                ),
-            )
-            union_size = loop(compact)
+                    for query in range(queries):
+                        bit = jnp.int32(1 << query)
+
+                        @plsc.parallel_loop(
+                            0, per_query, lanes, unroll=alignment // lanes
+                        )
+                        def scatter_q(i, query=query, bit=bit):
+                            keys = ids[pl.ds(query * per_query + i, lanes)]
+                            valid = (
+                                (keys >= t0)
+                                & (keys < t1)
+                                & (query < row_queries)
+                                & row_valid
+                            )
+                            safe = jnp.clip(keys - t0, 0, hist_tile - 1)
+                            old = plsc.load_gather(hist, [safe], mask=valid)
+                            plsc.store_scatter(hist, [safe], old | bit, mask=valid)
+
+                    def compact_tile(i, count):
+                        logical = t0 + i + jnp.arange(lanes)
+                        owner = hist[pl.ds(i, lanes)]
+                        page = plsc.load_gather(
+                            page_ids,
+                            [
+                                jnp.minimum(
+                                    logical // per_page * parts, table.shape[1] - 1
+                                )
+                            ],
+                        )
+                        valid = (
+                            (owner != 0)
+                            & (logical < t1)
+                            & (logical * block < table.shape[1] * page_size)
+                            & (page >= 0)
+                            & (page < cache_pages)
+                        )
+                        for part in range(1, parts):
+                            column = logical * parts + part
+                            following = plsc.load_gather(
+                                page_ids, [jnp.minimum(column, table.shape[1] - 1)]
+                            )
+                            valid &= (logical * block + part * page_size >= width) | (
+                                (column < table.shape[1])
+                                & (following >= 0)
+                                & (following < cache_pages)
+                            )
+                        plsc.store_compressed(
+                            logical_ids.at[pl.ds(count, lanes)], logical, mask=valid
+                        )
+                        plsc.store_compressed(
+                            owner_ids.at[pl.ds(count, lanes)], owner, mask=valid
+                        )
+                        return count + plsc.all_reduce_population_count(valid)[0]
+
+                    loop = cast(
+                        Callable[[Callable[[jax.Array, jax.Array], jax.Array]], jax.Array],
+                        plsc.parallel_loop(
+                            0,
+                            hist_tile,
+                            lanes,
+                            unroll=1 if hist_tile == alignment else alignment // lanes,
+                            carry=union_count,
+                        ),
+                    )
+                    return loop(compact_tile)
+
+                union_size = lax.fori_loop(0, hist_num_tiles, tile_step, jnp.int32(0))
+            else:
+                @plsc.parallel_loop(
+                    0, hist_size, lanes, unroll=alignment // lanes
+                )
+                def clear_hist(i):
+                    hist[pl.ds(i, lanes)] = jnp.zeros(lanes, jnp.int32)
+
+                # One presence histogram per query; a block's owner bit is set when
+                # that query lists it. ``scan_count`` dedupes repeats within a query.
+                @plsc.parallel_loop(0, columns, lanes, unroll=alignment // lanes)
+                def scatter(i):
+                    keys = ids[pl.ds(i, lanes)]
+                    query = (i + jnp.arange(lanes)) // per_query
+                    base = query * histogram_width
+                    inc, mask = plsc.scan_count(
+                        keys,
+                        mask=(keys >= 0)
+                        & (keys < blocks)
+                        & (query < row_queries)
+                        & row_valid,
+                    )
+                    plsc.addupdate_scatter(
+                        hist,
+                        [base + jnp.clip(keys, 0, histogram_width - 1)],
+                        inc,
+                        mask=mask,
+                    )
+
+                def compact(i, count):
+                    logical = i + jnp.arange(lanes)
+                    owner = jnp.zeros(lanes, jnp.int32)
+                    for query in range(queries):
+                        present = hist[pl.ds(query * histogram_width + i, lanes)] != 0
+                        owner = owner | (present.astype(jnp.int32) << query)
+                    page = plsc.load_gather(
+                        page_ids,
+                        [jnp.minimum(logical // per_page * parts, table.shape[1] - 1)],
+                    )
+                    valid = (
+                        (owner != 0)
+                        & (logical < blocks)
+                        & (logical * block < table.shape[1] * page_size)
+                        & (page >= 0)
+                        & (page < cache_pages)
+                    )
+                    for part in range(1, parts):
+                        column = logical * parts + part
+                        following = plsc.load_gather(
+                            page_ids, [jnp.minimum(column, table.shape[1] - 1)]
+                        )
+                        valid &= (logical * block + part * page_size >= width) | (
+                            (column < table.shape[1])
+                            & (following >= 0)
+                            & (following < cache_pages)
+                        )
+                    plsc.store_compressed(
+                        logical_ids.at[pl.ds(count, lanes)], logical, mask=valid
+                    )
+                    plsc.store_compressed(
+                        owner_ids.at[pl.ds(count, lanes)], owner, mask=valid
+                    )
+                    return count + plsc.all_reduce_population_count(valid)[0]
+
+                loop = cast(
+                    Callable[[Callable[[jax.Array, jax.Array], jax.Array]], jax.Array],
+                    plsc.parallel_loop(
+                        0,
+                        histogram_width,
+                        lanes,
+                        # Fully unrolling one histogram vector miscompiles the
+                        # page-ID gather in libtpu 0.0.50.
+                        unroll=1 if histogram_width == alignment else alignment // lanes,
+                        carry=jnp.int32(0),
+                    ),
+                )
+                union_size = loop(compact)
             ends = []
             position = jnp.int32(0)
             for ownership in (1, 3, 2):

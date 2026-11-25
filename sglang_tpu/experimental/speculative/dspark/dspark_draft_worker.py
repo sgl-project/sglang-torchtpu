@@ -121,5 +121,11 @@ def _attach_target_vocab(
     embedding = target_input_embedding(target_model)
     if embedding is None:
         draft_model.lm_head = lm_head
-        return
-    draft_model.attach_shared_modules(embed_tokens=embedding, lm_head=lm_head)
+    else:
+        draft_model.attach_shared_modules(embed_tokens=embedding, lm_head=lm_head)
+    if getattr(getattr(draft_model, "config", None), "model_type", None) == "deepseek_v41":
+        from sglang_tpu.models.deepseek_v41.ops.dspark_markov import (
+            prepare_model_for_dsv41_sharded_markov,
+        )
+
+        prepare_model_for_dsv41_sharded_markov(draft_model)
