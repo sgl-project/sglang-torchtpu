@@ -14,7 +14,7 @@ from sglang_tpu.mm_embedding import (
     TpuEmbeddingResult,
 )
 
-register_cpu_ci(est_time=8, suite="stage-a-test-cpu-intel")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 @pytest.mark.parametrize("cpu_ids", [[], [1, 99, 99, 2, 100], [99] * 8])
