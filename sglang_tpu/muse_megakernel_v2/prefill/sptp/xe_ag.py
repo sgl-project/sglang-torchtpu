@@ -105,7 +105,32 @@ def xe_ag_dequant_call(
             name=f"muse_sptp_xe_ag_dequant_t{rows}_n{n}{f'_tl{tiled}' if tiled else ''}",
         )(*args)
 
+    def kernel3d(x_ref, s_ref, o_ref):
+        o_ref[...] = (x_ref[...].astype(jnp.float32) * s_ref[...][:, :, None]).astype(
+            jnp.bfloat16
+        )
+
+    def call3d(xe8, xs_all):
+        # tiled 4: own rows to [Ts, nk, 128] before the AG (1/tp of the relayout), then an
+        # elementwise dequant of the gathered tiles
+        g = jax.lax.all_gather(xe8.reshape(Ts, nk, 128), axis, axis=0, tiled=True)
+        tm = 256
+        return pl.pallas_call(
+            kernel3d,
+            grid=(rows // tm,),
+            in_specs=[
+                pl.BlockSpec((tm, nk, 128), lambda i: (i, 0, 0)),
+                pl.BlockSpec((tm, 1), lambda i: (i, 0)),
+            ],
+            out_specs=pl.BlockSpec((tm, nk, 128), lambda i: (i, 0, 0)),
+            out_shape=jax.ShapeDtypeStruct((rows, nk, 128), jnp.bfloat16),
+            compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+            name=f"muse_sptp_xe_dequant3d_t{rows}",
+        )(g, xs_all)
+
     def call(xe8, xs_all):
+        if tiled == 4:
+            return call3d(xe8, xs_all)
         out = None
         for j in range(n):
             g = jax.lax.all_gather(

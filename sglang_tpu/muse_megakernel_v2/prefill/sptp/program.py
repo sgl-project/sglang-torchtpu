@@ -306,15 +306,22 @@ def build_forward(c: PFConfig, axis: str = "model"):
         and not ogate_kernel
         and os.environ.get("SPTP_PA_TMAJ", "1") == "1"
     )
-    # SPTP_OGATE_PK=n (with SPTP_PA_OGATE_TOK=1): that o gate as one Pallas pass over the raw RPA
-    # output (u32 head pairs), not XLA's slice / transpose copies and four passes
+    # SPTP_OGATE_PK=12 (with SPTP_PA_OGATE_TOK=1): that o gate as one Pallas pass over the raw RPA
+    # output (u32 head pairs), not XLA's slice / transpose copies and four passes (1, 2: older
+    # kernel variants, sptp/ogate.py)
     ogate_pk = (
         o_gate_pk_call(
             c,
-            int(os.environ.get("SPTP_OGATE_PK_TM", "256")),
+            int(os.environ.get("SPTP_OGATE_PK_TM", "512")),
             int(os.environ.get("SPTP_OGATE_PK", "0")),
         )
         if pa_gtok and os.environ.get("SPTP_OGATE_PK", "0") != "0"
+        else None
+    )
+    # SPTP_OGATE_PK=13 (with SPTP_PA_TMAJ): the same Pallas o gate writing the [qd, T] layout
+    ogate_tm = (
+        o_gate_pk_call(c, int(os.environ.get("SPTP_OGATE_PK_TM", "512")), 13)
+        if pa_tmaj and not xag_gate4 and os.environ.get("SPTP_OGATE_PK", "0") == "13"
         else None
     )
     pa_head = pa_head and not pa_gtok and not pa_tmaj
@@ -582,7 +589,10 @@ def build_forward(c: PFConfig, axis: str = "model"):
                             stream, ids, tw, f8, f_s = pa_o(*args)
                             xe8, xs = pa_pool(l, f8, f_s, smalls, wpool)
                 else:
-                    if ogate_kernel:
+                    if ogate_tm is not None:
+                        with _scope("sp_o_gate"):
+                            g8, g_s = ogate_tm(o, gate)
+                    elif ogate_kernel:
                         with _scope("sp_o_gate"):
                             g8, g_s = o_gate(o, gate)
                     else:
@@ -623,7 +633,8 @@ def build_forward(c: PFConfig, axis: str = "model"):
                                         "SPTP_PA_HEAD=0, SPTP_PA_TMAJ=0"
                                     )
                             elif pa_tmaj:
-                                g8 = g8.transpose(0, 2, 3, 1).reshape(qd, T)
+                                if ogate_tm is None:
+                                    g8 = g8.transpose(0, 2, 3, 1).reshape(qd, T)
                             elif pa_head:
                                 g8 = g8.reshape(c.kv_heads, T, gq * hd)
                             else:

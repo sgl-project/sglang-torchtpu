@@ -83,10 +83,11 @@ def o_gate_pk_call(c: PFConfig, tm: int = 256, v: int = 1):
     if T % tm or hd != 64 or gq % 2:
         raise ValueError(f"o gate pk: {T} rows / tile {tm}, head_dim {hd}, group {gq}")
 
-    def kernel_v11(o_ref, g_ref, x_ref, s_ref, a_ref):
-        # v11: 32-row chunks (one e4m3 vreg per 128 lanes) held in registers through both passes;
-        # head sums of squares as two bf16 dots (hi + lo split), not a 6-pass f32 dot
-        del a_ref
+    def kernel_v12(o_ref, g_ref, x_ref, s_ref, a_ref):
+        # v12 / v13: 32-row chunks (one e4m3 vreg per 128 lanes), statically unrolled so the
+        # stride-G/2 loads have static starts; head sums of squares as two bf16 dots (hi + lo),
+        # not a 6-pass f32 dot. v12 quantizes from registers; v13 writes [qd, T] (SPTP_PA_TMAJ's
+        # layout) from a VMEM copy, one 128 x 128 transpose per block.
         R = 32
         ou = o_ref.bitcast(jnp.uint32)
         lane = jax.lax.broadcasted_iota(jnp.int32, (R, 128), 1)
@@ -95,9 +96,8 @@ def o_gate_pk_call(c: PFConfig, tm: int = 256, v: int = 1):
             jax.lax.broadcasted_iota(jnp.int32, (128, 128), 0) // hd
             == jax.lax.broadcasted_iota(jnp.int32, (128, 128), 1) // hd
         ).astype(jnp.bfloat16)
-
-        def chunk(ci, carry):
-            r0 = pl.multiple_of(ci * R, R)
+        for ci in range(tm // R):
+            r0 = ci * R
             m = jnp.zeros((R, 128), jnp.float32)
             acts = []
             for k in range(hkv):
@@ -115,25 +115,31 @@ def o_gate_pk_call(c: PFConfig, tm: int = 256, v: int = 1):
                     col = k * npair * 128 + p * 128
                     gf = g_ref[pl.ds(r0, R), col : col + 128].astype(jnp.float32)
                     a = jax.nn.sigmoid(gf) * x2 * jax.lax.rsqrt(ss / hd + c.rms_eps)
-                    acts.append(a)
+                    if v == 13:
+                        a_ref[pl.ds(r0, R), col : col + 128] = a
+                    else:
+                        acts.append(a)
                     m = jnp.maximum(m, jnp.abs(a))
             sc = jnp.maximum(jnp.max(m, axis=1, keepdims=True), 1e-30) / 448.0
+            s_ref[pl.ds(r0, R), :] = sc
+            if v == 13:
+                continue
             inv = 1.0 / sc
             for j, a in enumerate(acts):
                 x_ref[pl.ds(r0, R), j * 128 : (j + 1) * 128] = jnp.clip(
                     a * inv, -448.0, 448.0
                 ).astype(jnp.float8_e4m3fn)
-            s_ref[pl.ds(r0, R), :] = sc
-            return carry
-
-        jax.lax.fori_loop(0, tm // R, chunk, 0)
-
-    def kernel_v5(o_ref, g_ref, x_ref, s_ref, a_ref):
-        # timing ablation only: the DMA floor (touch one vreg of each input)
-        x_ref[...] = jnp.zeros(x_ref.shape, x_ref.dtype)
-        s_ref[...] = o_ref[0, pl.ds(0, tm), :].astype(jnp.float32)[:, :1] + g_ref[
-            :, :1
-        ].astype(jnp.float32)
+        if v != 13:
+            return
+        for r0 in range(0, tm, 128):
+            inv = 1.0 / s_ref[pl.ds(r0, 128), :]
+            for j in range(qd // 128):
+                a = jnp.clip(
+                    a_ref[pl.ds(r0, 128), j * 128 : (j + 1) * 128] * inv, -448.0, 448.0
+                )
+                x_ref[j * 128 : (j + 1) * 128, pl.ds(r0, 128)] = a.T.astype(
+                    jnp.float8_e4m3fn
+                )
 
     def kernel_v2(o_ref, g_ref, x_ref, s_ref, a_ref):
         # v2: each lane's head sum of squares by one f32 dot with the 64-lane block-ones matrix
@@ -148,10 +154,7 @@ def o_gate_pk_call(c: PFConfig, tm: int = 256, v: int = 1):
         mabs = jnp.zeros((tm, 128), jnp.float32)
         for k in range(hkv):
             for p in range(npair):
-                if v == 4:  # timing ablation only: contiguous rows (wrong pairing)
-                    w = ou[k, pl.ds(p * tm, tm), :]
-                else:
-                    w = ou[k, pl.ds(p, tm, stride=npair), :]
+                w = ou[k, pl.ds(p, tm, stride=npair), :]
                 ev = pltpu.bitcast(w << 16, jnp.float32)
                 od = pltpu.bitcast(w & jnp.uint32(0xFFFF0000), jnp.float32)
                 x2 = jnp.where(lo_half, ev, pltpu.roll(od, hd, 1))
@@ -163,32 +166,11 @@ def o_gate_pk_call(c: PFConfig, tm: int = 256, v: int = 1):
                 )
                 col = k * npair * 128 + p * 128
                 gf = g_ref[:, col : col + 128].astype(jnp.float32)
-                # v6: sigmoid as one tanh (EUP) instead of exp and a divide
-                if v == 9:  # timing ablation only: no EUP
-                    a = gf * x2 * (ss * 0.01 + 1.0)
-                elif v == 10:  # timing ablation only: no sigmoid
-                    a = gf * x2 * jax.lax.rsqrt(ss / hd + c.rms_eps)
-                else:
-                    sg = (
-                        0.5 * jnp.tanh(0.5 * gf) + 0.5
-                        if v in (6, 8)
-                        else jax.nn.sigmoid(gf)
-                    )
-                    a = sg * x2 * jax.lax.rsqrt(ss / hd + c.rms_eps)
+                a = jax.nn.sigmoid(gf) * x2 * jax.lax.rsqrt(ss / hd + c.rms_eps)
                 a_ref[:, col : col + 128] = a
                 mabs = jnp.maximum(mabs, jnp.abs(a))
         s = jnp.maximum(jnp.max(mabs, axis=1, keepdims=True), 1e-30) / 448.0
-        if v == 7:  # timing ablation only: no second pass
-            x_ref[...] = jnp.zeros(x_ref.shape, x_ref.dtype)
-        elif v == 3:
-            # one divide per row, a multiply per element
-            x_ref[...] = jnp.clip(a_ref[...] * (1.0 / s), -448.0, 448.0).astype(
-                jnp.float8_e4m3fn
-            )
-        else:
-            x_ref[...] = jnp.clip(a_ref[...] / s, -448.0, 448.0).astype(
-                jnp.float8_e4m3fn
-            )
+        x_ref[...] = jnp.clip(a_ref[...] / s, -448.0, 448.0).astype(jnp.float8_e4m3fn)
         s_ref[...] = s
 
     def kernel(o_ref, g_ref, x_ref, s_ref, a_ref):
@@ -218,18 +200,22 @@ def o_gate_pk_call(c: PFConfig, tm: int = 256, v: int = 1):
     def call(o, gate):
         o3 = o.reshape(hkv, T * gq, 128)
         return pl.pallas_call(
-            {5: kernel_v5, 11: kernel_v11}.get(v, kernel_v2 if v >= 2 else kernel),
+            {12: kernel_v12, 13: kernel_v12}.get(v, kernel_v2 if v >= 2 else kernel),
             grid=(T // tm,),
             in_specs=[
                 pl.BlockSpec((hkv, tm * gq, 128), lambda i: (0, i, 0)),
                 pl.BlockSpec((tm, qd), lambda i: (i, 0)),
             ],
             out_specs=(
-                pl.BlockSpec((tm, qd), lambda i: (i, 0)),
+                pl.BlockSpec((qd, tm), lambda i: (0, i))
+                if v == 13
+                else pl.BlockSpec((tm, qd), lambda i: (i, 0)),
                 pl.BlockSpec((tm, 1), lambda i: (i, 0)),
             ),
             out_shape=(
-                jax.ShapeDtypeStruct((T, qd), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct(
+                    (qd, T) if v == 13 else (T, qd), jnp.float8_e4m3fn
+                ),
                 jax.ShapeDtypeStruct((T, 1), jnp.float32),
             ),
             scratch_shapes=[pltpu.VMEM((tm, qd), jnp.float32)],
