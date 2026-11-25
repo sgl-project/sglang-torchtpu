@@ -156,6 +156,10 @@ class Memory(msgspec.Struct):
         int,
         "The size of host KV cache memory pool in gigabytes. Overrides --hicache-ratio in either host memory mode.",
     ] = 0
+    hicache_swa_fraction: A[
+        Optional[float],
+        "Fraction of --hicache-size given to the sliding-window (SWA) host pool of a hybrid full/SWA model; the other host pools split the rest by device bytes. Unset, every pool's share follows its device bytes. A cached prefix is reusable only up to a node whose window is still cached, so agentic multi-turn traffic can need a larger SWA share than the device pools imply. Needs --hicache-size; ignored with a unified KV pool (--enable-unified-memory).",
+    ] = None
     hicache_host_memory_fraction: A[
         Optional[float],
         "Fraction of the available host memory, bounded by visible cgroup memory.max/memory.high or v1 memory limits (after a 10 GiB reserve) that the HiCache host pools of all ranks on this machine may use. Applies only when neither --hicache-ratio nor --hicache-size is set: the default ratio is then reduced until the pools fit. Lower it when several engines share a memory cgroup.",
