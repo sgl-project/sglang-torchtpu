@@ -2,13 +2,19 @@
 
 With SGLANG_TPU_ENABLE_PROFILE_AUTO set, each scheduler arms the upstream
 staged profile (``profile_by_stage``) as soon as its profiler manager is built.
-From there the upstream lifecycle runs unchanged: the first batch of a stage
-opens a capture, and it closes after SGLANG_TPU_PROFILE_AUTO_STEPS forward
+From there the upstream lifecycle runs unchanged: the first eligible batch of a
+stage opens a capture, and it closes after SGLANG_TPU_PROFILE_AUTO_STEPS forward
 passes. Traces go to SGLANG_TORCH_PROFILER_DIR.
 
 - Stages follow the engine's role. A PD prefill engine captures prefill only,
   a PD decode engine decode only, and any other engine both. Upstream waits
   for both stages, so a PD engine would otherwise never finish.
+- Decode captures can skip initial warmup steps via
+  ``SGLANG_TPU_PROFILE_AUTO_DECODE_STEPS_TO_SKIP`` and wait until the batch's
+  minimum KV length reaches ``SGLANG_TPU_PROFILE_AUTO_DECODE_KV_LEN_THRESHOLD``.
+- Each profiled step writes a JSON line to
+  ``batch_composition_stats_<stage>_<rank parts>.json`` inside the trace output
+  directory with the same ``batch_id`` emitted on the step span.
 - After its last stage is flushed, each rank writes
   ``.xprof-done-<rank parts>`` beside the traces. The file holds the number of
   ranks in the engine, so a collector knows how many markers to wait for.
@@ -22,6 +28,7 @@ like upstream unless the manager was armed here.
 from __future__ import annotations
 
 import functools
+import json
 import time
 from typing import Any, Callable, Optional
 
@@ -31,8 +38,9 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.profiler_manager import (
     SchedulerProfilerManager,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_disagg
+from sglang_tpu import profile_batch_stats
 from sglang_tpu._logging import get_logger
 from sglang_tpu.envs import envs as tpu_envs
 
@@ -48,6 +56,8 @@ DONE_MARKER_PREFIX = ".xprof-done"
 
 # Set on a manager armed here: the stages it still has to capture.
 _PENDING_ATTR = "_tpu_profile_auto_pending"
+_DECODE_SKIPPED_ATTR = "_tpu_profile_auto_decode_skipped"
+_BATCH_COUNTER_ATTR = "_tpu_profile_auto_batch_counter"
 
 # Set by install(), which runs once per scheduler process.
 _is_installed = False
@@ -96,6 +106,18 @@ def _arm(manager: SchedulerProfilerManager) -> None:
         raise ValueError(
             f"SGLANG_TPU_PROFILE_AUTO_STEPS must be at least 1, got {steps}"
         )
+    decode_skip = tpu_envs.SGLANG_TPU_PROFILE_AUTO_DECODE_STEPS_TO_SKIP.get()
+    if decode_skip < 0:
+        raise ValueError(
+            "SGLANG_TPU_PROFILE_AUTO_DECODE_STEPS_TO_SKIP must be >= 0, "
+            f"got {decode_skip}"
+        )
+    kv_threshold = tpu_envs.SGLANG_TPU_PROFILE_AUTO_DECODE_KV_LEN_THRESHOLD.get()
+    if kv_threshold < -1:
+        raise ValueError(
+            "SGLANG_TPU_PROFILE_AUTO_DECODE_KV_LEN_THRESHOLD must be >= -1, "
+            f"got {kv_threshold}"
+        )
 
     stages = _STAGES_BY_PD_ROLE.get(get_disagg().disaggregation_mode, _ALL_STAGES)
     result = manager._init_profile(
@@ -113,12 +135,49 @@ def _arm(manager: SchedulerProfilerManager) -> None:
         return
 
     setattr(manager, _PENDING_ATTR, set(stages))
+    setattr(manager, _DECODE_SKIPPED_ATTR, 0)
+    setattr(manager, _BATCH_COUNTER_ATTR, 0)
+    profile_batch_stats.set_active_batch_id(None)
     logger.info(
         "Auto profiling armed for %s, %d step(s) each. Traces will be saved to: %s",
         ", ".join(stages),
         steps,
         manager.torch_profiler_output_dir,
     )
+
+
+def _next_batch_id(manager: SchedulerProfilerManager, batch: Any) -> int:
+    forward_ct = manager.get_forward_ct()
+    if forward_ct and forward_ct > 0:
+        return int(forward_ct)
+    forward_iter = getattr(batch, "forward_iter", None)
+    if forward_iter is not None and int(forward_iter) > 0:
+        return int(forward_iter)
+    batch_ct = getattr(manager, _BATCH_COUNTER_ATTR, 0) + 1
+    setattr(manager, _BATCH_COUNTER_ATTR, batch_ct)
+    return batch_ct
+
+
+def _write_batch_stats_line(
+    manager: SchedulerProfilerManager,
+    stage: str,
+    stats: dict[str, Any],
+    *,
+    append: bool,
+) -> None:
+    """Write one JSONL row to ``batch_composition_stats_<stage>_<rank parts>.json``."""
+    out_dir = getattr(manager, "torch_profiler_output_dir", None)
+    if out_dir is None:
+        return
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        rank_suffix = "-".join(manager._rank_parts())
+        stats_path = out_dir / f"batch_composition_stats_{stage}_{rank_suffix}.json"
+        mode = "a" if append else "w"
+        with stats_path.open(mode, encoding="utf-8") as f:
+            f.write(json.dumps(stats) + "\n")
+    except Exception:
+        logger.warning("Failed to write batch composition stats", exc_info=True)
 
 
 def _write_done_marker(manager: SchedulerProfilerManager) -> None:
@@ -152,6 +211,62 @@ def _profile_batch_predicate(
         # Not ours to capture. Upstream would also end a running decode
         # capture early on the first prefill batch after prefill's capture.
         return
+
+    if pending is not None and stage is not None:
+        batch_id = _next_batch_id(self, batch)
+        was_starting = (
+            stage == "prefill" and getattr(self, "profiler_prefill_ct", 0) == 0
+        ) or (stage == "decode" and getattr(self, "profiler_decode_ct", 0) == 0)
+
+        if was_starting:
+            if stage == "decode":
+                skip_target = (
+                    tpu_envs.SGLANG_TPU_PROFILE_AUTO_DECODE_STEPS_TO_SKIP.get()
+                )
+                skipped = getattr(self, _DECODE_SKIPPED_ATTR, 0)
+                if skip_target > 0 and skipped < skip_target:
+                    setattr(self, _DECODE_SKIPPED_ATTR, skipped + 1)
+                    logger.debug(
+                        "Skipping auto-profile decode step %d/%d before profiling.",
+                        skipped + 1,
+                        skip_target,
+                    )
+                    return
+
+            stats = profile_batch_stats.get_batch_composition_stats(
+                batch, batch_id=batch_id
+            )
+            if stage == "decode":
+                kv_threshold = (
+                    tpu_envs.SGLANG_TPU_PROFILE_AUTO_DECODE_KV_LEN_THRESHOLD.get()
+                )
+                if kv_threshold >= 0 and stats["min_kv_len"] < kv_threshold:
+                    logger.debug(
+                        "Skipping auto-profile decode step as min KV len %d < threshold %d.",
+                        stats["min_kv_len"],
+                        kv_threshold,
+                    )
+                    return
+
+            upstream(self, batch)
+            if self.profile_in_progress:
+                _write_batch_stats_line(self, stage, stats, append=False)
+                profile_batch_stats.set_active_batch_id(batch_id)
+            else:
+                profile_batch_stats.set_active_batch_id(None)
+            return
+
+        upstream(self, batch)
+        if self.profile_in_progress:
+            stats = profile_batch_stats.get_batch_composition_stats(
+                batch, batch_id=batch_id
+            )
+            _write_batch_stats_line(self, stage, stats, append=True)
+            profile_batch_stats.set_active_batch_id(batch_id)
+        else:
+            profile_batch_stats.set_active_batch_id(None)
+        return
+
     upstream(self, batch)
 
 
@@ -160,6 +275,7 @@ def _stop_profile(
     self: SchedulerProfilerManager,
     stage: Optional[ForwardMode] = None,
 ):
+    profile_batch_stats.set_active_batch_id(None)
     result = upstream(self, stage=stage)
     pending = _pending_stages(self)
     if not pending or stage is None or result is None or not result.success:

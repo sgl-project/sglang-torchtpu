@@ -883,6 +883,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             warmup_async=warmup_async,
         )
         self.model_runner.compile_policy = self
+        if not self.model_runner.is_draft_worker:
+            from sglang_tpu import profile_batch_stats
+
+            profile_batch_stats.set_target_compile_policy(self)
 
         if is_dp_attention_enabled():
             self._install_dp_idle_as_decode()

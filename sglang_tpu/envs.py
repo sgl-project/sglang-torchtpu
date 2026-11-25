@@ -134,6 +134,12 @@ class TpuEnvs:
     # of MB.
     SGLANG_TPU_ENABLE_PROFILE_AUTO = EnvBool(False)
     SGLANG_TPU_PROFILE_AUTO_STEPS = EnvInt(5)
+    # Initial decode batches to skip before opening an auto-profile decode
+    # capture (avoids capturing initial decode warmup / recompilation).
+    SGLANG_TPU_PROFILE_AUTO_DECODE_STEPS_TO_SKIP = EnvInt(0)
+    # Minimum per-request KV length required before opening an auto-profile
+    # decode capture (-1 disables the threshold).
+    SGLANG_TPU_PROFILE_AUTO_DECODE_KV_LEN_THRESHOLD = EnvInt(-1)
     # Kimi-K3: run attention-residual aggregation for decode-sized batches as
     # one Pallas kernel (pending add + mix + out norm) instead of the torch
     # reference (see kimi_attn_residual.py and hooks/attn_residual.py). Not

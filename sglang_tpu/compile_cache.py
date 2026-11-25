@@ -93,6 +93,8 @@ _ENV_FIELDS_NOT_KEYED = frozenset(
         # PP buffered hand-off: how many sends a stage queues, on the host.
         "SGLANG_TPU_PP_BUFFERED_SEND_DEPTH",
         # Profiler scope.
+        "SGLANG_TPU_PROFILE_AUTO_DECODE_KV_LEN_THRESHOLD",
+        "SGLANG_TPU_PROFILE_AUTO_DECODE_STEPS_TO_SKIP",
         "SGLANG_TPU_PROFILE_NUM_CHIPS",
         "SGLANG_TPU_PROFILE_NUM_SPARSE_CORES",
         "SGLANG_TPU_PROFILE_PYTHON_TRACER",
