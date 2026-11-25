@@ -17,6 +17,8 @@ def register_qb_rope_op():
 def supports_qb_rope(layer, x, positions, table) -> bool:
     from sglang.srt.layers.linear import ColumnParallelLinear
     from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+    from sglang_tpu.envs import envs
+    from sglang_tpu.kernels.fp8_linear_small_m import supports as small_m_supports
 
     linear = layer.wq_b
     # A wrapper or a different method can implement adapters, communication or
@@ -61,4 +63,8 @@ def supports_qb_rope(layer, x, positions, table) -> bool:
         and table.shape[0] > 0
         and table.shape[1] in (64, 128)
         and table.dtype == torch.float32
+        and not (
+            envs.SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL.get()
+            and small_m_supports(x.shape[0], *weight.shape)
+        )
     )

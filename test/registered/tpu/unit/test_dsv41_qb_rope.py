@@ -41,7 +41,7 @@ def _module():
     return SimpleNamespace(wq_b=linear, head_dim=512, n_local_heads=64)
 
 
-def test_fallback_formats_and_linear_behavior():
+def test_fallback_formats_and_linear_behavior(monkeypatch):
     layer = _module()
     x = torch.empty(6, 1280, device="meta", dtype=torch.bfloat16)
     pos = torch.empty(6, device="meta", dtype=torch.int64)
@@ -54,6 +54,9 @@ def test_fallback_formats_and_linear_behavior():
     assert not supports_qb_rope(layer, x.float(), pos, table)
     assert not supports_qb_rope(layer, x, pos[:1], table)
     assert not supports_qb_rope(layer, x, pos, table[:, :32])
+    with monkeypatch.context() as patch:
+        patch.setenv("SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL", "1")
+        assert not supports_qb_rope(layer, x, pos, table)
     linear = layer.wq_b
     for owner, name, value in (
         (linear, "weight", linear.weight.T),
