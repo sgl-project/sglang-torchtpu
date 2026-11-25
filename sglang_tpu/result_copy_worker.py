@@ -8,6 +8,7 @@ import torch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang_tpu.experimental.speculative.draft_info import HostPaddedDraftInput
+from sglang_tpu.hooks.cpu_pinning import keep_off_main_core
 
 
 class TpuAsyncCopyEvent:
@@ -71,7 +72,10 @@ class TPUAsyncCopyWorker:
         # unrelated work submitted by the scheduler.
         self.stream = self.device_module.Stream(device=self.device_index)
         self.executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="result-copy"
+            max_workers=1,
+            thread_name_prefix="result-copy",
+            # The thread starts at the first submit, in the pinned event loop.
+            initializer=keep_off_main_core,
         )
 
     def submit(
@@ -94,6 +98,15 @@ class TPUAsyncCopyWorker:
             self._copy, result, tail, return_logprob, return_hidden_states
         )
         result.copy_done = TpuAsyncCopyEvent(event, submitted)
+
+    def copy_to_host(self, tensor: torch.Tensor) -> Future[torch.Tensor]:
+        """Copy one tensor to the host on the worker; the future resolves to
+        the host tensor once the transfer has landed.
+
+        Views are copied as they are, with no device clone, so the caller must
+        not pass a view of a buffer a later step donates.
+        """
+        return self.executor.submit(self._copy_to_host, tensor)
 
     def close(self) -> None:
         """Drain copy submissions and stop the worker; transfers may still be pending."""
@@ -120,3 +133,15 @@ class TPUAsyncCopyWorker:
             # copy_to_cpu calls result.copy_done.record() after issuing the copies.
             result.copy_to_cpu(return_logprob, return_hidden_states)
             return draft_tail
+
+    @torch.inference_mode()
+    def _copy_to_host(self, tensor: torch.Tensor) -> torch.Tensor:
+        with (
+            torch.accelerator.device_index(self.device_index),
+            self.device_module.stream(self.stream),
+        ):
+            host = tensor.to("cpu", non_blocking=True)
+            landed = self.device_module.Event()
+            landed.record(self.stream)
+        landed.synchronize()
+        return host

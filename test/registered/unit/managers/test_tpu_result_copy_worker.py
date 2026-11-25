@@ -12,6 +12,7 @@ import torch
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.experimental.speculative.block_info import HostPaddedBlockDraftInput
+from sglang_tpu.hooks import cpu_pinning
 from sglang_tpu.result_copy_worker import (
     TpuAsyncCopyEvent,
     TPUAsyncCopyWorker,
@@ -271,6 +272,74 @@ def test_view_tail_is_cloned_on_the_submitting_thread(monkeypatch):
     assert clone_threads == [threading.current_thread()]
     view_tail.to.assert_not_called()
     assert tail is draft_tail
+
+
+def test_copy_to_host_resolves_after_the_transfer_lands(monkeypatch):
+    """A single-tensor copy is issued on the worker's stream and resolves only
+    once its event has synchronized. A view is copied as it is: a device clone
+    would add an eager program per step at the live batch shape. The worker
+    thread, started after the scheduler pinned its main thread, leaves that core."""
+    steps = []
+    placed = []
+    monkeypatch.setattr(cpu_pinning, "_other_cpus", {7})
+    monkeypatch.setattr(
+        cpu_pinning.os,
+        "sched_setaffinity",
+        lambda pid, cpus: placed.append((get_ident(), pid, set(cpus))),
+        raising=False,
+    )
+    private_stream = object()
+    landed = Event()
+
+    @contextmanager
+    def on_stream(value):
+        steps.append(("enter", value))
+        yield
+        steps.append(("leave", value))
+
+    class CopyEvent:
+        def record(self, stream):
+            steps.append(("record", stream))
+
+        def synchronize(self):
+            assert landed.wait(timeout=5)
+            steps.append("synchronized")
+
+    device_module = SimpleNamespace(
+        Stream=Mock(return_value=private_stream), stream=on_stream, Event=CopyEvent
+    )
+    monkeypatch.setattr(torch, "get_device_module", Mock(return_value=device_module))
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+    monkeypatch.setattr(
+        torch.accelerator,
+        "device_index",
+        lambda value: contextmanager(lambda: (yield))(),
+    )
+    host = object()
+    view = Mock(_base=object())
+    view.to.side_effect = lambda *args, **kwargs: steps.append("copy") or host
+
+    worker = TPUAsyncCopyWorker()
+    try:
+        copy = worker.copy_to_host(view)
+        with pytest.raises(TimeoutError):
+            copy.result(timeout=0.05)
+        landed.set()
+        assert copy.result(timeout=5) is host
+    finally:
+        landed.set()
+        worker.close()
+    view.clone.assert_not_called()
+    view.to.assert_called_once_with("cpu", non_blocking=True)
+    [(thread, pid, cpus)] = placed
+    assert thread != get_ident() and (pid, cpus) == (0, {7})
+    assert steps == [
+        ("enter", private_stream),
+        "copy",
+        ("record", private_stream),
+        ("leave", private_stream),
+        "synchronized",
+    ]
 
 
 if __name__ == "__main__":

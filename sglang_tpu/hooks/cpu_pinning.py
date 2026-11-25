@@ -20,6 +20,10 @@ import threading
 
 logger = logging.getLogger(__name__)
 
+# The CPUs the pinned main thread leaves to the scheduler's other threads; None
+# until pinning runs.
+_other_cpus: set[int] | None = None
+
 
 def _core_of(cpu: int) -> set[int]:
     path = f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
@@ -47,7 +51,18 @@ def bind_rank_cpu_set(original_fn, gpu_id: int):
     return original_fn(parallel.tp_rank % tp_size_per_node)
 
 
+def keep_off_main_core() -> None:
+    """Move the calling thread to the other threads' CPUs. A thread started after
+    pinning inherits its creator's mask, which is the main thread's core."""
+    if _other_cpus is not None:
+        try:
+            os.sched_setaffinity(0, _other_cpus)
+        except OSError:
+            pass
+
+
 def pin_scheduler_main_thread(scheduler, *args, **kwargs) -> None:
+    global _other_cpus
     from sglang_tpu.envs import envs as tpu_envs
 
     if not tpu_envs.SGLANG_TPU_ENABLE_SCHEDULER_THREAD_PINNING.get() or not hasattr(
@@ -68,6 +83,7 @@ def pin_scheduler_main_thread(scheduler, *args, **kwargs) -> None:
                 os.sched_setaffinity(int(tid), rest)
             except OSError:
                 pass
+    _other_cpus = rest
     os.sched_setaffinity(0, {main_cpu})
     logger.info(
         "Scheduler main thread pinned to CPU %d; other threads on %d CPUs",

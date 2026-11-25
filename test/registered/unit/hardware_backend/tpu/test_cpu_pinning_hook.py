@@ -15,7 +15,12 @@ RANK_CPUS = {14, 15, 16, 126, 127, 128}
 
 
 class TestCpuPinningHook(CustomTestCase):
-    def _run(self, allowed=RANK_CPUS, cpu_count=224, enabled=True):
+    def setUp(self):
+        patcher = mock.patch.object(cpu_pinning, "_other_cpus", None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _run(self, allowed=RANK_CPUS, cpu_count=224, enabled=True, later_thread=False):
         placed = {}
         patches = [
             mock.patch.object(
@@ -46,6 +51,9 @@ class TestCpuPinningHook(CustomTestCase):
                 p.start()
             try:
                 cpu_pinning.pin_scheduler_main_thread(object())
+                if later_thread:
+                    placed.clear()
+                    cpu_pinning.keep_off_main_core()
             finally:
                 for p in patches:
                     p.stop()
@@ -57,6 +65,14 @@ class TestCpuPinningHook(CustomTestCase):
         self.assertEqual(placed[101], {15, 16, 127, 128})
         self.assertEqual(placed[102], {15, 16, 127, 128})
         self.assertNotIn(MAIN_TID, placed)
+
+    def test_thread_started_after_pinning_leaves_the_main_core(self):
+        """A thread created by the pinned main thread inherits its single CPU;
+        keep_off_main_core moves it to the other threads' CPUs."""
+        self.assertEqual(self._run(later_thread=True), {0: {15, 16, 127, 128}})
+
+    def test_later_thread_untouched_without_pinning(self):
+        self.assertEqual(self._run(enabled=False, later_thread=True), {})
 
     def test_off_by_default(self):
         self.assertEqual(self._run(enabled=False), {})
