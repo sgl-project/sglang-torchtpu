@@ -1,6 +1,6 @@
-"""TPU-specific test support for this fork."""
+"""Accuracy and performance eval machinery for the TPU nightlies."""
 
-from sglang.test.tpu.evals.eval_support import (
+from sglang_tpu.testing.evals.eval_support import (
     BASE_URL,
     DEEPSEEK_V41_FLASH,
     GEMMA4_26B_A4B,
@@ -27,7 +27,7 @@ from sglang.test.tpu.evals.eval_support import (
     sgl_eval_runner,
     wait_for_health,
 )
-from sglang.test.tpu.evals.model_config import (
+from sglang_tpu.testing.evals.model_config import (
     build_gates,
     build_model,
     build_test_case,

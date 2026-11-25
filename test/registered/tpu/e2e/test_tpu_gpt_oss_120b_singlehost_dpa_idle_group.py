@@ -8,7 +8,7 @@ first.
 import os
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu import model_config_main
+from sglang_tpu.testing.evals import model_config_main
 
 register_tpu_ci(
     est_time=3600,

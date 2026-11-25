@@ -29,7 +29,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionTestCase,
 )
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu.utils.server_test_suite import resolve_tpu_model_path
+from sglang_tpu.testing.utils.server_test_suite import resolve_tpu_model_path
 
 # est_time covers a cold Hugging Face pull; /weights is used when hydrated.
 register_tpu_ci(

@@ -33,6 +33,9 @@ logger = logging.getLogger(__name__)
 # it (enforced by test_tpu_kernel_compile_cache_key.py). The whole package
 # rather than a file list, so kernel helpers are covered too; an edit anywhere
 # in it costs one recompile.
+# Except these package directories: test harnesses that no serving process
+# imports and that build no kernels (test_tpu_compile_cache_key_testing.py).
+UNHASHED_PACKAGE_DIRS = frozenset({"testing"})
 # Files in sglang/srt that kernels call while tracing: tpu_moe_utils resolves
 # SGLANG_TPU_INT4_MOE_MODE, which picks the INT4 MoE kernel variant.
 TPU_KERNEL_CORE_FILES = ("layers/moe/tpu_moe_utils.py",)
@@ -228,8 +231,15 @@ def kernel_source_roots(
 
         # `sglang` can resolve as a namespace package, which has no __file__.
         srt_root = Path(environ.__file__).resolve().parent
+    package_paths = tuple(
+        sorted(
+            entry.name
+            for entry in package_root.iterdir()
+            if entry.name not in UNHASHED_PACKAGE_DIRS
+        )
+    )
     return (
-        ("sglang_tpu", package_root, (".",)),
+        ("sglang_tpu", package_root, package_paths),
         ("sglang/srt", srt_root, TPU_KERNEL_CORE_FILES),
     )
 

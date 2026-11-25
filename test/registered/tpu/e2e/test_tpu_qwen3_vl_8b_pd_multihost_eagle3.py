@@ -26,7 +26,7 @@ from typing import Dict, List, Mapping, Optional, Tuple
 SGLANG_IMPORT_ERROR = None
 try:
     from sglang.test.ci.ci_register import register_tpu_ci
-    from sglang.test.tpu import model_config_main
+    from sglang_tpu.testing.evals import model_config_main
 except ModuleNotFoundError as exc:
     # Source-only checkouts can still run the launch-configuration tests.
     SGLANG_IMPORT_ERROR = exc

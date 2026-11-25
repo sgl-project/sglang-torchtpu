@@ -84,7 +84,7 @@ def run_shard(
     if result["num_examples"] != len(ids):
         raise RuntimeError("MMMU-Pro shard is incomplete")
 
-    from sglang.test.tpu.evals.full_eval_artifacts import archive_results
+    from sglang_tpu.testing.evals.full_eval_artifacts import archive_results
 
     archive_results(files[0].parent)
     summary = {
@@ -116,7 +116,7 @@ def main():
     from sgl_eval.evals import _registry
     from sgl_eval.evals._mmmu_pro import load_mmmu_pro
 
-    from sglang.test.tpu.evals.eval_support import sgl_eval_args
+    from sglang_tpu.testing.evals.eval_support import sgl_eval_args
 
     def load_shard(split="test", num_examples=None):
         if num_examples is not None:

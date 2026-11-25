@@ -28,7 +28,7 @@ from pathlib import Path
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.tpu.evals import model_config
+from sglang_tpu.testing.evals import model_config
 
 register_cpu_ci(est_time=70, suite="base-a-test-cpu")
 
@@ -577,7 +577,7 @@ class TestReservedKindValues(CustomTestCase):
     SCAN_ROOTS = (
         TPU_TESTS,
         *TAXONOMY_TPU_TESTS.values(),
-        REPO / "python" / "sglang" / "test" / "tpu",
+        REPO / "sglang_tpu" / "testing",
     )
 
     @staticmethod

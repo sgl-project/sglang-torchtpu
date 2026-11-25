@@ -8,15 +8,15 @@ from sglang.test.recompilation_gate import (
     assert_no_serving_recompilation,
     recompilation_gate_runner,
 )
-from sglang.test.tpu import (
+from sglang_tpu.testing.evals import (
     BASE_URL,
     GPT_OSS_120B,
     HEALTH_TIMEOUT,
     fixture_runtime_envs,
     run_model_config,
 )
-from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
-from sglang.test.tpu.utils.server_test_suite import resolve_tpu_model_path
+from sglang_tpu.testing.utils.launcher_test_case import TPULauncherTestCase
+from sglang_tpu.testing.utils.server_test_suite import resolve_tpu_model_path
 
 register_tpu_ci(
     est_time=1800,

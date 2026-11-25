@@ -47,7 +47,7 @@ import requests
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, CustomTestCase, dump_metric
-from sglang.test.tpu import emit_result_payload
+from sglang_tpu.testing.evals import emit_result_payload
 
 # run_suite requires every file under test/registered to carry a registration;
 # same convention as debug_utils/comparator/testing_helpers.py.

@@ -41,7 +41,7 @@
     "python/sglang/srt/managers/scheduler_components/profiler_manager.py": 5,
     "python/sglang/srt/managers/scheduler_pp_mixin.py": 3,
     "python/sglang/srt/mem_cache/allocation.py": 4,
-    "python/sglang/srt/mem_cache/allocator/swa.py": 10,
+    "python/sglang/srt/mem_cache/allocator/swa.py": 9,
     "python/sglang/srt/mem_cache/kv_cache_builder.py": 1,
     "python/sglang/srt/mem_cache/kv_cache_configurator.py": 3,
     "python/sglang/srt/mem_cache/memory_pool.py": 4,
@@ -141,18 +141,6 @@
     "python/sglang/multimodal_gen/test/unit/test_tpu_enablement.py",
     "python/sglang/multimodal_gen/test/unit/test_tpu_platform.py",
     "python/sglang/srt/layers/moe/tpu_moe_utils.py",
-    "python/sglang/srt/layers/quantization/mxfp4_tpu_util.py",
-    "python/sglang/test/tpu/__init__.py",
-    "python/sglang/test/tpu/evals/__init__.py",
-    "python/sglang/test/tpu/evals/eval_support.py",
-    "python/sglang/test/tpu/evals/full_eval_artifacts.py",
-    "python/sglang/test/tpu/evals/mmmu_full.py",
-    "python/sglang/test/tpu/evals/model_config.py",
-    "python/sglang/test/tpu/utils/__init__.py",
-    "python/sglang/test/tpu/utils/accuracy_base.py",
-    "python/sglang/test/tpu/utils/kv_offload_probe.py",
-    "python/sglang/test/tpu/utils/launcher_test_case.py",
-    "python/sglang/test/tpu/utils/pd_singlehost_base.py",
-    "python/sglang/test/tpu/utils/server_test_suite.py"
+    "python/sglang/srt/layers/quantization/mxfp4_tpu_util.py"
   ]
 }

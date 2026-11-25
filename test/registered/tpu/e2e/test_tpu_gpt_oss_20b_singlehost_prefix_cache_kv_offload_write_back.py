@@ -9,10 +9,10 @@ decode KV, and GSM8K the quality after it.
 import os
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu import model_config_main
-from sglang.test.tpu.utils.accuracy_base import recipe_server_args
-from sglang.test.tpu.utils.kv_offload_probe import kv_offload_runner
-from sglang.test.tpu.utils.server_test_suite import resolve_tpu_model_path
+from sglang_tpu.testing.evals import model_config_main
+from sglang_tpu.testing.utils.accuracy_base import recipe_server_args
+from sglang_tpu.testing.utils.kv_offload_probe import kv_offload_runner
+from sglang_tpu.testing.utils.server_test_suite import resolve_tpu_model_path
 
 # Expected runtime includes model load, compilation, and the eviction probe.
 register_tpu_ci(

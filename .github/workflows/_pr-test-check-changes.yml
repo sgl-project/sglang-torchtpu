@@ -119,6 +119,8 @@ jobs:
               - "python/sglang/kernels/jit/!(csrc)/**/!(*.md)"
               - "python/sglang/kernels/{ops,jit/csrc}/!(diffusion)/**/!(*.md)"
               - "python/sglang/kernels/ops/diffusion/common/**/!(*.md)"
+              # [Do Not Upstream] TPU test support; its dashboard contract lints run in the CPU stage.
+              - "sglang_tpu/testing/**"
               - "scripts/ci/cuda/*"
               - "scripts/ci/utils/*"
               - "test/{,registered/,registered/kernels/}!(*.md)"

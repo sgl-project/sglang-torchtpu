@@ -26,8 +26,8 @@ from typing import ClassVar
 from urllib.parse import urlsplit
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu import run_model_config
-from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
+from sglang_tpu.testing.evals import run_model_config
+from sglang_tpu.testing.utils.launcher_test_case import TPULauncherTestCase
 
 # Measured in CI: 1734 s to healthy, then 160 requests at ~13.6 s.
 register_tpu_ci(

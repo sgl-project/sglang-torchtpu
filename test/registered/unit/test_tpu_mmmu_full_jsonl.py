@@ -13,7 +13,7 @@ from pathlib import Path
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.tpu.evals.mmmu_full import read_jsonl_ids
+from sglang_tpu.testing.evals.mmmu_full import read_jsonl_ids
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

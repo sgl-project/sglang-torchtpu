@@ -13,7 +13,7 @@ serves from its own recipe rather than the accuracy nightly's.
 import os
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu import model_config_main
+from sglang_tpu.testing.evals import model_config_main
 
 # Longer than the non-speculative c64 file: bring-up also loads the draft model
 # and compiles the draft forward. Drives the JobSet poll budget.

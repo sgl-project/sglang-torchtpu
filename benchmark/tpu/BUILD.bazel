@@ -86,7 +86,7 @@ py_library(
 )
 
 # Shell recipes, evaluation configs, and helper programs resolved at runtime by
-# sglang.test.tpu. Executable bits are preserved in Bazel runfiles.
+# sglang_tpu.testing. Executable bits are preserved in Bazel runfiles.
 filegroup(
     name = "runtime",
     srcs = glob(

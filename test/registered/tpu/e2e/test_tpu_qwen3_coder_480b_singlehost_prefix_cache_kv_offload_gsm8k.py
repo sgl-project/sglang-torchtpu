@@ -17,8 +17,8 @@ controls. GSM8K then scores the same boot, with prefix caching still on.
 import os
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu import model_config_main
-from sglang.test.tpu.utils.kv_offload_probe import kv_offload_runner
+from sglang_tpu.testing.evals import model_config_main
+from sglang_tpu.testing.utils.kv_offload_probe import kv_offload_runner
 
 # Bring-up plus the offload probe's ~26k tokens of filler prefill plus 200 GSM8K
 # examples. Above the 3600 the spec-decoding lane uses, by the probe's cost.

@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu.utils.kv_offload_probe import (
+from sglang_tpu.testing.utils.kv_offload_probe import (
     CacheObservation,
     KvOffloadProbe,
     TailReplay,
@@ -208,7 +208,7 @@ class TestDecodeTails(unittest.TestCase):
         self.assertEqual(len(failures), 1)
         self.assertIn("from host", failures[0])
 
-    @patch("sglang.test.tpu.utils.kv_offload_probe.requests.post")
+    @patch("sglang_tpu.testing.utils.kv_offload_probe.requests.post")
     def test_token_ids_and_logprobs_round_trip(self, post: Mock) -> None:
         post.return_value.json.return_value = {
             "text": "ab",
@@ -275,7 +275,7 @@ class TestDecodeTailSequence(unittest.TestCase):
             device_pool_tokens=8192, probe_tokens=1024, hicache_ratio=3.0
         )
         with patch(
-            "sglang.test.tpu.utils.kv_offload_probe.requests.post",
+            "sglang_tpu.testing.utils.kv_offload_probe.requests.post",
             side_effect=self._post,
         ):
             probe = run_probe(
@@ -310,7 +310,7 @@ class TestDecodeTailSequence(unittest.TestCase):
             device_pool_tokens=8192, probe_tokens=1024, hicache_ratio=3.0
         )
         with patch(
-            "sglang.test.tpu.utils.kv_offload_probe.requests.post", side_effect=short
+            "sglang_tpu.testing.utils.kv_offload_probe.requests.post", side_effect=short
         ):
             with self.assertRaisesRegex(RuntimeError, "generated 0 tokens"):
                 run_probe(
@@ -323,7 +323,7 @@ class TestDecodeTailSequence(unittest.TestCase):
 
 
 class TestDpRouting(unittest.TestCase):
-    @patch("sglang.test.tpu.utils.kv_offload_probe.requests.post")
+    @patch("sglang_tpu.testing.utils.kv_offload_probe.requests.post")
     def test_generate_routes_to_requested_dp_rank(self, post: Mock) -> None:
         response = post.return_value
         response.json.return_value = {
@@ -346,7 +346,7 @@ class TestDpRouting(unittest.TestCase):
         self.assertEqual(observation.device_tokens, 64)
         self.assertEqual(post.call_args.kwargs["json"]["routed_dp_rank"], 3)
 
-    @patch("sglang.test.tpu.utils.kv_offload_probe.requests.post")
+    @patch("sglang_tpu.testing.utils.kv_offload_probe.requests.post")
     def test_generate_rejects_wrong_dp_rank(self, post: Mock) -> None:
         post.return_value.json.return_value = {
             "text": "ok",

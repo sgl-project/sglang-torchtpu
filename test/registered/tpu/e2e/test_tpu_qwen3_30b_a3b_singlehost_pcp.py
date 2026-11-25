@@ -12,8 +12,8 @@ import os
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.needle_probe import needle_runner
-from sglang.test.tpu import model_config_main
-from sglang.test.tpu.utils.server_test_suite import resolve_tpu_model_path
+from sglang_tpu.testing.evals import model_config_main
+from sglang_tpu.testing.utils.server_test_suite import resolve_tpu_model_path
 
 # Nightly, not the PR gate: test_tpu_gpt_oss_20b_singlehost_pcp.py runs the same
 # probe on a checkpoint that loads and compiles in a fraction of the time. This

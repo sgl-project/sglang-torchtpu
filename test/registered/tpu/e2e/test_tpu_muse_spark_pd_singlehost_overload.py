@@ -41,8 +41,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any, ClassVar
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu import RecipeLauncher, run_model_config, wait_for_health
-from sglang.test.tpu.utils.pd_singlehost_base import PDSingleHostTestCase, peer_hostname
+from sglang_tpu.testing.evals import RecipeLauncher, run_model_config, wait_for_health
 from sglang_tpu.testing.overload_stress import (
     OK,
     EvalRetryRelay,
@@ -55,6 +54,10 @@ from sglang_tpu.testing.overload_stress import (
     scrape_engine,
     scrape_failure_counts,
     wait_until_idle,
+)
+from sglang_tpu.testing.utils.pd_singlehost_base import (
+    PDSingleHostTestCase,
+    peer_hostname,
 )
 
 register_tpu_ci(

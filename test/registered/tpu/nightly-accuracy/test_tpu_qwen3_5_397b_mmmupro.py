@@ -6,8 +6,11 @@ sgl-eval's own loader and grader, thinking on, with the model card's sampling.
 import unittest
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu import QWEN3_5_397B, make_model_config, make_runner
-from sglang.test.tpu.utils.accuracy_base import AccuracyTestCase, gate_server_failures
+from sglang_tpu.testing.evals import QWEN3_5_397B, make_model_config, make_runner
+from sglang_tpu.testing.utils.accuracy_base import (
+    AccuracyTestCase,
+    gate_server_failures,
+)
 
 register_tpu_ci(
     est_time=9000,

@@ -23,15 +23,15 @@ from typing import Any
 import msgspec
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu.evals.eval_support import wait_for_health
-from sglang.test.tpu.utils.kv_offload_probe import (
+from sglang_tpu.testing.evals.eval_support import wait_for_health
+from sglang_tpu.testing.utils.kv_offload_probe import (
     EvictionPlan,
     plan_eviction,
     probe_prompt,
     run_probe,
     validate_probe,
 )
-from sglang.test.tpu.utils.pd_singlehost_base import PDSingleHostTestCase
+from sglang_tpu.testing.utils.pd_singlehost_base import PDSingleHostTestCase
 
 register_tpu_ci(
     est_time=3600,
