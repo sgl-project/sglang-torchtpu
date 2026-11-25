@@ -107,12 +107,17 @@ def _row_tile() -> int:
     return dev_int(tpu_envs.SGLANG_TPU_MUSE_MK_DEV_ROW_TILE, _ROW_TILE)
 
 
+def _dev_force_tiled() -> bool:
+    """Dev A/B: TP steps of <= BASE_STEP_MAX_ROWS rows on the row-tiled program too."""
+    return tpu_envs.SGLANG_TPU_MUSE_MK_DEV_FORCE_TILED.get()
+
+
 def step_rows(n_tokens: int, tp: int, moe_mode: MoeMode) -> int:
     """Padded rows of a step: a multiple of the TP size; row-tiled steps (every EP step) also
     of the row tile (each device then owns rows / tp rows of the expert reduce-scatter and u
     all-gather)."""
     rows = _round_up(n_tokens, tp)
-    if rows > BASE_STEP_MAX_ROWS or moe_mode == "ep":
+    if rows > BASE_STEP_MAX_ROWS or moe_mode == "ep" or _dev_force_tiled():
         rows = _round_up(n_tokens, math.lcm(_row_tile(), tp))
     return rows
 
@@ -705,7 +710,7 @@ class MuseMegakernel(torch.nn.Module):
         opt = tpu_envs.SGLANG_TPU_MUSE_MK_OPT.get()
         fold_env = tpu_envs.SGLANG_TPU_MUSE_MK_FOLD.get()
         # the EP layout runs the row-tiled program at every size
-        tiled = rows > BASE_STEP_MAX_ROWS or self.moe_mode == "ep"
+        tiled = rows > BASE_STEP_MAX_ROWS or self.moe_mode == "ep" or _dev_force_tiled()
         # few-row steps (decode) gather their rows in one round and have nothing to fold
         fold_base = fold_env and n_req * q > 2 and not tiled
         unshifted = 1.02 * g.scale_query_by * g.head_dim * g.attn_scale <= UNSHIFTED_MAX
