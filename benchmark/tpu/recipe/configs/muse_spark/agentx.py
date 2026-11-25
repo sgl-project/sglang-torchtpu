@@ -195,6 +195,9 @@ def config_for(
     drafts at the golden acceptance length regardless of the target logits.
     """
     running, verify, interval, adaptive = PROFILES.get(conc, DEFAULT_PROFILE)
+    # AX_RUNNING / AX_INTERVAL: the profile's request cap / interval for a sweep point
+    running = int(os.environ.get("AX_RUNNING", running))
+    interval = int(os.environ.get("AX_INTERVAL", interval))
     # From conc 16: one 4096-token prefill graph beside a 56 GB write-through
     # host pool per rank, 30% of it for sliding-window KV, and sessions.
     large = conc >= 16
