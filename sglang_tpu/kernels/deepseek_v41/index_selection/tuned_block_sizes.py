@@ -35,16 +35,14 @@ def publish_block_max_config(
         or 128 % block_size != 0
     ):
         return None
-    if rows <= 8:
+    if rows % 8 == 0:
         row_tile = 8
-    elif rows <= 16:
-        row_tile = 16
-    elif rows <= 32:
-        row_tile = 32
-    elif rows % 48 == 0:
-        row_tile = 48
+        for candidate in (64, 48, 32, 24, 16, 8):
+            if rows % candidate == 0:
+                row_tile = candidate
+                break
     else:
-        row_tile = 64
+        row_tile = min(64, ((rows + 7) // 8) * 8)
     blocks = (width + block_size - 1) // block_size
     min_block_tile = 128 // block_size
     block_tile = min(1024, ((blocks + min_block_tile - 1) // min_block_tile) * min_block_tile)

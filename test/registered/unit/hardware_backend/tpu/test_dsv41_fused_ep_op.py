@@ -766,8 +766,7 @@ def test_layer_requirements_and_skips(monkeypatch):
         "fp32 correction bias over every routed expert"
     ]
 
-    # Hash layers always keep gmm_v2; draft (is_nextn) layers keep gmm_v2 when
-    # SGLANG_TPU_DSV41_FUSED_EP_DSPARK=0. A refused layer raises.
+    # Hash layers always keep gmm_v2; a refused layer raises.
     moe = _moe(gmm, gate, shared)
     moe.is_hash = True
     assert not op_mod.prepare_moe_layer_for_fused_ep(
@@ -775,16 +774,6 @@ def test_layer_requirements_and_skips(monkeypatch):
     )
     assert moe.experts.w13_weight.numel() > 0
     assert moe.dp_local_forward is None
-
-    monkeypatch.setenv("SGLANG_TPU_DSV41_FUSED_EP_DSPARK", "0")
-    moe = _moe(gmm, gate, shared)
-    moe.is_nextn = True
-    assert not op_mod.prepare_moe_layer_for_fused_ep(
-        moe, ep=1, ep_rank=0, multimodal_enabled=False
-    )
-    assert moe.experts.w13_weight.numel() > 0
-    assert moe.dp_local_forward is None
-    monkeypatch.delenv("SGLANG_TPU_DSV41_FUSED_EP_DSPARK", raising=False)
     with pytest.raises(ValueError, match="SGLANG_SHARED_EXPERT_TP1"):
         op_mod.prepare_moe_layer_for_fused_ep(
             _moe(gmm, gate, shared, tp1=False),
@@ -847,7 +836,7 @@ def test_prepare_model_checks_and_counts(monkeypatch):
     ]
     # Only prepared layers take the seam in _run_moe_ffn_dp_sync; hash-routed
     # layers keep their gmm_v2 experts while DSpark draft layers (is_nextn)
-    # are prepared by default (SGLANG_TPU_DSV41_FUSED_EP_DSPARK=1).
+    # are prepared alongside target layers.
     assert hashed.experts.w13_weight.numel() > 0
     assert hashed.dp_local_forward is None
     for m in layers[1:]:

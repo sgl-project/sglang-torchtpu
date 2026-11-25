@@ -1021,9 +1021,13 @@ def tpu_dsv41_project_wo_a(original, layer, o, *args, **kwargs):
     scale = getattr(wo_a, "_tpu_wo_a_fp8_scale", None) if wo_a is not None else None
     if scale is None:
         return original(layer, o, *args, **kwargs)
+    from sglang.srt.model_executor.forward_context import get_attn_backend
     from sglang_tpu.models.deepseek_v41.ops.wo_a_fp8 import wo_a_fp8_matmul
 
-    # On TPU CSA2, inverse RoPE is already applied by CSA2 (apply_mqa_inv_rope is identity).
+    positions = kwargs.get("positions", args[0] if args else None)
+    attn_backend = get_attn_backend()
+    if hasattr(attn_backend, "apply_mqa_inv_rope"):
+        o = attn_backend.apply_mqa_inv_rope(layer, o, positions)
     o_grouped = o.view(o.shape[0], layer.n_local_groups, -1)
     return wo_a_fp8_matmul(o_grouped, wo_a.weight, scale)
 
@@ -1032,14 +1036,15 @@ def prepare_tpu_dsv41_dummy_model(result, loader, *, model_config, device_config
     """AFTER DummyModelLoader.load_model: apply V4.1 post-load transforms
     (vocab-parallel LM head sharding, FP8 wo_a, and fused EP MoE preparation)
     that DefaultModelLoader runs through load_weights / postprocess_weights."""
+    from sglang.srt.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
+    from sglang.srt.models.deepseek_v4_nextn import DeepseekV4ForCausalLMNextN
     from sglang_tpu.envs import envs as tpu_envs
 
-    if (
-        torch.cuda.is_available()
-        or getattr(getattr(result, "config", None), "model_type", None) != "deepseek_v41"
-    ):
+    if getattr(getattr(result, "config", None), "model_type", None) != "deepseek_v41":
         return result
-    is_draft = result.__class__.__name__.endswith("DSpark") or result.__class__.__name__.endswith("NextN")
+    is_draft = isinstance(
+        result, (DeepseekV4ForCausalLMDSpark, DeepseekV4ForCausalLMNextN)
+    )
     if (
         not is_draft
         and tpu_envs.SGLANG_TPU_ENABLE_DSV41_VOCAB_PARALLEL_HEAD.get()

@@ -130,7 +130,7 @@ def greedy_markov_drafts(
             x,
             model.lm_head.weight,
             head.markov_w1.weight,
-            head.markov_w2.weight,
+            getattr(head, "_tpu_sharded_markov_w2_weight"),
             prev,
             world=int(getattr(head, "_tpu_sharded_markov_world")),
             vocab=vocab,

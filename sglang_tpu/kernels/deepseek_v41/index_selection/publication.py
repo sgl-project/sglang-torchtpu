@@ -188,9 +188,9 @@ def _candidate_block_scores(scores, lengths, block_size, config):
     blocks = pl.cdiv(width, block_size)
     padded_rows = pl.cdiv(rows, row_tile) * row_tile
     if padded_rows > rows:
-        scores = jnp.pad(
-            scores, ((0, padded_rows - rows), (0, 0)), constant_values=-jnp.inf
-        )
+        # Pad only the tiny 1D lengths vector with 0; the final row tile of
+        # `scores` is a partial BlockSpec window whose invisible rows are masked
+        # via `columns < limits`, avoiding a full [rows, width] scores copy.
         lengths = jnp.pad(lengths, (0, padded_rows - rows), constant_values=0)
     padded_blocks = pl.cdiv(blocks, block_tile) * block_tile
     token_tile = block_tile * block_size

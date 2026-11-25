@@ -83,13 +83,15 @@ CONFIG["runtime_env"].update(
         "SGLANG_TPU_DSV41_FUSED_EP": "1",
         "SGLANG_TPU_DSV41_FUSED_EP_DISPATCH": "auto",
         "SGLANG_SHARED_EXPERT_TP1": "1",
+        # Per-channel FP8 grouped wo_a contraction (opt-in; ~1.44 GB/rank HBM
+        # saved and 2.5-3.4x faster wo_a at decode).
+        "SGLANG_TPU_DSV41_WO_A_FP8": "1",
         # Spec-step host pipelining: upload the DSV4.1 metadata fields in one
         # packed transfer, build the slot-only draft/verify attention metadata
-        # ahead of the blocking reads, flush queued Engram verify commits at
-        # length read, and build the position-dependent rows on the device.
+        # ahead of the blocking reads, and build the position-dependent rows on
+        # the device.
         "SGLANG_TPU_DSV41_PACKED_METADATA": "1",
         "SGLANG_TPU_SPEC_PREBUILD_SLOT_METADATA": "1",
-        "SGLANG_TPU_DSV41_FLUSH_ENGRAM_AT_LENGTH_READ": "1",
         "SGLANG_TPU_SPEC_DEVICE_ROWS": "1",
     }
 )

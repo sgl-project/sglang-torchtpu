@@ -1630,8 +1630,8 @@ def host_table_without_cuda():
 
 # hasher -> verify commits not yet applied to its host history, oldest first.
 _PENDING_COMMITS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
-# hasher -> active on-device TPU verify handler (when tables fit in TPU HBM).
-_DEVICE_VERIFY: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+# hasher -> active on-device TPU verify handler (process-lifetime per hasher).
+_DEVICE_VERIFY: dict[Any, Any] = {}
 
 
 def commit_engram_history(
@@ -1699,7 +1699,7 @@ def has_pending_engram_commits(hasher) -> bool:
     if hasher is None:
         return False
     dev = _DEVICE_VERIFY.get(hasher)
-    if dev is not None and dev._dev_ahead:
+    if dev is not None and dev.has_pending_commits:
         return True
     return bool(_PENDING_COMMITS and _PENDING_COMMITS.get(hasher))
 

@@ -292,14 +292,34 @@ class DeviceEngramVerify:
 
     @staticmethod
     def can_enable(coordinator: Any, hasher: Any, device: torch.device) -> bool:
-        from sglang_tpu.envs import envs as tpu_envs
-
-        if not tpu_envs.SGLANG_TPU_DSV41_DEVICE_ENGRAM_VERIFY.get():
-            return False
         if device.type != "tpu" or hasher.history is None:
             return False
         embs = coordinator.embeddings
         if len(embs) != 2:
+            return False
+        # Exact uint32 limb arithmetic bounds:
+        # - (r_hi % p) * ((1<<32) % p) + (r_lo % p) fits in uint32 iff p < 2^16.
+        # - _mul_u17_u47_to_u32_pair requires 0 <= source < 2^17 and 0 <= mult < 2^47.
+        tables = getattr(coordinator, "tables", None)
+        if not isinstance(tables, dict):
+            return False
+        primes = np.asarray(tables["primes"], dtype=np.int64)
+        mults = np.asarray(tables["multipliers"], dtype=np.int64)
+        token_map = np.asarray(tables["token_map"], dtype=np.int64)
+        pad_id = int(coordinator.pad_id)
+        if (
+            primes.size == 0
+            or int(primes.min()) <= 0
+            or int(primes.max()) >= (1 << 16)
+            or mults.size == 0
+            or int(mults.min()) < 0
+            or int(mults.max()) >= (1 << 47)
+            or token_map.size == 0
+            or int(token_map.min()) < 0
+            or int(token_map.max()) >= (1 << 17)
+            or pad_id < 0
+            or pad_id >= (1 << 17)
+        ):
             return False
         total_bytes = 0
         dim0 = int(embs[0][1].dim)
@@ -313,6 +333,10 @@ class DeviceEngramVerify:
             total_bytes += emb.weight.numel() * emb.weight.element_size()
             total_bytes += emb.scale.numel() * emb.scale.element_size()
         return total_bytes <= _MAX_DEVICE_TABLE_BYTES
+
+    @property
+    def has_pending_commits(self) -> bool:
+        return self._dev_ahead
 
     def mark_cpu_history_updated(self) -> None:
         self._cpu_ahead = True

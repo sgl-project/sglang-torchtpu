@@ -614,11 +614,6 @@ def is_dsv41_moe(module: torch.nn.Module) -> bool:
 def layer_skip_reason(moe: torch.nn.Module) -> Optional[str]:
     """Why a V4.1 MoE layer keeps the gmm_v2 path although the switch is on.
     The decision depends only on the model config, so all ranks agree."""
-    if moe.is_nextn:
-        from sglang_tpu.envs import envs as tpu_envs
-
-        if not tpu_envs.SGLANG_TPU_DSV41_FUSED_EP_DSPARK.get():
-            return "NextN/MTP draft layer"
     if moe.is_hash:
         return "hash-routed layer (token-id top-k)"
     return None
@@ -849,12 +844,9 @@ def prepare_moe_layer_for_fused_ep(
     to_k32z = k32z.is_deferred(experts)
     gate_up_bits = k32z.SERVING_GATE_UP_BITS if to_k32z else 0
     dispatch, push_max_rows = selected_dispatch(), fe.PUSH_MAX_ROWS
-    from sglang_tpu.envs import envs as tpu_envs
-
     shared_ops = (
         _shared_expert_fp8_operands(moe)
         if dispatch in (fe.DISPATCH_PUSH, fe.DISPATCH_AUTO)
-        and tpu_envs.SGLANG_TPU_DSV41_FUSED_EP_SHARED_EXPERT.get()
         else None
     )
     fuse_shared = shared_ops is not None
@@ -1057,7 +1049,6 @@ def apply_fused_ep(
     key = getattr(moe, _KEY_ATTR)
     experts = moe.experts
     op = _get_op(*key)
-    shared_ops = getattr(moe, _SHARED_ATTR, None)
     args = (
         hidden_states,
         gating,

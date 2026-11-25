@@ -337,11 +337,8 @@ def sharded_greedy_markov_pallas(
 def prepare_model_for_dsv41_sharded_markov(model) -> bool:
     """Shard ``markov_head.markov_w2`` across DP ranks to match ``VocabParallelLMHead``
     and pre-register the sharded Markov op before torch.compile traces."""
-    from sglang_tpu.envs import envs as tpu_envs
     from sglang_tpu.models.deepseek_v41.vocab_parallel_head import VocabParallelLMHead
 
-    if not tpu_envs.SGLANG_TPU_DSV41_SHARDED_DSPARK_MARKOV.get():
-        return False
     head = getattr(model, "markov_head", None)
     lm_head = getattr(model, "lm_head", None)
     if head is None or lm_head is None:
@@ -378,17 +375,11 @@ def prepare_model_for_dsv41_sharded_markov(model) -> bool:
     shard = vocab // world
     start = rank * shard
     with torch.no_grad():
-        old = w2.data
-        # clone() ensures storage_offset == 0 on every rank (required by SPMD shared compile).
-        sliced = old[start : start + shard].clone().contiguous()
-        head.markov_w2.weight = torch.nn.Parameter(sliced, requires_grad=False)
-        storage = old.untyped_storage()
-        if storage.data_ptr() != sliced.untyped_storage().data_ptr():
-            try:
-                storage.resize_(0)
-            except RuntimeError:
-                pass
-        del old
+        # Keep head.markov_w2.weight intact for the non-greedy sampled-draft path
+        # (DSparkDraftWorker.sample_drafts -> markov_head.sample_block -> project_bias),
+        # and store this rank's contiguous [V/W, R] slice (~16.5 MiB) for the fused
+        # greedy op (clone() guarantees storage_offset == 0 for SPMD shared compile).
+        sliced = w2.data[start : start + shard].clone().contiguous()
 
     get_sharded_markov_op(
         world=world,
@@ -398,9 +389,10 @@ def prepare_model_for_dsv41_sharded_markov(model) -> bool:
         gamma=gamma,
     )
     setattr(head, SHARDED_W2_ATTR, True)
+    setattr(head, "_tpu_sharded_markov_w2_weight", sliced)
     setattr(head, "_tpu_sharded_markov_world", world)
     logger.info(
-        "SGLANG_TPU_DSV41_SHARDED_DSPARK_MARKOV: sharded markov_w2 to [%d, %d] "
+        "Sharded DSpark greedy Markov enabled: markov_w2 slice [%d, %d] "
         "(world=%d, rank=%d, gamma=%d).",
         shard,
         int(w1.shape[1]),

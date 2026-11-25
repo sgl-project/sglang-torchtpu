@@ -734,11 +734,14 @@ def _device_row_fields_tpu(
     columns: int,
     base_page: int,
 ) -> Dict[str, object]:
-    """Single-program TPU version of ``_device_row_fields``."""
+    """Fused TPU version of ``_device_row_fields`` (replaces ~55 eager ops with 1 op
+    plus 3 distinct-buffer copies so graph inputs never alias ``forward_batch`` or ``valid``)."""
     from sglang_tpu.models.deepseek_v41 import device_rows
 
     ratio_items = tuple(tables.index_pages.items())
     ratios = tuple(r for r, _ in ratio_items)
+    # Distinct-buffer copies: the host build's fields are separate graph inputs,
+    # not aliases of forward_batch.positions / out_cache_loc or valid.
     positions = forward_batch.positions.to(torch.int32, copy=True)
     out_cache_loc = forward_batch.out_cache_loc.to(torch.int32, copy=True)
     outs = device_rows.fused_device_row_fields(
@@ -2120,25 +2123,17 @@ class DSV41TPUAttnBackend(AttentionBackend):
         records = metadata.swa_write_records
         plan = metadata.swa_window_plan
         if plan is not None:
-            if hasattr(self.csa2_ops, "publish_swa_window"):
-                swa.copy_(
-                    self.csa2_ops.publish_swa_window(
-                        swa,
-                        records,
-                        kv,
-                        plan.history_src,
-                        plan.history_dst,
-                        plan.commit_token,
-                        plan.commit_dst,
-                    )
+            swa.copy_(
+                self.csa2_ops.publish_swa_window(
+                    swa,
+                    records,
+                    kv,
+                    plan.history_src,
+                    plan.history_dst,
+                    plan.commit_token,
+                    plan.commit_dst,
                 )
-            else:
-                # One publish also copies ring history into the workspace pages the
-                # chunk attends and the chunk's last window back into the ring.
-                history = swa.reshape(-1, kv.shape[1])[plan.history_src]
-                kv = torch.cat((kv, history, kv[plan.commit_token]))
-                records = torch.cat((records, plan.history_dst, plan.commit_dst))
-                swa.copy_(self.csa2_ops.publish_swa(swa, records, kv))
+            )
         else:
             swa.copy_(self.csa2_ops.publish_swa(swa, records, kv))
 
