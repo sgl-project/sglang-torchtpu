@@ -54,6 +54,8 @@ def pending_step_limit(scheduler: Scheduler) -> int:
     """
     cost = scheduler._tpu_pp_chunk_cost
     pp_size, top = get_parallel().pp_size, cost.buckets[-1]
+    # A full step holds at most the admission cap; a compile bucket above it only pads.
+    full_step = min(top, scheduler.chunked_prefill_size)
     requests = list(scheduler.waiting_queue)
     if scheduler.chunked_req is not None:
         requests.append(scheduler.chunked_req)
@@ -80,7 +82,7 @@ def pending_step_limit(scheduler: Scheduler) -> int:
             cached = matched_prefix_len(scheduler.tree_cache, req)
             cached_prefix[req.rid] = cached
         pending += max(len(req.origin_input_ids) + len(req.output_ids) - cached, 0)
-        if pending >= pp_size * top:
+        if pending >= pp_size * full_step:
             # The limit saturates at a full step; the rest need no match.
             break
     # A micro-batch slot holds its batch until the result is processed, when
@@ -88,7 +90,7 @@ def pending_step_limit(scheduler: Scheduler) -> int:
     for batch, done in zip(scheduler.mbs, scheduler.last_mbs):
         if batch is not None and batch is not done:
             pending += _prefill_tokens(batch)
-    if pending >= pp_size * top:
+    if pending >= pp_size * full_step:
         return top
     granule = cost.granularity
     granules = math.ceil(pending / (pp_size * scheduler._tpu_pp_chunk_spread * granule))

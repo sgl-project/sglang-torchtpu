@@ -98,12 +98,21 @@ def adder(model=None):
 
 
 def scheduler(
-    waiting, chunked=None, mbs=(), last_mbs=(), matched=0, host=0, tail=0, spread=1.0
+    waiting,
+    chunked=None,
+    mbs=(),
+    last_mbs=(),
+    matched=0,
+    host=0,
+    tail=0,
+    spread=1.0,
+    chunk_cap=16384,
 ):
     # Spread 1 (one step per stage), not the shipped default 2, unless a test passes it.
     return NS(
         _tpu_pp_chunk_cost=cost(),
         _tpu_pp_chunk_spread=spread,
+        chunked_prefill_size=chunk_cap,
         waiting_queue=waiting,
         chunked_req=chunked,
         mbs=list(mbs),
@@ -160,6 +169,15 @@ def test_spread_keeps_the_largest_step_from_one_full_step_per_stage():
     in_flight = [batch(16384) for _ in range(4)]
     sched = scheduler([req(65536)], mbs=in_flight, last_mbs=[None] * 4, spread=2.0)
     assert pending_step_limit(sched) == 16384
+
+
+def test_full_step_is_the_admission_cap_not_a_padding_bucket():
+    """A compile bucket above --chunked-prefill-size only pads; a full step of
+    real work per stage must still keep the largest step under the spread."""
+    at_cap = [req(12288, rid=str(i)) for i in range(8)]
+    assert pending_step_limit(scheduler(at_cap, spread=2.0, chunk_cap=12288)) == 16384
+    below = at_cap[:7] + [req(12000, rid="7")]
+    assert pending_step_limit(scheduler(below, spread=2.0, chunk_cap=12288)) == 6144
 
 
 def test_cached_prefix_of_a_waiting_request_is_not_pending_work():
