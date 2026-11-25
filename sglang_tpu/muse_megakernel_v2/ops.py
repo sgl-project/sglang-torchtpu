@@ -47,6 +47,10 @@ from sglang_tpu.muse_megakernel_v2.common.consts import (
     UNSHIFTED_MAX,
 )
 from sglang_tpu.muse_megakernel_v2.common.ep_layout import KPERM_BLOCK, kperm
+from sglang_tpu.muse_megakernel_v2.common.ep_placement import (
+    load_placement,
+    permute_ep_experts,
+)
 from sglang_tpu.muse_megakernel_v2.common.ep_weights import (
     convert_experts_to_ep,
     ep_expert_refs,
@@ -200,11 +204,6 @@ def _validate_ep_serving(parallel: ParallelContext) -> None:
     if tpu_envs.SGLANG_TPU_MUSE_MK_QBLOCK.get() != KPERM_BLOCK:
         raise NotImplementedError(
             f"SGLANG_TPU_MUSE_MOE_MODE=ep needs SGLANG_TPU_MUSE_MK_QBLOCK={KPERM_BLOCK}"
-        )
-    if tpu_envs.SGLANG_TPU_MUSE_MK_EXPERT_GROUP.get():
-        raise NotImplementedError(
-            "SGLANG_TPU_MUSE_MOE_MODE=ep: no stacked expert groups "
-            "(SGLANG_TPU_MUSE_MK_EXPERT_GROUP=0)"
         )
     required = (
         tpu_envs.SGLANG_TPU_MUSE_MK_PREFILL,
@@ -526,8 +525,16 @@ class MuseMegakernel(torch.nn.Module):
                     )
             torch.accelerator.synchronize()
             logger.info("Muse megakernel: fp4 experts requantized to block %d", qblock)
-        for layer in decoder.layers:
+        placement = load_placement(n_layers=L, n_experts=geo.n_experts) if ep else None
+        el = geo.n_experts // parallel.tp_size
+        for li, layer in enumerate(decoder.layers):
             attn, moe = layer.self_attn, layer.mlp
+            # the fp4 layers take the placement; the fp8 ones keep checkpoint order
+            perm = (
+                placement[li]
+                if placement is not None and _expert_kind(moe.experts) == "fp4"
+                else None
+            )
             if layer.post_attention_layernorm.weight is not None:
                 raise NotImplementedError("affine post-attention norm")
             qkvg.append(
@@ -548,6 +555,8 @@ class MuseMegakernel(torch.nn.Module):
             rw = moe.gate.weight.detach()
             rw = rw if rw.shape == (H, geo.n_experts) else rw.t()
             rpad = torch.zeros(H, Ep, dtype=torch.bfloat16, device=device)
+            if perm is not None:  # router column s scores the expert at slot s
+                rw = rw[:, torch.as_tensor(perm, device=rw.device)]
             rpad[:, : geo.n_experts] = rw.to(torch.bfloat16)
             wrouter.append(rpad)
             sm = torch.zeros(SMALL_ROWS, H, dtype=torch.float32, device=device)
@@ -573,7 +582,10 @@ class MuseMegakernel(torch.nn.Module):
                 pre_expert_w = pre_expert_w[_kperm_index(geo.expert_hidden, device)]
             sm[S["pre_expert_w"], : geo.expert_hidden] = pre_expert_w
             sm[S["expert_bias"], :Ep] = NEG
-            sm[S["expert_bias"], : geo.n_experts] = moe.e_score_correction_bias.float()
+            bias = moe.e_score_correction_bias.float()
+            if perm is not None:
+                bias = bias[torch.as_tensor(perm, device=bias.device)]
+            sm[S["expert_bias"], : geo.n_experts] = bias
             sm[S["post_expert_w"], : geo.expert_hidden] = moe.post_expert_norm.gain()
             # fp8 e4m3 dense copies with per-output-channel scales (the router stays bf16).
             for name, mats in (
@@ -595,6 +607,11 @@ class MuseMegakernel(torch.nn.Module):
             kinds.append(kind)
             if ep:
                 convert_experts_to_ep(moe.experts, kind, geo.inter_local)
+                if perm is not None:
+                    rank = parallel.tp_rank
+                    permute_ep_experts(
+                        moe.experts, kind, perm[rank * el : (rank + 1) * el], rank=rank
+                    )
                 experts.extend(ep_expert_refs(moe.experts))
             else:
                 experts.extend(_expert_refs(moe.experts, kind))

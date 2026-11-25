@@ -34,6 +34,7 @@ from sglang_tpu.muse_megakernel_v2.common.numerics import (
     _topk_iter,
     heads_rms_xla,
 )
+from sglang_tpu.muse_megakernel_v2.common.plan import expert_units, layer_units
 from sglang_tpu.muse_megakernel_v2.common.qkv import qkv_from_proj
 
 # dtype instances: RPA / gmm_v2 configs read .itemsize
@@ -56,8 +57,9 @@ def _bf(x):
 
 
 def n_expert_refs(c: PFConfig) -> int:
-    """Expert operands of the SP program: (w13, s13, w2, s2) per layer."""
-    return 4 * c.n_layers
+    """Expert operands of the SP program: (w13, s13, w2, s2) per expert unit (a layer or a
+    stacked group, common/plan.expert_units)."""
+    return 4 * len(expert_units(c))
 
 
 def _counts(dest, n: int):
@@ -145,10 +147,10 @@ def build_forward(c: PFConfig, axis: str = "model"):
     from sglang_tpu.moe.pallas.gmm_v2 import TileSizes, gmm_v2
 
     c.validate()
-    if c.fp8_gather or c.expert_groups:
+    if c.fp8_gather:
         raise NotImplementedError(
             "the sequence-parallel prefill program has no e4m3 gathers "
-            "(SGLANG_TPU_MUSE_MK_PREFILL_FP8_GATHER) or stacked expert groups"
+            "(SGLANG_TPU_MUSE_MK_PREFILL_FP8_GATHER)"
         )
     if len(c.expert_kinds) != c.n_layers:
         raise ValueError(f"expert_kinds {c.expert_kinds}: one per layer needed")
@@ -167,12 +169,35 @@ def build_forward(c: PFConfig, axis: str = "model"):
     # tile_m (R=16 / 64: 64 beat 256 by 12% / 4%), and at 16 rows the chunk pipeline has no
     # transfer to hide (R=16: 1 chunk 0.48 vs 4 chunks 0.72 ms/layer; R=32 / 64: 4 chunks win)
     expert_tiles = (64,) + EXPERT_TILES[1:] if T <= 1024 else EXPERT_TILES
+    unit_of = layer_units(c)
     n_chunks = 1 if T <= 16 else N_CHUNKS
 
-    def expert_ffn(kind: str, x, group_sizes, w13, s13, w2, s2, group_offset, lo, hi):
+    def expert_ffn(kind: str, x, group_sizes, w13, s13, w2, s2, in_group, lo, hi):
         """silu(x @ gate) * (x @ up) @ w2 over rows grouped by local expert -> bf16 [cap, He].
-        gmm_v2 quantizes x and h to e4m3 (W4A8 / W8A8) and accumulates in f32."""
+        gmm_v2 quantizes x and h to e4m3 (W4A8 / W8A8) and accumulates in f32.
+
+        in_group: the layer's index in its stacked expert group (refs [n, E, ...]), or None.
+        gmm_v2 runs lhs group g on rhs[g - group_offset] (group 0 is the padding group, so
+        offset 1); a stacked layer k runs on the flattened [n * E, ...] refs with k * E empty
+        groups after the padding group, which leaves the row layout as is."""
         q_dtype = jnp.float4_e2m1fn if kind == "fp4" else jnp.float8_e4m3fn
+        if in_group is not None:
+            n_e = w13.shape[1]
+            w13, s13, w2, s2 = (t.reshape(-1, *t.shape[2:]) for t in (w13, s13, w2, s2))
+            group_sizes = jnp.concatenate(
+                [
+                    group_sizes[:1],
+                    jnp.zeros((in_group * n_e,), group_sizes.dtype),
+                    group_sizes[1:],
+                ]
+            )
+        # gmm_v2 needs at least as many lhs groups as rhs groups (+ the padding group)
+        short = w13.shape[0] + 1 - group_sizes.shape[0]
+        if short > 0:
+            group_sizes = jnp.concatenate(
+                [group_sizes, jnp.zeros((short,), group_sizes.dtype)]
+            )
+        group_offset = jnp.ones((1,), jnp.int32)
 
         def gmm(lhs, rhs, scale, fuse_act=None):
             return gmm_v2(
@@ -232,8 +257,8 @@ def build_forward(c: PFConfig, axis: str = "model"):
                 c.expert_kinds[l],
                 a2a.unpack_rows(recv, lo, hi, He),
                 a2a.chunk_group_sizes(pln, j, n_chunks),
-                *experts[4 * l : 4 * l + 4],
-                jnp.ones((1,), jnp.int32),
+                *experts[4 * unit_of[l][0] : 4 * unit_of[l][0] + 4],
+                unit_of[l][1],
                 lo,
                 hi,
             )

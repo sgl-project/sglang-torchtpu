@@ -837,6 +837,9 @@ class TpuEnvs:
     SGLANG_TPU_MUSE_MK_EP_ARM = EnvStr("gather")
     # a2a arm: up to this many rows pool / unpool read a 1/tp column slice. 0: off.
     SGLANG_TPU_MUSE_MK_EP_COL_POOL_MAX_ROWS = EnvInt(16)
+    # EP static expert placement, JSON inline or a path (muse_megakernel_v2/common/
+    # ep_placement.py): per layer, slot -> checkpoint expert. Empty: checkpoint order.
+    SGLANG_TPU_MUSE_EXPERT_PLACEMENT = EnvStr("")
     # EP megakernel without Pallas bounds checks.
     SGLANG_TPU_EP_NO_BOUNDS = EnvBool(False)
     # Rows up to which global-layer chunk loops are hoisted per global layer (0: shared loop).

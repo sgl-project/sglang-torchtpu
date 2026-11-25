@@ -159,6 +159,18 @@ def n_expert_refs(c):
     return 4 * len(expert_units(c))
 
 
+def layer_units(c):
+    """Per layer: (expert unit index, the layer's index in its stacked group or None)."""
+    out: list = [None] * c.n_layers
+    for u, unit in enumerate(expert_units(c)):
+        if unit[0] == "group":
+            for li in range(unit[1], unit[2]):
+                out[li] = (u, li - unit[1])
+        else:
+            out[unit[1]] = (u, None)
+    return out
+
+
 def route_blocks(c):
     """Lane blocks per vec_route field: (row, slot) pairs and distinct experts both fit."""
     return -(-c.rows * c.top_k // LANE)
