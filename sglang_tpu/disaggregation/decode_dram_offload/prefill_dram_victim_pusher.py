@@ -30,6 +30,7 @@ from sglang_tpu.disaggregation.decode_dram_offload.radix_host_ops import (
     leaf_of,
     lock_host_path,
     mark_next_victim,
+    path_token_count,
     path_tokens,
     unlock_host_path,
     window_host_pages,
@@ -325,8 +326,15 @@ class PrefillDramVictimPusher:
                 self._routes.pop(node, None)
             if not pushable or node in busy:
                 continue
+            pushed_tokens = self._pushed_len.get(node)
+            # Revisited routes commonly have no new tokens to push. Check
+            # current ancestor metadata before copying their whole token path.
+            if pushed_tokens is not None and pushed_tokens == path_token_count(
+                self._cache, node
+            ):
+                continue
             path = path_tokens(self._cache, node)
-            if self._pushed_len.get(node) == len(path):
+            if pushed_tokens == len(path):
                 continue
             pages = host_pages(self._cache, self._host_pool, node)
             if pages is None:
