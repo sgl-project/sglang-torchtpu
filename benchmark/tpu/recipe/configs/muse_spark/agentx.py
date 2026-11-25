@@ -386,6 +386,14 @@ def config_for(
         env.update(MK_DECODE_ENV)
     if mk_prefill:
         env.update(MK_PREFILL_ENV)
+        if large:
+            # prefill/sptp (the default program with TP experts): an 8192-token chunk costs
+            # 30.0 us/token vs 33.2 at 4096 (62 layers, device time); shorter turns keep 4096.
+            args.update(
+                chunked_prefill_size=8192,
+                max_prefill_tokens=8192,
+                tpu_compile_tokens=[4096, 8192],
+            )
     if mk_qblock:
         # Block-256 requantized fp4 experts (main #2131) and the key-column mask.
         env["SGLANG_TPU_MUSE_MK_QBLOCK"] = str(mk_qblock)
