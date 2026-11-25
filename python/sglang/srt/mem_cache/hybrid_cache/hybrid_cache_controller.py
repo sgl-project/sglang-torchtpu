@@ -409,21 +409,17 @@ class HybridCacheController(BaseHiCacheController):
 
     @classmethod
     def create_for_backend(cls, *args, **kwargs) -> HybridCacheController:
-        """Instantiate the io-backend-specific hybrid controller.
+        """Instantiate the hybrid controller for ``io_backend``: the platform's
+        class when the backend needs its own (e.g. no device streams), else ``cls``."""
+        from sglang.srt.platforms import current_platform
 
-        Mirrors ``HiCacheController.create_for_backend``: a TPU DMA backend
-        (e.g. raiden) has no device streams and drives per-pool all-layer DMAs,
-        so it needs its own controller class.
-        """
-        from sglang_tpu.tpu_dma_hicache import is_tpu_dma_hicache_backend
-
-        if is_tpu_dma_hicache_backend(kwargs.get("io_backend")):
-            from sglang_tpu.tpu_dma_hybrid_cache_controller import (
-                TpuDMAHybridCacheController,
+        controller_cls = (
+            current_platform.get_hybrid_cache_controller_cls(
+                kwargs.get("io_backend", "")
             )
-
-            return TpuDMAHybridCacheController(*args, **kwargs)
-        return cls(*args, **kwargs)
+            or cls
+        )
+        return controller_cls(*args, **kwargs)
 
     def _start_storage_threads(self):
         super()._start_storage_threads()
