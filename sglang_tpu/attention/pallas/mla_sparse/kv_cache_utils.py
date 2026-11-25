@@ -530,6 +530,7 @@ def update_sparse_mla_kv_cache_dcp(
     rope_spec: SparseMLAKVCacheSpec,
     dcp_size: int,
     interleave_size: int,
+    write_rope: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
     """Scatter this step's MLA latents into a DCP position-sharded cache.
 
@@ -570,11 +571,19 @@ def update_sparse_mla_kv_cache_dcp(
       dcp_rank: i32 scalar, this shard's DCP index.
       nope_spec, rope_spec: layout descriptors the shards were allocated from.
       dcp_size, interleave_size: the shard layout.
+      write_rope: as in `update_sparse_mla_kv_cache`.
 
     Returns:
       The updated (nope, rope) shards, same shapes/dtypes as the inputs.
     """
-    _check_inputs(kv_cache_nope, kv_cache_rope, kv_c_normed, nope_spec, rope_spec)
+    _check_inputs(
+        kv_cache_nope,
+        kv_cache_rope,
+        kv_c_normed,
+        nope_spec,
+        rope_spec,
+        check_rope_shape=write_rope,
+    )
     page, slot = _get_dcp_page_and_slot(
         kv_c_normed.shape[0],
         seq_lens,
@@ -594,6 +603,7 @@ def update_sparse_mla_kv_cache_dcp(
         slot,
         nope_spec,
         rope_spec,
+        write_rope=write_rope,
     )
 
 

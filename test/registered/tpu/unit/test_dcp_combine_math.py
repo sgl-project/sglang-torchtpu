@@ -459,7 +459,7 @@ class TestAllHeadsLocal(CustomTestCase):
             distribution=tensor,
             active_num_tokens=tensor,
             dcp_kv_lens_global=tensor,
-            dcp_cp_rank=tensor,
+            dcp_cp_rank=torch.tensor([rank], dtype=torch.int32),
         )
         return backend
 

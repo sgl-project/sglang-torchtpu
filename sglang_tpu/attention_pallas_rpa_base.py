@@ -194,6 +194,10 @@ class PallasForwardMetadata:
     raw_page_base: torch.Tensor | None = None
     # Prefill context parallelism using ring attention (SGLANG_TPU_PCP_MODE=ring)
     cp_ring: PcpRingMetadata | None = None
+    # Sparse MLA under DCP only: i32[max_num_seqs * pages_per_seq]  the latent
+    # stripe's page table. ``page_indices`` then covers the allocator's whole
+    # slot space (the replicated indexer's) and ``kv_lens`` is global.
+    dcp_latent_page_indices: torch.Tensor | None = None
 
 
 def _make_active_num_tokens(cu_q_lens: torch.Tensor, non_empty_bs: int) -> torch.Tensor:
@@ -608,6 +612,11 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
     # Set by each subclass to select the kernel variant; None on the base only.
     kernel_spec: ClassVar[RpaKernelSpec | None] = None
 
+    # True for a subclass whose own forward reads the DCP metadata (global
+    # lengths, stripe page table) correctly; the base DCP init refuses any other
+    # subclass that overrides forward_decode / forward_extend.
+    runs_own_dcp_forward: ClassVar[bool] = False
+
     # The torch custom op exposes KV updates as an in-place mutation, so syncing
     # model outputs during TPU precompile is enough to execute the graph.
     requires_kv_sync_after_compile = False
@@ -665,7 +674,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                     "SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=1 (the default)."
                 )
             cls = type(self)
-            if (
+            if not cls.runs_own_dcp_forward and (
                 cls.forward_decode is not BaseTpuPallasRpaAttnBackend.forward_decode
                 or cls.forward_extend is not BaseTpuPallasRpaAttnBackend.forward_extend
             ):
@@ -688,7 +697,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 torch.arange(self._dcp, dtype=torch.int64, device=self.device)
                 == self._dcp_rank
             )
-            self._dcp_op = build_dcp_kernel_op(self.kernel_spec)
+            if not cls.runs_own_dcp_forward:
+                self._dcp_op = build_dcp_kernel_op(self.kernel_spec)
 
         max_bs = get_exec().graph.torch_compile_max_bs
         if max_bs:
@@ -1918,6 +1928,12 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         cp = self._dcp
         group = self._dcp_group
 
+        cp_rank = md.dcp_cp_rank if md.dcp_cp_rank is not None else self._cp_rank_t
+        cp_rank_index = cp_rank.to(torch.int64)
+        cp_rank_mask = (
+            torch.arange(cp, device=cp_rank.device, dtype=cp_rank.dtype) == cp_rank
+        )
+
         # The kernels run on every query head the group holds; each rank then
         # keeps its own ``layer_q_heads`` of the result.
         group_q_heads = layer_q_heads * self._dcp_head_blocks
@@ -1926,12 +1942,12 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             # the whole group's (--dcp-replicate-q-proj).
             q_all = q.contiguous()
         else:
-            q_all = gather_heads(q.contiguous(), group, cp, self._cp_rank_mask)
+            q_all = gather_heads(q.contiguous(), group, cp, cp_rank_mask)
 
         def keep_own_heads(x: torch.Tensor) -> torch.Tensor:
             if x.shape[1] == layer_q_heads:
                 return x
-            return own_heads(x, cp, self._cp_rank_index)
+            return own_heads(x, cp, cp_rank_index)
 
         if forward_batch.forward_mode.is_decode():
             # ``md.kv_lens`` is this rank's page-striped share of seq_len (the
@@ -1962,9 +1978,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 3,  # attention_scope: STRIPED
                 1,  # rpa_cases: DECODE only
             )
-            out, lse = merge_across_ranks(
-                out_p.float(), lse_p, group, cp, self._cp_rank_mask
-            )
+            out, lse = merge_across_ranks(out_p.float(), lse_p, group, cp, cp_rank_mask)
             out, lse = keep_own_heads(out), keep_own_heads(lse)
             if sinks is not None:
                 out = sink_fold(out, lse, sinks)
@@ -2028,7 +2042,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             0 if is_mixed else 2,  # rpa_cases: DECODE + MIXED / MIXED only
         )
         out_prefix, lse_prefix = merge_across_ranks(
-            out_prefix.float(), lse_prefix, group, cp, self._cp_rank_mask
+            out_prefix.float(), lse_prefix, group, cp, cp_rank_mask
         )
         out_prefix, lse_prefix = keep_own_heads(out_prefix), keep_own_heads(lse_prefix)
         out_chunk = keep_own_heads(out_chunk).float()
