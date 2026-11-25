@@ -793,7 +793,12 @@ def _validate_dsa(server_args) -> None:
     _validate_mtp_index_share(cfg, hf_config)
     if not is_deepseek_dsa(hf_config):
         return
-    if cfg.attention_backend != "pallas_tpu_mla_sparse":
+    # K3_PROGRAM serves the attention and the DSA indexer in its own programs
+    # (sglang_tpu/k3_programs): neither sglang's sparse backend nor its tracer runs.
+    k3_program = (
+        str(getattr(cfg, "speculative_algorithm", "") or "").upper() == "K3_PROGRAM"
+    )
+    if not k3_program and cfg.attention_backend != "pallas_tpu_mla_sparse":
         raise ValueError(
             "Sparse attention (DSA) on TPU needs --attention-backend "
             f"pallas_tpu_mla_sparse, got {cfg.attention_backend!r}."
@@ -1119,6 +1124,13 @@ def _validate_decode_context_parallel(server_args) -> None:
             "SparseCore gather offloads off and returns wrong first tokens with "
             "them on."
         )
+
+
+def _k3_program_selected() -> bool:
+    """Whether the Kimi-K3 megakernel programs serve (K3_PROGRAM)."""
+    from sglang_tpu.hooks.k3_program import k3_program_active
+
+    return k3_program_active()
 
 
 def _experimental_spec_enabled() -> bool:
@@ -1467,10 +1479,12 @@ class TpuSRTPlatform(SRTPlatform):
     def supports_mamba_prefix_cache(self, model_config) -> bool:
         from sglang.srt.configs.hybrid_arch import hybrid_gdn_config, hybrid_kda_config
 
-        # GDN and KDA run the same kernel and pass it the same snapshot plan.
+        # GDN and KDA run the same kernel and pass it the same snapshot plan;
+        # the Kimi-K3 programs' worker copies each tracked chunk's state itself.
         return (
             hybrid_gdn_config(model_config) is not None
             or hybrid_kda_config(model_config) is not None
+            or _k3_program_selected()
         )
 
     def validate_mamba_prefix_cache(self, view, hf_config=None) -> None:
@@ -1515,6 +1529,11 @@ class TpuSRTPlatform(SRTPlatform):
         return shared_slice.receiver(tp_rank)
 
     def get_mamba_pool_cls(self) -> type:
+        if _k3_program_selected():
+            # Kimi-K3 programs: KDA state in the unified pools.
+            from sglang_tpu.k3_programs.sglang_pools import K3StatePool
+
+            return K3StatePool
         # Hybrid GDN models (Qwen3.5 / Qwen3-Next) store their recurrent state
         # in a TPU-native, Pallas-kernel-layout pool.
         from sglang_tpu.mamba_pool import TpuMambaPool
@@ -1586,6 +1605,11 @@ class TpuSRTPlatform(SRTPlatform):
         # upstream pool.
         from sglang.srt.runtime_context import get_exec
 
+        if _k3_program_selected():
+            # Kimi-K3 programs: the unified pools, MLA KV and KDA state.
+            from sglang_tpu.k3_programs.sglang_pools import K3UnifiedKVPool
+
+            return K3UnifiedKVPool
         if get_exec().kernel.attention_backend == "pallas_tpu_mla":
             from sglang_tpu.kv_pool import (
                 TpuFusedMLATokenToKVPool,
@@ -1598,6 +1622,12 @@ class TpuSRTPlatform(SRTPlatform):
         return MLATokenToKVPool
 
     def get_dsa_kv_pool_cls(self) -> type:
+        if _k3_program_selected():
+            # Kimi-K3.1 on the K3 programs: the unified pools plus the DSA
+            # index-key pools beside them.
+            from sglang_tpu.k3_programs.sglang_pools import K3UnifiedKVPool
+
+            return K3UnifiedKVPool
         from sglang_tpu.kv_pool import TpuSplitMLATokenToKVPool
 
         return TpuSplitMLATokenToKVPool

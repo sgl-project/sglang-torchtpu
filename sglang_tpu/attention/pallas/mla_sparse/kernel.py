@@ -37,6 +37,9 @@ DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE = 64
 DEFAULT_ATTENTION_KERNEL_BATCH_SIZE = 16
 # The native SparseCore gather's unit, which `topk_cap` must be a multiple of.
 GATHER_ATOM_ROWS = native_sc_gather.OCCURRENCES_PER_ATOM
+# pltpu.reciprocal from jax 0.11 on; before that (e.g. jax 0.10.2) the same op
+# is pl.reciprocal.
+_reciprocal = pltpu.reciprocal if hasattr(pltpu, "reciprocal") else pl.reciprocal
 
 
 def cdiv(a, b):
@@ -624,7 +627,7 @@ def _attention_kernel(
         out = (
             lax.div(pv, l_sum)
             if q_dtype == jnp.float32
-            else (pv * pltpu.reciprocal(l_sum, approx=True)).astype(q_dtype)
+            else (pv * _reciprocal(l_sum, approx=True)).astype(q_dtype)
         )
         return out
 
@@ -882,7 +885,7 @@ def _attention_kernel(
                 out = (
                     lax.div(pv, l_sum)
                     if q_dtype == jnp.float32
-                    else (pv * pltpu.reciprocal(l_sum, approx=True)).astype(q_dtype)
+                    else (pv * _reciprocal(l_sum, approx=True)).astype(q_dtype)
                 )
                 bo_x2_ref.at[bo_sem_idx, batch_idx][...] = out[:, :o_dim]
                 if return_lse:
