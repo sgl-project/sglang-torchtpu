@@ -16,10 +16,12 @@ from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.model_loader import weight_utils
 from sglang.srt.model_loader.loader import DefaultModelLoader
+from sglang.srt.platforms.device_mixin import DeviceMixin
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu import ep_local_expert_reader
 from sglang_tpu.envs import envs
+from sglang_tpu.tpu_platform import TpuSRTPlatform
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -99,7 +101,8 @@ def _read(files, iterator, expert_range, disable_mmap=True):
         it = weight_utils.safetensors_weights_iterator(
             files, disable_mmap=disable_mmap, local_expert_range=expert_range
         )
-    return dict(it)
+    with patch.object(weight_utils, "current_platform", TpuSRTPlatform()):
+        return dict(it)
 
 
 class TestEpLocalExpertReads(CustomTestCase):
@@ -503,7 +506,10 @@ class TestLoaderPassesTheRange(CustomTestCase):
         for tpu in (True, False):
             with (
                 self.subTest(tpu=tpu),
-                patch(f"{_LOADER}._is_tpu", tpu),
+                patch(
+                    f"{_LOADER}.current_platform",
+                    TpuSRTPlatform() if tpu else DeviceMixin(),
+                ),
                 patch(
                     f"{_MOD}.tpu_local_routed_expert_range", return_value=(2, 4)
                 ) as expert_range,

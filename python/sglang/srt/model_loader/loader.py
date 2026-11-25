@@ -141,31 +141,8 @@ from sglang.srt.utils import (
     get_device_capability,
     is_npu,
     is_pin_memory_available,
-    is_tpu,
     rank0_log,
 )
-
-_is_tpu = is_tpu()
-
-
-def _drain_device_transients_after_module_load() -> None:
-    """Flush any deferred device copy/free work after a module's
-    ``process_weights_after_loading``.
-
-    Some accelerator backends execute device copies and frees lazily, so the
-    transient buffers created during weight post-processing -- e.g. the FP8
-    block->channelwise float32 dequant in ``prepare_tpu_fp8_moe_weights`` and
-    the dense FP8 linear conversion -- otherwise accumulate across modules and
-    can spike device memory to OOM. Synchronizing per module frees each
-    module's transients before the next.
-
-    Only backends with this deferred-execution behavior need it (currently
-    torch_tpu; no-op elsewhere). Mirrors the load-stream drain in #105, which
-    does not cover this post-load loop.
-    """
-    if _is_tpu:
-        current_platform.synchronize()
-
 
 if TYPE_CHECKING:
     from sglang.srt.configs.device_config import DeviceConfig
@@ -485,18 +462,12 @@ class DefaultModelLoader(BaseModelLoader):
         """The model configuration (for checking architecture, etc)."""
 
         local_expert_range: Optional[Tuple[int, int]] = None
-        """Routed-expert ids this EP rank stores, when the model opts into
-        EP-local reads (see ``tpu_local_routed_expert_range``)."""
+        """Routed-expert ids this EP rank stores, when the platform reads only
+        those from the checkpoint (``current_platform.get_local_expert_range``)."""
 
         @classmethod
         def init_new(cls, model_config: ModelConfig, model):
-            local_expert_range = None
-            if _is_tpu:
-                from sglang_tpu.ep_local_expert_reader import (
-                    tpu_local_routed_expert_range,
-                )
-
-                local_expert_range = tpu_local_routed_expert_range(model)
+            local_expert_range = current_platform.get_local_expert_range(model)
             return cls(
                 model_config.model_path,
                 model_config.revision,
@@ -1168,13 +1139,8 @@ class DefaultModelLoader(BaseModelLoader):
             # parameters onto device for processing and back off after.
             with device_loading_context(module, target_device):
                 quant_method.process_weights_after_loading(module)
-            _drain_device_transients_after_module_load()
-        if target_device.type == "tpu":
-            from sglang_tpu.moe.pallas.fused_moe_decode.fused_moe_decode_op import (
-                prepare_model_for_fused_moe_decode,
-            )
-
-            prepare_model_for_fused_moe_decode(model)
+            current_platform.after_module_weights_processed(module)
+        current_platform.after_model_weights_processed(model, target_device)
         finalize_gfx115_weight_padding(model)
 
     @staticmethod
@@ -3636,7 +3602,7 @@ def load_model_with_cpu_quantization(
                 # parameters onto device for processing and back off after.
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
-                _drain_device_transients_after_module_load()
+                current_platform.after_module_weights_processed(module)
 
         model.to(target_device)
 

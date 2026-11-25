@@ -2091,3 +2091,43 @@ class TpuSRTPlatform(SRTPlatform):
             np.random.seed(seed)
             torch.manual_seed(seed)
             torch.tpu.manual_seed_all(seed)
+
+    def supports_async_weight_loading(self) -> bool:
+        # Threaded host->device parameter copies race torch_tpu's enqueue path.
+        return False
+
+    def after_module_weights_processed(self, module: torch.nn.Module) -> None:
+        # torch_tpu frees lazily, so each module's post-processing transients
+        # (e.g. prepare_tpu_fp8_moe_weights' float32 dequant) would pile up and OOM.
+        self.synchronize()
+
+    def after_model_weights_processed(
+        self, model: torch.nn.Module, target_device: torch.device
+    ) -> None:
+        if target_device.type != "tpu":
+            return
+        from sglang_tpu.moe.pallas.fused_moe_decode.fused_moe_decode_op import (
+            prepare_model_for_fused_moe_decode,
+        )
+
+        prepare_model_for_fused_moe_decode(model)
+
+    def get_local_expert_range(
+        self, model: torch.nn.Module
+    ) -> Optional[tuple[int, int]]:
+        from sglang_tpu.ep_local_expert_reader import tpu_local_routed_expert_range
+
+        return tpu_local_routed_expert_range(model)
+
+    def create_local_expert_reader(
+        self,
+        hf_weights_files: list[str],
+        local_expert_range: tuple[int, int],
+        *,
+        disable_mmap: bool,
+    ):
+        from sglang_tpu.ep_local_expert_reader import EpLocalExpertReader
+
+        return EpLocalExpertReader.maybe_create(
+            hf_weights_files, local_expert_range, disable_mmap=disable_mmap
+        )
