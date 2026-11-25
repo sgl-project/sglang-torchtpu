@@ -17,14 +17,16 @@ from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.muse_megakernel_v2.common.coll import GridColl, ag_kinds, run_pipeline
 from sglang_tpu.muse_megakernel_v2.common.config import PFConfig
-from sglang_tpu.muse_megakernel_v2.common.consts import small_row
+from sglang_tpu.muse_megakernel_v2.common.consts import (
+    SPTP_XAG_QKVG_COLLECTIVE_ID,
+    small_row,
+)
 from sglang_tpu.muse_megakernel_v2.common.numerics import _rope_roll
 from sglang_tpu.muse_megakernel_v2.common.qkv import qkv_from_proj
 from sglang_tpu.muse_megakernel_v2.common.trace import _scope
 from sglang_tpu.muse_megakernel_v2.prefill.sptp.qkvg import _q_rpa, qkv_epilogue
 
 # Barrier id of this kernel; distinct from common.consts' (0, 6, 7, 9-12).
-SPTP_XAG_QKVG_COLLECTIVE_ID = 15
 _FP8_MAX = 448.0
 
 

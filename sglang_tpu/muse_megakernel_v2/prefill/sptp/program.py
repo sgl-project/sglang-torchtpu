@@ -22,7 +22,11 @@ import jax.numpy as jnp
 
 from sglang_tpu.muse_megakernel_v2.common import plan
 from sglang_tpu.muse_megakernel_v2.common.config import PFConfig
-from sglang_tpu.muse_megakernel_v2.common.consts import LANE, small_row
+from sglang_tpu.muse_megakernel_v2.common.consts import (
+    LANE,
+    SPTP_PA_COLLECTIVE_ID,
+    small_row,
+)
 from sglang_tpu.muse_megakernel_v2.common.numerics import _rms, heads_rms_xla
 from sglang_tpu.muse_megakernel_v2.common.qkv import qkv_from_proj
 from sglang_tpu.muse_megakernel_v2.common.trace import _scope
@@ -64,8 +68,6 @@ QKVG_TILE = 256
 # x_norm AG chunks overlapped with the chunked qkvg card, and that card's row tile
 XAG_CHUNKS = 4
 XAG_TILE = 128
-# Pallas barrier id of the post-attention kernel's in-kernel a2a (SPTP_PA_A2A)
-SPTP_PA_COLLECTIVE_ID = 17
 
 
 def _bf16_rows(x):
