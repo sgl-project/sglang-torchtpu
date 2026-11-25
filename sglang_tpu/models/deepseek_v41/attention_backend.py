@@ -374,8 +374,11 @@ def _host_or_read(forward_batch: ForwardBatch, name: str, length: int) -> torch.
 _HOST_CHECKS: Dict[str, int] = {}
 
 
-def _request_token_counts(forward_batch: ForwardBatch, bs: int) -> torch.Tensor:
-    """[B] int64 query rows of each batch row; bucket-padding rows get 0."""
+def _request_token_counts(
+    forward_batch: ForwardBatch, req_pool_indices: torch.Tensor
+) -> torch.Tensor:
+    """Host query counts. The worker pads the end of the batch with pool slot 0."""
+    bs = req_pool_indices.numel()
     mode = forward_batch.forward_mode
     real_bs = min(bs, int(getattr(forward_batch, _REAL_B_KEY, bs)))
     counts = torch.zeros(bs, dtype=torch.int64)
@@ -383,23 +386,24 @@ def _request_token_counts(forward_batch: ForwardBatch, bs: int) -> torch.Tensor:
         return counts
     if mode.is_decode():
         counts[:real_bs] = 1
-        return counts
-    if mode.is_target_verify():
+    elif mode.is_target_verify():
         # extend_seq_lens is not set on verify batches; every request has the same width.
         spec_info = forward_batch.spec_info
         assert spec_info is not None, "a verify batch carries spec_info"
         counts[:real_bs] = int(spec_info.draft_token_num)
-        return counts
-    if mode.is_extend():
+    elif mode.is_extend():
         lens = forward_batch.extend_seq_lens_cpu
         if lens is None:
             lens = forward_batch.extend_seq_lens
         assert lens is not None, "an extend batch carries extend_seq_lens"
         counts[:real_bs] = _as_cpu_int64(lens, bs)[:real_bs]
-        return counts
-    raise NotImplementedError(
-        f"DeepSeek-V4.1 TPU attention serves extend, decode and target verify, not {mode.name}"
-    )
+    else:
+        raise NotImplementedError(
+            f"DeepSeek-V4.1 TPU attention serves extend, decode and target verify, not {mode.name}"
+        )
+    # DSpark constructs draft and target forwards at the physical DP bucket.
+    # The shim can therefore regard even the reserved padding slots as real.
+    return counts.masked_fill_(req_pool_indices == 0, 0)
 
 
 def _full_page_table(
@@ -666,7 +670,7 @@ def _device_row_metadata(
         return None  # SWA table from a device full_to_swa mapping
     bs = int(forward_batch.batch_size)
     num_tokens = forward_batch.positions.shape[0]
-    counts = _request_token_counts(forward_batch, bs)
+    counts = _request_token_counts(forward_batch, req_pool_indices)
     query_start_loc = F.pad(torch.cumsum(counts, 0), (1, 0))
     host_rows = torch.full((num_tokens,), -1, dtype=torch.int64)
     host_rows[: int(query_start_loc[-1])] = torch.repeat_interleave(
@@ -924,11 +928,11 @@ def build_forward_metadata(
     positions = _extend_positions(forward_batch, num_tokens)
     out_cache_loc = _host_or_read(forward_batch, "out_cache_loc", num_tokens)
 
-    counts = _request_token_counts(forward_batch, bs)
+    req_pool_indices = _host_or_read(forward_batch, "req_pool_indices", bs)
+    counts = _request_token_counts(forward_batch, req_pool_indices)
     query_start_loc = F.pad(torch.cumsum(counts, 0), (1, 0))
     real_tokens = int(query_start_loc[-1])
     assert real_tokens <= num_tokens, f"{real_tokens=} > {num_tokens=}"
-    req_pool_indices = _host_or_read(forward_batch, "req_pool_indices", bs)
     host_input_mirror.release(forward_batch)
     token_rows, valid, token_req_pool = _token_rows(
         counts, out_cache_loc, req_pool_indices, num_tokens
