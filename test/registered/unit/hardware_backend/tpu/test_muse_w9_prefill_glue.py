@@ -575,19 +575,21 @@ def test_ccs_fuse_ag_a1_mode3_in_kernel_lowering():
                 check_vma=False,
             )
         )
+        args_spec = (
+            jax.ShapeDtypeStruct((tp_d * tp_d, c_k, 8192), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((tp_d * c_next, 8192), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((tp_d * 8192, qg_cols), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((tp_d, qg_cols), jnp.float32),
+            jax.ShapeDtypeStruct((tp_d * tp_d * c_k, 128), jnp.float32),
+            jax.ShapeDtypeStruct((tp_d * tp_d * c_k, 128), jnp.float32),
+        )
         shlo = (
-            sm.trace(
-                jax.ShapeDtypeStruct((tp_d * tp_d, c_k, 8192), jnp.float8_e4m3fn),
-                jax.ShapeDtypeStruct((tp_d * c_next, 8192), jnp.float8_e4m3fn),
-                jax.ShapeDtypeStruct((tp_d * 8192, qg_cols), jnp.float8_e4m3fn),
-                jax.ShapeDtypeStruct((tp_d, qg_cols), jnp.float32),
-                jax.ShapeDtypeStruct((tp_d * tp_d * c_k, 128), jnp.float32),
-                jax.ShapeDtypeStruct((tp_d * tp_d * c_k, 128), jnp.float32),
-            )
+            sm.trace(*args_spec)
             .lower(lowering_platforms=("tpu",))
             .as_text("stablehlo")
         )
         assert tag in shlo and "partition_id" not in shlo
+        return _body, args_spec
 
     with (
         mock.patch(
@@ -597,8 +599,39 @@ def test_ccs_fuse_ag_a1_mode3_in_kernel_lowering():
     ):
         _run_lower(8, 16, 2, 512, 512, "_inag_xy")
         if len(devs) >= 16:
-            _run_lower(16, 8, 1, 512, 512, "_inag_xyz")
+            body16, spec16 = _run_lower(16, 8, 1, 512, 512, "_inag_xyz")
             _run_lower(16, 8, 1, 512, 1280, "_inag_xyz")
+
+            from jax.experimental import topologies
+
+            try:
+                topo16 = topologies.get_topology_desc(
+                    platform="tpu", topology_name="tpu7x=2x2x2"
+                )
+            except Exception:
+                topo16 = None
+            if topo16 is not None:
+                aot_mesh16 = Mesh(np.array(topo16.devices).reshape(16), ("model",))
+                shd16 = jax.sharding.NamedSharding(aot_mesh16, P("model"))
+                aot_args = tuple(
+                    jax.ShapeDtypeStruct(s.shape, s.dtype, sharding=shd16)
+                    for s in spec16
+                )
+                compiled = (
+                    jax.jit(
+                        jax.shard_map(
+                            body16,
+                            mesh=aot_mesh16,
+                            in_specs=(P("model"),) * 6,
+                            out_specs=(P("model"),) * 4,
+                            check_vma=False,
+                        )
+                    )
+                    .trace(*aot_args)
+                    .lower()
+                    .compile()
+                )
+                assert compiled is not None
 
             # 16-device Mosaic interpret=True + detect_races=True 0-ULP parity on c_next=128 (64,32,32).
             from jax import lax
@@ -1136,8 +1169,8 @@ def test_xor1_callsite_split_moe_and_chunk_b2_lowering():
     assert "xor1_xytorus_ag_tp8" in hlo_moe3 and "partition_id" not in hlo_moe3
 
 
-def test_tp16_ccs_fuse_ag_a1_nonzero_raises_loudly():
-    """Verify #2833 §1: TP=16 rejects CCS_FUSE_AG_A1 != 0 loudly in from_model and _ops."""
+def test_tp16_ccs_fuse_ag_a1_guard():
+    """Verify #3733: TP=16 allows CCS_FUSE_AG_A1 in (0, 3) and rejects other values loudly."""
     import types
 
     from sglang.srt.configs.muse_spark import MuseSparkTextConfig
@@ -1164,7 +1197,7 @@ def test_tp16_ccs_fuse_ag_a1_nonzero_raises_loudly():
         text_config=cfg,
     )
 
-    for bad_val in ("1", "2", "3"):
+    for bad_val in ("1", "2", "4"):
         with (
             mock.patch.dict(
                 os.environ, {"SGLANG_TPU_MUSE_KERNEL_CCS_FUSE_AG_A1": bad_val}
@@ -1173,23 +1206,60 @@ def test_tp16_ccs_fuse_ag_a1_nonzero_raises_loudly():
                 "sglang.srt.runtime_context.get_parallel", return_value=parallel
             ),
         ):
-            with pytest.raises(ValueError, match="CCS_FUSE_AG_A1 != 0"):
+            with pytest.raises(ValueError, match=r"CCS_FUSE_AG_A1 not in \(0, 3\)"):
                 integration.MusePrefillKernels.from_model(fake_model)
+
+    # Mode 3 passes the TP=16 guard in from_model (layers=[] returns None later).
+    with (
+        mock.patch.dict(
+            os.environ,
+            {
+                "SGLANG_TPU_MUSE_KERNEL_CCS_FUSE_AG_A1": "3",
+                "SGLANG_TPU_MUSE_KERNEL_TP16_PREFILL": "1",
+            },
+        ),
+        mock.patch(
+            "sglang.srt.runtime_context.get_parallel", return_value=parallel
+        ),
+    ):
+        assert integration.MusePrefillKernels.from_model(fake_model) is None
 
     fake_mesh = types.SimpleNamespace(shape={"model": 16})
     with mock.patch(
         "sglang_tpu.moe.pallas.fused_moe_rs_op._get_mesh", return_value=fake_mesh
     ):
-        with pytest.raises(ValueError, match="CCS_FUSE_AG_A1 != 0"):
-            integration._ops(
+        for bad_mode in (1, 2, 4):
+            with pytest.raises(ValueError, match=r"CCS_FUSE_AG_A1 not in \(0, 3\)"):
+                integration._ops(
+                    h_q_local=8,
+                    h_kv_local=1,
+                    a1_variant="v6",
+                    a3_variant="v16",
+                    fused_glue=False,
+                    head_norm_eps=1e-8,
+                    ccs_fuse_ag_a1=bad_mode,
+                )
+
+    jax = pytest.importorskip("jax")
+    devs = jax.devices()
+    if len(devs) >= 16:
+        from jax.sharding import Mesh
+
+        mesh16 = Mesh(np.array(devs[:16]), ("model",))
+        with mock.patch(
+            "sglang_tpu.moe.pallas.fused_moe_rs_op._get_mesh", return_value=mesh16
+        ):
+            ops3 = integration._ops(
                 h_q_local=8,
                 h_kv_local=1,
                 a1_variant="v6",
                 a3_variant="v16",
                 fused_glue=False,
                 head_norm_eps=1e-8,
-                ccs_fuse_ag_a1=1,
+                causal_chunk_stream=True,
+                ccs_fuse_ag_a1=3,
             )
+            assert ops3.a1_chunk_agd is not None
 
 
 def test_xor1_nan_poisoned_scratch_interpret_parity():
