@@ -700,20 +700,20 @@ class TpuEnvs:
     SGLANG_TPU_FUSED_RS_PAIR_LOCAL_RANKS = EnvBool(False)
     # Pair exchange: cross-chip pair sums travel as e4m3 with one f32 scale per row
     # (~0.56x the bf16 ICI bytes; numerics change).
-    SGLANG_TPU_FUSED_RS_PAIR_FP8_ROWS = EnvBool(False)
+    SGLANG_TPU_FUSED_RS_PAIR_FP8_ROWS = EnvBool(True)
     # Expert-TP W4A16 fused-RS: quantize both GMM inputs to e4m3 with one scale per
     # row, as the EP gmm_v2 path does (W4A8; numerics change).
     SGLANG_TPU_FUSED_RS_W4A8_ROWS = EnvBool(False)
     # Fused-RS W4A16 GMM2: dequantize the fp4 weights with their block-256 scales to bf16,
     # then run K as one dot, instead of applying each block's scale after its own dot (one
     # more bf16 rounding of the scaled weights). Was SGLANG_TPU_FUSED_RS_GMM2_FOLD.
-    SGLANG_TPU_FUSED_RS_GMM2_DEQUANT_WEIGHTS = EnvBool(False)
+    SGLANG_TPU_FUSED_RS_GMM2_DEQUANT_WEIGHTS = EnvBool(True)
     # The same for GMM1 (K = hidden as one dot instead of one dot per 256-row block).
     # Was SGLANG_TPU_FUSED_RS_GMM1_FOLD.
-    SGLANG_TPU_FUSED_RS_GMM1_DEQUANT_WEIGHTS = EnvBool(False)
+    SGLANG_TPU_FUSED_RS_GMM1_DEQUANT_WEIGHTS = EnvBool(True)
     # Fused-RS: extra row buckets (comma list, multiples of the sublane tiling) added
     # to the power-of-two buckets; exact.
-    SGLANG_TPU_FUSED_RS_EXTRA_M_BUCKETS = EnvStr(None)
+    SGLANG_TPU_FUSED_RS_EXTRA_M_BUCKETS = EnvStr("160,192")
     # Pair exchange: add the sibling's partial in bf16, 8 rows per op, instead of
     # per row in f32.
     SGLANG_TPU_FUSED_RS_PAIR_SUM_BF16 = EnvBool(False)
@@ -725,31 +725,31 @@ class TpuEnvs:
     SGLANG_TPU_FUSED_RS_KEY_SORT = EnvBool(False)
     # e4m3 pair exchange: GMM epilogues skip the x1.0 global scale when the experts have none
     # and the zeroing of rows outside the tile (never sent); bit-identical sent rows.
-    SGLANG_TPU_FUSED_RS_LEAN_EPILOGUE = EnvBool(False)
+    SGLANG_TPU_FUSED_RS_LEAN_EPILOGUE = EnvBool(True)
     # e4m3 pair exchange: the first N q8 blocks of each forwarded run of tile g - 2 are summed
     # and quantized inside tile g's GMM1 (co-issued with its matmul) instead of after GMM2.
-    SGLANG_TPU_FUSED_RS_Q8_IN_GMM1 = EnvInt(0)
+    SGLANG_TPU_FUSED_RS_Q8_IN_GMM1 = EnvInt(3)
     # With Q8_IN_GMM1: q8 blocks of 8 rows whose row maxima come from a sublane tree (same bytes).
-    SGLANG_TPU_FUSED_RS_Q8_TREE = EnvBool(False)
+    SGLANG_TPU_FUSED_RS_Q8_TREE = EnvBool(True)
     # Fused-RS expert TP: the first N row gathers of tile g + 1 are issued inside GMM1(g)'s
     # straight-line code (co-issued with the matmul) instead of in a scalar loop before it.
-    SGLANG_TPU_FUSED_RS_GATHER_IN_GMM1 = EnvInt(0)
+    SGLANG_TPU_FUSED_RS_GATHER_IN_GMM1 = EnvInt(128)
     # e4m3 pair path: piece offsets by masking the run length (no running sum), the q8 and
     # scale DMAs of a piece under one predicate, pieces >= 64 rows behind one branch.
-    SGLANG_TPU_FUSED_RS_PAIR_MASK_OFFSETS = EnvBool(False)
+    SGLANG_TPU_FUSED_RS_PAIR_MASK_OFFSETS = EnvBool(True)
     # With Q8_IN_GMM1: a tile's partial rows go to the sibling's ring as one DMA of the tile's
     # row bucket, issued at the end of the GMM2 bucket branch (the ring slot is private to
     # the tile; the rows past the tile are never read) instead of power-of-two pieces.
-    SGLANG_TPU_FUSED_RS_PAIR_SEND_BUCKET = EnvBool(False)
+    SGLANG_TPU_FUSED_RS_PAIR_SEND_BUCKET = EnvBool(True)
     # Fused-RS pair exchange: pass a 1-element dummy for the per-row top-k slots (only the
     # direct-write path reads them). Frees size_m x 4 B of SMEM, which at 8192 tokens keeps
     # the fp8-expert call from spilling scalars to HBM.
-    SGLANG_TPU_FUSED_RS_PAIR_NO_TOPK_SMEM = EnvBool(False)
+    SGLANG_TPU_FUSED_RS_PAIR_NO_TOPK_SMEM = EnvBool(True)
     # Fused-RS expert TP: smallest call (tokens) that uses the sibling pair exchange.
-    SGLANG_TPU_FUSED_RS_PAIR_MIN_TOKENS = EnvInt(4096)
+    SGLANG_TPU_FUSED_RS_PAIR_MIN_TOKENS = EnvInt(2048)
     # With Q8_IN_GMM1: each (tile, owner) run's first row in the tile comes from a table built
     # with the routing metadata instead of an in-kernel sum over the lower owners' runs.
-    SGLANG_TPU_FUSED_RS_PAIR_SRC_TABLE = EnvBool(False)
+    SGLANG_TPU_FUSED_RS_PAIR_SRC_TABLE = EnvBool(True)
     # Batched RPA: run target-verify rows (speculative_num_draft_tokens per request) as MIXED
     # with a q block of that width; the prefill block search otherwise pads each request's
     # rows to a ~2048-row block (16 x 8 rows at 150K context: 42 -> 2.2 ms per layer).

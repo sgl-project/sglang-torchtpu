@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The per-device body of the SP + TP prefill program (prototype, not wired into serving).
+"""The per-device body of the SP + TP prefill program (serving: SGLANG_TPU_MUSE_MK_PREFILL_SPTP).
 
 Dense path as prefill/spep (rank m owns rows [m * Ts, (m + 1) * Ts), Ts = rows / tp), MoE as
 prefill/tp (expert-TP fused-RS, every rank 1/tp of every expert's intermediate). Per layer:
@@ -207,16 +207,16 @@ def build_forward(c: PFConfig, axis: str = "model"):
     )
     # SPTP_XAG_FUSED=1: the x_norm AG by in-kernel remote DMA inside the qkvg kernel, one row
     # tile of SPTP_XAG_SEG rows per rank at a time (sptp/xag_qkvg.py)
-    xag_fused = not xla_qkvg and os.environ.get("SPTP_XAG_FUSED", "0") == "1"
+    xag_fused = not xla_qkvg and os.environ.get("SPTP_XAG_FUSED", "1") == "1"
     xag_seg = int(os.environ.get("SPTP_XAG_SEG", "32"))
     xag_gap = int(os.environ.get("SPTP_XAG_GAP", "0"))
     # SPTP_XAG_NORM=1 (with SPTP_XAG_FUSED=1): the input norm and e4m3 row quant per tile in
     # that kernel too, the row scales gathered with the rows
-    xag_norm = xag_fused and fused_rq and os.environ.get("SPTP_XAG_NORM", "0") == "1"
+    xag_norm = xag_fused and fused_rq and os.environ.get("SPTP_XAG_NORM", "1") == "1"
     # SPTP_XAG_ORDER=0: common.coll.run_pipeline's stage order (partner share issued late)
     xag_dma_first = os.environ.get("SPTP_XAG_ORDER", "1") != "0"
     # SPTP_XAG_EPI=1: head norms as split-bf16 dots (2 passes, not HIGHEST) and vreg-wide rope
-    xag_split_epi = os.environ.get("SPTP_XAG_EPI", "0") == "1"
+    xag_split_epi = os.environ.get("SPTP_XAG_EPI", "1") == "1"
     # SPTP_XAG_GATE4=1: gate in the [Hkv, T, G, 128] head layout (no transpose before the o gate)
     xag_gate4 = xag_fused and q_rpa and os.environ.get("SPTP_XAG_GATE4", "0") == "1"
     # SPTP_OGATE_KERNEL=1: the Pallas o-gate card (sptp/ogate.py; gate4-aware) instead of XLA
@@ -229,7 +229,7 @@ def build_forward(c: PFConfig, axis: str = "model"):
     o_gate = ogate_k
     # SPTP_XAG_QSTRIDED=1: q written as [Hkv, T * G, 128] by strided stores (same HBM bytes)
     xag_q_strided = (
-        xag_fused and q_rpa and os.environ.get("SPTP_XAG_QSTRIDED", "0") == "1"
+        xag_fused and q_rpa and os.environ.get("SPTP_XAG_QSTRIDED", "1") == "1"
     )
     xag_norm_dbg = xag_norm and os.environ.get("SPTP_XAG_NORM_DBG", "0") == "1"  # debug
     # debug: 2 / 3 / 4 take only q / kv / gate from the fused-norm kernel, the rest from the
@@ -259,7 +259,7 @@ def build_forward(c: PFConfig, axis: str = "model"):
             # as the plain cast in the 1-layer check, 1.5 us / tile)
             exact_cast=os.environ.get("SPTP_XAG_RNE", "0") == "1",
             w_start=int(os.environ.get("SPTP_XAG_WSTART", "0")),
-            m_split=int(os.environ.get("SPTP_XAG_MSPLIT", "1")),
+            m_split=int(os.environ.get("SPTP_XAG_MSPLIT", "2")),
             dma_split=int(os.environ.get("SPTP_XAG_DSPLIT", "1")),
             n_tail=os.environ.get("SPTP_XAG_NTAIL", "0") == "1",
             route=int(os.environ.get("SPTP_XAG_ROUTE", "0")),
@@ -288,7 +288,7 @@ def build_forward(c: PFConfig, axis: str = "model"):
     }
     # SPTP_POSTATTN=1: requant, o proj, attention residual, router, pool and pre-expert norm of
     # own rows in two Pallas kernels (sptp/postattn.py)
-    pa = os.environ.get("SPTP_POSTATTN", "0") == "1"
+    pa = os.environ.get("SPTP_POSTATTN", "1" if q_rpa and fused_rq else "0") == "1"
     if pa and not (q_rpa and fused_rq):
         raise ValueError("SPTP_POSTATTN needs the q_rpa path and the fused rms quant")
     pa_tn, pa_tp, pa_rc = (
@@ -300,7 +300,7 @@ def build_forward(c: PFConfig, axis: str = "model"):
         )
     )
     # SPTP_PA_A2A=1: the gated-output a2a by remote DMA inside the o proj kernel
-    pa_a2a = pa and os.environ.get("SPTP_PA_A2A", "0") == "1"
+    pa_a2a = pa and os.environ.get("SPTP_PA_A2A", "1") == "1"
     # SPTP_PA_HEAD=0: that kernel takes a token-major [T, qd] copy of the o gate's output
     # instead of its head layout [Hkv, T, G * d] as is
     pa_head = pa_a2a and os.environ.get("SPTP_PA_HEAD", "1") == "1"
@@ -342,7 +342,7 @@ def build_forward(c: PFConfig, axis: str = "model"):
     # SPTP_OGATE_PK=13 (with SPTP_PA_TMAJ): the same Pallas o gate writing the [qd, T] layout
     ogate_tm = (
         o_gate_pk_call(c, int(os.environ.get("SPTP_OGATE_PK_TM", "512")), 13)
-        if pa_tmaj and not xag_gate4 and os.environ.get("SPTP_OGATE_PK", "0") == "13"
+        if pa_tmaj and not xag_gate4 and os.environ.get("SPTP_OGATE_PK", "13") == "13"
         else None
     )
     pa_head = pa_head and not pa_gtok and not pa_tmaj
@@ -410,7 +410,7 @@ def build_forward(c: PFConfig, axis: str = "model"):
                 axis=axis,
                 split_epi=xag_split_epi,
                 gate4=xag_gate4,
-                m_split=int(os.environ.get("SPTP_XAG_MSPLIT", "1")),
+                m_split=int(os.environ.get("SPTP_XAG_MSPLIT", "2")),
                 q_strided=xag_q_strided,
                 n_pre=n_pre,
                 wk=int(os.environ.get("SPTP_XAG_WK", "1")),

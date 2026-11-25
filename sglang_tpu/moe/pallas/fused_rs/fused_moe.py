@@ -459,7 +459,7 @@ def moe_gmm_local_rs_nodedup(
         dtype=jnp.int32,
     )
 
-    # Below PAIR_MIN_TOKENS (default 4096) every row goes to its owner as its own DMA.
+    # Below PAIR_MIN_TOKENS every row goes to its owner as its own DMA.
     pair_exchange = (
         expert_tp
         and num_tokens >= tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_MIN_TOKENS.get()

@@ -45,12 +45,12 @@ class RpaOpts:
     def from_env(cls) -> "RpaOpts":
         env = os.environ.get
         return cls(
-            tri=env("SPTP_RPA_TRI", "0") == "1",
-            qt_bf16=env("SPTP_RPA_QTB", "0") == "1",
-            global_blocks=env("SPTP_RPA_GBLOCKS", ""),
+            tri=env("SPTP_RPA_TRI", "1") == "1",
+            qt_bf16=env("SPTP_RPA_QTB", "1") == "1",
+            global_blocks=env("SPTP_RPA_GBLOCKS", "1024:1024"),
             swa_blocks=env("SPTP_RPA_SBLOCKS", ""),
             kv_stack=int(env("SPTP_RPA_KV_STACK", "0")),
-            prefill_only=env("SPTP_RPA_PREFILL_ONLY", "0") == "1",
+            prefill_only=env("SPTP_RPA_PREFILL_ONLY", "1") == "1",
             out_tok=env("SPTP_RPA_OUT_TOK", "0") == "1",
         )
 
