@@ -99,8 +99,24 @@ _DECODE = ((5, 1, 0), (130, 1, 0), (700, 1, 0), (1500, 1, 0))
 # Over 512 tokens the main records are gathered in 128-row chunks; 1168 rows
 # (9 x 128 + 16) end in a partial chunk.
 _LONG_PREFILL = ((0, 700, 0), (500, 420, 300), (1200, 30, 0), (60, 0, 0))
-_PADDED_TOKENS = {_PREFILL: 144, _DECODE: 8, _LONG_PREFILL: 1168}
-_PHASES = {"prefill": _PREFILL, "decode": _DECODE, "long_prefill": _LONG_PREFILL}
+# Equal-shaped target verify batches exercise both sides of the runtime
+# boundary guard. The second batch has an empty request and two padding rows.
+_VERIFY = ((128, 6, 0), (192, 6, 0), (256, 6, 0), (320, 6, 0))
+_RAGGED_VERIFY = ((128, 7, 0), (192, 0, 0), (256, 9, 0), (320, 6, 0))
+_PADDED_TOKENS = {
+    _PREFILL: 144,
+    _DECODE: 8,
+    _LONG_PREFILL: 1168,
+    _VERIFY: 24,
+    _RAGGED_VERIFY: 24,
+}
+_PHASES = {
+    "prefill": _PREFILL,
+    "decode": _DECODE,
+    "long_prefill": _LONG_PREFILL,
+    "verify": _VERIFY,
+    "ragged_verify": _RAGGED_VERIFY,
+}
 
 
 class _Case:
