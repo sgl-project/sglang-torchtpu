@@ -266,9 +266,25 @@ PER_CONC = {
             "SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE": "131072",
         },
     ),
+    8: (
+        {
+            "--speculative-num-draft-tokens": ["4"],
+            "--max-running-requests": ["2"],
+            "--torch-compile-max-bs": ["2"],
+            "--tpu-compile-bs": ["1", "2"],
+            "--tpu-compile-tokens": ["1024", "2048", "4096"],
+            "--prefill-decode-interval": ["128"],
+            "--hicache-ratio": ["2.0"],
+            "--hicache-write-policy": ["write_back"],
+        },
+        {
+            "SGLANG_SIMULATE_ACC_LEN": "3.06",
+            "SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE": "131072",
+        },
+    ),
     9: (
         {
-            "--speculative-num-draft-tokens": ["8"],
+            "--speculative-num-draft-tokens": ["4"],
             "--max-running-requests": ["4"],
             "--torch-compile-max-bs": ["4"],
             "--tpu-compile-bs": ["1", "2", "3", "4"],
@@ -278,25 +294,24 @@ PER_CONC = {
             "--hicache-write-policy": ["write_back"],
         },
         {
-            "SGLANG_SIMULATE_ACC_LEN": "4.05",
+            "SGLANG_SIMULATE_ACC_LEN": "3.06",
             "SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE": "131072",
         },
     ),
     10: (
         {
-            "--speculative-num-draft-tokens": ["8"],
-            "--max-running-requests": ["6"],
-            "--torch-compile-max-bs": ["6"],
-            "--tpu-compile-bs": ["1", "2", "3", "4", "5", "6"],
+            "--speculative-num-draft-tokens": ["4"],
+            "--max-running-requests": ["8"],
+            "--torch-compile-max-bs": ["8"],
+            "--tpu-compile-bs": ["1", "2", "3", "4", "5", "6", "7", "8"],
             "--tpu-compile-tokens": ["1024", "2048", "4096"],
             "--prefill-decode-interval": ["64"],
             "--hicache-ratio": ["2.0"],
             "--hicache-write-policy": ["write_back"],
         },
         {
-            "SGLANG_SIMULATE_ACC_LEN": "4.05",
+            "SGLANG_SIMULATE_ACC_LEN": "3.06",
             "SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE": "131072",
-            "SGLANG_TPU_MUSE_MK_MAX_ROWS": "48",
         },
     ),
     16: (
