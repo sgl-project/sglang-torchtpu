@@ -613,9 +613,21 @@ def _ep_counting_route(
     )
 
 
-# Minimum routed rows (m * topk) needed to amortize the 3-kernel launch
-# overhead of prequantize_lhs_fp8 + 2 row_gathers over a single ragged_gather_v2.
-_PREQUANT_MIN_ROUTED_ROWS = 2048
+def _prequant_dispatch_beneficial(
+    num_tokens: int, owned_rows: float, hidden_size: int
+) -> bool:
+    """Cost model for prequantize_lhs_fp8 + 2 row_gathers vs ragged_gather_v2.
+
+    Uses TPU7x per-stage linear fits (in microseconds): ragged_gather_v2
+    (~11.5 + 2.90 * (H / 1024) * R / 1000) vs prequant
+    (~2.0 + 2.15 * (H / 1024) * m / 1000) + row_gather on fp8 data
+    (~11.0 + 0.78 * (H / 1024) * R / 1000) + row_gather on scales
+    (~9.1 + 0.67 * R / 1000). Requires a 3 us margin (> 13.6 us total) over the
+    ~10.6 us extra launch overhead.
+    """
+    h_k = hidden_size / 1024.0
+    gain_us = ((2.12 * h_k - 0.67) * owned_rows - 2.15 * h_k * num_tokens) / 1000.0
+    return gain_us > 13.6
 
 
 def _prequant_dispatch_ok(
@@ -959,12 +971,10 @@ def _fused_moe_jax(
             )
         )
 
-    # Pre-quantizing all m tokens upfront saves quant work only when expected
-    # owned rows exceed m (fanout >= 2) and amortizes launch overhead at >= 2048 rows.
-    owned_fanout_ok = (
-        topk * num_experts >= 2 * global_num_experts
+    expected_owned_rows = (
+        m * topk * num_experts / global_num_experts
         if ep_route is not None
-        else topk >= 2
+        else m * topk
     )
     gmm1_tiling = None
     x_scale_sorted = None
@@ -978,8 +988,7 @@ def _fused_moe_jax(
         and not w_quant_bits
         and not w1_packed
         and (not use_group_offset or ep_route is not None)
-        and m * topk >= _PREQUANT_MIN_ROUTED_ROWS
-        and owned_fanout_ok
+        and _prequant_dispatch_beneficial(m, expected_owned_rows, hidden_size)
     ):
         gmm1_tiling = _build_gmm1_tiling(
             jax.ShapeDtypeStruct((m * topk, hidden_size), hidden_states.dtype)

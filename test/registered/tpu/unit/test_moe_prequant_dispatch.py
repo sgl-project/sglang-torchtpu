@@ -88,8 +88,12 @@ class TestRowGather(unittest.TestCase):
         key = jax.random.PRNGKey(0)
         for rows, width, n, dtype in [
             (300, 128, 16, jnp.uint32),
+            (300, 128, 512, jnp.uint32),
+            (300, 128, 768, jnp.uint32),
             (300, 128, 1000, jnp.uint32),  # not a multiple of 16: padded + sliced
             (513, 1536, 4096, jnp.uint32),
+            (640, 1024, 5120, jnp.uint32),
+            (768, 1024, 6144, jnp.uint32),
             (8192, 1536, 65536, jnp.uint32),
             (1024, 384, 2080, jnp.float32),
         ]:
@@ -171,7 +175,7 @@ class TestPrequantGmm(unittest.TestCase):
 
 @unittest.skipUnless(_has_tpu_via_jax(), _SKIP_REASON)
 class TestFusedMoePrequantDispatch(unittest.TestCase):
-    E, H, TWO_N, TOPK = 16, 1024, 256, 8
+    E, H, TWO_N, TOPK = 16, 4096, 256, 8
 
     def _run(self, prequant, x, w1, s1, w2, s2, wts, ids, *, global_e=0, offset=0):
         from sglang_tpu.envs import envs
@@ -232,10 +236,10 @@ class TestFusedMoePrequantDispatch(unittest.TestCase):
                 self.assertTrue(_bits_equal(on, off))
 
     def test_ep_counting_route_on_equals_off(self):
-        # EP=4 (topk/ep = 2 >= 2) exercises ep_route + dynamic gather_end.
+        # EP=4 (topk/ep = 2, owned_rows = 4096) exercises ep_route + dynamic gather_end.
         key = jax.random.PRNGKey(13)
         kw1, kw2, kx, ki, kt = jax.random.split(key, 5)
-        global_e, offset, m = self.E * 4, self.E, 512
+        global_e, offset, m = self.E * 4, self.E, 2048
         w1, s1 = _fp8_weights(kw1, self.E, self.H, self.TWO_N)
         w2, s2 = _fp8_weights(kw2, self.E, self.TWO_N // 2, self.H)
         x = _activations(kx, m, self.H)
@@ -279,6 +283,20 @@ class TestFusedMoePrequantDispatch(unittest.TestCase):
                     True, x, w1, s1, w2, s2, wts, ids, global_e=global_e, offset=offset
                 )
                 self.assertNotIn("prequantize_lhs_fp8", hlo)
+
+    def test_cost_model_boundaries(self):
+        from sglang_tpu.moe.pallas.fused_moe_op import _prequant_dispatch_beneficial
+
+        # Fanout <= 1 never wins at any hidden size.
+        self.assertFalse(_prequant_dispatch_beneficial(8192, 8192, 4096))
+        self.assertFalse(_prequant_dispatch_beneficial(8192, 8192, 7168))
+        # Low-fanout / small-H boundary cases stay on fallback.
+        self.assertFalse(_prequant_dispatch_beneficial(512, 2048, 4096))
+        self.assertFalse(_prequant_dispatch_beneficial(1024, 2048, 2048))
+        # High-fanout or large-R_own cases enable prequant dispatch.
+        self.assertTrue(_prequant_dispatch_beneficial(256, 2048, 4096))
+        self.assertTrue(_prequant_dispatch_beneficial(2048, 4096, 4096))
+        self.assertTrue(_prequant_dispatch_beneficial(256, 2048, 7168))
 
 
 if __name__ == "__main__":

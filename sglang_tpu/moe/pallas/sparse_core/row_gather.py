@@ -91,8 +91,8 @@ def _row_gather_kernel(
             if exact_rows is None:
                 copy_out()
             else:
-                # A step's rows lie all below or all past exact_rows (the caller checks
-                # exact_rows % (num_streams * lanes) == 0); past it there is no output.
+                # Because exact_rows is a multiple of one step (num_streams * lanes),
+                # every row in this step is either in bounds or padding; skip padding.
                 pl.when(first_row < exact_rows)(copy_out)
 
         # Several independent Indirect gathers per step keep reads in flight.
@@ -143,12 +143,14 @@ def _col_chunks(width: int, max_words: int) -> int:
     return width // 128
 
 
-# Max 16-row (sc.num_lanes) subchunks per outer block per subcore; halves on small
-# gathers to keep padding small.
+# Maximum number of lane-sized (16-row) subchunks each subcore processes per
+# outer block. Smaller gathers pick a divisor of the row count to avoid tail
+# padding.
 _MAX_ROW_SUBCHUNKS = 8
 _STREAMS = 2
-# Fits 2 streams x 2 double-buffers x 16 lanes x 768 u32 = 192 KiB (75% of the
-# 256 KiB SparseCore VMEM floor, 128-word aligned).
+# Largest 128-word-aligned column chunk that keeps 2 double-buffered gather
+# streams (2 * 2 * 16 * 768 u32 = 192 KiB) within the 256 KiB SparseCore VMEM
+# limit.
 _MAX_CHUNK_WORDS = 768
 
 
@@ -173,23 +175,42 @@ def row_gather(
         return x[indices]
     lanes = sc.num_lanes
     num_cores = sc.num_cores * sc.num_subcores
+    unit = lanes * num_cores
     n = indices.shape[0]
-    num_row_subchunks = _MAX_ROW_SUBCHUNKS
     num_streams = _STREAMS
-    # Small gathers: fewer subchunks per block so the padding stays small.
-    while num_row_subchunks > num_streams and n <= lanes * num_cores * (
-        num_row_subchunks // 2
-    ):
-        num_row_subchunks //= 2
-    step_rows = lanes * num_streams
-    if n % step_rows:
-        num_streams = 1
-        step_rows = lanes
+    if n % unit == 0:
+        # Pick the largest subchunk count dividing n // unit for zero padding,
+        # preferring even counts so two DMA streams stay active.
+        chunks = n // unit
+        even = next(
+            (s for s in range(_MAX_ROW_SUBCHUNKS, 0, -_STREAMS) if chunks % s == 0),
+            0,
+        )
+        if even:
+            num_row_subchunks = even
+        else:
+            num_streams = 1
+            num_row_subchunks = next(
+                (
+                    s
+                    for s in range(_MAX_ROW_SUBCHUNKS - 1, 0, -_STREAMS)
+                    if chunks % s == 0
+                ),
+                1,
+            )
+    else:
+        num_row_subchunks = _STREAMS
+        if n <= unit or n % (lanes * num_streams):
+            num_streams = 1
+            num_row_subchunks = 1
     assert num_row_subchunks % num_streams == 0
-    block = lanes * num_row_subchunks * num_cores
+    step_rows = lanes * num_streams
+    block = unit * num_row_subchunks
     pad = -n % block
     if pad:
-        indices = jnp.pad(indices, (0, pad))
+        # Wrap existing indices instead of zero-padding so all lanes do not
+        # gather row 0 in lockstep and serialize on HBM banks.
+        indices = jnp.pad(indices, (0, pad), mode="wrap")
     exact = n % step_rows == 0
     out_rows = n if exact else n + pad
     mesh = plsc.VectorSubcoreMesh(

@@ -2115,7 +2115,7 @@ def _prequantize_kernel(x_ref, q_ref, s_ref, *, q_dtype):
     s_ref[...] = scales
 
 
-# Row-tiling (M) block size for prequantize_lhs_fp8 VMEM tiles (K quant block is 512).
+# Number of token rows processed per VMEM tile in prequantize_lhs_fp8.
 _PREQUANT_ROW_TILE = 256
 
 
