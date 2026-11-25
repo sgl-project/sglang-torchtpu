@@ -273,65 +273,37 @@ def _down(mid: jax.Array, w_ref: jax.Array, s_row: jax.Array) -> jax.Array:
 
 
 def _kernel(
-    counts_ref: jax.Array,
-    offsets_ref: jax.Array,
-    tok_ref: jax.Array,
-    wt_ref: jax.Array,
-    x_ref: jax.Array,
-    w1_hbm: jax.Array,
-    s1_hbm: jax.Array,
-    w2_hbm: jax.Array,
-    s2_hbm: jax.Array,
-    o_ref: jax.Array,
-    w1_buf: jax.Array,
-    s1_buf: jax.Array,
-    w2_buf: jax.Array,
-    s2_buf: jax.Array,
-    sems: jax.Array,
-    xq_ref: jax.Array,
-    xs_ref: jax.Array,
-    acc_ref: jax.Array,
-    xg_ref: jax.Array,
-    xsg_ref: jax.Array,
-    active_ref: jax.Array,
+    counts_ref: jax.Array,  # SMEM int32 [E]. Rows routed to each expert.
+    offsets_ref: jax.Array,  # SMEM int32 [E]. Each expert's first pair in the list.
+    tok_ref: jax.Array,  # SMEM int32 [T * k]. Token of each pair, grouped by expert.
+    wt_ref: jax.Array,  # SMEM f32 [T * k]. Routing weight of each pair.
+    x_ref: jax.Array,  # VMEM bf16 [T, H]. Input rows.
+    w1_hbm: jax.Array,  # HBM fp8 [E, H, 2n]. Gate/up weights.
+    s1_hbm: jax.Array,  # HBM f32 [E, 1, 1, 2n]. Their per-column scales.
+    w2_hbm: jax.Array,  # HBM fp8 [E, n, H]. Down weights.
+    s2_hbm: jax.Array,  # HBM f32 [E, 1, 1, H]. Their per-column scales.
+    o_ref: jax.Array,  # VMEM [T, H], x's dtype. Output rows.
+    w1_buf: jax.Array,  # VMEM fp8 [slots, H, 2n]. Ring: w1 of the experts in flight.
+    s1_buf: jax.Array,  # VMEM f32 [slots, 1, 2n]. Ring: their w1 scales.
+    w2_buf: jax.Array,  # VMEM fp8 [slots, n, H]. Ring: their w2.
+    s2_buf: jax.Array,  # VMEM f32 [slots, 1, H]. Ring: their w2 scales.
+    sems: jax.Array,  # DMA semaphores [slots, w1_chunks + w2_chunks + 2], one per copy.
+    xq_ref: jax.Array,  # VMEM f32 [T, H]. x quantized to fp8 values.
+    xs_ref: jax.Array,  # VMEM f32 [nq, T, lanes]. x's scale per row per block.
+    acc_ref: jax.Array,  # VMEM f32 [T, H]. Sum of weight * expert output.
+    xg_ref: jax.Array,  # VMEM f32 [R, H]. One row tile gathered from xq_ref.
+    xsg_ref: jax.Array,  # VMEM f32 [nq, R, lanes]. That tile's block scales.
+    active_ref: jax.Array,  # SMEM int32 [E + 1]. Ids of the hit experts, by tile size.
     *,
-    limit: float | None,
-    slots: int,
-    w1_chunks: int,
-    w2_chunks: int,
-    tile_rows: tuple[int, ...],
+    limit: float | None,  # SiLU clamp limit, or None.
+    slots: int,  # Weight ring depth.
+    w1_chunks: int,  # DMAs per expert's w1.
+    w2_chunks: int,  # DMAs per expert's w2.
+    tile_rows: tuple[int, ...],  # Row-tile sizes, see _TILE_ROWS.
 ):
-    """Kernel body. T tokens, k experts per token, E experts, H model width,
-    n expert width, nq = H / 512 quantization blocks, R = max(tile_rows).
-
-    Args:
-      counts_ref: SMEM int32 [E]. Rows routed to each expert.
-      offsets_ref: SMEM int32 [E]. Each expert's first entry in the pair list.
-      tok_ref: SMEM int32 [T * k]. Token of each pair; pairs grouped by expert.
-      wt_ref: SMEM f32 [T * k]. Routing weight of each pair.
-      x_ref: VMEM bf16 [T, H]. Input rows.
-      w1_hbm: HBM fp8 [E, H, 2n]. Gate/up weights.
-      s1_hbm: HBM f32 [E, 1, 1, 2n]. Their per-column scales.
-      w2_hbm: HBM fp8 [E, n, H]. Down weights.
-      s2_hbm: HBM f32 [E, 1, 1, H]. Their per-column scales.
-      o_ref: VMEM [T, H], x's dtype. Output rows.
-      w1_buf: VMEM fp8 [slots, H, 2n]. Weight ring: w1 of the experts in flight.
-      s1_buf: VMEM f32 [slots, 1, 2n].
-      w2_buf: VMEM fp8 [slots, n, H].
-      s2_buf: VMEM f32 [slots, 1, H].
-      sems: DMA semaphores [slots, w1_chunks + w2_chunks + 2], one per copy.
-      xq_ref: VMEM f32 [T, H]. x quantized to fp8 values.
-      xs_ref: VMEM f32 [nq, T, lanes]. x's scale per row per block.
-      acc_ref: VMEM f32 [T, H]. Sum of weight * expert output.
-      xg_ref: VMEM f32 [R, H]. One tile's rows gathered from xq_ref.
-      xsg_ref: VMEM f32 [nq, R, lanes]. Those rows' block scales.
-      active_ref: SMEM int32 [E + 1]. Ids of the hit experts, by tile class.
-      limit: SiLU clamp limit, or None.
-      slots: weight ring depth.
-      w1_chunks: DMAs per expert's w1.
-      w2_chunks: DMAs per expert's w2.
-      tile_rows: row-tile sizes by expert row count.
-    """
+    """Kernel body. In the shapes: T tokens, k experts per token, E experts, H
+    model width, n expert width, nq = H / 512 quantization blocks, R =
+    max(tile_rows)."""
     t, h = x_ref.shape
     num_experts, _, two_n = w1_hbm.shape
     n = two_n // 2
