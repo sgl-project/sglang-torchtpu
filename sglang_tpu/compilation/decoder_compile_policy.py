@@ -140,6 +140,8 @@ _COMPILE_BAR_FORMAT = (
 # XLA TopK has a static output width. Warm the physically qualified serving
 # width so the common candidate path does not compile on its first request.
 _DISTRIBUTED_TOP_K_WARMUP_K = 50
+# Arbitrary bound; a server holds one entry per (field, token bucket) in use.
+_MAX_DP_COUNT_TENSORS = 64
 
 
 def _moe_topk_extra_tensor_attrs(model: torch.nn.Module) -> tuple[str, ...]:
@@ -616,6 +618,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         # Variant tags actually warmed, so precompile() can tell a family that
         # was compiled from one an override dropped.
         self._compiled_extend_variants: set[str] = set()
+        # (field, counts) -> device counts (SGLANG_TPU_DP_COUNT_CACHE).
+        self._dp_counts: dict[tuple, torch.Tensor] = {}
 
     @property
     def _cp_strategy(self) -> Any:
@@ -1953,20 +1957,41 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         forward_batch.is_extend_in_batch = mode == ForwardMode.EXTEND
         forward_batch.global_num_tokens_cpu = list(global_num_tokens)
         forward_batch.original_global_num_tokens_cpu = list(global_num_tokens)
-        forward_batch.global_num_tokens_gpu = self._dp_count_tensor(global_num_tokens)
+        forward_batch.global_num_tokens_gpu = self._dp_count_tensor(
+            "tokens", global_num_tokens
+        )
         forward_batch.global_num_tokens_for_logprob_cpu = [bs] * dp_size
         forward_batch.global_num_tokens_for_logprob_gpu = self._dp_count_tensor(
-            [bs] * dp_size
+            "logprob", [bs] * dp_size
         )
 
-    def _dp_count_tensor(self, counts: list[int]) -> torch.Tensor:
+    def _dp_count_tensor(self, field: str, counts: list[int]) -> torch.Tensor:
         """``counts`` on the device without waiting for the dispatched programs.
 
         torch.tensor(list, device=TPU) blocks the host until the device finishes
         the programs already dispatched, so every spec step's draft and verify
-        preparation waited here for the previous program. A fresh tensor per
-        forward: prepare_mlp_sync_batch writes the counts in place.
-        """
+        preparation waited here for the previous program.
+
+        prepare_mlp_sync_batch writes the counts in place; at this uniform MAX_LEN
+        bucket, without attention TP/CP alignment, it writes the same values, so
+        SGLANG_TPU_DP_COUNT_CACHE keeps one tensor per (field, counts). Per field:
+        one tensor passed as both counts would trip the tracer's alias guard."""
+        parallel = get_parallel()
+        if (
+            not tpu_envs.SGLANG_TPU_DP_COUNT_CACHE.get()
+            or parallel.attn_tp_size != 1
+            or parallel.attn_cp_size != 1
+        ):
+            return self._upload_dp_counts(counts)
+        key = (field, tuple(counts))
+        tensor = self._dp_counts.get(key)
+        if tensor is None:
+            if len(self._dp_counts) >= _MAX_DP_COUNT_TENSORS:
+                self._dp_counts.clear()
+            tensor = self._dp_counts[key] = self._upload_dp_counts(counts)
+        return tensor
+
+    def _upload_dp_counts(self, counts: list[int]) -> torch.Tensor:
         return upload(torch.tensor(counts, dtype=torch.int64), self.model_runner.device)
 
     def _dummy_kv_slot(self) -> int:

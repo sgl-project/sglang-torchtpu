@@ -25,6 +25,7 @@ from sglang_tpu.hooks.dflash_mla import (
     select_dflash_mla_attention,
 )
 from sglang_tpu.hooks.dp_prompt_backlog import hook_specs as dp_prompt_backlog_hooks
+from sglang_tpu.hooks.dp_sync_shm import hook_specs as dp_sync_shm_hooks
 from sglang_tpu.hooks.draft_kv_pool import (
     attach_unified_draft_kv_pool,
     bind_unified_swa_draft_host_pool,
@@ -492,6 +493,8 @@ HOOKS.extend(replay_chunk_fit_hooks())
 # SGLANG_TPU_DP_PROMPT_BACKLOG_MARGIN > 0).
 HOOKS.extend(dp_prompt_backlog_hooks())
 HOOKS.extend(server_prompt_ids_hooks())
+# Shared-memory DP MLP-sync exchange (pass-through unless SGLANG_TPU_DP_SYNC_SHM).
+HOOKS.extend(dp_sync_shm_hooks())
 # After dsv4_hooks: the V4.1 pool hooks must be the outer wrapper.
 HOOKS.extend(dsv41_hooks())
 

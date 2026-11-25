@@ -9,7 +9,7 @@ batch layout (row counts, slots) still comes from the host. Every function gives
 the same values as its host counterpart in attention_backend / request_window.
 """
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -17,6 +17,7 @@ from sglang_tpu.models.deepseek_v41.request_window import (
     SWA_PAGE_TOKENS,
     WINDOW_TOKENS,
     WindowPlan,
+    live_plan_rows,
     ring_rows,
 )
 
@@ -75,6 +76,7 @@ def window_pages(
     minimum: torch.Tensor,
     columns: int,
     base_page: int,
+    requests: Optional[int] = None,
 ) -> Tuple[torch.Tensor, WindowPlan]:
     """request_window.extend_window_pages with ``first`` on the device.
 
@@ -105,6 +107,12 @@ def window_pages(
     row_start = (torch.cumsum(counts, 0, dtype=counts.dtype) - counts)[:, None]
     commit_token = torch.where(kept_ok, row_start + kept - first[:, None], 0)
     commit_dst = torch.where(kept_ok, ring_rows(slot, kept.clamp(min=0)), -1)
+    keep = live_plan_rows(live[:, 0], requests)
+    if keep is not None:
+        history_src, history_dst, commit_token, commit_dst = (
+            t.index_select(0, keep)
+            for t in (history_src, history_dst, commit_token, commit_dst)
+        )
 
     # All int32: casting to int64 on the device does not lower on TPU, so with
     # device rows the host plan is uploaded as int32 too (window_plan_upload).

@@ -45,6 +45,11 @@ class TpuEnvs:
     SGLANG_TPU_MALLOC_TRIM_AFTER_WARMUP_ENABLED = EnvBool(True)
     # Seconds between periodic trims. 0 turns the periodic trim off.
     SGLANG_TPU_MALLOC_TRIM_INTERVAL_SEC = EnvFloat(0.0)
+    # DSV4.1 host Engram: gathers of at least MIN_ROWS table rows (extend-size
+    # chunks) run torch.index_select on this many intra-op threads, capped at the
+    # rank's CPU affinity set (engram_host.pack_rows). 0 keeps single-threaded NumPy.
+    SGLANG_TPU_DSV41_ENGRAM_PACK_THREADS = EnvInt(0)
+    SGLANG_TPU_DSV41_ENGRAM_PACK_THREADS_MIN_ROWS = EnvInt(8192)
     # Kimi-K3: run these RMSNorm-fed dense decode GEMVs as fp8 W8A8 with a static
     # input scale (see kimi_k3/static_fp8.py). Comma-separated subset of
     # moe_front, latent_up, kda_qkvg, mla_qkv_a, or "all" (every validated part:
@@ -459,21 +464,39 @@ class TpuEnvs:
     # Upload the DSV4.1 per-forward attention metadata as one buffer per dtype
     # (fields become device views) instead of one copy per field.
     SGLANG_TPU_DSV41_PACKED_METADATA = EnvBool(False)
+    # Pass the packed metadata buffers to the compiled forward as plain arguments
+    # and slice the fields inside the graph: TorchTPU re-materializes each view
+    # argument on every call.
+    SGLANG_TPU_DSV41_LIFT_PACKED_VIEWS = EnvBool(False)
     # A DSpark verify reads and writes the request-window SWA rings directly, as
     # decode does, instead of copying history into extend workspace pages.
     SGLANG_TPU_DSV41_VERIFY_SWA_RING = EnvBool(False)
     # DeepSeek-V4.1 SWA publish: sort and pair a forward's write records once,
     # in its first layer, instead of in every layer.
     SGLANG_TPU_DSV41_SWA_PUBLISH_PLAN = EnvBool(False)
+    # DeepSeek-V4.1 request window: size an extend's SWA row moves to the rank's
+    # request slots instead of the fixed extend batch (torch_compile_max_bs).
+    SGLANG_TPU_DSV41_SWA_PLAN_TRIM = EnvBool(False)
+    # DSV4.1 spec device rows: one host-to-device copy per metadata build.
+    SGLANG_TPU_DSV41_PACKED_ROW_UPLOAD = EnvBool(False)
     # Spec step: build the slot-only attention metadata of the draft and verify
     # forwards before the blocking length read / draft-token read (slot_metadata.py).
     SGLANG_TPU_SPEC_PREBUILD_SLOT_METADATA = EnvBool(False)
     # DSpark: apply the queued Engram verify commits right after the spec step's
     # sequence-length read, when the host has already waited for the previous verify.
     SGLANG_TPU_DSV41_FLUSH_ENGRAM_AT_LENGTH_READ = EnvBool(False)
+    # Host Engram flush: read the 64-bit commit and draft-token tensors in one
+    # device-to-host transfer too, not one transfer each.
+    SGLANG_TPU_DSV41_ENGRAM_BATCH_INT64 = EnvBool(False)
     # Spec step: skip the step's sequence-length read; the DSV4.1 draft and verify
     # metadata build their position-dependent rows on the device (device_rows.py).
     SGLANG_TPU_SPEC_DEVICE_ROWS = EnvBool(False)
+    # Reuse an idle DP rank's all-padding spec step inputs per batch bucket
+    # instead of rebuilding and uploading them every step (base_spec_worker.py).
+    SGLANG_TPU_SPEC_IDLE_INPUT_CACHE = EnvBool(False)
+    # Keep one device copy per DP token-count row of the bucket-padded spec
+    # forwards instead of uploading two per forward (decoder_compile_policy.py).
+    SGLANG_TPU_DP_COUNT_CACHE = EnvBool(False)
     # Debug: also build each device-row forward's metadata on the host from read-back
     # rows and raise if any field differs (adds the reads back).
     SGLANG_TPU_SPEC_DEVICE_ROWS_CHECK = EnvBool(False)
@@ -860,6 +883,9 @@ class TpuEnvs:
     # > 0 also moves continuations of routed requests when the backlog gap exceeds
     # this x the prompt (they then recompute it elsewhere). 0 = never.
     SGLANG_TPU_DP_PROMPT_BACKLOG_CONTINUATION_MARGIN = EnvFloat(0.0)
+    # Exchange the per-step DP MLP-sync rows through shared memory instead of
+    # gloo when every DP rank runs on one x86 host (dp_sync_shm.py).
+    SGLANG_TPU_DP_SYNC_SHM = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:

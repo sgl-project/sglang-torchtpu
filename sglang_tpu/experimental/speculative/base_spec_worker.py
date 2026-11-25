@@ -31,7 +31,7 @@ import copy
 import itertools
 from abc import abstractmethod
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 from torch import nn
@@ -107,6 +107,7 @@ from sglang_tpu.experimental.speculative.host_verify_rows import (
     StepHostRows,
     record_host_rows,
 )
+from sglang_tpu.experimental.speculative.idle_step import idle_step
 from sglang_tpu.experimental.speculative.pd_draft_prefill import (
     build_pd_hidden_pool,
     prebuilt_extend_groups,
@@ -193,6 +194,19 @@ def _check_draft_lm_head_group(draft_model: nn.Module, *, attn_tp_size: int) -> 
         )
 
 
+class _IdleStepInputs(NamedTuple):
+    """An idle DP rank's all-padding step inputs at one batch bucket; read only
+    downstream, so SGLANG_TPU_SPEC_IDLE_INPUT_CACHE reuses them across steps."""
+
+    verify_input: TpuSpecVerifyInput
+    # Distinct tensors: the dynamo tracer guards on aliased inputs.
+    bonus_tokens: torch.Tensor
+    seq_lens: torch.Tensor
+    accept_lens: torch.Tensor
+    rows: VerifyRows
+    live_mask: torch.Tensor
+
+
 class TpuSpecWorker(BaseSpecWorker):
     """Speculative decoding as draft -> verify -> commit.
 
@@ -277,6 +291,7 @@ class TpuSpecWorker(BaseSpecWorker):
         self._accept_threshold_acc = get_spec().speculative_accept_threshold_acc
         # Filled per batch bucket once the target compile policy exists.
         self._all_drafts: dict[int, torch.Tensor] = {}
+        self._idle_inputs: dict[int, _IdleStepInputs] = {}
         # Benchmark knob: force the accept length (SGLANG_SIMULATE_ACC_LEN), as core DFlash does.
         self._simulate_acc_len = SIMULATE_ACC_LEN
         if self._simulate_acc_len > 0 and SIMULATE_ACC_TOKEN_MODE not in (
@@ -1547,24 +1562,12 @@ class TpuSpecWorker(BaseSpecWorker):
         own TP group included; the active code at the shared bucket does.
         """
         padded_bs = self._decode_bucket(batch, 0)
-        verify_input = TpuSpecVerifyInput.idle(
-            verify_window_rows=self.verify_window_rows,
-            padded_bs=padded_bs,
-            device=self.device,
-        )
-        # Distinct tensors: the dynamo tracer guards on aliased inputs, and the
-        # active step never passes one tensor for two of these fields.
+        inputs = self._idle_step_inputs(padded_bs)
         state = SpecState(
-            bonus_tokens=self._device_zeros(padded_bs),
-            seq_lens=self._device_zeros(padded_bs),
-            req_pool_indices=verify_input.req_pool_indices,
+            bonus_tokens=inputs.bonus_tokens,
+            seq_lens=inputs.seq_lens,
+            req_pool_indices=inputs.verify_input.req_pool_indices,
             draft_carry=self.make_dummy_carry(padded_bs),
-        )
-        rows = select_verify_rows(
-            verify_input.verify_cache_candidates,
-            verify_input.committed_lens,
-            state.seq_lens,
-            self.num_verify_rows,
         )
         # The forwards' preparation writes these; the idle batch must stay idle.
         with overridden_fields(
@@ -1574,25 +1577,53 @@ class TpuSpecWorker(BaseSpecWorker):
             input_ids=batch.input_ids,
             out_cache_loc=batch.out_cache_loc,
         ):
-            self._forward_idle_step(
-                batch=batch, state=state, rows=rows, verify_input=verify_input
-            )
+            self._forward_idle_step(batch=batch, state=state, inputs=inputs)
+
+    def _idle_step_inputs(self, padded_bs: int) -> _IdleStepInputs:
+        if not tpu_envs.SGLANG_TPU_SPEC_IDLE_INPUT_CACHE.get():
+            return self._build_idle_step_inputs(padded_bs)
+        inputs = self._idle_inputs.get(padded_bs)
+        if inputs is None:
+            inputs = self._build_idle_step_inputs(padded_bs)
+            self._idle_inputs[padded_bs] = inputs
+        return inputs
+
+    def _build_idle_step_inputs(self, padded_bs: int) -> _IdleStepInputs:
+        verify_input = TpuSpecVerifyInput.idle(
+            verify_window_rows=self.verify_window_rows,
+            padded_bs=padded_bs,
+            device=self.device,
+        )
+        seq_lens = self._device_zeros(padded_bs)
+        rows = select_verify_rows(
+            verify_input.verify_cache_candidates,
+            verify_input.committed_lens,
+            seq_lens,
+            self.num_verify_rows,
+        )
+        return _IdleStepInputs(
+            verify_input=verify_input,
+            bonus_tokens=self._device_zeros(padded_bs),
+            seq_lens=seq_lens,
+            accept_lens=self._device_zeros(padded_bs),
+            rows=rows,
+            # Padded rows have req_pool_indices 0.
+            live_mask=verify_input.req_pool_indices != 0,
+        )
 
     def _forward_idle_step(
         self,
         *,
         batch: ScheduleBatch,
         state: SpecState,
-        rows: VerifyRows,
-        verify_input: TpuSpecVerifyInput,
+        inputs: _IdleStepInputs,
     ) -> None:
         """The active step's forwards and syncs in order on idle rows: draft, verify, commit."""
-        # Padded rows have req_pool_indices 0; no temperatures means the greedy draft.
-        live_mask = state.req_pool_indices != 0
+        # No temperatures means the greedy draft.
         idle_bucket = BucketState(
             key=state.req_pool_indices,
             state=state,
-            live_mask=live_mask,
+            live_mask=inputs.live_mask,
             temperatures=None,
             top_ks=None,
         )
@@ -1600,18 +1631,22 @@ class TpuSpecWorker(BaseSpecWorker):
         # wait on this rank's forwards.
         self._step_host_rows = self._new_step_host_rows(
             seq_lens=state.seq_lens,
-            verify_input=verify_input,
+            verify_input=inputs.verify_input,
             seq_lens_cpu=torch.zeros(state.seq_lens.shape, dtype=torch.int64),
         )
+        # A fused mixed step's target forward carries this rank's prompt rows, so
+        # its forwards are not all padding.
+        scope = (
+            idle_step()
+            if tpu_envs.SGLANG_TPU_SPEC_IDLE_INPUT_CACHE.get()
+            and self._mixed_prompt is None
+            else contextlib.nullcontext()
+        )
         try:
-            self._forward_idle_draft_verify(
-                batch=batch,
-                state=state,
-                rows=rows,
-                verify_input=verify_input,
-                idle_bucket=idle_bucket,
-                live_mask=live_mask,
-            )
+            with scope:
+                self._forward_idle_draft_verify(
+                    batch=batch, state=state, inputs=inputs, idle_bucket=idle_bucket
+                )
         finally:
             self._step_host_rows = None
 
@@ -1642,11 +1677,10 @@ class TpuSpecWorker(BaseSpecWorker):
         *,
         batch: ScheduleBatch,
         state: SpecState,
-        rows: VerifyRows,
-        verify_input: TpuSpecVerifyInput,
+        inputs: _IdleStepInputs,
         idle_bucket: BucketState,
-        live_mask: torch.Tensor,
     ) -> None:
+        rows, verify_input = inputs.rows, inputs.verify_input
         draft_result = self.draft(batch, idle_bucket, rows, verify_input)
         verify_tokens = draft_result.verify_tokens
         if verify_tokens is None:
@@ -1662,10 +1696,10 @@ class TpuSpecWorker(BaseSpecWorker):
         )
         accept = finalize_accept(
             draft_result.draft_tokens,
-            self._device_zeros(state.seq_lens.shape[0]),
+            inputs.accept_lens,
             state.bonus_tokens,
             state.seq_lens,
-            live_mask,
+            inputs.live_mask,
         )
         self.commit(batch, state, rows, verify_input, logits_output, accept)
 

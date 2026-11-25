@@ -401,6 +401,65 @@ def packed_row_words(
     return padded_tokens * (row_bytes // 4)
 
 
+# SGLANG_TPU_DSV41_ENGRAM_PACK_THREADS = N > 0: gathers of at least
+# SGLANG_TPU_DSV41_ENGRAM_PACK_THREADS_MIN_ROWS rows (extend-size chunks) use
+# torch.index_select on N intra-op threads instead of single-threaded NumPy:
+# a gather of random rows of the 92 GiB shmem table is TLB/DRAM-latency bound,
+# and parallel misses overlap. Small (verify) gathers keep the NumPy path,
+# whose per-call cost is fixed overhead. Threads inherit the rank's CPU set.
+_PACK_THREADS_STATE: dict[str, Any] = {"threads": None, "calls": 0, "ms": 0.0}
+
+
+def _pack_threads_config() -> tuple[int, int]:
+    from sglang_tpu.envs import envs
+
+    return (
+        int(envs.SGLANG_TPU_DSV41_ENGRAM_PACK_THREADS.get() or 0),
+        int(envs.SGLANG_TPU_DSV41_ENGRAM_PACK_THREADS_MIN_ROWS.get() or 0),
+    )
+
+
+def _engage_pack_threads(requested: int) -> int:
+    threads = _PACK_THREADS_STATE["threads"]
+    if threads is None:
+        import os
+
+        try:
+            cpus = len(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
+            cpus = os.cpu_count() or 1
+        threads = max(1, min(requested, cpus))
+        if torch.get_num_threads() != threads:
+            torch.set_num_threads(threads)
+        _PACK_THREADS_STATE["threads"] = threads
+        logger.info(
+            "Engram pack threads engaged: %d intra-op threads (requested %d, "
+            "%d CPUs in this rank's affinity set)",
+            torch.get_num_threads(),
+            requested,
+            cpus,
+        )
+    return threads
+
+
+def _gather_rows_threaded(table: torch.Tensor, local: np.ndarray) -> np.ndarray:
+    """``np.take(table_bytes, local, axis=0)`` on torch's intra-op threads."""
+    import time
+
+    start = time.perf_counter()
+    out = torch.index_select(table, 0, torch.from_numpy(local)).numpy()
+    state = _PACK_THREADS_STATE
+    state["calls"] += 1
+    state["ms"] += (time.perf_counter() - start) * 1e3
+    if state["calls"] % 2000 == 0:
+        logger.info(
+            "Engram pack threads: %d large gathers, %.3f ms per gather",
+            state["calls"],
+            state["ms"] / state["calls"],
+        )
+    return out
+
+
 def pack_rows(
     weight: torch.Tensor,
     scale: torch.Tensor,
@@ -451,10 +510,22 @@ def pack_rows(
         local = indices.detach().numpy().astype(np.int64, copy=False) - row_start
         owned = (local >= 0) & (local < rows)
         local = np.clip(local, 0, rows - 1).reshape(-1)
-        raw = np.take(weight.detach().view(torch.uint8).numpy(), local, axis=0)
+        threads, min_rows = _pack_threads_config()
+        threaded = threads > 0 and local.size >= max(min_rows, 1)
+        if threaded:
+            _engage_pack_threads(threads)
+            raw = _gather_rows_threaded(weight.detach().view(torch.uint8), local)
+        else:
+            raw = np.take(weight.detach().view(torch.uint8).numpy(), local, axis=0)
         scales = np.take(scale.detach().view(torch.uint8).numpy(), local, axis=0)
         scales[~owned.reshape(-1)] = _INVALID_SCALE
-        packed[:tokens, :raw_bytes] = raw.reshape(tokens, raw_bytes)
+        if threaded:
+            # The interleave copy into the slot rows also on the intra-op threads.
+            torch.from_numpy(packed)[:tokens, :raw_bytes].copy_(
+                torch.from_numpy(raw).view(tokens, raw_bytes)
+            )
+        else:
+            packed[:tokens, :raw_bytes] = raw.reshape(tokens, raw_bytes)
         packed[:tokens, raw_bytes : raw_bytes + scale_bytes] = scales.reshape(
             tokens, scale_bytes
         )
@@ -1831,17 +1902,35 @@ def flush_engram_commits(
 
 
 def _read_to_host(tensors: Sequence[torch.Tensor]) -> list[torch.Tensor]:
-    """``tensors`` on the host; the int32 device ones in one read (concatenated on
-    the device), others one by one. Only int32 joins the batch: casting a 64-bit
-    integer on the TPU does not lower."""
+    """``tensors`` on the host, one read per dtype (concatenated on the device).
+
+    Without SGLANG_TPU_DSV41_ENGRAM_BATCH_INT64 only int32 joins a batch and
+    64-bit tensors are read one by one. A concatenation needs no cast, but if a
+    64-bit one fails to lower, that group falls back to separate reads."""
+    from sglang_tpu.envs import envs as tpu_envs
+
+    dtypes = (torch.int32, torch.int64)
+    if not tpu_envs.SGLANG_TPU_DSV41_ENGRAM_BATCH_INT64.get():
+        dtypes = (torch.int32,)
     out: list = list(tensors)
-    batch = [
-        i
-        for i, t in enumerate(tensors)
-        if t.device.type != "cpu" and t.dtype == torch.int32
-    ]
-    if len(batch) > 1:
-        flat = torch.cat([tensors[i].reshape(-1) for i in batch]).cpu()
+    for dtype in dtypes:
+        batch = [
+            i
+            for i, t in enumerate(tensors)
+            if t.device.type != "cpu" and t.dtype == dtype
+        ]
+        if len(batch) < 2:
+            continue
+        try:
+            flat = torch.cat([tensors[i].reshape(-1) for i in batch]).cpu()
+        except RuntimeError:
+            if dtype == torch.int32:
+                raise
+            logger.warning(
+                "Engram read: the int64 batch failed; reading separately",
+                exc_info=True,
+            )
+            continue
         offset = 0
         for i in batch:
             n = tensors[i].numel()

@@ -1038,6 +1038,9 @@ class TestExperimentalSpecHooks(CustomTestCase):
         """An idle DP rank runs the active step's forwards and syncs in order (the
         greedy draft, verify, commit) on all-padding rows; a skipped one leaves
         its peers hanging in the collective."""
+        from sglang_tpu.experimental.speculative.base_spec_worker import (
+            _IdleStepInputs,
+        )
         from sglang_tpu.experimental.speculative.block_spec_worker import (
             TpuBlockSpecWorker,
         )
@@ -1063,11 +1066,18 @@ class TestExperimentalSpecHooks(CustomTestCase):
         worker.commit = lambda *args: calls.append(
             ("commit", args[4], args[5].accept_lens.tolist())
         )
-        worker._device_zeros = lambda rows: torch.zeros((rows,), dtype=torch.int64)
         worker.num_verify_rows = 3
         zeros = torch.zeros((4,), dtype=torch.int64)
         state = SpecState(bonus_tokens=zeros, seq_lens=zeros, req_pool_indices=zeros)
-        worker._forward_idle_step(batch=None, state=state, rows=None, verify_input=None)
+        inputs = _IdleStepInputs(
+            verify_input=None,
+            bonus_tokens=zeros,
+            seq_lens=zeros,
+            accept_lens=zeros.clone(),
+            rows=None,
+            live_mask=zeros != 0,
+        )
+        worker._forward_idle_step(batch=None, state=state, inputs=inputs)
         self.assertEqual(
             calls,
             [
@@ -1077,6 +1087,58 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 ("commit", "out", [0, 0, 0, 0]),
             ],
         )
+
+    def test_idle_input_cache_is_per_bucket_and_off_by_default(self):
+        """SGLANG_TPU_SPEC_IDLE_INPUT_CACHE reuses an idle rank's inputs per batch
+        bucket; reusing another bucket's would run the wrong shape and hang the
+        peers, and with the env off every step must build fresh inputs."""
+        from sglang_tpu.envs import envs as tpu_envs
+        from sglang_tpu.experimental.speculative.block_spec_worker import (
+            TpuBlockSpecWorker,
+        )
+
+        worker = object.__new__(TpuBlockSpecWorker)
+        worker._idle_inputs = {}
+        worker._build_idle_step_inputs = lambda padded_bs: object()
+        with tpu_envs.SGLANG_TPU_SPEC_IDLE_INPUT_CACHE.override(False):
+            self.assertIsNot(worker._idle_step_inputs(4), worker._idle_step_inputs(4))
+        with tpu_envs.SGLANG_TPU_SPEC_IDLE_INPUT_CACHE.override(True):
+            four = worker._idle_step_inputs(4)
+            self.assertIs(worker._idle_step_inputs(4), four)
+            self.assertIsNot(worker._idle_step_inputs(8), four)
+
+    def test_idle_scope_stays_closed_while_a_fused_mixed_prompt_is_stashed(self):
+        """A prompt-only rank's fused mixed step runs through _forward_idle_step, but
+        its target forward carries the prompt rows: the idle-metadata reuse scope
+        must stay closed then, or the next same-shaped step reuses stale rows."""
+        from sglang_tpu.envs import envs as tpu_envs
+        from sglang_tpu.experimental.speculative.base_spec_worker import (
+            _IdleStepInputs,
+        )
+        from sglang_tpu.experimental.speculative.block_spec_worker import (
+            TpuBlockSpecWorker,
+        )
+        from sglang_tpu.experimental.speculative.idle_step import in_idle_step
+        from sglang_tpu.experimental.speculative.spec_types import SpecState
+
+        worker = object.__new__(TpuBlockSpecWorker)
+        seen = []
+        worker._forward_idle_draft_verify = lambda **kwargs: seen.append(in_idle_step())
+        zeros = torch.zeros((4,), dtype=torch.int64)
+        state = SpecState(bonus_tokens=zeros, seq_lens=zeros, req_pool_indices=zeros)
+        inputs = _IdleStepInputs(
+            verify_input=None,
+            bonus_tokens=zeros,
+            seq_lens=zeros,
+            accept_lens=zeros.clone(),
+            rows=None,
+            live_mask=zeros != 0,
+        )
+        with tpu_envs.SGLANG_TPU_SPEC_IDLE_INPUT_CACHE.override(True):
+            for prompt in (None, object()):
+                worker._mixed_prompt = prompt
+                worker._forward_idle_step(batch=None, state=state, inputs=inputs)
+        self.assertEqual(seen, [True, False])
 
     def test_target_token_sync_has_one_shape_on_every_dp_rank(self):
         """Every DP rank must issue extend's target-token sync at one shape; an idle

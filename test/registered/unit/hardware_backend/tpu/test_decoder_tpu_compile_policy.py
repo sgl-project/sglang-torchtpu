@@ -2327,6 +2327,35 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
         self.assertEqual(batch.global_num_tokens_gpu.tolist(), [64] * 4)
         self.assertEqual(batch.global_num_tokens_for_logprob_gpu.tolist(), [4] * 4)
 
+    def test_dp_count_cache_keeps_fields_distinct_and_skips_attention_tp(self):
+        """SGLANG_TPU_DP_COUNT_CACHE reuses the device counts per (field, counts).
+        The token and logprob tensors stay distinct even with equal counts (one
+        tensor as both inputs trips the tracer's alias guard), and attention TP
+        keeps fresh tensors: core re-aligns the counts it writes into them."""
+        from sglang.srt.runtime_context import get_flags
+        from sglang_tpu.envs import envs as tpu_envs
+
+        def counts(attn_dp_size, num_tokens, bs):
+            self.publish_config(tp_size=4, attn_dp_size=attn_dp_size)
+            policy = _make_policy()
+            batches = [SimpleNamespace(), SimpleNamespace()]
+            with get_flags().dp.override(enabled=True):
+                for batch in batches:
+                    policy.set_dp_attention_metadata(
+                        batch, num_tokens, bs, ForwardMode.TARGET_VERIFY
+                    )
+            return batches
+
+        with tpu_envs.SGLANG_TPU_DP_COUNT_CACHE.override(True):
+            first, second = counts(attn_dp_size=4, num_tokens=4, bs=4)
+            self.assertIs(second.global_num_tokens_gpu, first.global_num_tokens_gpu)
+            self.assertIsNot(
+                first.global_num_tokens_gpu, first.global_num_tokens_for_logprob_gpu
+            )
+            self.assertEqual(first.global_num_tokens_gpu.tolist(), [4] * 4)
+            first, second = counts(attn_dp_size=2, num_tokens=8, bs=4)
+            self.assertIsNot(second.global_num_tokens_gpu, first.global_num_tokens_gpu)
+
     def test_materialize_out_syncs_global_top_k_and_flagged_kv_side_effects(self):
         global_top_k_logits = torch.zeros(1)
         global_top_k_token_ids = torch.zeros(1, dtype=torch.int32)

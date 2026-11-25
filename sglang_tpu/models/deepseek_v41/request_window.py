@@ -20,11 +20,15 @@ last ``WINDOW_TOKENS`` rows are written back to the ring. Both moves are extra
 records of the layer's one ``publish_swa`` call (``WindowPlan``).
 """
 
-from typing import NamedTuple
+import logging
+from typing import NamedTuple, Optional
 
 import torch
 
 from sglang.srt.utils import ceil_div
+
+logger = logging.getLogger(__name__)
+_LOGGED_TRIM = set()
 
 SWA_PAGE_TOKENS = 64
 WINDOW_TOKENS = 128
@@ -39,7 +43,8 @@ EXTRA_WORKSPACE_PAGES_PER_REQUEST = 4
 
 
 class WindowPlan(NamedTuple):
-    """Row moves of one extend forward, each ``[B * WINDOW_TOKENS]``."""
+    """Row moves of one extend forward, each ``[R * WINDOW_TOKENS]``: R = B, or
+    the live-request bound under SGLANG_TPU_DSV41_SWA_PLAN_TRIM (plan_requests)."""
 
     # int64 buffer row holding a history position (0 where unused), and int32
     # workspace row to copy it to (-1 where unused).
@@ -93,6 +98,55 @@ def window_buffer_pages(
     )
 
 
+def plan_requests(num_slots: int) -> Optional[int]:
+    """Request rows of an extend's WindowPlan under SGLANG_TPU_DSV41_SWA_PLAN_TRIM,
+    else None (one per batch row).
+
+    Only a live request moves rows: one with rows, on a nonzero slot, the first of
+    its slot. Distinct nonzero slots number at most ``num_slots - 1``, so that
+    many plan rows hold every move while the fixed extend batch (64) pads the
+    publish of each layer with unused records."""
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if not tpu_envs.SGLANG_TPU_DSV41_SWA_PLAN_TRIM.get():
+        return None
+    return max(num_slots - 1, 1)
+
+
+def live_plan_rows(
+    live: torch.Tensor, requests: Optional[int]
+) -> Optional[torch.Tensor]:
+    """``[min(B, requests)]`` batch rows holding every live request first (stable),
+    or None to keep all B rows. Static in shape, so the device build uses it too.
+
+    A batch with more live requests than ``requests`` has a slot past the pool
+    (precompile dummies only); its extra requests move no rows."""
+    if requests is None or requests >= live.shape[0]:
+        return None
+    if live.shape[0] not in _LOGGED_TRIM:
+        # Once per batch size and process: the engagement proof of the trim.
+        _LOGGED_TRIM.add(live.shape[0])
+        logger.info(
+            "DSV4.1 SWA plan trim: on, %d -> %d request rows, %d -> %d window "
+            "records per layer publish",
+            live.shape[0],
+            requests,
+            2 * live.shape[0] * WINDOW_TOKENS,
+            2 * requests * WINDOW_TOKENS,
+        )
+    # Stable partition by scatter, not a sort: rank of each row in (live, rest).
+    # int32 cumsum: an int64 one does not lower on the TPU vector units.
+    on = live.to(torch.int32)
+    off = 1 - on
+    rank = torch.where(
+        live,
+        torch.cumsum(on, 0, dtype=torch.int32) - 1,
+        on.sum(dtype=torch.int32) + torch.cumsum(off, 0, dtype=torch.int32) - 1,
+    )
+    rows = torch.arange(live.shape[0], dtype=torch.int32, device=live.device)
+    return torch.empty_like(rows).scatter_(0, rank.long(), rows)[:requests]
+
+
 def ring_rows(slots: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
     page = (
         RESERVED_PAGES + slots * RING_PAGES + positions // SWA_PAGE_TOKENS % RING_PAGES
@@ -114,9 +168,12 @@ def _assign_workspace_pages(
     base_page: int,
     capacity_pages: int,
 ) -> torch.Tensor:
-    """[B, columns] int64 table giving each request fresh pages over
-    ``[first - 128, first + count)``; unused columns stay on the null page."""
-    pages = torch.zeros(first.shape[0], columns, dtype=torch.int64)
+    """[B, columns] int32 table giving each request fresh pages over
+    ``[first - 128, first + count)``; unused columns stay on the null page.
+
+    int32, the upload's dtype: a dense [B, 4 * max_context / 256] table is MBs,
+    and an int64 build then a conversion copies it twice per extend."""
+    pages = torch.zeros(first.shape[0], columns, dtype=torch.int32)
     used = 0
     for b, (start, count) in enumerate(zip(first.tolist(), counts.tolist())):
         if not count:
@@ -127,7 +184,7 @@ def _assign_workspace_pages(
             raise RuntimeError(f"position {start + count - 1} is past the SWA table")
         width = high - low + 1
         pages[b, low : high + 1] = torch.arange(
-            base_page + used, base_page + used + width
+            base_page + used, base_page + used + width, dtype=torch.int32
         )
         used += width
     if used > capacity_pages:
@@ -147,11 +204,13 @@ def extend_window_pages(
     columns: int,
     base_page: int,
     capacity_pages: int,
+    requests: Optional[int] = None,
 ) -> tuple[torch.Tensor, WindowPlan]:
     """Workspace SWA table and row moves of an extend forward.
 
     ``slots``, ``first`` (first position of the chunk), ``counts`` (chunk rows)
     and ``minimum`` (first visible position) are ``[B]`` int64 host tensors.
+    ``requests`` (plan_requests) caps the plan's request rows.
     """
     pages = _assign_workspace_pages(
         first=first,
@@ -190,6 +249,11 @@ def extend_window_pages(
     row_start = (torch.cumsum(counts, 0) - counts)[:, None]
     commit_token = torch.where(kept_ok, row_start + kept - first[:, None], 0)
     commit_dst = torch.where(kept_ok, ring_rows(slot, kept.clamp(min=0)), -1)
+    keep = live_plan_rows(live[:, 0], requests)
+    if keep is not None:
+        history_src, history_dst, commit_token, commit_dst = (
+            t[keep] for t in (history_src, history_dst, commit_token, commit_dst)
+        )
 
     plan = WindowPlan(
         history_src=history_src.reshape(-1),
@@ -230,6 +294,7 @@ class DSV41TPURequestWindow:
         chunk_tokens = window_chunk_tokens(get_schedule().chunked_prefill_size)
         batch_rows = extend_batch_rows()
         self.workspace_first_page = RESERVED_PAGES + RING_PAGES * num_slots
+        self.plan_requests = plan_requests(num_slots)
         self.workspace_pages = _workspace_pages(
             num_slots=num_slots, chunk_tokens=chunk_tokens, batch_rows=batch_rows
         )

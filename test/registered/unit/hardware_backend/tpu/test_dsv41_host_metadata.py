@@ -370,12 +370,14 @@ def test_device_rows_compute_no_int64_on_the_device(layout):
     assert mode.ops == []
 
 
-def test_device_rows_feed_the_graph_the_same_input_form_as_host_rows():
+@pytest.mark.parametrize("packed_rows", [False, True])
+def test_device_rows_feed_the_graph_the_same_input_form_as_host_rows(packed_rows):
     """Active ranks build a spec forward's rows on the device, idle ranks on the
     host, and both run the same compiled forward. TorchTPU compiles a view input
     as its whole base buffer, so a packed host field or an aliased one failed
     the idle rank's verify (RuntimeProgramInputMismatch): with device rows, every
-    row field must be its own tensor in both builds."""
+    row field must be its own tensor in both builds, also when the device build
+    uploads its host rows as one packed buffer."""
     slot_fields = {"full_pages", "swa_pages"}
     seq_lens, slots = [4096, 98310, 17], [1, 2, 3]
     kw = dict(
@@ -392,9 +394,12 @@ def test_device_rows_feed_the_graph_the_same_input_form_as_host_rows():
     on = SimpleNamespace(get=lambda: True)
     device_fb = _verify_batch(seq_lens, slots)
     device_fb.req_pool_indices_cpu = torch.tensor(slots, dtype=torch.int64)
+    flag = SimpleNamespace(get=lambda: packed_rows)
     with (
         patch.object(tpu_envs, "SGLANG_TPU_SPEC_DEVICE_ROWS", on),
         patch.object(tpu_envs, "SGLANG_TPU_DSV41_PACKED_METADATA", on),
+        patch.object(tpu_envs, "SGLANG_TPU_DSV41_PACKED_ROW_UPLOAD", flag),
+        patch.object(tpu_envs, "SGLANG_TPU_DSV41_VERIFY_SWA_RING", flag),
     ):
         builds = {"host": _verify_batch(seq_lens, slots), "device": device_fb}
         for name, fb in builds.items():
@@ -867,6 +872,98 @@ def test_spec_worker_builds_host_rows_only_for_a_consumer():
             assert worker._new_step_host_rows(**kwargs) is None
             idle = torch.zeros(plan.seq_lens.shape, dtype=torch.int64)
             assert worker._new_step_host_rows(**kwargs, seq_lens_cpu=idle) is not None
+
+
+def _idle_backend():
+    backend = object.__new__(ab.DSV41TPUAttnBackend)
+    backend._slot_tables = None
+    backend._idle_metadata_inputs = {}
+    built = []
+
+    def build(forward_batch, *, slot_tables):
+        rows = forward_batch.positions.shape[0]
+        none = ("engram", "swa_window_plan", "tail", "tail_gather", "tail_inverse")
+        fields = {
+            name: torch.zeros(rows, dtype=torch.int32)
+            for name in ab._METADATA_INPUT_FIELDS
+            if name not in none
+        }
+        fields["low_ratio"] = {}
+        metadata = ab.DSV41TPUForwardMetadata(**fields)
+        built.append(metadata)
+        return metadata
+
+    backend._build_forward_metadata = build
+    return backend, built
+
+
+def _idle_verify_batch(pbs, rows_per_req=4):
+    return FB(
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        batch_size=pbs,
+        positions=torch.zeros(pbs * rows_per_req, dtype=torch.int64),
+    )
+
+
+def test_idle_step_metadata_reuses_inputs_in_a_fresh_object():
+    """An idle DP rank's step (SGLANG_TPU_SPEC_IDLE_INPUT_CACHE) reuses the input
+    leaves built for its shape, but in a new metadata object: layers fill scratch
+    fields on it, which must not leak into the next forward."""
+    from sglang_tpu.experimental.speculative.idle_step import idle_step
+
+    backend, built = _idle_backend()
+    with idle_step():
+        backend.init_forward_metadata(_idle_verify_batch(4))
+        first = backend.forward_metadata
+        first.selected[4] = torch.ones(1)
+        first.engram = ("rows",)
+        backend.init_forward_metadata(_idle_verify_batch(4))
+        second = backend.forward_metadata
+        backend.init_forward_metadata(_idle_verify_batch(8))
+    assert len(built) == 2  # one per shape
+    assert second is not first
+    assert second.selected == {} and second.engram is None
+    for name in ab._METADATA_INPUT_FIELDS:
+        if name != "engram":
+            assert getattr(second, name) is getattr(first, name), name
+    # Outside an idle step every forward builds its own.
+    backend.init_forward_metadata(_idle_verify_batch(4))
+    assert len(built) == 3
+
+
+def test_idle_step_metadata_with_tail_is_rebuilt():
+    """Decoder-replay (tail) metadata is per forward; it is never reused."""
+    from sglang_tpu.experimental.speculative.idle_step import idle_step
+
+    backend, built = _idle_backend()
+    build = backend._build_forward_metadata
+
+    def build_with_tail(forward_batch, *, slot_tables):
+        metadata = build(forward_batch, slot_tables=slot_tables)
+        metadata.tail = object()
+        return metadata
+
+    backend._build_forward_metadata = build_with_tail
+    with idle_step():
+        backend.init_forward_metadata(_idle_verify_batch(4))
+        backend.init_forward_metadata(_idle_verify_batch(4))
+    assert len(built) == 2
+
+
+def test_idle_step_never_reuses_metadata_of_a_forward_with_prompt_rows():
+    """A fused mixed prefill + verify step runs its MIXED target forward inside the
+    idle spec step on a prompt-only rank; that forward holds real prompt rows, so a
+    same-shaped later one must not get its positions, slots or KV locations."""
+    from sglang_tpu.experimental.speculative.idle_step import idle_step
+
+    backend, built = _idle_backend()
+    for mode in (ForwardMode.MIXED, ForwardMode.EXTEND):
+        batch = FB(forward_mode=mode, batch_size=4, positions=torch.zeros(16))
+        with idle_step():
+            backend.init_forward_metadata(batch)
+            backend.init_forward_metadata(batch)
+    assert len(built) == 4
+    assert backend._idle_metadata_inputs == {}
 
 
 if __name__ == "__main__":

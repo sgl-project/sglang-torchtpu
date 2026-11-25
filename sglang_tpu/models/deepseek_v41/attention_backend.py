@@ -48,6 +48,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang_tpu.compilation import host_input_mirror, slot_metadata
 from sglang_tpu.compilation.compiled_forward_shim import _REAL_B_KEY
+from sglang_tpu.experimental.speculative.idle_step import in_idle_step
 from sglang_tpu.fused_eager import fused_eager_ops, submit
 from sglang_tpu.models.deepseek_v41.decoder_replay import (
     DecoderTail,
@@ -63,7 +64,11 @@ from sglang_tpu.models.deepseek_v41.memory_pool import (
     PAGE_RECORDS,
     SWA_PAGE_TOKENS,
 )
-from sglang_tpu.models.deepseek_v41.metadata_pack import pack_upload
+from sglang_tpu.models.deepseek_v41.metadata_pack import (
+    lift_views,
+    pack_upload,
+    restore_views,
+)
 from sglang_tpu.models.deepseek_v41.ops.qb_rope import (
     register_qb_rope_op,
     supports_qb_rope,
@@ -218,6 +223,11 @@ class DSV41TPUForwardMetadata:
     # keep_gathered), read by the group's later layers and dropped at its last.
     gathered_main: Dict[int, tuple] = field(default_factory=dict)
 
+    @property
+    def packed_bases(self) -> tuple:
+        """The upload buffers the packed input fields view (see ``lift_views``)."""
+        return _lifted_inputs(self)[1]
+
 
 # Host-built fields: the direct tracer's graph inputs. The rest is per-forward
 # scratch the layers fill, so it is left out of the pytree and every unflatten
@@ -248,25 +258,49 @@ def _fused_ep_enabled() -> bool:
     return is_dsv41_fused_ep_enabled()
 
 
+def _lifted_inputs(m: "DSV41TPUForwardMetadata") -> tuple:
+    """``lift_views`` of the input fields (``tail`` keeps its own), cached per
+    field identity: the reader of a replay resolves ``packed_bases`` by path."""
+    values = tuple(getattr(m, f) for f in _METADATA_INPUT_FIELDS if f != "tail")
+    key = tuple(map(id, values))
+    cached = m.__dict__.get("_lifted")
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if tpu_envs.SGLANG_TPU_DSV41_LIFT_PACKED_VIEWS.get():
+        lifted = lift_views(values)
+    else:
+        lifted = (list(values), (), ())
+    m.__dict__["_lifted"] = (key, lifted)
+    return lifted
+
+
 def _register_metadata_pytree() -> None:
     try:
         from jax import tree_util
     except ModuleNotFoundError:  # CPU unit tests without JAX
         return
+    lifted_fields = tuple(f for f in _METADATA_INPUT_FIELDS if f != "tail")
+
+    def flatten(m):
+        values, bases, specs = _lifted_inputs(m)
+        children = [(tree_util.GetAttrKey(f), v) for f, v in zip(lifted_fields, values)]
+        children.append((tree_util.GetAttrKey("tail"), m.tail))
+        children.append((tree_util.GetAttrKey("packed_bases"), bases))
+        return tuple(children), (m.tail_rows, specs)
+
+    def unflatten(aux, children):
+        tail_rows, specs = aux
+        *values, tail, bases = children
+        values = restore_views(values, bases, specs)
+        return DSV41TPUForwardMetadata(
+            **dict(zip(lifted_fields, values)), tail=tail, tail_rows=tail_rows
+        )
+
     # Keyed by attribute: direct_compile resolves every leaf of a deferred call
     # through its key path and accepts only GetAttr / Dict / Sequence keys.
-    tree_util.register_pytree_with_keys(
-        DSV41TPUForwardMetadata,
-        lambda m: (
-            tuple(
-                (tree_util.GetAttrKey(f), getattr(m, f)) for f in _METADATA_INPUT_FIELDS
-            ),
-            m.tail_rows,
-        ),
-        lambda tail_rows, children: DSV41TPUForwardMetadata(
-            **dict(zip(_METADATA_INPUT_FIELDS, children)), tail_rows=tail_rows
-        ),
-    )
+    tree_util.register_pytree_with_keys(DSV41TPUForwardMetadata, flatten, unflatten)
 
 
 _register_metadata_pytree()
@@ -411,10 +445,24 @@ def _request_token_counts(
     return counts.masked_fill_(req_pool_indices == 0, 0)
 
 
+def _unique_rows(req_pool_indices: torch.Tensor):
+    """(unique slots, inverse) when padding repeats a slot (an extend's batch cap
+    pads with slot 0), so row-wise tables are built once per distinct slot and
+    expanded: exact, as each row depends on its slot only. None if all distinct."""
+    unique, inverse = torch.unique(req_pool_indices, return_inverse=True)
+    if unique.numel() == req_pool_indices.numel():
+        return None
+    return unique, inverse
+
+
 def _full_page_table(
     req_to_token: torch.Tensor, req_pool_indices: torch.Tensor, columns: int
 ) -> torch.Tensor:
     """[B, columns] int64: page p of a request is req_to_token[req, 256 p] // 256."""
+    rows = _unique_rows(req_pool_indices)
+    if rows is not None:
+        unique, inverse = rows
+        return _full_page_table(req_to_token, unique, columns)[inverse]
     starts = req_to_token[req_pool_indices.to(req_to_token.device), ::FULL_PAGE_TOKENS]
     starts = _host_int64(starts[:, :columns])
     if starts.shape[1] < columns:
@@ -527,6 +575,7 @@ def _window_swa_table(
         columns=columns,
         base_page=window.workspace_first_page,
         capacity_pages=window.workspace_pages,
+        requests=getattr(window, "plan_requests", None),
     )
 
 
@@ -542,6 +591,12 @@ def _attends_ring(forward_batch: ForwardBatch) -> bool:
     if not mode.is_extend():
         return True
     return mode.is_target_verify() and tpu_envs.SGLANG_TPU_DSV41_VERIFY_SWA_RING.get()
+
+
+def _packed_row_upload() -> bool:
+    from sglang_tpu.envs import envs as tpu_envs
+
+    return tpu_envs.SGLANG_TPU_DSV41_PACKED_ROW_UPLOAD.get()
 
 
 class SlotTables(msgspec.Struct, frozen=True):
@@ -614,8 +669,20 @@ def _slot_tables(
         host["swa_pages"] = decode_window_pages(req_pool_indices, swa_columns)
     elif not uses_window and full_to_swa_index_mapping is None:
         host["swa_pages"] = _swa_page_table(full_pages, None)
+    rows = _unique_rows(req_pool_indices)
     for ratio in low_ratios:
-        host[f"index_pages.{ratio}"] = _index_pages(full_pages, ratio)
+        if rows is None:
+            host[f"index_pages.{ratio}"] = _index_pages(full_pages, ratio)
+        else:
+            # Row-wise in full_pages, whose rows repeat with the slots.
+            unique, inverse = rows
+            first = torch.zeros(unique.numel(), dtype=torch.int64)
+            first.scatter_(
+                0, inverse.flip(0), torch.arange(inverse.numel() - 1, -1, -1)
+            )
+            host[f"index_pages.{ratio}"] = _index_pages(full_pages[first], ratio)[
+                inverse
+            ]
     dev = _upload_metadata(host, device=device)
     return SlotTables(
         req_pool_indices=req_pool_indices,
@@ -732,11 +799,16 @@ def _device_row_metadata(
         host["live"] = device_rows.window_live(req_pool_indices, counts)
         host["first_row"] = query_start_loc[:-1].clamp(max=max(num_tokens - 1, 0))
     host_input_mirror.release(forward_batch)
-    dev = _upload_metadata(host, device=device, pack=False)
+    packed = _packed_row_upload()
+    dev = _upload_metadata(host, device=device, pack=packed)
 
     # One program, not ~60: past PJRT's 32 in-flight executions each small op
     # would block dispatch until the running forward ends (fused_eager.py).
     with fused_eager_ops(forward_batch.positions.device.type == "tpu") as fused:
+        if packed:
+            # One upload; the fields stay graph inputs of their own, as the host
+            # build (idle ranks) gives them, and the copies join this program.
+            dev = {k: v.clone() for k, v in dev.items()}
         fields = _device_row_fields(
             forward_batch,
             dev=dev,
@@ -744,9 +816,12 @@ def _device_row_metadata(
             window=window,
             columns=columns if window else 0,
             base_page=request_window.workspace_first_page if window else 0,
+            plan_requests=(
+                getattr(request_window, "plan_requests", None) if window else None
+            ),
         )
     if fused:
-        submit(_metadata_leaves(fields))
+        submit([*_metadata_leaves(fields), dev["query_start_loc"], dev["swa_minimum"]])
     return DSV41TPUForwardMetadata(
         query_start_loc=dev["query_start_loc"],
         full_pages=tables.full_pages_device,
@@ -763,6 +838,7 @@ def _device_row_fields(
     window: bool,
     columns: int,
     base_page: int,
+    plan_requests: Optional[int] = None,
 ) -> Dict[str, object]:
     """The position-dependent metadata fields, as device ops only (no upload,
     no read), each a tensor of its own like the host build's."""
@@ -787,6 +863,7 @@ def _device_row_fields(
             minimum=dev["swa_minimum"],
             columns=columns,
             base_page=base_page,
+            requests=plan_requests,
         )
         swa_pages = swa_pages.to(torch.int32)
     low_ratio = {}
@@ -1264,7 +1341,18 @@ def _upload_metadata(
     }
     if not pack or not tpu_envs.SGLANG_TPU_DSV41_PACKED_METADATA.get():
         return {k: t.to(device=device, non_blocking=True) for k, t in host.items()}
-    return dict(zip(host, pack_upload(list(host.values()), device=device)))
+    # Pack the small fields only: a multi-MB table (an extend's [B, 4 * max_context
+    # / 256] SWA table) costs more to copy into the pack than its own upload saves.
+    small = [k for k, t in host.items() if t.numel() <= _PACK_MAX_NUMEL]
+    out = dict(zip(small, pack_upload([host[k] for k in small], device=device)))
+    for k, t in host.items():
+        if k not in out:
+            out[k] = t.to(device=device, non_blocking=True)
+    return {k: out[k] for k in host}
+
+
+# Fields above this many elements upload on their own (_upload_metadata).
+_PACK_MAX_NUMEL = 1 << 16
 
 
 # =============================================================================
@@ -1407,6 +1495,8 @@ class DSV41TPUAttnBackend(AttentionBackend):
         self.forward_metadata: Optional[DSV41TPUForwardMetadata] = None
         # Set by prepare_slot_tables, consumed by the next metadata build.
         self._slot_tables: Optional[SlotTables] = None
+        # (forward mode, batch rows, token rows) -> an idle step's metadata inputs.
+        self._idle_metadata_inputs: Dict[tuple, Dict[str, object]] = {}
         # The DSpark draft runs TARGET_VERIFY as one non-causal block per request.
         self.is_dspark_draft = (
             model_runner.is_draft_worker and model_runner.spec_algorithm.is_dspark()
@@ -1555,6 +1645,9 @@ class DSV41TPUAttnBackend(AttentionBackend):
 
         ``reuse``: keep tables already held for the same slots (built earlier in
         the same step); the page table may have grown since an older build."""
+        if in_idle_step():
+            # An idle step's metadata is reused or built whole (init_forward_metadata).
+            return
         req_pool_indices = req_pool_indices.to(torch.int64)
         held = self._slot_tables
         if (
@@ -1576,7 +1669,44 @@ class DSV41TPUAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         slot_tables, self._slot_tables = self._slot_tables, None
-        self.forward_metadata = build_forward_metadata(
+        mode = forward_batch.forward_mode
+        if in_idle_step() and (mode.is_target_verify() or mode.is_decode()):
+            self.forward_metadata = self._idle_forward_metadata(forward_batch)
+            return
+        self.forward_metadata = self._build_forward_metadata(
+            forward_batch, slot_tables=slot_tables
+        )
+
+    def _idle_forward_metadata(
+        self, forward_batch: ForwardBatch
+    ) -> DSV41TPUForwardMetadata:
+        """An idle DP rank's all-padding rows (slot 0, length 0) give the same
+        metadata at one shape every step: reuse its host-built input leaves in a
+        fresh object, since layers fill per-forward scratch fields on it."""
+        key = (
+            forward_batch.forward_mode,
+            int(forward_batch.batch_size),
+            int(forward_batch.positions.shape[0]),
+        )
+        inputs = self._idle_metadata_inputs.get(key)
+        if inputs is not None:
+            host_input_mirror.release(forward_batch)
+            return DSV41TPUForwardMetadata(**inputs)
+        metadata = self._build_forward_metadata(forward_batch, slot_tables=None)
+        if (
+            metadata.tail is None
+            and metadata.swa_window_plan is None
+            and metadata.engram is None
+        ):
+            self._idle_metadata_inputs[key] = {
+                name: getattr(metadata, name) for name in _METADATA_INPUT_FIELDS
+            }
+        return metadata
+
+    def _build_forward_metadata(
+        self, forward_batch: ForwardBatch, *, slot_tables: Optional[SlotTables]
+    ) -> DSV41TPUForwardMetadata:
+        return build_forward_metadata(
             forward_batch,
             req_to_token=self.req_to_token,
             full_to_swa_index_mapping=self.token_to_kv_pool.full_to_swa_index_mapping,
