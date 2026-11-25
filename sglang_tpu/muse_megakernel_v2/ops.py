@@ -417,8 +417,11 @@ class MuseMegakernel(torch.nn.Module):
         self.geo = geo
         # extend steps run the prefill program
         self.prefill = prefill
-        # the prefill program is prefill/sptp (weights["sptp_*"]) rather than prefill/tp
+        # the prefill program is prefill/sptp: with TP experts on weights["sptp_*"] (instead of
+        # prefill/tp), with EP experts on the EP layout's whole wo / pool / unpool (instead of
+        # prefill/spep)
         self.prefill_sptp = prefill_sptp
+        self.sptp_weights = prefill_sptp and moe_mode != "ep"
         self.prefill_fp8_gather = prefill_fp8_gather
         # layers of block-requantized fp4 experts, which the fused-RS MoE runs as W4A16
         self.w4a16_layers = w4a16_layers
@@ -445,7 +448,7 @@ class MuseMegakernel(torch.nn.Module):
         self.prefill_whole_wo = "wo_full" in weights
         if self.prefill_whole_wo:
             self.register_buffer("w_wo_full", weights["wo_full"], persistent=False)
-        if prefill_sptp:
+        if self.sptp_weights:
             for name in SPTP_WEIGHT_NAMES:
                 self.register_buffer(
                     f"w_sptp_{name}", weights[f"sptp_{name}"], persistent=False
@@ -500,7 +503,11 @@ class MuseMegakernel(torch.nn.Module):
                 f"SGLANG_TPU_MUSE_MK_PREFILL: the Muse prefill program runs at TP "
                 f"{PREFILL_TP}, got {parallel.tp_size}"
             )
-        sptp = prefill and not ep and tpu_envs.SGLANG_TPU_MUSE_MK_PREFILL_SPTP.get()
+        sptp = (
+            prefill
+            and tpu_envs.SGLANG_TPU_MUSE_MK_PREFILL_SPTP.get()
+            and (not ep or tpu_envs.SGLANG_TPU_MUSE_MK_PREFILL_SPTP_EP.get())
+        )
         if prefill:
             _check_prefill_setup(SPTP_ROW_ALIGN if sptp else ROW_ALIGN)
         geo = _ModelSpec(model, ep_ranks=parallel.moe_ep_size if ep else 1)
@@ -601,7 +608,7 @@ class MuseMegakernel(torch.nn.Module):
                     mats[-1], scale = _fp8_channelwise(mats[-1])
                 sm[S[name + "_s"], : scale.numel()] = scale
             smalls.append(sm)
-            if sptp:
+            if sptp and not ep:
                 _append_sptp_weights(sptp_w, sm, attn.o_proj.weight, moe)
             kind = _expert_kind(moe.experts)
             kinds.append(kind)
@@ -647,7 +654,7 @@ class MuseMegakernel(torch.nn.Module):
         }
         if wo_full:
             weights["wo_full"] = _stack(wo_full)
-        if sptp:
+        if sptp and not ep:
             weights.update({f"sptp_{n}": _stack(ts) for n, ts in sptp_w.items()})
         extra = sum(t.numel() * t.element_size() for t in weights.values())
         logger.info(
@@ -1230,7 +1237,7 @@ class MuseMegakernel(torch.nn.Module):
             self.w_wo_full
             if n == "wo" and self.prefill_whole_wo
             else getattr(self, f"w_sptp_{n}")
-            if self.prefill_sptp and n in SPTP_WEIGHT_NAMES
+            if self.sptp_weights and n in SPTP_WEIGHT_NAMES
             else getattr(self, f"w_{n}")
             for n in WEIGHT_NAMES
         ]

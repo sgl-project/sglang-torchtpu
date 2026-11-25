@@ -31,6 +31,7 @@ from sglang_tpu.muse_megakernel_v2.common.consts import (
 from sglang_tpu.muse_megakernel_v2.common.numerics import _rms, heads_rms_xla
 from sglang_tpu.muse_megakernel_v2.common.qkv import qkv_from_proj
 from sglang_tpu.muse_megakernel_v2.common.trace import _scope
+from sglang_tpu.muse_megakernel_v2.prefill.spep import program as PF_SP
 from sglang_tpu.muse_megakernel_v2.prefill.spep.program import (
     _BF16,
     _F32,
@@ -112,17 +113,20 @@ def n_expert_refs(c: PFConfig) -> int:
 
 def build_forward(c: PFConfig, axis: str = "model"):
     """prefill/tp's (meta, pos, kv_lens, cu_q, dist, pf, psw, emb, *weights, *experts, *kv) ->
-    (hidden, aux, *kv), dense path sequence-parallel, MoE expert-TP."""
+    (hidden, aux, *kv), dense path sequence-parallel, MoE expert-TP; with c.sp, the MoE is
+    prefill/spep's EP MoE on whole experts (the decode EP weight layout)."""
     c.validate()
-    if c.sp or c.fp8_gather:
-        raise ValueError("SP + TP takes prefill/tp's config without sp / fp8_gather")
+    if c.fp8_gather:
+        raise ValueError("prefill/sptp gathers in e4m3 itself: no fp8_gather")
+    ep = c.sp
     L, T, tp, hd = c.n_layers, c.rows, c.tp, c.head_dim
     Ts = T // tp
     H, He, qd = c.hidden, c.expert_hidden, c.q_dim
     if Ts % 8:
         raise ValueError(f"{T} rows: rows / tp must be a multiple of 8")
-    ne = n_expert_refs(c)
-    layer_experts = _layer_experts(c)
+    ne = PF_SP.n_expert_refs(c) if ep else n_expert_refs(c)
+    layer_experts = None if ep else _layer_experts(c)
+    ep_moe_fn, ep_combine = PF_SP.ep_moe(c, axis) if ep else (None, None)
     q8 = _bf16_rows if DEBUG_BF16_ACTIVATIONS else _fp8_rows
     # SPTP_RMS_QUANT_3PASS=1: rms, then a separate amax pass, then the cast
     fused_rq = (
@@ -828,72 +832,82 @@ def build_forward(c: PFConfig, axis: str = "model"):
                         f8, f_s = q8(ffn)
                     pooled = dense(f8, f_s, wpool[l], sm, "wpool", He)
                     xe8, xs = rms_q8(pooled, small_row(sm, "pre_expert_w")[:, :He])
-            with _scope("sp_xe_ag"):
-                if pa:
-                    # lane-dense [k, Ts] / [1, Ts] kernel outputs: gather on the row axis
-                    def ag1(x):
-                        return jax.lax.all_gather(x, axis, axis=1, tiled=True)
+            if ep:
+                # own rows' e4m3 expert input and routing straight into the EP a2a MoE
+                with _scope("sp_moe"):
+                    ids_o, tw_o = (ids.T, tw.T) if pa else (ids, tw)
+                    y = ep_combine(
+                        ep_moe_fn(l, me, xe8, xs.reshape(Ts, 1), ids_o, experts),
+                        tw_o,
+                        sm,
+                    ).astype(_BF16)
+            else:
+                with _scope("sp_xe_ag"):
+                    if pa:
+                        # lane-dense [k, Ts] / [1, Ts] kernel outputs: gather on the row axis
+                        def ag1(x):
+                            return jax.lax.all_gather(x, axis, axis=1, tiled=True)
 
-                    ids_all, tw_all = ag1(ids).T, ag1(tw).T
-                    ids_own = ids.T
-                    if pa_xag:
-                        xe_all, xs_row = xe_wait_call(c, 1 if pa_gtok else pa_ng)(
-                            *xa_out
+                        ids_all, tw_all = ag1(ids).T, ag1(tw).T
+                        ids_own = ids.T
+                        if pa_xag:
+                            xe_all, xs_row = xe_wait_call(c, 1 if pa_gtok else pa_ng)(
+                                *xa_out
+                            )
+                            xs_all = xs_row.reshape(T, 1)
+                            # the MoE takes the tiled [T, He / 128, 128] lhs as is
+                            xe = (xe_all.astype(_F32) * xs_row.reshape(T, 1, 1)).astype(
+                                _BF16
+                            )
+                        else:
+                            xs_all = ag1(xs).reshape(T, 1)
+                        if pa_xag:
+                            pass
+                        elif xe_ag_k is not None:
+                            xe = xe_ag_k(xe8, xs_all)
+                        elif xe_pallas:
+                            xe = dequant(ag(xe8, axis), xs_all)
+                        else:
+                            xe = (ag(xe8, axis).astype(_F32) * xs_all).astype(_BF16)
+                    else:
+                        # the switch-off op order (lowers as the un-integrated sptp program)
+                        if xe_pallas:
+                            xe = dequant(ag(xe8, axis), ag(xs, axis))
+                        else:
+                            xe = (ag(xe8, axis).astype(_F32) * ag(xs, axis)).astype(_BF16)
+                        ids_all, tw_all = ag(ids, axis), ag(tw, axis)
+                        ids_own = ids
+                    counts = None
+                    if local_counts:
+                        # per-expert counts of own rows' slots, summed over ranks (the MoE's one-hot
+                        # count over every rank's slots, 1/tp of the compares); out-of-range ids
+                        # count as expert 0, as the MoE routes them
+                        ids_c = jnp.where(
+                            (ids_own >= 0) & (ids_own < c.n_experts), ids_own, 0
+                        ).reshape(-1)
+                        own = jnp.sum(
+                            (ids_c[:, None] == jnp.arange(c.n_experts)[None, :]).astype(
+                                jnp.int32
+                            ),
+                            axis=0,
                         )
-                        xs_all = xs_row.reshape(T, 1)
-                        # the MoE takes the tiled [T, He / 128, 128] lhs as is
-                        xe = (xe_all.astype(_F32) * xs_row.reshape(T, 1, 1)).astype(
-                            _BF16
-                        )
-                    else:
-                        xs_all = ag1(xs).reshape(T, 1)
-                    if pa_xag:
-                        pass
-                    elif xe_ag_k is not None:
-                        xe = xe_ag_k(xe8, xs_all)
-                    elif xe_pallas:
-                        xe = dequant(ag(xe8, axis), xs_all)
-                    else:
-                        xe = (ag(xe8, axis).astype(_F32) * xs_all).astype(_BF16)
-                else:
-                    # the switch-off op order (lowers as the un-integrated sptp program)
-                    if xe_pallas:
-                        xe = dequant(ag(xe8, axis), ag(xs, axis))
-                    else:
-                        xe = (ag(xe8, axis).astype(_F32) * ag(xs, axis)).astype(_BF16)
-                    ids_all, tw_all = ag(ids, axis), ag(tw, axis)
-                    ids_own = ids
-                counts = None
-                if local_counts:
-                    # per-expert counts of own rows' slots, summed over ranks (the MoE's one-hot
-                    # count over every rank's slots, 1/tp of the compares); out-of-range ids
-                    # count as expert 0, as the MoE routes them
-                    ids_c = jnp.where(
-                        (ids_own >= 0) & (ids_own < c.n_experts), ids_own, 0
-                    ).reshape(-1)
-                    own = jnp.sum(
-                        (ids_c[:, None] == jnp.arange(c.n_experts)[None, :]).astype(
-                            jnp.int32
-                        ),
-                        axis=0,
+                        counts = jnp.sum(ag(own[None], axis), axis=0)
+                with _scope("sp_moe"):
+                    y = fused_rs_moe(
+                        c,
+                        layer_experts,
+                        l,
+                        xe,
+                        ids_all,
+                        tw_all,
+                        experts,
+                        group_offset,
+                        sm,
+                        axis,
+                        # ids / tw are all-gathered: equal on every rank, no rank-0 broadcast
+                        skip_routing_psum=True,
+                        group_sizes=counts,
                     )
-                    counts = jnp.sum(ag(own[None], axis), axis=0)
-            with _scope("sp_moe"):
-                y = fused_rs_moe(
-                    c,
-                    layer_experts,
-                    l,
-                    xe,
-                    ids_all,
-                    tw_all,
-                    experts,
-                    group_offset,
-                    sm,
-                    axis,
-                    # ids / tw are all-gathered: equal on every rank, no rank-0 broadcast
-                    skip_routing_psum=True,
-                    group_sizes=counts,
-                )
             if defer_res and l + 1 < L:
                 # stream stays the pre-residual one until the next layer's kernel finishes it
                 with _scope("sp_unpool"):

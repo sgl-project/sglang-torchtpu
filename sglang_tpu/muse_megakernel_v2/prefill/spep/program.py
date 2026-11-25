@@ -141,22 +141,17 @@ def residual(c: PFConfig, stream, sm, name: str, delta):
     ) * _bf(_rms(delta, c.post_eps))
 
 
-def build_forward(c: PFConfig, axis: str = "model"):
-    """prefill/tp's (meta, pos, kv_lens, cu_q, dist, pf, psw, emb, *weights, *experts, *kv) ->
-    (hidden, aux, *kv), computed in the sequence-parallel layout with an EP MoE."""
+def ep_moe(c: PFConfig, axis: str = "model"):
+    """prefill/spep's EP MoE on own rows, for any sequence-parallel dense path: (moe, combine).
+
+    moe(l, me, xe8, xs, ids, experts) -> [Ts, top_k, He] bf16 expert outputs of own rows (e4m3
+    input xe8 with row scales xs, ids [Ts, top_k]); combine(y, tw, sm) -> u [Ts, He] f32, the
+    slots' post-expert-normed outputs weighted by tw."""
     from sglang_tpu.moe.pallas.gmm_v2 import TileSizes, gmm_v2
 
-    c.validate()
-    if c.fp8_gather:
-        raise NotImplementedError(
-            "the sequence-parallel prefill program has no e4m3 gathers "
-            "(SGLANG_TPU_MUSE_MK_PREFILL_FP8_GATHER)"
-        )
-    if len(c.expert_kinds) != c.n_layers:
-        raise ValueError(f"expert_kinds {c.expert_kinds}: one per layer needed")
-    L, T, tp, hd, K = c.n_layers, c.rows, c.tp, c.head_dim, c.top_k
+    T, tp, K = c.rows, c.tp, c.top_k
     Ts, El = T // tp, c.n_experts // tp
-    H, He, qd, kvd = c.hidden, c.expert_hidden, c.q_dim, c.kv_dim
+    He = c.expert_hidden
     P = Ts * K  # (row, slot) pairs this rank routes
     G = tp * El  # global experts
     # every (source, expert) segment padded to a2a.SEG rows on both sides
@@ -283,6 +278,25 @@ def build_forward(c: PFConfig, axis: str = "model"):
         post = small_row(sm, "post_expert_w")[0, :He]
         ynorm = _rms(y.astype(_F32) * post, c.post_eps)
         return jnp.sum(ynorm * tw[:, :, None], axis=1)
+
+    return moe, combine
+
+
+def build_forward(c: PFConfig, axis: str = "model"):
+    """prefill/tp's (meta, pos, kv_lens, cu_q, dist, pf, psw, emb, *weights, *experts, *kv) ->
+    (hidden, aux, *kv), computed in the sequence-parallel layout with an EP MoE."""
+    c.validate()
+    if c.fp8_gather:
+        raise NotImplementedError(
+            "the sequence-parallel prefill program has no e4m3 gathers "
+            "(SGLANG_TPU_MUSE_MK_PREFILL_FP8_GATHER)"
+        )
+    if len(c.expert_kinds) != c.n_layers:
+        raise ValueError(f"expert_kinds {c.expert_kinds}: one per layer needed")
+    L, T, tp, hd = c.n_layers, c.rows, c.tp, c.head_dim
+    Ts = T // tp
+    H, He, qd = c.hidden, c.expert_hidden, c.q_dim
+    moe, combine = ep_moe(c, axis)
 
     def forward(
         meta,
