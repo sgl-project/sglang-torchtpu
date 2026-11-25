@@ -143,6 +143,7 @@ EP_ENV = {
     "SGLANG_TPU_MUSE_MK_SP_EP_LAYOUT": "1",
 }
 EP_DROPPED_ENV = ("SGLANG_TPU_MUSE_MK_PREFILL_FP8_GATHER", "SGLANG_TPU_MUSE_MK_KPERM")
+# EP_VERIFY (env): the EP verify width, tokens per request per step
 EP_VERIFY = 8
 
 
@@ -151,18 +152,19 @@ def apply_ep(config, *, running, adaptive, simulate_acceptance, ep_arm):
     if adaptive:
         raise ValueError("MOE_MODE=ep: no adaptive verify width")
     args, env = config["server_args"], config["runtime_env"]
+    verify = int(os.environ.get("EP_VERIFY", EP_VERIFY))
     args["ep_size"] = 8
     # The replicated wo (64 MiB/layer/rank) eats the 0.95 headroom: the logits program
     # failed to load 60 MB short at extend precompile.
     args["mem_fraction_static"] = 0.93
-    args["speculative_num_draft_tokens"] = EP_VERIFY
+    args["speculative_num_draft_tokens"] = verify
     for name in EP_DROPPED_ENV:
         env.pop(name, None)
     env.update(EP_ENV)
     env["SGLANG_TPU_MUSE_MK_EP_ARM"] = ep_arm
-    env["SGLANG_TPU_MUSE_MK_MAX_ROWS"] = str(-(-running * EP_VERIFY // 16) * 16)
+    env["SGLANG_TPU_MUSE_MK_MAX_ROWS"] = str(-(-running * verify // 16) * 16)
     if simulate_acceptance:
-        env["SGLANG_SIMULATE_ACC_LEN"] = GOLDEN_AL[EP_VERIFY - 1]
+        env["SGLANG_SIMULATE_ACC_LEN"] = GOLDEN_AL[verify - 1]
     return config
 
 
@@ -212,6 +214,9 @@ def config_for(
     drafts at the golden acceptance length regardless of the target logits.
     """
     running, verify, interval, adaptive = PROFILES.get(conc, DEFAULT_PROFILE)
+    # AX_RUNNING / AX_INTERVAL: the profile's request cap / interval for a sweep point
+    running = int(os.environ.get("AX_RUNNING", running))
+    interval = int(os.environ.get("AX_INTERVAL", interval))
     # From conc 16: one 4096-token prefill graph beside a 56 GB write-through
     # host pool per rank, 30% of it for sliding-window KV, and sessions.
     large = conc >= 16
