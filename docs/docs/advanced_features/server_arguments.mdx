@@ -492,7 +492,13 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--prefill-decode-interval-min-bs`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Apply `--prefill-decode-interval` only while the running batch holds at least this many requests. Below it, prefill is admitted every round so the batch fills quickly. In data-parallel attention mode, each rank compares its own running batch. Set to 0 to apply the interval at any batch size.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Apply `--prefill-decode-interval` only while the running batch holds at least this many requests. Below it, prefill is admitted once `--prefill-decode-interval-below-min-bs` decode rounds have run (by default every round) so the batch fills quickly. In data-parallel attention mode, each rank compares its own running batch. Set to 0 to apply the interval at any batch size.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--prefill-decode-interval-below-min-bs`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The number of decode rounds to run after a prefill batch while the running batch holds fewer than `--prefill-decode-interval-min-bs` requests; at or above that size the full `--prefill-decode-interval` applies. A batch that shrinks below that size mid-interval ends the interval once this many rounds have run. Set to 0 to admit prefill every round below that size. Requires `--prefill-decode-interval-min-bs` > 0.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>
@@ -2233,6 +2239,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--hicache-swa-fraction`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Fraction of `--hicache-size` given to the sliding-window (SWA) host pool of a hybrid full/SWA model; the other host pools split the rest by device bytes. Unset, every pool's share follows its device bytes. Needs `--hicache-size`; ignored with a unified KV pool.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: float</td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--hicache-write-policy`</td>

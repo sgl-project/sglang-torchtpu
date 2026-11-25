@@ -49,6 +49,12 @@
     "qwen3-8b": {
       "name": "Qwen3-8B"
     },
+    "qwen3.5-35b-a3b": {
+      "name": "Qwen3.5-35B-A3B"
+    },
+    "qwen3.6-27b": {
+      "name": "Qwen3.6-27B"
+    },
     "qwen3.8-27b": {
       "name": "Qwen3.8-27B"
     },
@@ -100,6 +106,7 @@
     "hybrid": "DP attention hybrid (attn-TP>1)",
     "tp": "Tensor parallel",
     "pcp": "Prefill context parallel",
+    "pcp-ring": "Prefill context parallel, ring mode (striped KV cache)",
     "pp": "Pipeline parallel",
     "pd": "PD disaggregation",
     "epd": "EPD (standalone vision encode server)",

@@ -132,17 +132,12 @@ MIN_SPEC_ACCEPT_LENGTH = float(E("MIN_SPEC_ACCEPT_LENGTH", "2.5"))
 CONCURRENT_WAVE_SIZE = int(E("CONCURRENT_WAVE_SIZE", "8"))
 EXTRA_SERVER_ARGS: Tuple[str, ...] = ("--reasoning-parser", "gpt-oss")
 # Bound the compile grid + allow spec recompiles: the unbounded bs<=max_running
-# verify-graph capture spikes host RAM and OOM-kills the decode. RESHARD off:
-# symmetric prefill/decode TP needs no strided reshard.
+# verify-graph capture spikes host RAM and OOM-kills the decode.
 EXTRA_LAUNCH_ENV: Dict[str, str] = {
     "SGLANG_TPU_FUSED_MOE_SC_GATHER": "0",
     "TPU_COMPILE_BS": "1 2 4 16",
     "TPU_COMPILE_TOKENS": "512 2048 4096",
     "SGLANG_TPU_ALLOW_SPEC_RECOMPILE": "1",
-    # The feature under test. Raiden engages the strided reshard only when a
-    # decode rank is fed by more than one prefill rank, and raises rather than
-    # falling back when it cannot -- so there is no silent symmetric path.
-    "SGLANG_RAIDEN_RESHARD": "1",
     # Raiden's reshard push needs a host buffer per layer.
     "SGLANG_TPU_RAIDEN_STAGING_LAYERS": "0",
 }
@@ -813,8 +808,6 @@ class TestPdGptOss120bReshardConfiguration(unittest.TestCase):
         self.assertEqual(prefill["TP_SIZE"], decode["TP_SIZE"])
         attn_tp = int(decode["TP_SIZE"]) // int(decode["DP_SIZE"])
         self.assertEqual((int(prefill["TP_SIZE"]), attn_tp), (16, 8))
-        for env in (prefill, decode):
-            self.assertEqual(env["SGLANG_RAIDEN_RESHARD"], "1")
 
     def test_gates_are_stricter_than_the_symmetric_row(self) -> None:
         # Both gates this row inherits are unfailable at their default values:

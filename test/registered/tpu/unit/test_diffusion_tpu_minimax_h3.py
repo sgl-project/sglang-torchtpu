@@ -69,6 +69,7 @@ def _installed():
             (comfyui_step, "MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT"),
             (dit, "_minimax_h3_attention_core_bcg"),
             (dit.MiniMaxH3DiTModel, "_compile_conditions"),
+            (dit.MiniMaxH3DiTModel, "_embed"),
         ):
             stack.enter_context(patch.object(target, name, getattr(target, name)))
         minimax_h3.install()

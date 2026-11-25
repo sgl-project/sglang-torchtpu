@@ -2007,6 +2007,11 @@ class KvBufferDesc:
         return (page_size // self.tokens_per_row) * self.row_bytes
 
 
+# KV pool layouts (KVCache.kv_pool_layout).
+LAYER_MAJOR = "layer_major"
+BLOCK_MAJOR = "block_major"
+
+
 class KVCache(abc.ABC):
     layer_shard_enabled: bool = False
     post_capture_active: bool = False
@@ -2028,6 +2033,13 @@ class KVCache(abc.ABC):
     # A draft pool whose rows are the target's sliding-window ids
     # (SGLANG_ROCM_ENABLE_DFLASH_SWA_DRAFT_KV), not its full-attention ids.
     follows_target_swa_ids: bool = False
+
+    def kv_pool_layout(self) -> str:
+        """How the pool holds its layers: ``LAYER_MAJOR``, a buffer per layer;
+        or ``BLOCK_MAJOR``, page buffers of ``[num_blocks, layer_num, *page]``
+        whose rows each hold one page of every layer. A pool of sub-pools
+        (SWA, hybrid) answers for itself, not for its sub-pools."""
+        return LAYER_MAJOR
 
     @abc.abstractmethod
     def __init__(

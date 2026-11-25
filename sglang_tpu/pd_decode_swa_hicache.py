@@ -502,12 +502,16 @@ def _build_full_swa_host_stack(
 
 def _upstream_host_pool_sizes(memory: Any, kvcache: Any) -> tuple:
     """(full, SWA) host pool sizes as upstream's hybrid stack sizes them:
-    ``--hicache-size`` split by the pools' device bytes, or (None, None) for
-    the ``--hicache-ratio`` sizing the group applies itself."""
+    ``--hicache-size`` split by the pools' device bytes or
+    ``--hicache-swa-fraction``, or (None, None) for the ``--hicache-ratio``
+    sizing the group applies itself."""
     if memory.hicache_size <= 0:
         return None, None
-    return hybrid_pool_assembler._split_hicache_size(
-        memory.hicache_size, (kvcache.full_kv_pool, kvcache.swa_kv_pool)
+    return hybrid_pool_assembler._split_hybrid_swa_hicache_size(
+        memory.hicache_size,
+        full_kv_pool=kvcache.full_kv_pool,
+        swa_kv_pool=kvcache.swa_kv_pool,
+        swa_fraction=memory.hicache_swa_fraction,
     )
 
 
