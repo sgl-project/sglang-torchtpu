@@ -1092,16 +1092,17 @@ def test_b1_moe_ops_env_default_ast_and_lock_free_prewarm():
         with mock.patch.object(sk_ops, "_B1_MOE_LOCK", _ExplodingLock()):
             for tp in (8, 16):
                 for rep, sp, cm, r16 in layer_cfgs:
-                    assert callable(
-                        sk_ops.get_b1_moe_chip_sharded_op(
-                            tp,
-                            bf16_router=r16,
-                            num_replicas=rep,
-                            has_spec_slot=sp,
-                            replica_cost_mode=cm,
-                            return_sharded=True,
+                    for ret_sh in ((True, False) if tp == 16 else (True,)):
+                        assert callable(
+                            sk_ops.get_b1_moe_chip_sharded_op(
+                                tp,
+                                bf16_router=r16,
+                                num_replicas=rep,
+                                has_spec_slot=sp,
+                                replica_cost_mode=cm,
+                                return_sharded=ret_sh,
+                            )
                         )
-                    )
                     assert callable(
                         sk_ops.get_b1_moe_b2_chip_sharded_op(
                             tp,
@@ -1126,7 +1127,7 @@ def test_b1_moe_ops_env_default_ast_and_lock_free_prewarm():
                             )
                         )
 
-    assert len(captured) == 16
+    assert len(captured) == 18
     for op_name, (n_params, in_specs, out_specs) in captured.items():
         assert in_specs is not None and len(in_specs) == n_params, (
             f"{op_name}: {len(in_specs) if in_specs else None} != {n_params}"
@@ -1222,8 +1223,7 @@ def test_muse_spark_b1_moe_b2_superkernel_dispatch_tp8_and_tp16():
         extend_seq_lens=None,
     )
 
-    for tp in (8, 16):
-        batch = 64
+    for tp, batch in ((8, 64), (16, 64), (16, 256)):
         r_pair = batch // (tp // 2)
         calls: list[str] = []
 
@@ -1235,9 +1235,10 @@ def test_muse_spark_b1_moe_b2_superkernel_dispatch_tp8_and_tp16():
             gt = torch.zeros((batch, 1024 // (tp // 8)), dtype=torch.bfloat16)
             return st + 1.0, qkv, gt
 
-        def _fake_step_a(_rk, st, *_rest):
+        def _fake_step_a(_rk, st, *_rest, ret_sh=True):
             calls.append(f"step_a:{st.shape[0]}")
-            return st + 1.0, torch.zeros((batch // tp, h_pre), dtype=torch.bfloat16)
+            out_r = (batch // tp) if ret_sh else batch
+            return st + 1.0, torch.zeros((out_r, h_pre), dtype=torch.bfloat16)
 
         def _fake_fn_op(sh_flag):
             def _fn(st, mo, *_rest):
@@ -1320,7 +1321,7 @@ def test_muse_spark_b1_moe_b2_superkernel_dispatch_tp8_and_tp16():
             lyr.mlp._norm_2d = lambda l=lyr: l.mlp._buffers["_fused_decode_norm_2d"]
             lyr.mlp._fused_decode_mode = "sparse"
             lyr.mlp._fused_decode_op = object()
-            lyr.mlp._fused_decode_batches = (64, 128)
+            lyr.mlp._fused_decode_batches = (64, 128, 256)
             lyr.mlp._fused_decode_num_replicas = 0
             lyr.mlp._fused_decode_has_spec_slot = False
             lyr.mlp._fused_decode_replica_cost_mode = "tiles"
@@ -1377,7 +1378,9 @@ def test_muse_spark_b1_moe_b2_superkernel_dispatch_tp8_and_tp16():
             ),
             mock.patch(
                 "sglang_tpu.muse_megakernel.decode.b1_moe_ops.get_b1_moe_chip_sharded_op",
-                return_value=_fake_step_a,
+                side_effect=lambda *_a, return_sharded=True, **_kw: (
+                    lambda *args, _rs=return_sharded: _fake_step_a(*args, ret_sh=_rs)
+                ),
             ),
             mock.patch(
                 "sglang_tpu.kernels.decode_collective_bridges_w8.get_attn_to_moe_chip_sharded_bridge_op",
@@ -1395,7 +1398,7 @@ def test_muse_spark_b1_moe_b2_superkernel_dispatch_tp8_and_tp16():
                 input_embeds=embeds,
             )
         assert out.shape == (batch, h_dim)
-        if tp == 8:
+        if tp == 8 or batch == 256:
             assert calls == [
                 f"step_b:{r_pair}:False",
                 f"step_a:{r_pair}",
@@ -1404,7 +1407,7 @@ def test_muse_spark_b1_moe_b2_superkernel_dispatch_tp8_and_tp16():
         else:
             assert calls == [
                 f"step_b:{r_pair}:False",
-                f"chip_b1:{r_pair}:{batch}",
+                f"step_a:{r_pair}",
                 f"chip_fn:False:{r_pair}:{batch}",
             ]
 
@@ -3452,4 +3455,383 @@ def test_step_c_tp16_bd4_interpret_parity_and_tpu7x_aot():
             jax.shard_map(_aot_step_c_bd4, mesh=mesh_aot, in_specs=in_specs, out_specs=out_specs, check_vma=False),
         ).lower(*abstract).compile()
     assert compiled is not None
+
+
+def _make_standalone_step_a_ref_fn(*, world_size: int, scale_block: int, hidden: int, h_pre: int, batch_size: int, ret_sh: bool, cfg_ref, interp):
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+    from sglang_tpu.kernels.decode_collective_bridges_w8 import (
+        attn_to_moe_chip_sharded_bridge_jax,
+    )
+    from sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_sparse import (
+        _run_muse_sparse_from_vmem_core,
+        build_muse_sparse_scratch_shapes,
+    )
+    from sglang_tpu.muse_megakernel.decode.b1_moe_kernel import (
+        _unpack_muse_sparse_scratch,
+    )
+
+    def _run_standalone(
+        rank, stream_chip, gated_attn, wo, wo_scale, pa_alpha, pa_beta, pre_ff_gain,
+        w_pre_pair, s_pre_pair, w_router, pre_exp_gain,
+        bias, w1, s1, w2, s2, norm,
+    ):
+        st1, logits, expert_in = attn_to_moe_chip_sharded_bridge_jax(
+            stream_chip, gated_attn, wo, wo_scale, pa_alpha, pa_beta, pre_ff_gain,
+            w_pre_pair, s_pre_pair, w_router, pre_exp_gain,
+            world_size=world_size, pa_eps=1e-6, pre_ff_eps=1e-5, pre_ff_scale_input=False,
+            router_multiplier=0.17677669529663687, pre_exp_eps=1e-5, pre_exp_scale_input=False,
+            interpret=interp,
+        )
+        scratch_shapes = build_muse_sparse_scratch_shapes(
+            ep=world_size, batch_size=batch_size, scale_block=scale_block,
+            s1_dtype=s1.dtype, s2_dtype=s2.dtype, num_replicas=0,
+            return_sharded=ret_sh, config=cfg_ref,
+        )
+        v_sp = pl.BlockSpec(memory_space=pltpu.VMEM)
+        h_sp = pl.BlockSpec(memory_space=pltpu.HBM)
+
+        def _ref_moe(*refs):
+            it = iter(refs)
+            rk_r = next(it)
+            lg_r, bs_r, x_r = next(it), next(it), next(it)
+            w1_r, s1_r, w2_r, s2_r, nm_r = next(it), next(it), next(it), next(it), next(it)
+            out_r = next(it)
+            msc = _unpack_muse_sparse_scratch(
+                it, ep=world_size, scale_block=scale_block,
+                num_replicas=0, return_sharded=ret_sh, cfg=cfg_ref,
+            )
+            bsem = pltpu.get_barrier_semaphore()
+            for d_i in range(world_size):
+                pl.semaphore_signal(bsem, device_id={"model": jnp.int32(d_i)}, device_id_type=pl.DeviceIdType.MESH)
+            _run_muse_sparse_from_vmem_core(
+                rk_r[0], lg_r, bs_r, x_r, w1_r, s1_r, w2_r, s2_r, nm_r,
+                **{k: v for k, v in msc.items() if k != "w_mode"},
+                barrier_sem=bsem, output_ref=out_r, ep=world_size, batch_size=batch_size,
+                scale_block=scale_block, num_replicas=0, return_sharded=ret_sh,
+                replica_cost_mode="tiles", ep_axis_name="model", cfg=cfg_ref,
+                wait_entry_barrier=True, write_output_ref=True,
+            )
+
+        out_r = (batch_size // world_size) if ret_sh else batch_size
+        moe_out = pl.pallas_call(
+            _ref_moe,
+            out_shape=jax.ShapeDtypeStruct((out_r, h_pre), jnp.bfloat16),
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=1, grid=(1,),
+                in_specs=(v_sp, v_sp, v_sp, h_sp, h_sp, h_sp, h_sp, v_sp),
+                out_specs=v_sp, scratch_shapes=scratch_shapes,
+            ),
+            compiler_params=pltpu.CompilerParams(
+                vmem_limit_bytes=60 * 1024**2,
+                collective_id=0,
+                disable_bounds_checks=True,
+            ),
+            interpret=interp,
+        )(jnp.atleast_1d(rank), logits, bias, expert_in, w1, s1, w2, s2, norm)
+        return st1, moe_out
+
+    return _run_standalone
+
+
+def test_l61_tp16_b64_rep_interpret_parity():
+    """Verify L61 TP=16 B=64 Step (a) return_sharded=False Interpret parity & zero races."""
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    if len(jax.devices("cpu")) < 16:
+        pytest.skip("Requires XLA_FLAGS=--xla_force_host_platform_device_count=16")
+
+    from sglang_tpu.kernels.decode_collective_bridges_w8 import (
+        moe_post_chip_sharded_final_norm_jax,
+    )
+    from sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_sparse import (
+        default_sparse_decode_config,
+    )
+    from sglang_tpu.muse_megakernel.decode.b1_moe_kernel import (
+        b1_moe_chip_sharded_jax,
+    )
+
+    world_size, scale_block, hidden, h_pre = 16, 512, 8192, 4096
+    ip_race = pltpu.InterpretParams(
+        dma_execution_mode="eager", detect_races=True, uninitialized_memory="nan"
+    )
+    mesh_cpu = Mesh(np.array(jax.devices("cpu")[:world_size]), ("model",))
+    rng_64 = np.random.default_rng(20261218)
+    d64 = _build_b1_moe_inputs(
+        rng_64, world_size=world_size, batch_size=64, scale_block=scale_block,
+        num_replicas=0, bf16_router=True, sparse_heavy=False,
+    )
+    w_post_64 = jnp.asarray(
+        np.concatenate([(rng_64.standard_normal((h_pre, h_pre)) * 0.04).astype(np.float32) for _ in range(world_size)], axis=0),
+        dtype=jnp.float8_e4m3fn,
+    )
+    s_post_64 = jnp.asarray((np.abs(rng_64.standard_normal((h_pre,))) * 0.02 + 1e-3).astype(np.float32))
+    post_ff_g64 = jnp.asarray((np.ones((hidden,)) * 1.02).astype(np.float32))
+    pf_a64 = jnp.asarray((np.ones((hidden,)) * 0.93).astype(np.float32))
+    pf_b64 = jnp.asarray((np.ones((hidden,)) * 0.88).astype(np.float32))
+    fin_g64 = jnp.asarray((np.ones((hidden,)) * 1.05).astype(np.float32))
+    cfg64 = dataclasses.replace(
+        default_sparse_decode_config(64, world_size, scale_block),
+        pair_rs=True, bridge_ag=True, spec_prime_parts=0,
+    )
+    ip_fast = pltpu.InterpretParams(dma_execution_mode="eager")
+    ref_step_a = _make_standalone_step_a_ref_fn(
+        world_size=world_size, scale_block=scale_block, hidden=hidden, h_pre=h_pre,
+        batch_size=64, ret_sh=False, cfg_ref=cfg64, interp=ip_fast,
+    )
+
+    def _ref_l61(*args):
+        st1, moe_rep = ref_step_a(*args[:18])
+        return moe_post_chip_sharded_final_norm_jax(
+            st1, moe_rep, *args[18:],
+            world_size=world_size, sharded_moe_in=False, return_stream_too=False, interpret=ip_fast,
+        )
+
+    def _fused_l61(*args):
+        st1, moe_rep = b1_moe_chip_sharded_jax(
+            *args[:18], world_size=world_size, pa_eps=1e-6, pre_ff_eps=1e-5, pre_ff_scale_input=False,
+            router_multiplier=0.17677669529663687, pre_exp_eps=1e-5, pre_exp_scale_input=False,
+            return_sharded=False, config=cfg64, interpret=ip_race,
+        )
+        return moe_post_chip_sharded_final_norm_jax(
+            st1, moe_rep, *args[18:],
+            world_size=world_size, sharded_moe_in=False, return_stream_too=False, interpret=ip_race,
+        )
+
+    l61_args = (
+        d64["ranks"], d64["stream_chip_st"], d64["gated_full"], d64["wo_sharded"], d64["wo_scale"],
+        d64["pa_alpha"], d64["pa_beta"], d64["pre_ff_gain"],
+        d64["w_pre_pair"], d64["s_pre_pair"], d64["w_router"], d64["pre_exp_gain"],
+        d64["bias"], d64["w1_all"], d64["s1_all"], d64["w2_all"], d64["s2_all"], d64["post_exp_norm"],
+        w_post_64, s_post_64, post_ff_g64, pf_a64, pf_b64, fin_g64,
+    )
+    l61_specs = (
+        P("model"), P("model", None), P(None, "model"), P("model", None), P(),
+        P(), P(), P(),
+        P(None, "model"), P("model"), P(), P(),
+        P(), P("model", None, None), P("model", None, None), P("model", None, None), P("model", None, None), P(),
+        P("model", None), P(), P(), P(), P(), P(),
+    )
+    ref_hid = np.asarray(jax.jit(jax.shard_map(_ref_l61, mesh=mesh_cpu, in_specs=l61_specs, out_specs=P(), check_vma=False))(*l61_args), dtype=np.float32)
+    jax.clear_caches()
+    got_hid = np.asarray(jax.jit(jax.shard_map(_fused_l61, mesh=mesh_cpu, in_specs=l61_specs, out_specs=P(), check_vma=False))(*l61_args), dtype=np.float32)
+    jax.clear_caches()
+    assert np.all(np.isfinite(got_hid)) and _cosine_sim(ref_hid, got_hid) > 0.9999
+
+
+def test_tp16_b256_step_a_and_b_interpret_parity():
+    """Verify 2/3-scope TP=16 B=256 Step (a) & Step (b) Interpret parity & zero races."""
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    if len(jax.devices("cpu")) < 16:
+        pytest.skip("Requires XLA_FLAGS=--xla_force_host_platform_device_count=16")
+
+    from sglang_tpu.kernels.decode_collective_bridges_w8 import (
+        moe_to_attn_chip_sharded_bridge_jax,
+    )
+    from sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_sparse import (
+        default_sparse_decode_config,
+    )
+    from sglang_tpu.muse_megakernel.decode.b1_moe_b2_kernel import (
+        b1_moe_b2_chip_sharded_jax,
+    )
+    from sglang_tpu.muse_megakernel.decode.b1_moe_kernel import (
+        b1_moe_chip_sharded_jax,
+    )
+
+    world_size, scale_block = 16, 512
+    hidden, h_pre, qkv_cols, gate_cols = 8192, 4096, 640, 512
+    ip_race = pltpu.InterpretParams(
+        dma_execution_mode="eager", detect_races=True, uninitialized_memory="nan"
+    )
+    mesh_cpu = Mesh(np.array(jax.devices("cpu")[:world_size]), ("model",))
+    rng_256 = np.random.default_rng(20261219)
+    d256 = _build_b1_moe_inputs(
+        rng_256, world_size=world_size, batch_size=256, scale_block=scale_block,
+        num_replicas=0, bf16_router=True, sparse_heavy=False,
+    )
+    # Balance 1 hot expert per rank across all 16 ranks so 16-CPU Interpret stays fast (~2x).
+    b256_np = (rng_256.standard_normal((1, 256)) * 0.05).astype(np.float32)
+    b256_np[0, 0:256:16] += 12.0
+    d256["bias"] = jnp.asarray(b256_np)
+    w_post_256 = jnp.asarray(
+        np.concatenate([(rng_256.standard_normal((h_pre, h_pre)) * 0.04).astype(np.float32) for _ in range(world_size)], axis=0),
+        dtype=jnp.float8_e4m3fn,
+    )
+    s_post_256 = jnp.asarray((np.abs(rng_256.standard_normal((h_pre,))) * 0.02 + 1e-3).astype(np.float32))
+    post_ff_g = jnp.asarray((np.ones((hidden,)) * 1.02).astype(np.float32))
+    pf_a = jnp.asarray((np.ones((hidden,)) * 0.93).astype(np.float32))
+    pf_b = jnp.asarray((np.ones((hidden,)) * 0.88).astype(np.float32))
+    fin_g = jnp.asarray((np.ones((hidden,)) * 1.05).astype(np.float32))
+    w_qkv_256 = jnp.asarray(
+        np.concatenate([(rng_256.standard_normal((hidden, qkv_cols)) * 0.04).astype(np.float32) for _ in range(world_size)], axis=0),
+        dtype=jnp.float8_e4m3fn,
+    )
+    s_qkv_256 = jnp.asarray((np.abs(rng_256.standard_normal((qkv_cols,))) * 0.02 + 1e-3).astype(np.float32))
+    w_gate_256 = jnp.asarray(
+        np.concatenate([(rng_256.standard_normal((hidden, gate_cols)) * 0.04).astype(np.float32) for _ in range(world_size)], axis=0),
+        dtype=jnp.float8_e4m3fn,
+    )
+    s_gate_256 = jnp.asarray((np.abs(rng_256.standard_normal((gate_cols,))) * 0.02 + 1e-3).astype(np.float32))
+    cs_256 = jnp.asarray((rng_256.standard_normal((256, 2, 128)) * 0.3).astype(np.float32))
+    cfg256 = dataclasses.replace(
+        default_sparse_decode_config(256, world_size, scale_block),
+        pair_rs=True, bridge_ag=True, spec_prime_parts=0,
+    )
+    ip_fast = pltpu.InterpretParams(dma_execution_mode="eager")
+    ref_step_a = _make_standalone_step_a_ref_fn(
+        world_size=world_size, scale_block=scale_block, hidden=hidden, h_pre=h_pre,
+        batch_size=256, ret_sh=True, cfg_ref=cfg256, interp=ip_fast,
+    )
+
+    def _ref_b256(*args):
+        st1, moe_sh = ref_step_a(*args[:18])
+        b2_res = moe_to_attn_chip_sharded_bridge_jax(
+            st1, moe_sh, *args[18:],
+            world_size=world_size, sharded_moe_in=True, fuse_qkv_epi=True, interpret=ip_fast,
+        )
+        return st1, moe_sh, *b2_res
+
+    def _fused_a256(*args):
+        return b1_moe_chip_sharded_jax(
+            *args[:18], world_size=world_size, pa_eps=1e-6, pre_ff_eps=1e-5, pre_ff_scale_input=False,
+            router_multiplier=0.17677669529663687, pre_exp_eps=1e-5, pre_exp_scale_input=False,
+            return_sharded=True, config=cfg256, interpret=ip_race,
+        )
+
+    def _fused_b256(*args):
+        return b1_moe_b2_chip_sharded_jax(
+            *args, world_size=world_size, pa_eps=1e-6, pre_ff_eps=1e-5, pre_ff_scale_input=False,
+            router_multiplier=0.17677669529663687, pre_exp_eps=1e-5, pre_exp_scale_input=False,
+            fuse_qkv_epi=True, config=cfg256, interpret=ip_race,
+        )
+
+    b256_args = (
+        d256["ranks"], d256["stream_chip_st"], d256["gated_full"], d256["wo_sharded"], d256["wo_scale"],
+        d256["pa_alpha"], d256["pa_beta"], d256["pre_ff_gain"],
+        d256["w_pre_pair"], d256["s_pre_pair"], d256["w_router"], d256["pre_exp_gain"],
+        d256["bias"], d256["w1_all"], d256["s1_all"], d256["w2_all"], d256["s2_all"], d256["post_exp_norm"],
+        w_post_256, s_post_256, post_ff_g, pf_a, pf_b, fin_g,
+        w_qkv_256, s_qkv_256, w_gate_256, s_gate_256, cs_256,
+    )
+    b256_specs = (
+        P("model"), P("model", None), P(None, "model"), P("model", None), P(),
+        P(), P(), P(),
+        P(None, "model"), P("model"), P(), P(),
+        P(), P("model", None, None), P("model", None, None), P("model", None, None), P("model", None, None), P(),
+        P("model", None), P(), P(), P(), P(), P(),
+        P("model", None), P(), P("model", None), P(), P(),
+    )
+    ref_out_jax = jax.jit(
+        jax.shard_map(_ref_b256, mesh=mesh_cpu, in_specs=b256_specs, out_specs=(P("model"),) * 6, check_vma=False)
+    )(*b256_args)
+    ref_np = [np.asarray(x, dtype=np.float32) for x in ref_out_jax]
+    del ref_out_jax
+    jax.clear_caches()
+
+    got_a = jax.jit(
+        jax.shard_map(_fused_a256, mesh=mesh_cpu, in_specs=b256_specs[:18], out_specs=(P("model"), P("model")), check_vma=False)
+    )(*b256_args[:18])
+    got_a_np = [np.asarray(x, dtype=np.float32) for x in got_a]
+    del got_a
+    jax.clear_caches()
+    assert _cosine_sim(ref_np[0], got_a_np[0]) > 0.9999
+    assert _cosine_sim(ref_np[1], got_a_np[1]) > 0.9999
+
+    got_b = jax.jit(
+        jax.shard_map(_fused_b256, mesh=mesh_cpu, in_specs=b256_specs, out_specs=(P("model"),) * 4, check_vma=False)
+    )(*b256_args)
+    got_b_np = [np.asarray(x, dtype=np.float32) for x in got_b]
+    del got_b
+    jax.clear_caches()
+    for idx, nm in enumerate(("stream_chip", "q_5d", "kv_merged", "gate")):
+        assert np.all(np.isfinite(got_b_np[idx])), f"b256 {nm} non-finite"
+        assert _cosine_sim(ref_np[idx + 2], got_b_np[idx]) > 0.9999, f"b256 {nm} cos={_cosine_sim(ref_np[idx + 2], got_b_np[idx])}"
+
+
+def test_tp16_b256_and_l61_b64_rep_tpu7x_aot():
+    """Verify TPU7x 2x2x2 AOT compilation for L61 TP=16 B=64 rep and TP=16 B=256 Step (a)/(b)."""
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import topologies
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    from sglang_tpu.muse_megakernel.decode.b1_moe_b2_kernel import (
+        b1_moe_b2_chip_sharded_jax,
+    )
+    from sglang_tpu.muse_megakernel.decode.b1_moe_kernel import (
+        b1_moe_chip_sharded_jax,
+    )
+
+    world_size, scale_block = 16, 512
+    hidden, h_pre, inter = 8192, 4096, 4096
+    e_local, o_in, pre_pair_cols, n_chips = 256 // world_size, hidden // world_size, h_pre // 2, world_size // 2
+    nqb1, nqb2, qkv_cols, gate_cols = h_pre // scale_block, inter // scale_block, 640, 512
+
+    tpu_devs = topologies.get_topology_desc("tpu7x:2x2x2", platform="tpu").devices
+    mesh_aot = Mesh(
+        np.array(sorted(tpu_devs, key=lambda dv: (dv.coords[1], dv.coords[0], dv.core_on_chip))),
+        ("model",),
+    )
+
+    def _base_sds(B: int):
+        r_p = B // n_chips
+        return (
+            jax.ShapeDtypeStruct((1,), jnp.int32),
+            jax.ShapeDtypeStruct((r_p, hidden), jnp.float32),
+            jax.ShapeDtypeStruct((B, o_in), jnp.bfloat16),
+            jax.ShapeDtypeStruct((o_in, hidden), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, hidden), jnp.float32),
+            jax.ShapeDtypeStruct((1, hidden), jnp.float32),
+            jax.ShapeDtypeStruct((1, hidden), jnp.float32),
+            jax.ShapeDtypeStruct((1, hidden), jnp.float32),
+            jax.ShapeDtypeStruct((hidden, pre_pair_cols), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, pre_pair_cols), jnp.float32),
+            jax.ShapeDtypeStruct((hidden, 256), jnp.bfloat16),
+            jax.ShapeDtypeStruct((1, h_pre), jnp.float32),
+            jax.ShapeDtypeStruct((1, 256), jnp.float32),
+            jax.ShapeDtypeStruct((e_local, h_pre, 2 * inter), jnp.float4_e2m1fn),
+            jax.ShapeDtypeStruct((e_local, nqb1, 2 * inter), jnp.bfloat16),
+            jax.ShapeDtypeStruct((e_local, inter, h_pre), jnp.float4_e2m1fn),
+            jax.ShapeDtypeStruct((e_local, nqb2, h_pre), jnp.bfloat16),
+            jax.ShapeDtypeStruct((1, h_pre), jnp.bfloat16),
+        )
+
+    rep8_sds = (
+        jax.ShapeDtypeStruct((8, h_pre, 2 * inter), jnp.float4_e2m1fn),
+        jax.ShapeDtypeStruct((8, nqb1, 2 * inter), jnp.bfloat16),
+        jax.ShapeDtypeStruct((8, inter, h_pre), jnp.float4_e2m1fn),
+        jax.ShapeDtypeStruct((8, nqb2, h_pre), jnp.bfloat16),
+        jax.ShapeDtypeStruct((4, world_size * 8), jnp.int32),
+    )
+    b256_aot_sds = _base_sds(256) + (
+        jax.ShapeDtypeStruct((h_pre, h_pre), jnp.float8_e4m3fn),
+        jax.ShapeDtypeStruct((1, h_pre), jnp.float32),
+        jax.ShapeDtypeStruct((1, hidden), jnp.float32),
+        jax.ShapeDtypeStruct((1, hidden), jnp.float32),
+        jax.ShapeDtypeStruct((1, hidden), jnp.float32),
+        jax.ShapeDtypeStruct((1, hidden), jnp.float32),
+        jax.ShapeDtypeStruct((hidden, qkv_cols), jnp.float8_e4m3fn),
+        jax.ShapeDtypeStruct((1, qkv_cols), jnp.float32),
+        jax.ShapeDtypeStruct((hidden, gate_cols), jnp.float8_e4m3fn),
+        jax.ShapeDtypeStruct((1, gate_cols), jnp.float32),
+        jax.ShapeDtypeStruct((256, 2, 128), jnp.float32),
+    ) + rep8_sds
+    for fn_aot, sds_in, out_n in [
+        (lambda *a: b1_moe_chip_sharded_jax(*a, world_size=16, return_sharded=False), _base_sds(64) + rep8_sds, 2),
+        (lambda *a: b1_moe_chip_sharded_jax(*a, world_size=16, return_sharded=True), _base_sds(256) + rep8_sds, 2),
+        (lambda *a: b1_moe_b2_chip_sharded_jax(*a, world_size=16, fuse_qkv_epi=True), b256_aot_sds, 4),
+    ]:
+        comp = jax.jit(
+            jax.shard_map(fn_aot, mesh=mesh_aot, in_specs=(P(),) * len(sds_in), out_specs=(P(),) * out_n, check_vma=False)
+        ).trace(*sds_in).lower(lowering_platforms=("tpu",)).compile()
+        assert comp.memory_analysis().generated_code_size_in_bytes > 0
 
