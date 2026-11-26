@@ -154,6 +154,10 @@ class TpuEnvs:
     SGLANG_TPU_OPT_WAN_MEGAKERNEL_SKIP_SEMAPHORE_CHECKS = EnvBool(False)
     SGLANG_TPU_OPT_WAN_MEGAKERNEL_MASK_SCORES = EnvBool(False)
     SGLANG_TPU_OPT_WAN_MEGAKERNEL_ZERO_AHEAD = EnvBool(False)
+    # Row chunks of each MLP up-projection step's matmul, with
+    # PIPELINED_EPILOGUES (wan_megakernel/tiling.py Tiling.up_chunks; 8 at the
+    # recipes' 1,024-row tiles): the same bits; unset: one dot a step.
+    SGLANG_TPU_OPT_WAN_MEGAKERNEL_UP_ROW_CHUNKS = EnvInt(1)
     # Wan megakernel forward around the kernel, the same kernel inputs:
     # ROW_EMBED takes the patch embedding's rows as the linear makes them (no
     # channels-first copy and transpose back) and pads only this rank's rows;

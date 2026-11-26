@@ -185,6 +185,7 @@ def enable(model) -> bool:
         semaphore_checks=not envs.SGLANG_TPU_OPT_WAN_MEGAKERNEL_SKIP_SEMAPHORE_CHECKS.get(),
         mask_scores=envs.SGLANG_TPU_OPT_WAN_MEGAKERNEL_MASK_SCORES.get(),
         zero_ahead=envs.SGLANG_TPU_OPT_WAN_MEGAKERNEL_ZERO_AHEAD.get(),
+        up_chunks=envs.SGLANG_TPU_OPT_WAN_MEGAKERNEL_UP_ROW_CHUNKS.get(),
     )
     cfg_ranks, sp = get_classifier_free_guidance_world_size(), get_ulysses_ctx()[0]
     # Register the op first: packing frees the blocks' projections.
