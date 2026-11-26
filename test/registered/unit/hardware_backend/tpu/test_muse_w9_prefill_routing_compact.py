@@ -586,3 +586,151 @@ def test_strided_compact_qblock_r4_tier0_and_resolve_qblock_non_po2():
 
     assert int(tier_val) == 0
     assert np.array_equal(np.asarray(lhs_ref)[:loc_total], np.asarray(lhs_got)[:loc_total])
+
+
+def test_macro_vec_qblock_coarse48_parity_and_tpu7x_aot():
+    """Verify macro-vectorized q_block (n_blocks=48 at 24K, 64 at 8K/16K/32K) is race-free 0-ULP and compiles."""
+    jax = pytest.importorskip("jax")
+    import jax.numpy as jnp
+    from jax import export
+    from jax.experimental import topologies
+    from jax.experimental.pallas import tpu as pltpu
+
+    from sglang_tpu.muse_prefill_kernels.eplb import remap_zeroglue_virtual_ids
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.routing_pallas import (
+        pallas_qblock_remap_virtual_ids,
+        resolve_qblock_params,
+    )
+
+    assert resolve_qblock_params(8192 * 8, 8, 256) == (64, 128)
+    assert resolve_qblock_params(12288 * 8, 8, 256) == (48, 128)
+    assert resolve_qblock_params(16384 * 8, 8, 256) == (64, 128)
+    assert resolve_qblock_params(24576 * 8, 8, 256) == (48, 128)
+    assert resolve_qblock_params(24576 * 8, 16, 256) == (48, 128)
+    assert resolve_qblock_params(32768 * 8, 8, 256) == (64, 128)
+    assert resolve_qblock_params(36864 * 8, 8, 256) == (96, 128)
+
+    rng = np.random.default_rng(20261126)
+    eager_interp = pltpu.InterpretParams(
+        dma_execution_mode="eager",
+        detect_races=True,
+        uninitialized_memory="nan",
+    )
+    cases = (
+        (8, 32, 4096, 128, 4, 2, True),
+        (8, 32, 8192, 128, 4, 5, True),
+        (8, 32, 16384, 256, 2, 1, False),
+        (8, 32, 24576, 256, 4, 7, True),
+        (8, 32, 24576, 256, 1, 0, False),
+        (16, 16, 8192, 128, 2, 11, True),
+        (16, 16, 24576, 256, 2, 0, False),
+        (16, 16, 24576, 256, 4, 15, True),
+    )
+    with _tpu7x_cpu_context(interpret=False):
+        for ep_size, base_loc, t_tot, q_m, n_rep, rk, add_pad in cases:
+            e_loc = base_loc + n_rep
+            probs = 1.0 / (np.arange(1, ep_size * base_loc + 1, dtype=np.float64) ** 1.3)
+            probs /= probs.sum()
+            g_np = rng.choice(ep_size * base_loc, size=(t_tot, 8), p=probs).astype(np.int32)
+            if add_pad:
+                g_np[-128:, :] = ep_size * base_loc
+            g_j = jnp.asarray(g_np)
+            rk_j = jnp.int32(rk)
+            with mock.patch.dict(
+                os.environ, {"SGLANG_TPU_MUSE_KERNEL_PALLAS_SORTFREE_ROUTING": "0"}
+            ):
+                ref_g, ref_l = remap_zeroglue_virtual_ids(
+                    g_j,
+                    rk_j,
+                    ep_size=ep_size,
+                    num_local_experts=e_loc,
+                    num_base_local=base_loc,
+                    mode="q_block",
+                    quantum=q_m,
+                )
+            got_g, got_l = pallas_qblock_remap_virtual_ids(
+                g_j,
+                rk_j,
+                ep_size=ep_size,
+                num_local_experts=e_loc,
+                num_base_local=base_loc,
+                quantum=q_m,
+                interpret=eager_interp,
+            )
+            assert np.array_equal(np.asarray(got_g), np.asarray(ref_g)), (
+                f"global mismatch ep={ep_size} tg={t_tot} rep={n_rep} rk={rk}"
+            )
+            assert np.array_equal(np.asarray(got_l), np.asarray(ref_l)), (
+                f"local mismatch ep={ep_size} tg={t_tot} rep={n_rep} rk={rk}"
+            )
+
+        exp = export.export(
+            jax.jit(
+                lambda g, me: pallas_qblock_remap_virtual_ids(
+                    g,
+                    me,
+                    ep_size=8,
+                    num_local_experts=36,
+                    num_base_local=32,
+                    quantum=256,
+                )
+            ),
+            platforms=("tpu",),
+        )(
+            jax.ShapeDtypeStruct((24576, 8), jnp.int32),
+            jax.ShapeDtypeStruct((), jnp.int32),
+        )
+        assert "pallas_qblock_eplb_remap_tg24576_ep8_el36_nb48_q128" in exp.mlir_module()
+
+        for topo_name, ep_size, base_loc, e_loc in (
+            ("tpu7x=2x2x1", 8, 32, 36),
+            ("tpu7x=2x2x2", 16, 16, 18),
+        ):
+            topo = topologies.get_topology_desc(platform="tpu", topology_name=topo_name)
+            shd = jax.sharding.SingleDeviceSharding(topo.devices[0])
+            c_qb = (
+                jax.jit(
+                    lambda g, me, _ep=ep_size, _bl=base_loc, _el=e_loc: pallas_qblock_remap_virtual_ids(
+                        g,
+                        me,
+                        ep_size=_ep,
+                        num_local_experts=_el,
+                        num_base_local=_bl,
+                        quantum=256,
+                    )
+                )
+                .trace(
+                    jax.ShapeDtypeStruct((24576, 8), jnp.int32, sharding=shd),
+                    jax.ShapeDtypeStruct((), jnp.int32, sharding=shd),
+                )
+                .lower()
+                .compile()
+            )
+            assert c_qb is not None
+
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.pipeline import (
+        _allow_pallas_sortfree_routing,
+    )
+
+    assert not _allow_pallas_sortfree_routing(
+        1,
+        sortfree_prefill=True,
+        topk=8,
+        ep_size=8,
+        t_local=128,
+        n_loc_eff=32,
+        has_pad_sentinel=True,
+        eff_hoist_routing=True,
+        eff_cm_pipe=False,
+    )
+    assert _allow_pallas_sortfree_routing(
+        1,
+        sortfree_prefill=True,
+        topk=8,
+        ep_size=8,
+        t_local=256,
+        n_loc_eff=32,
+        has_pad_sentinel=True,
+        eff_hoist_routing=True,
+        eff_cm_pipe=False,
+    )
