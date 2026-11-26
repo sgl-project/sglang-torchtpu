@@ -59,6 +59,10 @@ class _Megakernel:
         self.step_constants: dict | None = (
             {} if envs.SGLANG_TPU_ENABLE_WAN_MEGAKERNEL_STEP_CONSTANTS.get() else None
         )
+        self.row_embed = envs.SGLANG_TPU_OPT_WAN_MEGAKERNEL_ROW_EMBED.get()
+        self.nonblocking_keys = (
+            envs.SGLANG_TPU_OPT_WAN_MEGAKERNEL_NONBLOCKING_KEYS.get()
+        )
 
 
 def is_packed(model) -> bool:
@@ -178,6 +182,9 @@ def enable(model) -> bool:
     tiling = Tiling(
         pipelined_epilogues=envs.SGLANG_TPU_OPT_WAN_MEGAKERNEL_PIPELINED_EPILOGUES.get(),
         dma_bounds_checks=not envs.SGLANG_TPU_OPT_WAN_MEGAKERNEL_SKIP_BOUNDS_CHECKS.get(),
+        semaphore_checks=not envs.SGLANG_TPU_OPT_WAN_MEGAKERNEL_SKIP_SEMAPHORE_CHECKS.get(),
+        mask_scores=envs.SGLANG_TPU_OPT_WAN_MEGAKERNEL_MASK_SCORES.get(),
+        zero_ahead=envs.SGLANG_TPU_OPT_WAN_MEGAKERNEL_ZERO_AHEAD.get(),
     )
     cfg_ranks, sp = get_classifier_free_guidance_world_size(), get_ulysses_ctx()[0]
     # Register the op first: packing frees the blocks' projections.
@@ -291,7 +298,11 @@ def _cross_kv(model, state, encoder_hidden_states, b, batch, batch_ctx):
     )
     ctx = model.condition_embedder.text_embedder(text)
     k2, v2 = pack.cross_kv(model, ctx[0].to(torch.bfloat16), state.cfg)
-    kv = (k2, v2, *pack.cross_keys(k2, v2, state.tiling.cross_keys))
+    if getattr(state, "nonblocking_keys", False):
+        keys = pack.cross_keys(k2, v2, state.tiling.cross_keys, nonblocking=True)
+    else:
+        keys = pack.cross_keys(k2, v2, state.tiling.cross_keys)
+    kv = (k2, v2, *keys)
     if rid is not None:
         state.kv_cache.insert(0, (key, weakref.ref(encoder_hidden_states), kv))
         del state.kv_cache[state.kv_cache_size :]
@@ -353,7 +364,10 @@ def _forward_one(
     _, _, frames, height, width = hidden_states.shape
     pt, ph, pw = model.patch_size
     f_, h_, w_ = frames // pt, height // ph, width // pw
-    x = model.patch_embedding(hidden_states).flatten(2).transpose(1, 2)  # [1, S, H]
+    if state.row_embed:  # the linear's rows as made, no channels-first round trip
+        x = model.patch_embedding(hidden_states, tokens=True)  # [1, S, H]
+    else:
+        x = model.patch_embedding(hidden_states).flatten(2).transpose(1, 2)  # [1, S, H]
     tokens = x.shape[1]
     emb = model.condition_embedder
     temb = emb.time_embedder(timestep, None)
@@ -368,9 +382,16 @@ def _forward_one(
         tiling, rows = for_tokens(tokens, sp, state.tiling)
         op = valid = None
     total = rows * sp
-    xs = torch.nn.functional.pad(x[0], (0, 0, 0, total - tokens))[
-        rank * rows : (rank + 1) * rows
-    ]
+    if state.row_embed:  # my rows of the sequence, zero rows past its end
+        start = min(rank * rows, tokens)
+        stop = min(start + rows, tokens)
+        xs = x[0, start:stop]
+        if stop - start < rows:
+            xs = torch.nn.functional.pad(xs, (0, 0, 0, rows - (stop - start)))
+    else:
+        xs = torch.nn.functional.pad(x[0], (0, 0, 0, total - tokens))[
+            rank * rows : (rank + 1) * rows
+        ]
     cos, sin = _rope_rows(model, state, f_, h_, w_, rows, rank, x.device)
     if valid is None:
         valid = torch.tensor([tokens], dtype=torch.int32, device=x.device)

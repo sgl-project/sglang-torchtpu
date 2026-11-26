@@ -309,5 +309,77 @@ class TestStepConstants(CustomTestCase):
         self.assertEqual([int(v[0]) for v in (valids[0], valids[3])], [72, 64])
 
 
+@unittest.skipUnless(_HAS_JAX, _SKIP)
+class TestRowEmbed(TestStepConstants):
+    """hook._forward_one with SGLANG_TPU_OPT_WAN_MEGAKERNEL_ROW_EMBED: sglang's
+    PatchEmbed (flatten off, as Wan builds it) gives its rows as the linear makes
+    them and each rank pads only its own: the op gets the same rows bit for bit on
+    every rank, whether its rows are all real, partly past the sequence's end or
+    all padding."""
+
+    def setUp(self):
+        super().setUp()
+        import torch
+
+        from sglang.multimodal_gen.runtime.layers.visual_embedding import PatchEmbed
+
+        conv = self.model.patch_embedding
+        pe = PatchEmbed(
+            patch_size=(1, 2, 2), in_chans=self.C, embed_dim=self.H, flatten=False
+        ).to(torch.bfloat16)
+        pe.proj.weight.data.copy_(conv.weight.data)
+        pe.proj.bias.data.copy_(conv.bias.data)
+        self.model.patch_embedding = pe
+
+    def forward(self, row_embed, sp, rank, lat):
+        torch = self.torch
+        with envs_mod().SGLANG_TPU_OPT_WAN_MEGAKERNEL_ROW_EMBED.override(row_embed):
+            weights = {name: torch.zeros(1) for name in self.hook.pack.WEIGHT_ORDER}
+            state = self.hook._Megakernel(
+                None, self.cfg, Tiling(), weights, None, self.tables, 1, sp
+            )
+        self.sgl_dist.sequence_model_parallel_all_gather = lambda x, dim: torch.cat(
+            [x] * sp, dim=dim
+        )
+        ctx = types.SimpleNamespace(
+            request_id="r", timesteps=torch.zeros(3), negative_prompt_embeds=None
+        )
+        text = torch.ones(1, 8, self.H, dtype=torch.bfloat16)
+        self.seen = []
+        out = self.hook._forward_one(
+            self.model,
+            state,
+            lat,
+            text,
+            0,
+            1,
+            torch.full((1,), 999.0),
+            ctx,
+            sp,
+            rank,
+        )
+        return out, self.seen[0]
+
+    def test_same_rows_every_rank(self):
+        torch = self.torch
+        g = torch.Generator().manual_seed(2)
+        # 3 x 10 x 50 = 1,500 tokens: 1,024 rows a device at 2 and 4 devices (rank
+        # 1 holds 476 real rows, ranks 2-3 none), 2,048 at 1 device.
+        lat = torch.randn(1, self.C, 3, 20, 100, generator=g).to(torch.bfloat16)
+        for sp in (1, 2, 4):
+            for rank in range(sp):
+                out0, seen0 = self.forward(False, sp, rank, lat)
+                out1, seen1 = self.forward(True, sp, rank, lat)
+                with self.subTest(sp=sp, rank=rank):
+                    self.assertTrue(torch.equal(out0, out1))
+                    for a, b in zip(seen0, seen1):
+                        self.assertEqual((a.dtype, a.shape), (b.dtype, b.shape))
+                        self.assertTrue(torch.equal(a, b))
+                    real = max(
+                        0, min(1500 - rank * seen1[0].shape[0], seen1[0].shape[0])
+                    )
+                    self.assertFalse(seen1[0][real:].any())
+
+
 if __name__ == "__main__":
     unittest.main()

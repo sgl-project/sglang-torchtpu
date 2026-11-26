@@ -145,6 +145,23 @@ class TpuEnvs:
     # work at every copy). Off: the current layout and checks.
     SGLANG_TPU_OPT_WAN_MEGAKERNEL_PIPELINED_EPILOGUES = EnvBool(False)
     SGLANG_TPU_OPT_WAN_MEGAKERNEL_SKIP_BOUNDS_CHECKS = EnvBool(False)
+    # More layout options, each the same bits (wan_megakernel/tiling.py):
+    # SKIP_SEMAPHORE_CHECKS compiles without Mosaic's semaphore checks;
+    # MASK_SCORES has the key tile holding the last real row subtract a per-key
+    # column (0 or +inf) on the fixed path instead of selecting its scores;
+    # ZERO_AHEAD zeroes each attention item's sum and output in the item
+    # before's epilogue.
+    SGLANG_TPU_OPT_WAN_MEGAKERNEL_SKIP_SEMAPHORE_CHECKS = EnvBool(False)
+    SGLANG_TPU_OPT_WAN_MEGAKERNEL_MASK_SCORES = EnvBool(False)
+    SGLANG_TPU_OPT_WAN_MEGAKERNEL_ZERO_AHEAD = EnvBool(False)
+    # Wan megakernel forward around the kernel, the same kernel inputs:
+    # ROW_EMBED takes the patch embedding's rows as the linear makes them (no
+    # channels-first copy and transpose back) and pads only this rank's rows;
+    # NONBLOCKING_KEYS uploads the cross-attention key counts without waiting,
+    # so a new request's or expert's first forward does not stall the host
+    # until the TPU queue has drained (sglang_tpu/host_upload.py).
+    SGLANG_TPU_OPT_WAN_MEGAKERNEL_ROW_EMBED = EnvBool(False)
+    SGLANG_TPU_OPT_WAN_MEGAKERNEL_NONBLOCKING_KEYS = EnvBool(False)
     # Launch-time xprof capture (see profile_auto.py): each stage once, without
     # /start_profile. Keep the step count small: each chip's trace is hundreds
     # of MB.
