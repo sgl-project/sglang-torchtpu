@@ -30,6 +30,8 @@ _B1_MOE_B2_OPS: dict[tuple, Callable] = {}
 _B1_MOE_B2_B16_OPS: dict[tuple, Callable] = {}
 _B1_MOE_B2_RPAD_OPS: dict[tuple, Callable] = {}
 _STEP_C_KV_WRITE_OPS: dict[tuple[bool, bool], Callable] = {}
+_STEP_C_KV_WRITE_MULTI_6D_OPS: dict[tuple[bool, bool], Callable] = {}
+_STEP_C_KV_WRITE_MULTI_5D_OPS: dict[tuple[int, bool, bool], Callable] = {}
 _B1_MOE_OPS: dict[tuple, Callable] = {}
 
 _B1_BASE_TENSOR_NAMES = (
@@ -719,6 +721,321 @@ def get_step_c_kv_write_op(
     return op
 
 
+def _step_c_kv_write_tags(
+    kv_pack_dense2: bool, kv_pack_bd4: bool
+) -> tuple[bool, bool, str]:
+    bd4_key = bool(kv_pack_bd4)
+    d2_key = bool(kv_pack_dense2) and not bd4_key
+    suffix = "_bd4" if bd4_key else ("_d2" if d2_key else "")
+    return d2_key, bd4_key, suffix
+
+
+def get_step_c_kv_write_multi_6d_op(
+    kv_pack_dense2: bool = False,
+    kv_pack_bd4: bool = False,
+) -> Callable:
+    """Return cached batched multi-layer Step (c) KV writer op for 6D KV bundles."""
+    d2_key, bd4_key, suffix = _step_c_kv_write_tags(kv_pack_dense2, kv_pack_bd4)
+    key = (d2_key, bd4_key)
+    op = _STEP_C_KV_WRITE_MULTI_6D_OPS.get(key)
+    if op is not None:
+        return op
+
+    with _B1_MOE_LOCK:
+        op = _STEP_C_KV_WRITE_MULTI_6D_OPS.get(key)
+        if op is None:
+            import jax
+            from torch_tpu._internal import pallas as _torch_pallas
+
+            from sglang_tpu.muse_megakernel.decode.b1_moe_b2_kernel import (
+                write_decode_kv_multi_layer_jax,
+            )
+            from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+            op_name = f"sglang_tpu_pallas::muse_w9_step_c_write_kv_multi_6d{suffix}"
+
+            def _wrapped_6d(
+                kv_new_layers: jax.Array,
+                kv_cache_fused: jax.Array,
+                kv_lens: jax.Array,
+                page_indices: jax.Array,
+                cu_q_lens: jax.Array,
+                cu_kv_lens: jax.Array,
+                distribution: jax.Array,
+                layer_ids: jax.Array,
+            ) -> jax.Array:
+                return write_decode_kv_multi_layer_jax(
+                    kv_new_layers,
+                    kv_cache_fused,
+                    kv_lens,
+                    page_indices,
+                    cu_q_lens,
+                    cu_kv_lens,
+                    distribution,
+                    layer_ids=layer_ids.reshape(-1),
+                    kv_pack_dense2=d2_key,
+                    kv_pack_bd4=bd4_key,
+                )
+
+            jax_kernel = _torch_pallas.custom_jax_kernel(
+                _wrapped_6d,
+                name=f"jax_{op_name}",
+                static_argnums=(),
+                donate_argnums=(1,),
+                input_output_aliases={1: 0},
+                warn_deprecated=False,
+            )
+
+            try:
+                torch._C._dispatch_key_for_device("tpu")
+                dev_types = ["tpu"]
+            except RuntimeError:
+                dev_types = None
+
+            @torch.library.custom_op(
+                op_name,
+                mutates_args=("kv_cache_fused",),
+                device_types=dev_types,
+            )
+            def step_c_kv_write_multi_6d_op(
+                kv_new_layers: torch.Tensor,
+                kv_cache_fused: torch.Tensor,
+                kv_lens: torch.Tensor,
+                page_indices: torch.Tensor,
+                cu_q_lens: torch.Tensor,
+                cu_kv_lens: torch.Tensor,
+                distribution: torch.Tensor,
+                layer_ids: torch.Tensor,
+            ) -> None:
+                with tpu_info_for_cpu_export():
+                    jax_kernel(
+                        kv_new_layers,
+                        kv_cache_fused,
+                        kv_lens,
+                        page_indices,
+                        cu_q_lens,
+                        cu_kv_lens,
+                        distribution,
+                        layer_ids,
+                    )
+
+            @step_c_kv_write_multi_6d_op.register_fake
+            def _(*args, **kwargs) -> None:
+                return None
+
+            _STEP_C_KV_WRITE_MULTI_6D_OPS[key] = step_c_kv_write_multi_6d_op
+            op = step_c_kv_write_multi_6d_op
+    return op
+
+
+def get_step_c_kv_write_multi_5d_op(
+    num_layers: int,
+    kv_pack_dense2: bool = False,
+    kv_pack_bd4: bool = False,
+) -> Callable:
+    """Return cached batched Step (c) KV writer op for ``2 <= num_layers <= 8`` 5D buffers."""
+    if not (2 <= num_layers <= 8):
+        raise ValueError(f"Expected 2 <= num_layers <= 8 for 5D multi-write, got {num_layers}")
+    d2_key, bd4_key, suffix = _step_c_kv_write_tags(kv_pack_dense2, kv_pack_bd4)
+    key = (int(num_layers), d2_key, bd4_key)
+    op = _STEP_C_KV_WRITE_MULTI_5D_OPS.get(key)
+    if op is not None:
+        return op
+
+    with _B1_MOE_LOCK:
+        op = _STEP_C_KV_WRITE_MULTI_5D_OPS.get(key)
+        if op is None:
+            import jax
+            from torch_tpu._internal import pallas as _torch_pallas
+
+            from sglang_tpu.muse_megakernel.decode.b1_moe_b2_kernel import (
+                write_decode_kv_multi_layer_jax,
+            )
+            from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+            op_name = f"sglang_tpu_pallas::muse_w9_step_c_write_kv_multi_5d_l{num_layers}{suffix}"
+            cache_names = tuple(f"c{i}" for i in range(num_layers))
+            meta_names = ("kv_lens", "page_indices", "cu_q_lens", "cu_kv_lens", "distribution")
+            arg_names = ("kv_new_layers",) + cache_names + meta_names
+
+            def _wrapped_5d(*args):
+                kv_new_layers = args[0]
+                caches = args[1 : 1 + num_layers]
+                kv_lens, page_indices, cu_q_lens, cu_kv_lens, distribution = args[1 + num_layers :]
+                return write_decode_kv_multi_layer_jax(
+                    kv_new_layers,
+                    caches,
+                    kv_lens,
+                    page_indices,
+                    cu_q_lens,
+                    cu_kv_lens,
+                    distribution,
+                    layer_ids=None,
+                    kv_pack_dense2=d2_key,
+                    kv_pack_bd4=bd4_key,
+                )
+
+            _wrapped_5d.__name__ = f"jax_multi_5d_l{num_layers}"
+            _wrapped_5d.__signature__ = inspect.Signature(
+                parameters=[
+                    inspect.Parameter(nm, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=jax.Array)
+                    for nm in arg_names
+                ],
+                return_annotation=tuple[(jax.Array,) * num_layers],  # type: ignore[valid-type]
+            )
+            _wrapped_5d.__annotations__ = {nm: jax.Array for nm in arg_names}
+            _wrapped_5d.__annotations__["return"] = tuple[(jax.Array,) * num_layers]  # type: ignore[valid-type]
+
+            jax_kernel = _torch_pallas.custom_jax_kernel(
+                _wrapped_5d,
+                name=f"jax_{op_name}",
+                static_argnums=(),
+                donate_argnums=tuple(range(1, 1 + num_layers)),
+                input_output_aliases={1 + i: i for i in range(num_layers)},
+                warn_deprecated=False,
+            )
+
+            try:
+                torch._C._dispatch_key_for_device("tpu")
+                dev_types = ["tpu"]
+            except RuntimeError:
+                dev_types = None
+
+            def _op_impl(*args) -> None:
+                with tpu_info_for_cpu_export():
+                    jax_kernel(*args)
+
+            _op_impl.__name__ = f"step_c_kv_write_multi_5d_l{num_layers}_op"
+            _op_impl.__signature__ = inspect.Signature(
+                parameters=[
+                    inspect.Parameter(nm, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=torch.Tensor)
+                    for nm in arg_names
+                ],
+                return_annotation=None,
+            )
+            _op_impl.__annotations__ = {nm: torch.Tensor for nm in arg_names}
+            _op_impl.__annotations__["return"] = None
+
+            step_c_kv_write_multi_5d_op = torch.library.custom_op(
+                op_name,
+                mutates_args=cache_names,
+                device_types=dev_types,
+            )(_op_impl)
+
+            @step_c_kv_write_multi_5d_op.register_fake
+            def _(*args, **kwargs) -> None:
+                return None
+
+            _STEP_C_KV_WRITE_MULTI_5D_OPS[key] = step_c_kv_write_multi_5d_op
+            op = step_c_kv_write_multi_5d_op
+    return op
+
+
+def flush_pending_step_c_kv_writes(pending_writes: list) -> None:
+    """Flush accumulated Step (c) KV writes via batched multi-layer Pallas writers."""
+    if not pending_writes:
+        return
+    groups: dict[tuple, list] = {}
+    for entry in pending_writes:
+        kv_cache, _, _, _, _, _, kv_layer_idx, _, dense2, bd4 = entry[:10]
+        key = (
+            entry[10]
+            if len(entry) >= 12
+            else (
+                id(kv_cache) if kv_layer_idx is not None else 0,
+                id(entry[2]),
+                id(entry[5]),
+                id(entry[1]),
+                id(entry[3]),
+                id(entry[4]),
+                bool(dense2),
+                bool(bd4),
+            )
+        )
+        groups.setdefault(key, []).append(entry)
+
+    for grp in groups.values():
+        (
+            kv_cache0,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            distribution,
+            kv_layer_idx0,
+            _,
+            dense2,
+            bd4,
+        ) = grp[0][:10]
+        if len(grp) == 1:
+            get_step_c_kv_write_op(kv_pack_dense2=dense2, kv_pack_bd4=bd4)(
+                grp[0][7],
+                kv_cache0,
+                kv_lens,
+                page_indices,
+                cu_q_lens,
+                cu_kv_lens,
+                distribution,
+                kv_layer_idx0,
+            )
+            continue
+
+        if kv_layer_idx0 is not None:
+            stacked = torch.stack([e[7] for e in grp], dim=0)
+            layer_ids = torch.cat([e[6].reshape(1) for e in grp], dim=0).to(torch.int32)
+            get_step_c_kv_write_multi_6d_op(kv_pack_dense2=dense2, kv_pack_bd4=bd4)(
+                stacked,
+                kv_cache0,
+                kv_lens,
+                page_indices,
+                cu_q_lens,
+                cu_kv_lens,
+                distribution,
+                layer_ids,
+            )
+            continue
+
+        chunks: list[list] = []
+        cur_chunk: list = []
+        seen_ids: set[int] = set()
+        for entry in grp:
+            cid = int(entry[11]) if len(entry) >= 12 else id(entry[0])
+            if len(cur_chunk) >= 8 or cid in seen_ids:
+                chunks.append(cur_chunk)
+                cur_chunk = []
+                seen_ids = set()
+            cur_chunk.append(entry)
+            seen_ids.add(cid)
+        if cur_chunk:
+            chunks.append(cur_chunk)
+
+        for ch in chunks:
+            if len(ch) == 1:
+                get_step_c_kv_write_op(kv_pack_dense2=dense2, kv_pack_bd4=bd4)(
+                    ch[0][7],
+                    ch[0][0],
+                    kv_lens,
+                    page_indices,
+                    cu_q_lens,
+                    cu_kv_lens,
+                    distribution,
+                    None,
+                )
+            else:
+                stacked = torch.stack([e[7] for e in ch], dim=0)
+                get_step_c_kv_write_multi_5d_op(
+                    len(ch), kv_pack_dense2=dense2, kv_pack_bd4=bd4
+                )(
+                    stacked,
+                    *(e[0] for e in ch),
+                    kv_lens,
+                    page_indices,
+                    cu_q_lens,
+                    cu_kv_lens,
+                    distribution,
+                )
+
+
 def get_b1_moe_chip_sharded_op(
     world_size: int,
     *,
@@ -921,3 +1238,12 @@ def prewarm_b1_moe_superkernel_ops(
                         rpa_mode_str=rpa_m,
                     )
                     get_step_c_kv_write_op(kv_pack_dense2=eff_d2, kv_pack_bd4=eff_bd4)
+                    if has_lidx:
+                        get_step_c_kv_write_multi_6d_op(
+                            kv_pack_dense2=eff_d2, kv_pack_bd4=eff_bd4
+                        )
+                    else:
+                        for _k5 in range(2, 9):
+                            get_step_c_kv_write_multi_5d_op(
+                                _k5, kv_pack_dense2=eff_d2, kv_pack_bd4=eff_bd4
+                            )

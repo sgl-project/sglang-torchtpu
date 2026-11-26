@@ -1153,6 +1153,8 @@ def test_b1_moe_ops_env_default_ast_and_lock_free_prewarm():
         mock.patch.dict(sk_ops._B1_MOE_OPS, {}, clear=True),
         mock.patch.dict(sk_ops._B1_MOE_B2_RPAD_OPS, {}, clear=True),
         mock.patch.dict(sk_ops._STEP_C_KV_WRITE_OPS, {}, clear=True),
+        mock.patch.dict(sk_ops._STEP_C_KV_WRITE_MULTI_6D_OPS, {}, clear=True),
+        mock.patch.dict(sk_ops._STEP_C_KV_WRITE_MULTI_5D_OPS, {}, clear=True),
     ):
         sk_ops.prewarm_b1_moe_superkernel_ops(
             16,
@@ -1176,6 +1178,24 @@ def test_b1_moe_ops_env_default_ast_and_lock_free_prewarm():
                     )
                     is not None
                 )
+                if has_lidx:
+                    assert (
+                        sk_ops.get_step_c_kv_write_multi_6d_op(
+                            kv_pack_dense2=bool(dense2),
+                            kv_pack_bd4=bool(bd4),
+                        )
+                        is not None
+                    )
+                else:
+                    for _k5 in range(2, 9):
+                        assert (
+                            sk_ops.get_step_c_kv_write_multi_5d_op(
+                                _k5,
+                                kv_pack_dense2=bool(dense2),
+                                kv_pack_bd4=bool(bd4),
+                            )
+                            is not None
+                        )
                 assert (
                     sk_ops.get_b1_moe_b2_rpad_chip_sharded_op(
                         16,
@@ -2206,11 +2226,11 @@ def test_step_c_rpa_plan_group_sizing_and_fallback():
     assert (slot_pg_1b, use_grp_1b, is_ok_1b) == (5, False, True)
     assert cfg_1b.swabatch_group_size == 1
 
-    # 4. Base > 20*512 rows or shared16 must return is_ok=False.
+    # 4. Base > 80*512 rows or active shared16 must return is_ok=False.
     _, _, _, _, ok_too_big = resolve_step_c_rpa_plan(
-        "w8,s4,batchfull,g4k,foldcol,batch4",
+        "w8,s4,batchfull,g4k,foldcol",
         sliding_window=None,
-        pages_per_seq=6,
+        pages_per_seq=32,
         phys_page_rows=512,
         kv_pack_dense2=False,
         b_tokens=64,
@@ -2223,6 +2243,7 @@ def test_step_c_rpa_plan_group_sizing_and_fallback():
         sliding_window=None,
         pages_per_seq=4,
         phys_page_rows=512,
+        has_shared_prefix=True,
     )
     assert ok_shared is False
 
@@ -2874,7 +2895,7 @@ def test_nonuniform_free_params_zero_compile_and_step_c_dispatch():
         out_c = m_c.forward(torch.zeros((batch,), dtype=torch.int32), torch.arange(batch, dtype=torch.int32), fb_c, input_embeds=torch.randn(batch, h_dim, dtype=torch.bfloat16))
     assert out_c.shape == (batch, h_dim)
     assert attn_calls == [0], f"Layer 1 self_attn must be skipped by Step (c), got attn_calls={attn_calls}"
-    assert op_calls == ["step_c", "write_kv_only", ("step_a", 3.0)]
+    assert op_calls == ["step_c", ("step_a", 3.0), "write_kv_only"]
 
     # 3b. Verify TP=16 Step (c) dispatches when kv_pack_bd4=True (bd4 phys_rows=128).
     attn_calls.clear()
@@ -2951,7 +2972,7 @@ def test_nonuniform_free_params_zero_compile_and_step_c_dispatch():
         out_c_bd4 = m_c.forward(torch.zeros((batch,), dtype=torch.int32), torch.arange(batch, dtype=torch.int32), fb_bd4, input_embeds=torch.randn(batch, h_dim, dtype=torch.bfloat16))
     assert out_c_bd4.shape == (batch, h_dim)
     assert attn_calls == [0]
-    assert bd4_calls == [("step_c", True), ("write_kv", True), ("step_a", 4.0)]
+    assert bd4_calls == [("step_c", True), ("step_a", 4.0), ("write_kv", True)]
 
     # 4. Verify B=16 replicated Step (b) dispatch when chip_sharded is off for B=16.
     attn_calls.clear()
