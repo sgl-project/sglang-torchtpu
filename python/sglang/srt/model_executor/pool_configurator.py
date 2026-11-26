@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 from bisect import bisect_right
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
@@ -199,6 +199,16 @@ def _charges_dflash_draft_kv_per_token(kvc: KVCacheConfigurator) -> bool:
         not kvc.is_draft_worker
         and kvc.spec_algorithm.is_dflash_family()
         and not get_spec().speculative_dflash_draft_kv_ring
+    )
+
+
+def _reserved_blocks_sizer(kvc: KVCacheConfigurator) -> Callable[[], int]:
+    """Blocks each full-attention KV pool reserves past the allocator: one
+    count for the whole group, target and draft alike, read when sizing
+    (``SRTPlatform.get_kv_pool_reserved_blocks``)."""
+    use_mla_backend = kvc.use_mla_backend
+    return lambda: current_platform.get_kv_pool_reserved_blocks(
+        use_mla_backend=use_mla_backend
     )
 
 
@@ -414,6 +424,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             kvc
         )
         dcp_size = get_parallel().attn_dcp_size
+        self._reserved_blocks = _reserved_blocks_sizer(kvc)
         # Determine effective number of layers for KV cache
         if mambaish := mambaish_config(kvc.model_config):
             effective_layer_ids = [
@@ -917,6 +928,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     ) -> MemoryPoolConfig:
         if self._uses_mxint8:
             available_bytes -= self._cell_size * page_size
+        # _cell_size already counts the draft layers, whose pools reserve the
+        # same blocks.
+        available_bytes -= self._reserved_blocks() * page_size * self._cell_size
         available_bytes = max(available_bytes - self._fixed_overhead_bytes, 0)
         max_total_num_tokens = (
             available_bytes // self._cell_size
@@ -1132,6 +1146,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         if self._draft_follows_swa:
             self._draft_swa_cell_size = self._draft_cell_size
             self._draft_cell_size = 0
+        self._reserved_blocks = _reserved_blocks_sizer(kvc)
 
         self._recompute_cell_size()
 
@@ -1183,6 +1198,20 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             + self._draft_swa_per_token
             * (self._draft_swa_layers_num + self._draft_swa_full_layers_num)
             + self._draft_cell_size
+        )
+
+    def _reserved_bytes(self, page_size: int) -> int:
+        # SWA pools reserve none. Draft layers of full capacity are charged
+        # whichever pool holds them, which at worst over-counts.
+        return (
+            self._reserved_blocks()
+            * page_size
+            * (
+                self._full_per_token * self._full_layers_num
+                + self._draft_full_per_token * self._draft_full_layers_num
+                + self._draft_swa_per_token * self._draft_swa_full_layers_num
+                + self._draft_cell_size
+            )
         )
 
     def _draft_pool_bytes_per_token(self) -> int:
@@ -1308,6 +1337,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
         available_bytes -= self._dummy_page_bytes(page_size)
+        available_bytes -= self._reserved_bytes(page_size)
         available_bytes -= self._pipeline_swa_bytes(page_size)
         if self._enable_unified_memory and self._full_layers_num > 0:
             max_total_num_tokens = self._max_unified_full_tokens(
@@ -1408,6 +1438,7 @@ class SWARequestCapPoolConfigurator(HybridSWAPoolConfigurator):
     ) -> MemoryPoolConfig:
         # SWA pool sized tightly from the cap; the rest of the budget goes to full.
         available_bytes -= self._dummy_page_bytes(page_size)
+        available_bytes -= self._reserved_bytes(page_size)
         swa_tokens = ceil_align(self._swa_cap, page_size)
         fixed_swa_bytes = swa_tokens * self._swa_cell_bytes()
         if self._enable_unified_memory and self._draft_pool_bytes_per_token() > 0:
