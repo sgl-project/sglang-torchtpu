@@ -2160,6 +2160,10 @@ def fused_moe_full_bridge_and_ffn(
         )
         _b2_direct_fp8_1pass = _use_pq_lhs_fp8 and _pq_lhs_mode == 4
         _b2_direct_fp8_2half = _use_pq_lhs_fp8 and _pq_lhs_mode == 5
+        _b2_pow2_env = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_B2_POW2_CHUNKS", None)
+        _use_b2_pow2 = bool(
+            _b2_direct_fp8_2half and _b2_pow2_env is not None and _b2_pow2_env.get()
+        )
 
         def _moe_b2_all_gather_local(arr):
             return _moe_b2_all_gather(arr, axis_name=expert_axis)
@@ -2308,9 +2312,26 @@ def fused_moe_full_bridge_and_ffn(
                 else:
                     hs_4d = dequant_single_gmm_layout(ag_i8)
                     hidden_states = hs_4d.reshape(ep_size * t_local, he_dim // 128, 128)
-            elif fused_b1_b2_mode in (3, 4) and (t_local % 256 == 0):
-                half_tok = t_local // 2
+            elif fused_b1_b2_mode in (3, 4) and (
+                (t_local % 256 == 0)
+                or (_use_b2_pow2 and t_local >= 256 and (t_local % 128 == 0))
+            ):
+                if _use_b2_pow2 and (t_local & (t_local - 1)) != 0 and t_local >= 384:
+                    if t_local % 384 == 0:
+                        c0_tok = t_local // 3
+                    else:
+                        pow2_c0 = 1 << ((t_local // 2).bit_length() - 1)
+                        c0_tok = (
+                            pow2_c0
+                            if (pow2_c0 % 128 == 0 and (t_local - pow2_c0) >= 128)
+                            else (t_local // 2)
+                        )
+                else:
+                    c0_tok = t_local // 2
+                c1_tok = t_local - c0_tok
+                half_tok = c0_tok
                 fp8_wp = fused_b1_b2_mode == 4
+                _use_row_range = _use_b2_pow2 and (c0_tok != c1_tok)
                 if _b2_direct_fp8_2half:
                     fp8_0, sc_0, smid_0, tk_u8_0, tk_w_0 = (
                         pallas_fused_b1_b2_wpool_quant(
@@ -2326,13 +2347,14 @@ def fused_moe_full_bridge_and_ffn(
                             pe_w,
                             router_mode=router_mode,
                             fp8_wpool=fp8_wp,
-                            half_idx=0,
+                            half_idx=None if _use_row_range else 0,
+                            row_range=(0, c0_tok) if _use_row_range else None,
                             full_stream_mid=True,
                             topk=topk,
                             emit_fp8_gmm=True,
                         )
                     )
-                    i8_0 = fp8_0.reshape(half_tok * (he_dim // 128), 128)
+                    i8_0 = fp8_0.reshape(c0_tok * (he_dim // 128), 128)
                 else:
                     sc_0 = None
                     i8_0, smid_0, tk_u8_0, tk_w_0 = pallas_fused_b1_b2_wpool_quant(
@@ -2374,13 +2396,14 @@ def fused_moe_full_bridge_and_ffn(
                             pe_w,
                             router_mode=router_mode,
                             fp8_wpool=fp8_wp,
-                            half_idx=1,
+                            half_idx=None if _use_row_range else 1,
+                            row_range=(c0_tok, t_local) if _use_row_range else None,
                             stream_mid_prev=smid_0_1,
                             topk=topk,
                             emit_fp8_gmm=True,
                         )
                     )
-                    i8_1 = fp8_1.reshape(half_tok * (he_dim // 128), 128)
+                    i8_1 = fp8_1.reshape(c1_tok * (he_dim // 128), 128)
                 else:
                     sc_1 = None
                     i8_1, stream_shard_mid, tk_u8_1, tk_w_1 = (
@@ -2410,10 +2433,29 @@ def fused_moe_full_bridge_and_ffn(
                     local_topk_ids_u8, axis_name=expert_axis, axis=0, tiled=True
                 )
                 if _b2_direct_fp8_2half:
-                    sc_01_local = jnp.concatenate([sc_0, sc_1], axis=0)
-                    hidden_states_scale = jax.lax.all_gather(
-                        sc_01_local, axis_name=expert_axis, axis=0, tiled=True
-                    ).reshape(-1)
+                    if c0_tok != c1_tok:
+                        ag_sc_0 = jax.lax.all_gather(
+                            sc_0, axis_name=expert_axis, axis=0, tiled=True
+                        ).reshape(ep_size, c0_tok)
+                        ag_sc_1 = jax.lax.all_gather(
+                            sc_1, axis_name=expert_axis, axis=0, tiled=True
+                        ).reshape(ep_size, c1_tok)
+                        if _use_b2_pow2:
+                            sc_buf = jnp.empty((ep_size, t_local), dtype=ag_sc_0.dtype)
+                            sc_buf = jax.lax.dynamic_update_slice(sc_buf, ag_sc_0, (0, 0))
+                            sc_buf = jax.lax.dynamic_update_slice(
+                                sc_buf, ag_sc_1, (0, c0_tok)
+                            )
+                            hidden_states_scale = sc_buf.reshape(-1)
+                        else:
+                            hidden_states_scale = jnp.concatenate(
+                                [ag_sc_0, ag_sc_1], axis=1
+                            ).reshape(-1)
+                    else:
+                        sc_01_local = jnp.concatenate([sc_0, sc_1], axis=0)
+                        hidden_states_scale = jax.lax.all_gather(
+                            sc_01_local, axis_name=expert_axis, axis=0, tiled=True
+                        ).reshape(-1)
                 ovl_deq0_env = getattr(
                     envs, "SGLANG_TPU_MUSE_KERNEL_OVERLAP_DEQ0_ROUTING_AG", None
                 )
@@ -2510,13 +2552,31 @@ def fused_moe_full_bridge_and_ffn(
                     )
                     precomputed_routing = None
                 if _b2_direct_fp8_2half:
-                    hidden_states = jnp.concatenate(
-                        [
-                            ag_i8_0.reshape(ep_size, half_tok, he_dim // 128, 128),
-                            ag_i8_1.reshape(ep_size, half_tok, he_dim // 128, 128),
-                        ],
-                        axis=1,
-                    ).reshape(ep_size * t_local, he_dim // 128, 128)
+                    if _use_b2_pow2:
+                        k_grp = he_dim // 128
+                        hs_buf = jnp.empty(
+                            (ep_size, t_local * k_grp, 128),
+                            dtype=ag_i8_0.dtype,
+                        )
+                        hs_buf = jax.lax.dynamic_update_slice(
+                            hs_buf,
+                            ag_i8_0.reshape(ep_size, c0_tok * k_grp, 128),
+                            (0, 0, 0),
+                        )
+                        hs_buf = jax.lax.dynamic_update_slice(
+                            hs_buf,
+                            ag_i8_1.reshape(ep_size, c1_tok * k_grp, 128),
+                            (0, c0_tok * k_grp, 0),
+                        )
+                        hidden_states = hs_buf.reshape(ep_size * t_local, k_grp, 128)
+                    else:
+                        hidden_states = jnp.concatenate(
+                            [
+                                ag_i8_0.reshape(ep_size, c0_tok, he_dim // 128, 128),
+                                ag_i8_1.reshape(ep_size, c1_tok, he_dim // 128, 128),
+                            ],
+                            axis=1,
+                        ).reshape(ep_size * t_local, he_dim // 128, 128)
                 elif _use_pq_lhs_fp8:
                     hidden_states, hidden_states_scale = (
                         _convert_both_halves_fp8_gmm_layout(

@@ -1527,6 +1527,10 @@ class TpuEnvs:
     # page-aligned chunk cuts; 2 = exact token compute charge + exact unaligned cuts;
     # >=64 = exact token compute charge + chunk cuts aligned to the token multiple (e.g. 4096).
     SGLANG_TPU_EXACT_CHUNK_FILL = EnvInt(0)
+    # Wave-16 opt-in asymmetric power-of-2 B1+B2 chunk split (e.g. 512+1024 on TP=16,
+    # 1024+2048 on TP=8 for 24K buckets) under GMM_PREQUANT_LHS_FP8=5 so every B2
+    # all_gather is a power-of-2 size without non-pow2 SparseCore AG cliffs.
+    SGLANG_TPU_MUSE_KERNEL_B2_POW2_CHUNKS = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:

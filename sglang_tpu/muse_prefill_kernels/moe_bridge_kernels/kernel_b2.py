@@ -1424,6 +1424,7 @@ def pallas_fused_b1_b2_wpool_quant(
     router_mode: str = "bf16_hilo",
     fp8_wpool: bool = False,
     half_idx: int | None = None,
+    row_range: tuple[int, int] | None = None,
     full_stream_mid: bool = False,
     stream_mid_prev: jax.Array | None = None,
     post_norm_eps: float = 1e-8,
@@ -1444,7 +1445,19 @@ def pallas_fused_b1_b2_wpool_quant(
     w_k, he_dim = wpool_fp8.shape
     num_experts = wrouter.shape[1]
     bm = LANE
-    out_rows = (t_local // 2) if half_idx is not None else t_local
+    if row_range is not None:
+        row_start, row_end = int(row_range[0]), int(row_range[1])
+        if row_start < 0 or row_end <= row_start or row_end > t_local:
+            raise ValueError(f"Invalid row_range={row_range} for t_local={t_local}")
+        out_rows = row_end - row_start
+        if row_start % bm != 0 or out_rows % bm != 0:
+            raise ValueError(f"row_range={row_range} must align to bm={bm}")
+        m_offset = row_start // bm
+        tag_half = f"_r{row_start}_{row_end}"
+    else:
+        out_rows = (t_local // 2) if half_idx is not None else t_local
+        m_offset = (half_idx * (out_rows // bm)) if half_idx is not None else 0
+        tag_half = f"_h{half_idx}" if half_idx is not None else "_full"
     assert h_dim == w_k == 8192 and he_dim == 4096
     assert out_rows % bm == 0 and num_experts % 8 == 0
 
@@ -1471,7 +1484,6 @@ def pallas_fused_b1_b2_wpool_quant(
     )
 
     num_steps = out_rows // bm
-    m_offset = (half_idx * num_steps) if half_idx is not None else 0
     strip_w = 256 if use_b12_fast else 2048
     num_strips = h_dim // strip_w
     sub_n = 256
@@ -1784,7 +1796,6 @@ def pallas_fused_b1_b2_wpool_quant(
     )
     w_lo_idx = 1 if (hilo_pre and not skip_zero_wlo) else 0
     tag_fp8 = "fp8" if fp8_wpool else "bf16"
-    tag_half = f"_h{half_idx}" if half_idx is not None else "_full"
     tag_out = "_outfp8" if emit_fp8_gmm else ""
     smid_rows = (
         t_local if (full_stream_mid or stream_mid_prev is not None) else out_rows
