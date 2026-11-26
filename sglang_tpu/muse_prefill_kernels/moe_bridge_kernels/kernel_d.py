@@ -137,7 +137,8 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
     use_zero_spill = (
         zero_spill
         or envs.SGLANG_TPU_MUSE_KERNEL_D_ZERO_SPILL.get()
-        or tok_tile_eff >= 32
+        or tok_tile_eff > 64
+        or (tok_tile_eff >= 32 and chunk_size <= 32)
     ) and not (emit_fp8_attn_in or use_blk_fp8_unpool)
     if chunk_size <= 32 and not use_zero_spill and chunk_size % 16 == 0:
         tok_tile_eff = min(tok_tile_eff, 16)
