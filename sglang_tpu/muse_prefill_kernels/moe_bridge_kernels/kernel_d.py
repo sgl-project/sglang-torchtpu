@@ -337,7 +337,7 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
 
             # Phase 1: Low-VREG top-8 combine into u_scratch_ref [tok_tile_eff, 4096]
             amax_u_128 = jnp.zeros((tok_tile_eff, LANE), dtype=jnp.float32)
-            if in_buf_is_fp8 and not kmajor_buf:
+            if in_buf_is_fp8 and not kmajor_buf and not eff_mxu_combine:
                 _combine_fp8_phase1(buf_2x_ref, slot, w_vmem_ref, u_scratch_ref)
             elif eff_mxu_combine:
                 c_grp_zs = 8
@@ -350,7 +350,10 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                     for c_blk in range(n2_cols // c_grp_zs):
                         c0, c1 = c_blk * c_grp_zs, (c_blk + 1) * c_grp_zs
                         u0, u1 = c0 * lanes, c1 * lanes
-                        vals_128x1024 = buf_2x_ref[slot, m0:m1, c0:c1, :].reshape(
+                        vals_raw = buf_2x_ref[slot, m0:m1, c0:c1, :]
+                        if in_buf_is_fp8:
+                            vals_raw = vals_raw.astype(jnp.bfloat16)
+                        vals_128x1024 = vals_raw.reshape(
                             16 * topk, c_grp_zs * lanes
                         )
                         u_sub_bf16 = jnp.dot(
@@ -416,7 +419,7 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                         u_scratch_ref[t0:t1, c0 * lanes : c1 * lanes] = u_sub
 
             if fp8_unpool:
-                if (in_buf_is_fp8 and not kmajor_buf) or not eff_mxu_combine:
+                if not eff_mxu_combine:
                     for c_blk in range(4):
                         u0, u1 = c_blk * 1024, (c_blk + 1) * 1024
                         amax_u_128 = jnp.maximum(
@@ -777,7 +780,7 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
             envs.SGLANG_TPU_MUSE_KERNEL_D_T64_C16.get()
             and tok_tile_eff % 32 == 0
         )
-        if in_buf_is_fp8:
+        if in_buf_is_fp8 and not eff_mxu_combine:
             _combine_fp8_phase1(buf_2x_ref, slot, w_vmem_ref, u_scratch_ref)
             if fp8_unpool and not use_blk_fp8_unpool:
                 for c_blk in range(4):
@@ -799,7 +802,10 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                 for c_blk in range(n2_cols // c_grp):
                     c0, c1 = c_blk * c_grp, (c_blk + 1) * c_grp
                     u0, u1 = c0 * lanes, c1 * lanes
-                    vals_128x1024 = buf_2x_ref[slot, m0:m1, c0:c1, :].reshape(
+                    vals_raw = buf_2x_ref[slot, m0:m1, c0:c1, :]
+                    if in_buf_is_fp8:
+                        vals_raw = vals_raw.astype(jnp.bfloat16)
+                    vals_128x1024 = vals_raw.reshape(
                         16 * topk, c_grp * lanes
                     )
                     u_sub_bf16 = jnp.dot(

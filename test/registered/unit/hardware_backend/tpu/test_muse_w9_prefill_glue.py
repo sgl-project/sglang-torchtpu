@@ -65,6 +65,7 @@ def test_w9_prefill_glue_flags_default_off_and_ast_get_hygiene():
         "sglang_tpu/kernels/xor1_bridge_all_gather.py",
         "sglang_tpu/muse_prefill_kernels/attn_kernels/kernel_a1.py",
         "sglang_tpu/muse_prefill_kernels/integration.py",
+        "sglang_tpu/muse_prefill_kernels/moe_bridge_kernels/kernel_d.py",
         "sglang_tpu/muse_prefill_kernels/moe_bridge_kernels/pipeline.py",
     )
     checked = set(_TOUCHED_FLAGS)
@@ -1772,6 +1773,135 @@ def test_d_zs_t128_static_fp8_partial_parity():
             np.asarray(jnp.concatenate([n0_zs, n1_zs], axis=0)),
             np.asarray(jnp.concatenate([n0_ref, n1_ref], axis=0)),
         )
+
+
+def test_d_fp8_mxu_combine_interpret_parity_and_aot():
+    """Verify D_MXU_COMBINE=1 on fp8 input across both non-zs (qbs=512) and zs (qbs=4096) paths."""
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import pallas as pl
+    from jax.experimental import topologies
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels import kernel_d
+
+    real_pc = pl.pallas_call
+
+    def _nan_interp(*args, **kwargs):
+        kwargs["interpret"] = pltpu.InterpretParams(
+            detect_races=True, uninitialized_memory="nan"
+        )
+        return real_pc(*args, **kwargs)
+
+    rng = np.random.default_rng(3969)
+    with (
+        mock.patch(
+            "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+        ),
+        tpu_info_for_cpu_export(),
+        mock.patch.object(pl, "pallas_call", _nan_interp),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_OPT, "get", return_value=7),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_T128_FAST, "get", return_value=True),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_SALU_OVERLAP, "get", return_value=True),
+        mock.patch.object(
+            tpu_envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_RS, "get", return_value=6.0
+        ),
+        jax.default_device(jax.devices("cpu")[0]),
+    ):
+        ob = jnp.array(
+            (rng.standard_normal((256 * 8, 32, 128)) * 0.25).astype(np.float32)
+        ).astype(jnp.float8_e4m3fn)
+        ip = jnp.array(rng.integers(0, 256 * 8, size=(256, 8), dtype=np.int32))
+        tw = jnp.array(rng.uniform(0.05, 0.25, size=(256, 8)).astype(np.float32)).astype(
+            jnp.bfloat16
+        )
+        sm = jnp.array(rng.standard_normal((256, 8192)).astype(np.float32))
+        wu = jnp.array(
+            (rng.standard_normal((4096, 8192)) * 0.3).astype(np.float32)
+        ).astype(jnp.float8_e4m3fn)
+        ws = jnp.array(rng.uniform(0.5, 1.5, (8192,)).astype(np.float32))
+        wv = jnp.array(rng.uniform(0.5, 1.5, (8192,)).astype(np.float32))
+
+        for qbs, zs in ((512, False), (4096, True)):
+            with mock.patch.object(
+                tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_MXU_COMBINE, "get", return_value=False
+            ):
+                ns_ref, ni_ref = kernel_d.pallas_combine_unpool_residual_nextnorm_4slab(
+                    ob, ip, tw, sm, wu, ws, wv, wv, wv, wv,
+                    tok_tile=128, zero_spill=zs, fp8_unpool=True, fp8_unpool_qbs=qbs,
+                    emit_static_fp8_attn_in=True,
+                )
+            with mock.patch.object(
+                tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_MXU_COMBINE, "get", return_value=True
+            ):
+                ns_mxu, ni_mxu = kernel_d.pallas_combine_unpool_residual_nextnorm_4slab(
+                    ob, ip, tw, sm, wu, ws, wv, wv, wv, wv,
+                    tok_tile=128, zero_spill=zs, fp8_unpool=True, fp8_unpool_qbs=qbs,
+                    emit_static_fp8_attn_in=True,
+                )
+            a_ref, a_mxu = np.asarray(ns_ref, dtype=np.float64), np.asarray(ns_mxu, dtype=np.float64)
+            cos_ns = float(
+                np.dot(a_ref.ravel(), a_mxu.ravel())
+                / (np.linalg.norm(a_ref) * np.linalg.norm(a_mxu) + 1e-30)
+            )
+            assert cos_ns >= 0.9998, f"qbs={qbs} zs={zs} ns cos={cos_ns}"
+            b_ref = np.asarray(ni_ref.astype(jnp.float32), dtype=np.float64)
+            b_mxu = np.asarray(ni_mxu.astype(jnp.float32), dtype=np.float64)
+            cos_ni = float(
+                np.dot(b_ref.ravel(), b_mxu.ravel())
+                / (np.linalg.norm(b_ref) * np.linalg.norm(b_mxu) + 1e-30)
+            )
+            assert cos_ni >= 0.999, f"qbs={qbs} zs={zs} ni cos={cos_ni}"
+
+    # TPU7x AOT compile checks for TP=8 (2x2x1, qbs=512) & TP=16 (2x2x2, qbs=4096 zs)
+    with (
+        mock.patch(
+            "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+        ),
+        tpu_info_for_cpu_export(),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_OPT, "get", return_value=7),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_T128_FAST, "get", return_value=True),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_SALU_OVERLAP, "get", return_value=True),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_MXU_COMBINE, "get", return_value=True),
+        mock.patch.object(
+            tpu_envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_RS, "get", return_value=6.0
+        ),
+    ):
+        for topo_name, tp_d, t_loc, qbs in (
+            ("tpu7x=2x2x1", 8, 3072, 512),
+            ("tpu7x=2x2x2", 16, 1536, 4096),
+        ):
+            topo = topologies.get_topology_desc(platform="tpu", topology_name=topo_name)
+            aot_mesh = Mesh(np.array(topo.devices).reshape(tp_d), ("model",))
+            sm_aot = jax.jit(
+                jax.shard_map(
+                    lambda ob_, ip_, tw_, sm_, w__, ws__, pf_, al__, be__, ni_: (
+                        kernel_d.pallas_combine_unpool_residual_nextnorm_4slab(
+                            ob_, ip_, tw_, sm_, w__, ws__, pf_, al__, be__, ni_,
+                            tok_tile=128, fp8_unpool=True, fp8_unpool_qbs=qbs,
+                            emit_static_fp8_attn_in=True,
+                        )
+                    ),
+                    mesh=aot_mesh,
+                    in_specs=(P("model"),) * 4 + (P(),) * 6,
+                    out_specs=P("model"),
+                    check_vma=False,
+                )
+            )
+            sm_aot.trace(
+                jax.ShapeDtypeStruct((tp_d * t_loc * 8, 32, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((tp_d * t_loc, 8), jnp.int32),
+                jax.ShapeDtypeStruct((tp_d * t_loc, 8), jnp.bfloat16),
+                jax.ShapeDtypeStruct((tp_d * t_loc, 8192), jnp.float32),
+                jax.ShapeDtypeStruct((4096, 8192), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((8192,), jnp.float32),
+                jax.ShapeDtypeStruct((8192,), jnp.float32),
+                jax.ShapeDtypeStruct((8192,), jnp.float32),
+                jax.ShapeDtypeStruct((8192,), jnp.float32),
+                jax.ShapeDtypeStruct((8192,), jnp.float32),
+            ).lower(lowering_platforms=("tpu",)).compile()
+
 
 
 
