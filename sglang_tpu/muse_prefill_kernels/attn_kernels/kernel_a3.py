@@ -3538,16 +3538,17 @@ def a3_v17_option3d_single_kernel_fused_gate_a2a_wo_3d_sp(
 
 
 # -----------------------------------------------------------------------------
-# Wave 9: Static-FP8 Ulysses Sequence-Parallel Attention (`v10_sp`, TP=16)
+# Wave 9: Static-FP8 Ulysses Sequence-Parallel Attention (`v10_sp`, TP=8 / TP=16)
 # -----------------------------------------------------------------------------
 def pallas_ulysses_norm_fp8_for_rev_a2a(
     raw_attn_out: jax.Array,
     *,
     head_norm_eps: float = 1e-5,
+    quantize_fp8: bool = True,
     tm: int = 512,
     vmem_limit_mb: int = 32,
 ) -> jax.Array:
-    """Per-head RMSNorm + `* 32.0` static FP8 quant before reverse A2A (`12 MB` total)."""
+    """Per-head RMSNorm (+ optional `* 32.0` static FP8 quant) before reverse A2A."""
     c_tok, q_local = raw_attn_out.shape
     assert q_local % 128 == 0
     tm_eff = next(
@@ -3572,38 +3573,44 @@ def pallas_ulysses_norm_fp8_for_rev_a2a(
                     1.0,
                     eps=head_norm_eps,
                 )
-                out_ref[r0:r1, c0:c1] = jnp.clip(
-                    a_norm * STATIC_A3_ACT_MULT, -FP8_MAX, FP8_MAX
-                ).astype(jnp.float8_e4m3fn)
+                out_ref[r0:r1, c0:c1] = (
+                    jnp.clip(a_norm * STATIC_A3_ACT_MULT, -FP8_MAX, FP8_MAX).astype(
+                        jnp.float8_e4m3fn
+                    )
+                    if quantize_fp8
+                    else a_norm.astype(jnp.bfloat16)
+                )
 
+    out_dtype = jnp.float8_e4m3fn if quantize_fp8 else jnp.bfloat16
     return pl.pallas_call(
         _norm_quant_tile,
         grid=(c_tok // tm_eff,),
         in_specs=[pl.BlockSpec((tm_eff, q_local), lambda i: (i, 0))],
         out_specs=pl.BlockSpec((tm_eff, q_local), lambda i: (i, 0)),
-        out_shape=jax.ShapeDtypeStruct((c_tok, q_local), jnp.float8_e4m3fn),
+        out_shape=jax.ShapeDtypeStruct((c_tok, q_local), out_dtype),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel",),
             vmem_limit_bytes=vmem_limit_mb * (1 << 20),
         ),
-        name=f"pallas_ulysses_norm_fp8_c{c_tok}_q{q_local}_tm{tm_eff}",
+        name=f"pallas_ulysses_norm_{'fp8' if quantize_fp8 else 'bf16'}_c{c_tok}_q{q_local}_tm{tm_eff}",
     )(raw_attn_out)
 
 
 def pallas_ulysses_gate_fuse(
-    attn_fp8_3d: jax.Array,
+    attn_3d: jax.Array,
     gate_2d: jax.Array,
     *,
+    input_is_prescaled: bool = True,
     tm: int = 256,
     vmem_limit_mb: int = 32,
 ) -> jax.Array:
-    """Applies local `sigmoid(gate)` to static-FP8 reverse-A2A attention in VMEM.
+    """Applies local `sigmoid(gate)` to reverse-A2A attention in VMEM and emits static-FP8.
 
-    `attn_fp8_3d [tp_deg, c_k, q_local]` already carries scale `STATIC_A3_ACT_MULT (32.0)`,
-    so `sigmoid(gate) * attn_fp8` directly produces static-FP8 `[c_k, tp_deg * q_local]`
-    without an intermediate HBM transpose or rescaling multiply.
+    When `input_is_prescaled=True`, `attn_3d [tp_deg, c_k, q_local]` already carries
+    `STATIC_A3_ACT_MULT (32.0)` (FP8 rev-A2A); when `False` (BF16 rev-A2A), multiplies
+    the gated product by `STATIC_A3_ACT_MULT` directly before static-FP8 quantization.
     """
-    tp_deg, c_k, q_local = attn_fp8_3d.shape
+    tp_deg, c_k, q_local = attn_3d.shape
     g_rows, n_full = gate_2d.shape
     assert g_rows == c_k and n_full == tp_deg * q_local and q_local % 128 == 0
     tm_eff = next(
@@ -3622,6 +3629,8 @@ def pallas_ulysses_gate_fuse(
                 prod = (
                     g_sig * a_ref[h, r0:r1, :].astype(jnp.bfloat16)
                 ).astype(jnp.float32)
+                if not input_is_prescaled:
+                    prod = prod * STATIC_A3_ACT_MULT
                 out_ref[r0:r1, col0:col1] = jnp.clip(
                     prod, -FP8_MAX, FP8_MAX
                 ).astype(jnp.float8_e4m3fn)
@@ -3639,8 +3648,9 @@ def pallas_ulysses_gate_fuse(
             dimension_semantics=("parallel",),
             vmem_limit_bytes=vmem_limit_mb * (1 << 20),
         ),
-        name=f"pallas_ulysses_gate_fuse_tp{tp_deg}_c{c_k}_q{q_local}_tm{tm_eff}",
-    )(attn_fp8_3d, gate_2d)
+        name=f"pallas_ulysses_gate_fuse_tp{tp_deg}_c{c_k}_q{q_local}_tm{tm_eff}"
+        + ("" if input_is_prescaled else "_bf16in"),
+    )(attn_3d, gate_2d)
 
 
 def pallas_ulysses_wo_local(
@@ -3655,9 +3665,9 @@ def pallas_ulysses_wo_local(
     """Zero-ICI token-local FP8 `o_proj` (`[T_shard, H] @ Wo_fp8[H, H] -> bf16[T_shard, H]`).
 
     Accepts 1 tensor or 2 chunk tensors `(q0, q1)` to avoid HBM concatenation on 2-chunk CCS.
-    For `sum(c_k) <= 1536` (`<= 12 MiB` activation), pins `q_parts` in VMEM across output tiles
-    `bn` so both activations and `Wo` (`64 MiB`) are read once from HBM; larger shards tile
-    rows into `t_blk <= 1024` blocks so VMEM stays bounded.
+    For `sum(c_k) <= 3072` (up to `24 MiB` activation at `H<=8192`), pins `q_parts` in VMEM
+    across output tiles `bn` (using `62 MiB` when `sum(c_k) > 1536`) so both activations and
+    `Wo` (`64 MiB`) are read once from HBM; larger shards tile rows into `t_blk <= 1024` blocks.
     """
     parts = q_parts if isinstance(q_parts, (tuple, list)) else (q_parts,)
     k_dim, n_dim = wo_fp8.shape
@@ -3666,8 +3676,9 @@ def pallas_ulysses_wo_local(
     for p in parts:
         assert p.shape[1] == k_dim
 
-    if len(parts) <= 2 and t_total <= 1536:
+    if len(parts) <= 2 and t_total <= 3072 and (t_total <= 1536 or k_dim <= 8192):
         n_parts = len(parts)
+        eff_vmem_mb = max(vmem_limit_mb, 62) if t_total > 1536 else vmem_limit_mb
 
         def _wo_pinned_kernel(*refs):
             q_refs = refs[:n_parts]
@@ -3703,7 +3714,7 @@ def pallas_ulysses_wo_local(
             out_shape=jax.ShapeDtypeStruct((t_total, n_dim), jnp.bfloat16),
             compiler_params=pltpu.CompilerParams(
                 dimension_semantics=("parallel",),
-                vmem_limit_bytes=vmem_limit_mb * (1 << 20),
+                vmem_limit_bytes=eff_vmem_mb * (1 << 20),
             ),
             name=f"pallas_ulysses_wo_p{'_'.join(str(p.shape[0]) for p in parts)}_k{k_dim}_bn{eff_bn}",
         )(*parts, wo_fp8, wo_scale_2d)

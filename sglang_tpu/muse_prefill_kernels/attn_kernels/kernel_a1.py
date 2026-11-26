@@ -5417,7 +5417,7 @@ def pallas_a1_chunk_1way_zc(
 
 
 # -----------------------------------------------------------------------------
-# Wave 9: Static-FP8 Ulysses Sequence-Parallel Attention (`v10_sp`, TP=16)
+# Wave 9: Static-FP8 Ulysses Sequence-Parallel Attention (`v10_sp`, TP=8 / TP=16)
 # -----------------------------------------------------------------------------
 def pallas_a1_ulysses_qkv_local(
     x_fp8_shard: jax.Array,
@@ -5441,10 +5441,10 @@ def pallas_a1_ulysses_qkv_local(
     Multiplies `x_fp8_shard [c_k, H]` once per `t_blk <= 1024` block against per-head-rank
     weights `w_qkv_3d [tp_deg, H, Q + 2*KV]` (`[Q | K | V]`, `w_qkv_sc_3d` pre-multiplied by
     `STATIC_A1_ACT_SCALE`), applies dual-head RMSNorm + RoPE using rank-local `cos_own/sin_own`,
-    and returns unpacked `(q_3d: bf16[tp_deg, c_k, Q], kv_3d: fp8[tp_deg, c_k, 128])` ready for
-    compact `27 MB` `lax.all_to_all` exchange before RPA packing.
+    and returns unpacked `(q_3d: bf16[tp_deg, c_k, Q], kv_3d: fp8[tp_deg, c_k, 2*KV])` ready for
+    direct 2-op `lax.all_to_all` exchange before RPA packing.
     """
-    assert h_kv_local == 1 and h_q_local % 2 == 0
+    assert h_kv_local in (1, 2) and h_q_local % 2 == 0
     c_k, k_dim = x_fp8_shard.shape
     tp_deg, w_k, qkv_cols = w_qkv_3d.shape
     assert w_k == k_dim
@@ -5452,6 +5452,7 @@ def pallas_a1_ulysses_qkv_local(
     kv_cols = 2 * h_kv_local * HEAD_DIM
     assert qkv_cols == q_size + kv_cols
     num_q_slices = q_size // 128
+    eff_vmem_mb = max(vmem_limit_mb, 60) if qkv_cols > 768 else vmem_limit_mb
 
     if c_k <= 1024:
         t_blk = c_k
@@ -5496,8 +5497,6 @@ def pallas_a1_ulysses_qkv_local(
             x_m = x_ref[m0:m1, :]
             cos_m = cos_ref[m0:m1, :]
             sin_m = sin_ref[m0:m1, :]
-            cos_kv = jnp.where(is_lo, cos_m, 1.0)
-            sin_kv = jnp.where(is_lo, sin_m, 0.0)
 
             if eff_sub_n > 0:
                 for c0 in range(0, q_size, eff_sub_n):
@@ -5525,13 +5524,13 @@ def pallas_a1_ulysses_qkv_local(
                         q_out_ref[0, m0:m1, c0 + d0 : c0 + d1] = _rope_128_vreg(
                             q_norm, cos_m, sin_m, lane, rope_mode=rope_mode
                         )
-                kv_pair = (
+                acc_kv = (
                     jnp.dot(
                         x_m,
-                        w_ref[0, :, q_size : q_size + 128],
+                        w_ref[0, :, q_size : q_size + kv_cols],
                         preferred_element_type=jnp.float32,
                     )
-                    * w_sc_ref[0, :, q_size : q_size + 128]
+                    * w_sc_ref[0, :, q_size : q_size + kv_cols]
                 )
             else:
                 acc = (
@@ -5552,22 +5551,46 @@ def pallas_a1_ulysses_qkv_local(
                     q_out_ref[0, m0:m1, c0:c1] = _rope_128_vreg(
                         q_norm, cos_m, sin_m, lane, rope_mode=rope_mode
                     )
-                kv_pair = acc[:, q_size : q_size + 128]
+                acc_kv = acc[:, q_size : q_size + kv_cols]
 
-            sq_lo = jnp.sum(kv_pair * kv_pair * mask_lo, axis=1, keepdims=True) * (
-                1.0 / 64.0
-            )
-            inv_rms_kv = jnp.where(is_lo, lax.rsqrt(sq_lo + 1e-5), 1.0)
-            kv_norm = (
-                (kv_pair * inv_rms_kv).astype(jnp.bfloat16).astype(jnp.float32)
-            )
-            kv_rot = _rope_128_vreg(
-                kv_norm, cos_kv, sin_kv, lane, rope_mode=rope_mode
-            )
-            kv_sc = jnp.where(is_lo, inv_k_scale, inv_v_scale)
-            kv_out_ref[0, m0:m1, :] = jnp.clip(
-                kv_rot.astype(jnp.float32) * kv_sc, -FP8_MAX, FP8_MAX
-            ).astype(jnp.float8_e4m3fn)
+            if h_kv_local == 1:
+                cos_kv = jnp.where(is_lo, cos_m, 1.0)
+                sin_kv = jnp.where(is_lo, sin_m, 0.0)
+                sq_lo = jnp.sum(acc_kv * acc_kv * mask_lo, axis=1, keepdims=True) * (
+                    1.0 / 64.0
+                )
+                inv_rms_kv = jnp.where(is_lo, lax.rsqrt(sq_lo + 1e-5), 1.0)
+                kv_norm = (
+                    (acc_kv * inv_rms_kv).astype(jnp.bfloat16).astype(jnp.float32)
+                )
+                kv_rot = _rope_128_vreg(
+                    kv_norm, cos_kv, sin_kv, lane, rope_mode=rope_mode
+                )
+                kv_sc = jnp.where(is_lo, inv_k_scale, inv_v_scale)
+                kv_out_ref[0, m0:m1, :] = jnp.clip(
+                    kv_rot.astype(jnp.float32) * kv_sc, -FP8_MAX, FP8_MAX
+                ).astype(jnp.float8_e4m3fn)
+            else:
+                k_pair = acc_kv[:, 0:128]
+                v_pair = acc_kv[:, 128:256].astype(jnp.bfloat16)
+                k_norm = _dual_head_rmsnorm_128(
+                    k_pair,
+                    is_lo,
+                    mask_lo,
+                    mask_hi,
+                    1.0,
+                    eps=1e-5,
+                    fast_6roll=use_fast_norm,
+                )
+                k_rot = _rope_128_vreg(
+                    k_norm, cos_m, sin_m, lane, rope_mode=rope_mode
+                )
+                kv_out_ref[0, m0:m1, 0:128] = jnp.clip(
+                    k_rot.astype(jnp.float32) * inv_k_scale, -FP8_MAX, FP8_MAX
+                ).astype(jnp.float8_e4m3fn)
+                kv_out_ref[0, m0:m1, 128:256] = jnp.clip(
+                    v_pair.astype(jnp.float32) * inv_v_scale, -FP8_MAX, FP8_MAX
+                ).astype(jnp.float8_e4m3fn)
 
     return pl.pallas_call(
         _ulysses_qkv_kernel,
@@ -5589,9 +5612,9 @@ def pallas_a1_ulysses_qkv_local(
         ],
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel"),
-            vmem_limit_bytes=vmem_limit_mb * (1 << 20),
+            vmem_limit_bytes=eff_vmem_mb * (1 << 20),
         ),
-        name=f"pallas_a1_ulysses_qkv_c{c_k}_tb{t_blk}_tm{tm_eff}"
+        name=f"pallas_a1_ulysses_qkv_c{c_k}_q{q_size}_kv{kv_cols}_tb{t_blk}_tm{tm_eff}"
         + (f"_sn{eff_sub_n}" if eff_sub_n > 0 else "")
         + ("_fn" if use_fast_norm else ""),
     )(x_fp8_shard, w_qkv_3d, w_qkv_sc_3d, cos_own, sin_own)
@@ -5606,9 +5629,11 @@ def pallas_pack_ulysses_qkv_for_rpa(
     tm: int = 512,
     vmem_limit_mb: int = 32,
 ) -> tuple[jax.Array, jax.Array]:
-    """Packs post-A2A `q_2d [c_tok, Q]` & `kv_2d [c_tok, 128]` into RPA v3 `rpa_layout`."""
-    assert h_kv_local == 1 and h_q_local % 2 == 0
+    """Packs post-A2A `q_2d [c_tok, Q]` & `kv_2d [c_tok, 2*KV]` into RPA v3 `rpa_layout`."""
+    assert h_kv_local in (1, 2) and h_q_local % 2 == 0
     c_tok, q_size = q_2d.shape
+    kv_cols = 2 * h_kv_local * HEAD_DIM
+    assert q_size == h_q_local * HEAD_DIM and kv_2d.shape == (c_tok, kv_cols)
     num_q_slices = q_size // 128
     tm_eff = next(
         t for t in (512, 256, 128, 64, 32, 16, 8) if t <= tm and c_tok % t == 0
@@ -5618,6 +5643,7 @@ def pallas_pack_ulysses_qkv_for_rpa(
         lane = lax.broadcasted_iota(jnp.int32, (tm_eff, 128), 1)
         is_lo = lane < 64
         mask_lo = is_lo.astype(jnp.float32)
+        mask_hi = 1.0 - mask_lo
 
         q_words = (
             q_out_ref.bitcast(jnp.uint32)
@@ -5625,19 +5651,26 @@ def pallas_pack_ulysses_qkv_for_rpa(
             .reshape(tm_eff * num_q_slices, 128)
         )
         for s in range(num_q_slices):
+            kv_head0 = (h_kv_local == 1) or (s < num_q_slices // 2)
             q_words[pl.ds(s, tm_eff, stride=num_q_slices)] = _rpa_q_word(
-                q_in_ref[:, s * 128 : (s + 1) * 128], is_lo, mask_lo
+                q_in_ref[:, s * 128 : (s + 1) * 128],
+                is_lo,
+                mask_lo if kv_head0 else mask_hi,
             )
 
-        kv_f32 = kv_in_ref[...].astype(jnp.float32)
-        k8 = jnp.clip(
-            jnp.where(is_lo, kv_f32, 0.0), -FP8_MAX, FP8_MAX
-        ).astype(jnp.float8_e4m3fn)
-        v8 = jnp.clip(
-            jnp.where(is_lo, pltpu.roll(kv_f32, shift=64, axis=1), 0.0),
-            -FP8_MAX,
-            FP8_MAX,
-        ).astype(jnp.float8_e4m3fn)
+        if h_kv_local == 1:
+            kv_f32 = kv_in_ref[...].astype(jnp.float32)
+            k8 = jnp.clip(
+                jnp.where(is_lo, kv_f32, 0.0), -FP8_MAX, FP8_MAX
+            ).astype(jnp.float8_e4m3fn)
+            v8 = jnp.clip(
+                jnp.where(is_lo, pltpu.roll(kv_f32, shift=64, axis=1), 0.0),
+                -FP8_MAX,
+                FP8_MAX,
+            ).astype(jnp.float8_e4m3fn)
+        else:
+            k8 = kv_in_ref[:, 0:128]
+            v8 = kv_in_ref[:, 128:256]
         kv_out_ref.bitcast(jnp.uint32).at[0].reshape(tm_eff, 128)[...] = (
             _f8_code_u32(k8) | (_f8_code_u32(v8) << 8)
         )
@@ -5647,7 +5680,7 @@ def pallas_pack_ulysses_qkv_for_rpa(
         grid=(c_tok // tm_eff,),
         in_specs=[
             pl.BlockSpec((tm_eff, q_size), lambda i: (i, 0)),
-            pl.BlockSpec((tm_eff, 128), lambda i: (i, 0)),
+            pl.BlockSpec((tm_eff, kv_cols), lambda i: (i, 0)),
         ],
         out_specs=[
             pl.BlockSpec((1, tm_eff, num_q_slices, 2, 128), lambda i: (0, i, 0, 0, 0)),
@@ -5661,7 +5694,7 @@ def pallas_pack_ulysses_qkv_for_rpa(
             dimension_semantics=("parallel",),
             vmem_limit_bytes=vmem_limit_mb * (1 << 20),
         ),
-        name=f"pallas_pack_ulysses_rpa_c{c_tok}_q{q_size}_tm{tm_eff}",
+        name=f"pallas_pack_ulysses_rpa_c{c_tok}_q{q_size}_kv{kv_cols}_tm{tm_eff}",
     )(q_2d, kv_2d)
     return q_5d, kv_buf.reshape(c_tok, 1, 4, 128)
 

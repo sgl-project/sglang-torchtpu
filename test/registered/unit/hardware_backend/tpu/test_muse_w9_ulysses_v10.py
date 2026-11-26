@@ -426,15 +426,35 @@ def test_v10_sp_16dev_interpret_nan_parity_vs_v6():
     assert rel_l2 <= 0.055, f"Wo parity rel_l2={rel_l2:.6f} too high"
 
 
+def _assert_tpu7x_spmd_export_and_compile(op_def, fake_torch_args):
+    """Verify zero `stablehlo.partition_id` in exported MLIR and full TPU7x SPMD XLA `.compile()`."""
+    import jax
+    from sglang_tpu.pallas_jax_op import _jax_placeholders
+
+    fn_obj = op_def._init_fn
+    jax_args = _jax_placeholders(
+        fake_torch_args, mesh=fn_obj.mesh, partition_specs=fn_obj.input_partition_specs
+    )
+    with tpu_info_for_cpu_export(), jax._src.config.export_ignore_forward_compatibility(True):
+        lowered = fn_obj.exported(*jax_args)
+        assert lowered is not None
+        assert "partition_id" not in lowered.mlir_module(), (
+            f"stablehlo.partition_id leaked in {fn_obj.name}"
+        )
+        compiled = fn_obj.jit_fn.trace(*jax_args).lower().compile()
+        assert compiled is not None
+
+
 def test_v10_sp_tpu7x_2x2x2_full_prod_aot_compile():
-    """Offline TPU v7 (`2x2x2` TP=16) Mosaic AOT compile of ALL `v10_sp` ops
-    at full Muse Spark production geometry (`H=8192`, `hq=8`, `hkv=1`), covering:
+    """Offline TPU v7 (`2x2x2` TP=16) Mosaic AOT compile + zero-`partition_id` check of ALL
+    `v10_sp` ops at full Muse Spark production geometry (`H=8192`, `hq=8`, `hkv=1`), covering:
       - `chunks=(512, 1024)` (`T=24K`),
       - non-24K `(384, 576, 576)` (`c_k % 64 == 0`), and
       - short single-chunk bucket (`t_shard=64`).
     """
     jax = pytest.importorskip("jax")
     torch = pytest.importorskip("torch")
+    from jax.experimental import topologies
     from jax.sharding import Mesh
 
     if len(jax.devices("cpu")) < _TP:
@@ -457,10 +477,10 @@ def test_v10_sp_tpu7x_2x2x2_full_prod_aot_compile():
         ),
     ):
         from sglang_tpu.muse_prefill_kernels.integration import _ops
-        from sglang_tpu.pallas_jax_op import _jax_placeholders
 
-        devs = jax.devices("cpu")[:_TP]
-        mesh = Mesh(np.array(devs), (_AXIS,))
+        topo = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x=2x2x2")
+        mesh = Mesh(np.array(topo.devices).reshape(_TP), (_AXIS,))
+        _ops.cache_clear()
         with mock.patch(
             "sglang_tpu.moe.pallas.fused_moe_rs_op._get_mesh", return_value=mesh
         ):
@@ -488,20 +508,6 @@ def test_v10_sp_tpu7x_2x2x2_full_prod_aot_compile():
 
         h_dim, q_loc = 8192, 512
 
-        def _export_check(op_def, fake_torch_args):
-            fn_obj = op_def._init_fn
-            jax_args = _jax_placeholders(
-                fake_torch_args,
-                mesh=fn_obj.mesh,
-                partition_specs=fn_obj.input_partition_specs,
-            )
-            with (
-                tpu_info_for_cpu_export(),
-                jax._src.config.export_ignore_forward_compatibility(True),
-            ):
-                lowered = fn_obj.exported(*jax_args)
-            assert lowered is not None
-
         for c_k in (512, 1024, 576, 64):
             c_tok = _TP * c_k
             x_t = torch.empty((c_k, h_dim), dtype=torch.bfloat16, device="meta")
@@ -509,32 +515,32 @@ def test_v10_sp_tpu7x_2x2x2_full_prod_aot_compile():
             wqs_t = torch.empty((_TP, 1, 640), dtype=torch.float32, device="meta")
             cos_t = torch.empty((c_tok, 128), dtype=torch.float32, device="meta")
             sin_t = torch.empty((c_tok, 128), dtype=torch.float32, device="meta")
-            _export_check(ops.a1_ulysses_qkv_chunk, (x_t, wq_t, wqs_t, cos_t, sin_t))
+            _assert_tpu7x_spmd_export_and_compile(ops.a1_ulysses_qkv_chunk, (x_t, wq_t, wqs_t, cos_t, sin_t))
 
             q3_t = torch.empty((_TP, c_k, q_loc), dtype=torch.bfloat16, device="meta")
             kv3_t = torch.empty((_TP, c_k, 128), dtype=torch.float8_e4m3fn, device="meta")
-            _export_check(ops.a1_ulysses_a2a_pack_chunk, (q3_t, kv3_t))
+            _assert_tpu7x_spmd_export_and_compile(ops.a1_ulysses_a2a_pack_chunk, (q3_t, kv3_t))
 
             xf8_t = torch.empty((c_k, h_dim), dtype=torch.float8_e4m3fn, device="meta")
             wg_t = torch.empty((h_dim, h_dim), dtype=torch.float8_e4m3fn, device="meta")
             wgs_t = torch.empty((1, h_dim), dtype=torch.float32, device="meta")
-            _export_check(ops.a1_ulysses_gate_chunk, (xf8_t, wg_t, wgs_t))
+            _assert_tpu7x_spmd_export_and_compile(ops.a1_ulysses_gate_chunk, (xf8_t, wg_t, wgs_t))
 
             raw_out_t = torch.empty((c_tok, q_loc), dtype=torch.bfloat16, device="meta")
-            _export_check(ops.a3_ulysses_rev_a2a_chunk, (raw_out_t,))
+            _assert_tpu7x_spmd_export_and_compile(ops.a3_ulysses_rev_a2a_chunk, (raw_out_t,))
 
             af8_t = torch.empty((_TP, c_k, q_loc), dtype=torch.float8_e4m3fn, device="meta")
             gk_t = torch.empty((c_k, h_dim), dtype=torch.bfloat16, device="meta")
-            _export_check(ops.a3_ulysses_gate_fuse_chunk, (af8_t, gk_t))
+            _assert_tpu7x_spmd_export_and_compile(ops.a3_ulysses_gate_fuse_chunk, (af8_t, gk_t))
 
             qf8_t = torch.empty((c_k, h_dim), dtype=torch.float8_e4m3fn, device="meta")
             wo_t = torch.empty((h_dim, h_dim), dtype=torch.float8_e4m3fn, device="meta")
             wos_t = torch.empty((1, h_dim), dtype=torch.float32, device="meta")
-            _export_check(ops.a3_ulysses_wo, (qf8_t, wo_t, wos_t))
+            _assert_tpu7x_spmd_export_and_compile(ops.a3_ulysses_wo, (qf8_t, wo_t, wos_t))
 
         q0_t = torch.empty((512, h_dim), dtype=torch.float8_e4m3fn, device="meta")
         q1_t = torch.empty((1024, h_dim), dtype=torch.float8_e4m3fn, device="meta")
-        _export_check(ops.a3_ulysses_wo_2chunk, (q0_t, q1_t, wo_t, wos_t))
+        _assert_tpu7x_spmd_export_and_compile(ops.a3_ulysses_wo_2chunk, (q0_t, q1_t, wo_t, wos_t))
 
 
 def test_v10_sp_weights_gates_use_agd_false_and_l61_prune():
@@ -715,11 +721,420 @@ def test_v10_sp_weights_gates_use_agd_false_and_l61_prune():
     assert kvp2.shape == (128, 1, 4, 128)
 
 
+def test_v10_sp_tp8_interpret_nan_parity_vs_v6_and_rev_bf16():
+    """8-device CPU interpret parity (`uninitialized_memory='nan'`) for TP=8 (`hq=16, hkv=2`):
+    - `pallas_a1_ulysses_qkv_local` (`sub_n=128`) + 2-op A2A + `pallas_pack_ulysses_qkv_for_rpa`
+      matches `v6` (`rpa_layout=True`) bit-for-bit on both `q_5d` and packed `kv_4d`.
+    - `pallas_ulysses_wo_local` pinned `3072` (`(1024, 2048)` chunks) matches `v6` reference
+      for both FP8 rev-A2A and BF16 rev-A2A (`quantize_fp8=False`, `input_is_prescaled=False`).
+    """
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from jax import lax
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+    tp8 = 8
+    if len(jax.devices("cpu")) < tp8:
+        pytest.skip(f"Need {tp8} CPU devices (got {len(jax.devices('cpu'))})")
+
+    from sglang_tpu.muse_prefill_kernels.attn_kernels import kernel_a1, kernel_a3
+    from sglang_tpu.muse_prefill_kernels.causal_chunk_stream import to_chunk_major_perm
+
+    devs = jax.devices("cpu")[:tp8]
+    mesh = Mesh(np.array(devs), (_AXIS,))
+
+    chunks = (1024, 2048)
+    t_shard = sum(chunks)  # 3072 -> triggers pinned_3072 Wo path cleanly!
+    t_total = tp8 * t_shard  # 24576
+    h_dim = 256
+    h_q_local, h_kv_local = 16, 2
+    q_size, kv_size = h_q_local * 64, h_kv_local * 64  # 1024, 128
+    n_full = tp8 * q_size  # 8192
+
+    rng = np.random.default_rng(2027)
+    attn_in_np = (rng.standard_normal((t_total, h_dim)) * 0.35).astype(np.float32)
+    q_w_np = (rng.standard_normal((tp8, q_size, h_dim)) * 0.2).astype(np.float32)
+    k_w_np = (rng.standard_normal((tp8, kv_size, h_dim)) * 0.2).astype(np.float32)
+    v_w_np = (rng.standard_normal((tp8, kv_size, h_dim)) * 0.2).astype(np.float32)
+    g_w_np = (rng.standard_normal((tp8, q_size, h_dim)) * 0.2).astype(np.float32)
+    wo_w_np = (rng.standard_normal((h_dim, tp8, q_size)) * 0.15).astype(np.float32)
+
+    theta = rng.uniform(0.0, 2.0, size=(t_total, 128)).astype(np.float32)
+    cos_np, sin_np = np.cos(theta), np.sin(theta)
+    perm_cm = np.array(to_chunk_major_perm(tp8, chunks), dtype=np.int64)
+    attn_in_shard_np = attn_in_np[perm_cm].reshape(tp8, t_shard, h_dim)
+
+    v6_w, v6_sc, ul_w, ul_sc, wg_parts, wgs_parts = [], [], [], [], [], []
+    for r in range(tp8):
+        qr, kr, vr, gr = q_w_np[r], k_w_np[r], v_w_np[r], g_w_np[r]
+        w6, sc6 = _fp8_k_major_np(np.concatenate([qr, gr, kr, vr], axis=0))
+        v6_w.append(w6)
+        v6_sc.append(sc6[None, :])
+        w_qkv, sc_qkv = _fp8_k_major_np(np.concatenate([qr, kr, vr], axis=0))
+        ul_w.append(w_qkv)
+        ul_sc.append(sc_qkv)
+        wg, wgs = _fp8_k_major_np(gr)
+        wg_parts.append(wg)
+        wgs_parts.append(wgs)
+
+    w_qkv_3d = np.stack(ul_w, axis=0)
+    w_qkv_sc_3d = np.stack(ul_sc, axis=0)[:, None, :]
+    wg_full = np.concatenate(wg_parts, axis=1)
+    wgs_full = np.concatenate(wgs_parts, axis=0)[None, :]
+    wo_full, wo_sc_full = _fp8_k_major_np(wo_w_np.reshape(h_dim, n_full))
+
+    def _put(arr, dt):
+        return jax.device_put(jnp.asarray(arr, dtype=dt), NamedSharding(mesh, P(_AXIS)))
+
+    with _interpret_on_cpu(mesh):
+        attn_in_d = _put(attn_in_shard_np, jnp.bfloat16)
+        v6_w_d = _put(np.stack(v6_w, 0), jnp.float8_e4m3fn)
+        v6_sc_d = _put(np.stack(v6_sc, 0), jnp.float32)
+        ul_w_d = _put(np.broadcast_to(w_qkv_3d[None], (tp8, *w_qkv_3d.shape)), jnp.float8_e4m3fn)
+        ul_sc_d = _put(np.broadcast_to(w_qkv_sc_3d[None], (tp8, *w_qkv_sc_3d.shape)), jnp.float32)
+        wg_d = _put(np.broadcast_to(wg_full[None], (tp8, *wg_full.shape)), jnp.float8_e4m3fn)
+        wgs_d = _put(np.broadcast_to(wgs_full[None], (tp8, *wgs_full.shape)), jnp.float32)
+        wo_d = _put(np.broadcast_to(wo_full[None], (tp8, *wo_full.shape)), jnp.float8_e4m3fn)
+        wos_d = _put(np.broadcast_to(wo_sc_full[None, None, :], (tp8, 1, h_dim)), jnp.float32)
+
+        c_offs = (0, tp8 * chunks[0])
+        cos_d = [
+            _put(np.broadcast_to(cos_np[None, c_offs[k] : c_offs[k] + tp8 * c_k], (tp8, tp8 * c_k, 128)), jnp.float32)
+            for k, c_k in enumerate(chunks)
+        ]
+        sin_d = [
+            _put(np.broadcast_to(sin_np[None, c_offs[k] : c_offs[k] + tp8 * c_k], (tp8, tp8 * c_k, 128)), jnp.float32)
+            for k, c_k in enumerate(chunks)
+        ]
+
+        # Test exact Q, K, V, gate parity on chunk 0 (`1024 -> 8192` tokens, `rpa_layout=False` in
+        # interpret to avoid JAX Mosaic BitcastTransform) and Wo parity on `(1024, 2048)` (`t_total=3072`).
+        def _v6_c0_fn(xk, w6, sc6, cc, ss):
+            x_fp8 = jnp.clip(
+                xk[0, : chunks[0]].astype(jnp.float32) * kernel_a1.STATIC_A1_ACT_MULT,
+                -448.0,
+                448.0,
+            ).astype(jnp.float8_e4m3fn)
+            ag = lax.all_gather(x_fp8, _AXIS, axis=0, tiled=False)
+            q_k, _, kv_k = kernel_a1.pallas_a1_chunk_1way(
+                ag,
+                w6[0],
+                sc6[0] * kernel_a1.STATIC_A1_ACT_SCALE,
+                cc[0].reshape(tp8, chunks[0], 128),
+                ss[0].reshape(tp8, chunks[0], 128),
+                None,
+                t_shard=chunks[0],
+                row_off=0,
+                h_q_local=h_q_local,
+                h_kv_local=h_kv_local,
+                rpa_layout=False,
+                mode="all",
+                tp_axis=_AXIS,
+                tm=256,
+            )
+            c_tok = tp8 * chunks[0]
+            return q_k.reshape(c_tok, q_size)[None], kv_k.reshape(c_tok, 2 * kv_size)[None]
+
+        def _v10_c0_fn(xk, wul, scul, cc, ss, *, sub_n: int):
+            me = lax.axis_index(_AXIS)
+            x_fp8 = jnp.clip(
+                xk[0, : chunks[0]].astype(jnp.float32) * kernel_a1.STATIC_A1_ACT_MULT,
+                -448.0,
+                448.0,
+            ).astype(jnp.float8_e4m3fn)
+            co = lax.dynamic_index_in_dim(cc[0].reshape(tp8, chunks[0], 128), me, axis=0, keepdims=False)
+            so = lax.dynamic_index_in_dim(ss[0].reshape(tp8, chunks[0], 128), me, axis=0, keepdims=False)
+            q3, kv3 = kernel_a1.pallas_a1_ulysses_qkv_local(
+                x_fp8,
+                wul[0],
+                scul[0] * kernel_a1.STATIC_A1_ACT_SCALE,
+                co,
+                so,
+                h_q_local=h_q_local,
+                h_kv_local=h_kv_local,
+                sub_n=sub_n,
+            )
+            c_tok = tp8 * chunks[0]
+            q2 = lax.all_to_all(q3, _AXIS, split_axis=0, concat_axis=0, tiled=False).reshape(c_tok, q_size)
+            kv2 = lax.all_to_all(kv3, _AXIS, split_axis=0, concat_axis=0, tiled=False).reshape(
+                c_tok, 2 * kv_size
+            )
+            return q2[None], kv2[None]
+
+        sm_v6_c0 = jax.shard_map(_v6_c0_fn, mesh=mesh, in_specs=(P(_AXIS),) * 5, out_specs=(P(_AXIS),) * 2, check_vma=False)
+        sm_v10_sn128 = jax.shard_map(lambda *a: _v10_c0_fn(*a, sub_n=128), mesh=mesh, in_specs=(P(_AXIS),) * 5, out_specs=(P(_AXIS),) * 2, check_vma=False)
+        sm_v10_sn0 = jax.shard_map(lambda *a: _v10_c0_fn(*a, sub_n=0), mesh=mesh, in_specs=(P(_AXIS),) * 5, out_specs=(P(_AXIS),) * 2, check_vma=False)
+        q6_d, kv6_d = jax.block_until_ready(sm_v6_c0(attn_in_d, v6_w_d, v6_sc_d, cos_d[0], sin_d[0]))
+        q10_d, kv10_d = jax.block_until_ready(sm_v10_sn128(attn_in_d, ul_w_d, ul_sc_d, cos_d[0], sin_d[0]))
+        q10_0_d, kv10_0_d = jax.block_until_ready(sm_v10_sn0(attn_in_d, ul_w_d, ul_sc_d, cos_d[0], sin_d[0]))
+
+        q6_u16 = np.asarray(lax.bitcast_convert_type(q6_d.addressable_shards[0].data[0], jnp.uint16))
+        q10_u16 = np.asarray(lax.bitcast_convert_type(q10_d.addressable_shards[0].data[0], jnp.uint16))
+        kv6_u8 = np.asarray(lax.bitcast_convert_type(kv6_d.addressable_shards[0].data[0], jnp.uint8))
+        kv10_u8 = np.asarray(lax.bitcast_convert_type(kv10_d.addressable_shards[0].data[0], jnp.uint8))
+        np.testing.assert_array_equal(q10_u16, q6_u16)
+        np.testing.assert_array_equal(kv10_u8, kv6_u8)
+        q6_f = np.asarray(q6_d.addressable_shards[0].data[0], dtype=np.float32)
+        q0_f = np.asarray(q10_0_d.addressable_shards[0].data[0], dtype=np.float32)
+        cos_sn0 = float(np.sum(q6_f * q0_f) / (np.linalg.norm(q6_f) * np.linalg.norm(q0_f) + 1e-12))
+        assert cos_sn0 >= 0.9998 and np.all(np.isfinite(q0_f))
+        np.testing.assert_array_equal(
+            np.asarray(lax.bitcast_convert_type(kv10_0_d.addressable_shards[0].data[0], jnp.uint8)),
+            kv6_u8,
+        )
+
+        # Verify FP8 rev-A2A, BF16 rev-A2A, and pinned `3072` `pallas_ulysses_wo_local((qp0, qp1), ...)`.
+        ar0_np = (rng.standard_normal((tp8, tp8 * chunks[0], q_size)) * 0.4).astype(np.float32)
+        ar1_np = (rng.standard_normal((tp8, tp8 * chunks[1], q_size)) * 0.4).astype(np.float32)
+        ar0_d, ar1_d = _put(ar0_np, jnp.bfloat16), _put(ar1_np, jnp.bfloat16)
+
+        def _v6_wo_fn(xk, ar0, ar1, w6, sc6, woseq, wosc):
+            def _one(x_part, ar_part):
+                x_f = jnp.clip(
+                    x_part.astype(jnp.float32) * kernel_a1.STATIC_A1_ACT_MULT, -448.0, 448.0
+                ).astype(jnp.float8_e4m3fn)
+                ag = lax.all_gather(x_f, _AXIS, axis=0, tiled=False)
+                # Extract gate exact [tp*c_k, q_size] via pallas_a1_chunk_1way.
+                c_k = x_part.shape[0]
+                t_g = jnp.zeros((tp8, c_k, 128), dtype=jnp.float32)
+                _, g_k, _ = kernel_a1.pallas_a1_chunk_1way(
+                    ag, w6[0], sc6[0] * kernel_a1.STATIC_A1_ACT_SCALE, t_g, t_g, None,
+                    t_shard=c_k, row_off=0, h_q_local=h_q_local, h_kv_local=h_kv_local,
+                    rpa_layout=False, mode="all", tp_axis=_AXIS, tm=256,
+                )
+                qp = kernel_a3.pallas_gate_static_fp8_quant(
+                    ar_part, g_k.reshape(tp8 * c_k, q_size), tm=512, head_norm_eps=1e-5, rpa_packed_out=False
+                ).reshape(tp8, c_k, q_size)
+                return lax.all_to_all(qp, _AXIS, split_axis=0, concat_axis=0, tiled=False).reshape(tp8, c_k, q_size)
+
+            qa0 = _one(xk[0, : chunks[0]], ar0[0])
+            qa1 = _one(xk[0, chunks[0] :], ar1[0])
+            qa = jnp.concatenate([qa0, qa1], axis=1)
+            return (
+                jnp.einsum(
+                    "rth,rhn->tn",
+                    qa.astype(jnp.float32),
+                    woseq[0].reshape(tp8, q_size, h_dim).astype(jnp.float32),
+                )
+                * (wosc[0] * kernel_a3.STATIC_A3_ACT_SCALE)
+            ).astype(jnp.bfloat16)[None]
+
+        def _v10_wo_fn(xk, ar0, ar1, wg, wgs, woseq, wosc, *, rev_bf16: bool):
+            def _one(x_part, ar_part):
+                c_k = x_part.shape[0]
+                x_f = jnp.clip(
+                    x_part.astype(jnp.float32) * kernel_a1.STATIC_A1_ACT_MULT, -448.0, 448.0
+                ).astype(jnp.float8_e4m3fn)
+                gk = kernel_a1.pallas_ulysses_local_gate(
+                    x_f, wg[0], wgs[0] * kernel_a1.STATIC_A1_ACT_SCALE
+                )
+                rn = kernel_a3.pallas_ulysses_norm_fp8_for_rev_a2a(
+                    ar_part, head_norm_eps=1e-5, quantize_fp8=not rev_bf16
+                ).reshape(tp8, c_k, q_size)
+                ra = lax.all_to_all(rn, _AXIS, split_axis=0, concat_axis=0, tiled=False).reshape(
+                    tp8, c_k, q_size
+                )
+                return kernel_a3.pallas_ulysses_gate_fuse(
+                    ra, gk, input_is_prescaled=not rev_bf16
+                )
+
+            qp0 = _one(xk[0, : chunks[0]], ar0[0])
+            qp1 = _one(xk[0, chunks[0] :], ar1[0])
+            return kernel_a3.pallas_ulysses_wo_local(
+                (qp0, qp1), woseq[0], wosc[0], bn=min(1024, h_dim)
+            )[None]
+
+        sm_v6_wo = jax.shard_map(_v6_wo_fn, mesh=mesh, in_specs=(P(_AXIS),) * 7, out_specs=P(_AXIS), check_vma=False)
+        sm_v10_fp8 = jax.shard_map(lambda *a: _v10_wo_fn(*a, rev_bf16=False), mesh=mesh, in_specs=(P(_AXIS),) * 7, out_specs=P(_AXIS), check_vma=False)
+        sm_v10_bf16 = jax.shard_map(lambda *a: _v10_wo_fn(*a, rev_bf16=True), mesh=mesh, in_specs=(P(_AXIS),) * 7, out_specs=P(_AXIS), check_vma=False)
+
+        wo_ref = np.asarray(jax.block_until_ready(sm_v6_wo(attn_in_d, ar0_d, ar1_d, v6_w_d, v6_sc_d, wo_d, wos_d)), dtype=np.float32).reshape(-1, h_dim)
+        wo_f8 = np.asarray(jax.block_until_ready(sm_v10_fp8(attn_in_d, ar0_d, ar1_d, wg_d, wgs_d, wo_d, wos_d)), dtype=np.float32).reshape(-1, h_dim)
+        wo_bf = np.asarray(jax.block_until_ready(sm_v10_bf16(attn_in_d, ar0_d, ar1_d, wg_d, wgs_d, wo_d, wos_d)), dtype=np.float32).reshape(-1, h_dim)
+        assert np.all(np.isfinite(wo_f8)) and np.all(np.isfinite(wo_bf))
+        cos_f8 = float(np.sum(wo_ref * wo_f8) / (np.linalg.norm(wo_ref) * np.linalg.norm(wo_f8) + 1e-12))
+        cos_bf = float(np.sum(wo_ref * wo_bf) / (np.linalg.norm(wo_ref) * np.linalg.norm(wo_bf) + 1e-12))
+        assert cos_f8 >= 0.9985, f"TP=8 FP8 rev-A2A Wo parity cos={cos_f8:.6f} too low"
+        assert cos_bf >= 0.9995, f"TP=8 BF16 rev-A2A Wo parity cos={cos_bf:.6f} too low"
+
+
+def test_v10_sp_tpu7x_2x2x1_tp8_prod_aot_compile_and_rev_bf16():
+    """Offline TPU v7 (`2x2x1` TP=8) Mosaic AOT compile + zero-`partition_id` check of ALL
+    `v10_sp` ops at full Muse Spark production geometry (`H=8192`, `hq=16`, `hkv=2`), including
+    `chunks=(1024, 2048)` (`T=24K`, `pinned_3072` `a3_ulysses_wo_2chunk`), short `c_k=64`,
+    and `ULYSSES_REV_BF16=True`.
+    """
+    jax = pytest.importorskip("jax")
+    torch = pytest.importorskip("torch")
+    from jax.experimental import topologies
+    from jax.sharding import Mesh
+
+    tp8 = 8
+    if len(jax.devices("cpu")) < tp8:
+        pytest.skip(f"Need {tp8} CPU devices (got {len(jax.devices('cpu'))})")
+
+    from sglang_tpu.muse_prefill_kernels.integration import _ops
+
+    topo = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x=2x2x1")
+    mesh = Mesh(np.array(topo.devices).reshape(tp8), (_AXIS,))
+    h_dim, q_loc, kv_cols = 8192, 1024, 256
+
+    _ops.cache_clear()
+    with mock.patch("sglang_tpu.moe.pallas.fused_moe_rs_op._get_mesh", return_value=mesh):
+        ops_f8 = _ops(
+            16, 2, "v10_sp", "v16", True, 1e-5,
+            a1_rpa_layout=True, causal_chunk_stream=True,
+            causal_chunk_spec="3072:1024,2048", ulysses_rev_bf16=False,
+        )
+        ops_bf16 = _ops(
+            16, 2, "v10_sp", "v16", True, 1e-5,
+            a1_rpa_layout=True, causal_chunk_stream=True,
+            causal_chunk_spec="3072:1024,2048", ulysses_rev_bf16=True,
+        )
+
+    assert ops_f8.a3_ulysses_rev_a2a_chunk._init_fn.name != ops_bf16.a3_ulysses_rev_a2a_chunk._init_fn.name
+    assert ops_f8.a3_ulysses_gate_fuse_chunk._init_fn.name != ops_bf16.a3_ulysses_gate_fuse_chunk._init_fn.name
+
+    for c_k in (1024, 2048, 64):
+        c_tok = tp8 * c_k
+        x_t = torch.empty((c_k, h_dim), dtype=torch.bfloat16, device="meta")
+        wq_t = torch.empty((tp8, h_dim, q_loc + kv_cols), dtype=torch.float8_e4m3fn, device="meta")
+        wqs_t = torch.empty((tp8, 1, q_loc + kv_cols), dtype=torch.float32, device="meta")
+        cos_t = torch.empty((c_tok, 128), dtype=torch.float32, device="meta")
+        sin_t = torch.empty((c_tok, 128), dtype=torch.float32, device="meta")
+        _assert_tpu7x_spmd_export_and_compile(ops_f8.a1_ulysses_qkv_chunk, (x_t, wq_t, wqs_t, cos_t, sin_t))
+
+        q3_t = torch.empty((tp8, c_k, q_loc), dtype=torch.bfloat16, device="meta")
+        kv3_t = torch.empty((tp8, c_k, kv_cols), dtype=torch.float8_e4m3fn, device="meta")
+        _assert_tpu7x_spmd_export_and_compile(ops_f8.a1_ulysses_a2a_pack_chunk, (q3_t, kv3_t))
+
+        xf8_t = torch.empty((c_k, h_dim), dtype=torch.float8_e4m3fn, device="meta")
+        wg_t = torch.empty((h_dim, h_dim), dtype=torch.float8_e4m3fn, device="meta")
+        wgs_t = torch.empty((1, h_dim), dtype=torch.float32, device="meta")
+        _assert_tpu7x_spmd_export_and_compile(ops_f8.a1_ulysses_gate_chunk, (xf8_t, wg_t, wgs_t))
+
+        raw_out_t = torch.empty((c_tok, q_loc), dtype=torch.bfloat16, device="meta")
+        gk_t = torch.empty((c_k, h_dim), dtype=torch.bfloat16, device="meta")
+        _assert_tpu7x_spmd_export_and_compile(ops_f8.a3_ulysses_rev_a2a_chunk, (raw_out_t,))
+        _assert_tpu7x_spmd_export_and_compile(ops_bf16.a3_ulysses_rev_a2a_chunk, (raw_out_t,))
+
+        _assert_tpu7x_spmd_export_and_compile(
+            ops_f8.a3_ulysses_gate_fuse_chunk,
+            (torch.empty((tp8, c_k, q_loc), dtype=torch.float8_e4m3fn, device="meta"), gk_t),
+        )
+        _assert_tpu7x_spmd_export_and_compile(
+            ops_bf16.a3_ulysses_gate_fuse_chunk,
+            (torch.empty((tp8, c_k, q_loc), dtype=torch.bfloat16, device="meta"), gk_t),
+        )
+
+    wo_t = torch.empty((h_dim, h_dim), dtype=torch.float8_e4m3fn, device="meta")
+    wos_t = torch.empty((1, h_dim), dtype=torch.float32, device="meta")
+    _assert_tpu7x_spmd_export_and_compile(
+        ops_f8.a3_ulysses_wo_2chunk,
+        (
+            torch.empty((1024, h_dim), dtype=torch.float8_e4m3fn, device="meta"),
+            torch.empty((2048, h_dim), dtype=torch.float8_e4m3fn, device="meta"),
+            wo_t,
+            wos_t,
+        ),
+    )
+
+
+def test_v10_sp_from_model_validation_tp8_and_tp16():
+    """Verify `MusePrefillKernels.from_model` cleanly validates TP=8 & TP=16 `v10_sp` flags."""
+    import os
+    import types
+
+    torch = pytest.importorskip("torch")
+    from sglang_tpu.muse_prefill_kernels import integration
+    from sglang_tpu.muse_prefill_kernels.attn_kernels.reference import QUERY_SCALE
+
+    cfg = types.SimpleNamespace(
+        num_attention_heads=128,
+        num_key_value_heads=16,
+        qk_scale_factor=QUERY_SCALE,
+        output_multiplier=0.17677669529663687,
+        routed_scaling_factor=1.0,
+        rms_norm_eps=1e-5,
+        post_norm_eps=1e-8,
+        hidden_size=8192,
+        moe_hidden_size=4096,
+        num_local_experts=256,
+        num_experts_per_tok=8,
+        head_dim=64,
+    )
+    fake_decoder = types.SimpleNamespace(
+        pp_group=types.SimpleNamespace(world_size=1),
+        layers=[
+            types.SimpleNamespace(
+                mlp=types.SimpleNamespace(
+                    experts=types.SimpleNamespace(w13_weight=torch.empty(0))
+                )
+            )
+        ],
+    )
+    fake_model = types.SimpleNamespace(model=fake_decoder, text_config=cfg)
+
+    def _run_from_model(tp_sz, extra_env, *, ep_tp2=False):
+        par = types.SimpleNamespace(
+            tp_size=tp_sz,
+            attn_tp_size=tp_sz,
+            moe_ep_size=(tp_sz // 2) if ep_tp2 else tp_sz,
+            moe_tp_size=2 if ep_tp2 else 1,
+            attn_dcp_size=1,
+        )
+        base_env = {
+            "SGLANG_TPU_MUSE_KERNEL_A1_VARIANT": "v10_sp",
+            "SGLANG_TPU_MUSE_KERNEL_A3_VARIANT": "v16",
+            "SGLANG_TPU_MUSE_KERNEL_CAUSAL_CHUNK_STREAM": "1",
+            "SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT": "1",
+            "SGLANG_TPU_MUSE_KERNEL_FORCE": "0",
+        }
+        base_env.update(extra_env)
+        with (
+            mock.patch("sglang.srt.layers.dp_attention.is_dp_attention_enabled", return_value=False),
+            mock.patch("sglang.srt.runtime_context.get_parallel", return_value=par),
+            mock.patch.dict(os.environ, base_env),
+            mock.patch.object(integration.logger, "warning") as mock_warn,
+        ):
+            integration.MusePrefillKernels.from_model(fake_model)
+            return [str(call.args[1]) for call in mock_warn.call_args_list if len(call.args) > 1]
+
+    # TP=8 valid: KV_PACK_HEADS=1 -> passes _v10_sp_config_error and reaches layer check.
+    r_tp8_ok = _run_from_model(8, {"SGLANG_TPU_KV_PACK_HEADS": "1"})
+    assert not any("v10_sp" in r for r in r_tp8_ok), r_tp8_ok
+
+    # TP=8 invalid: missing KV_PACK_HEADS, missing A1_RPA_LAYOUT, or ep_tp2=1.
+    for bad_env in (
+        {"SGLANG_TPU_KV_PACK_HEADS": "0"},
+        {"SGLANG_TPU_KV_PACK_HEADS": "1", "SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT": "0"},
+        {"SGLANG_TPU_KV_PACK_HEADS": "1", "SGLANG_TPU_MUSE_KERNEL_A3_VARIANT": "v3"},
+    ):
+        reasons = _run_from_model(8, bad_env)
+        assert any("v10_sp" in r for r in reasons), (bad_env, reasons)
+    reasons_ep2 = _run_from_model(8, {"SGLANG_TPU_KV_PACK_HEADS": "1", "SGLANG_TPU_MUSE_KERNEL_EP_TP2_PREFILL": "1"}, ep_tp2=True)
+    assert any("v10_sp" in r for r in reasons_ep2), reasons_ep2
+
+    # TP=16 valid: TP16_PREFILL=1, KV_PACK_HEADS=0, A1_RPA_LAYOUT=1.
+    r_tp16_ok = _run_from_model(16, {"SGLANG_TPU_MUSE_KERNEL_TP16_PREFILL": "1", "SGLANG_TPU_KV_PACK_HEADS": "0"})
+    assert not any("v10_sp" in r for r in r_tp16_ok), r_tp16_ok
+
+    # TP=16 invalid: missing A1_RPA_LAYOUT=1 or KV_PACK_HEADS=1.
+    for bad_env in (
+        {"SGLANG_TPU_MUSE_KERNEL_TP16_PREFILL": "1", "SGLANG_TPU_KV_PACK_HEADS": "0", "SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT": "0"},
+        {"SGLANG_TPU_MUSE_KERNEL_TP16_PREFILL": "1", "SGLANG_TPU_KV_PACK_HEADS": "1"},
+    ):
+        reasons = _run_from_model(16, bad_env)
+        assert any("v10_sp" in r for r in reasons), (bad_env, reasons)
+
+
 def test_v10_sp_code_hygiene_ast_and_defaults():
     """Verify default flags stay unchanged, AST parses cleanly, and 0 raw os.environ.get."""
     assert tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_VARIANT.get() == "v1"
+    assert tpu_envs.SGLANG_TPU_MUSE_KERNEL_ULYSSES_REV_BF16.get() is False
     repo = pathlib.Path(__file__).resolve().parents[5]
     for rel in (
+        "sglang_tpu/envs.py",
         "sglang_tpu/muse_prefill_kernels/attn_kernels/kernel_a1.py",
         "sglang_tpu/muse_prefill_kernels/attn_kernels/kernel_a3.py",
         "sglang_tpu/muse_prefill_kernels/integration.py",
