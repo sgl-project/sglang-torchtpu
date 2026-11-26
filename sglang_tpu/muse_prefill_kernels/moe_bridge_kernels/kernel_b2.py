@@ -1434,6 +1434,7 @@ def pallas_fused_b1_b2_wpool_quant(
     route_eps: float = 1e-15,
     topk: int = 8,
     emit_fp8_gmm: bool = False,
+    static_fp8_scale: float | None = None,
 ) -> tuple[jax.Array, ...]:
     """Single-launch fused Kernel B1 + VMEM-cached 32 MiB wpool_fp8 B2 + packed-bf16-scale quant.
 
@@ -1477,11 +1478,37 @@ def pallas_fused_b1_b2_wpool_quant(
     )
     if skip_zero_wlo:
         w_lo = jnp.zeros((8, num_experts), dtype=jnp.bfloat16)
+    if static_fp8_scale is None:
+        if emit_fp8_gmm:
+            from sglang_tpu.moe.pallas.fused_rs_muse.prefill_gmm_opts import (
+                resolve_static_fp8_lhs_scale,
+            )
+
+            static_fp8_val = resolve_static_fp8_lhs_scale(
+                envs.SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8.get(),
+                envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_LHS.get(),
+            )
+        else:
+            static_fp8_val = 0.0
+    else:
+        static_fp8_val = float(static_fp8_scale)
+        if static_fp8_val < 0.0 or static_fp8_val > 32.0:
+            raise ValueError(
+                f"static_fp8_scale must be in [0, 32], got {static_fp8_val}"
+            )
+    use_static_fp8 = bool(emit_fp8_gmm and static_fp8_val > 0.0)
+
     b2_vecs = (
         wpool_scale.swapaxes(0, 1).reshape(8, he_dim)
         if wpool_scale.ndim == 3
         else prepare_b2_static_inputs(wpool_scale, pre_expert_norm_w)
     )
+    if use_static_fp8:
+        b2_vecs = b2_vecs.at[1].set(
+            (b2_vecs[1].astype(jnp.float32) * jnp.float32(static_fp8_val)).astype(
+                b2_vecs.dtype
+            )
+        )
 
     num_steps = out_rows // bm
     b2_dbl_env = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_B2_DBL_STREAM", None)
@@ -1508,7 +1535,7 @@ def pallas_fused_b1_b2_wpool_quant(
         b2_vecs_ref,
         *tail_refs,
     ):
-        if emit_fp8_gmm:
+        if emit_fp8_gmm and not use_static_fp8:
             (
                 x_moe_fp8_out_ref,
                 x_moe_sc_out_ref,
@@ -1521,6 +1548,18 @@ def pallas_fused_b1_b2_wpool_quant(
                 dma_sems,
             ) = tail_refs
             x_moe_i8_out_ref = None
+        elif use_static_fp8:
+            (
+                x_moe_fp8_out_ref,
+                stream_mid_hbm_ref,
+                ids_out_ref,
+                ws_out_ref,
+                stream_buf_ref,
+                r_scratch_ref,
+                u_scratch_ref,
+                dma_sems,
+            ) = tail_refs
+            x_moe_sc_out_ref = x_moe_i8_out_ref = None
         else:
             (
                 x_moe_i8_out_ref,
@@ -1762,46 +1801,25 @@ def pallas_fused_b1_b2_wpool_quant(
             jnp.sum(sq_pe_128, axis=1, keepdims=True) * jnp.float32(inv_he)
             + jnp.float32(rms_eps)
         )
-        amax_128 = jnp.zeros((bm, LANE), dtype=jnp.float32)
-        for ns in range(he_dim // ep_sub_n):
-            nc0, nc1 = ns * ep_sub_n, (ns + 1) * ep_sub_n
-            u_f32 = u_scratch_ref[:, nc0:nc1].astype(jnp.float32)
-            x_norm_bf16 = (u_f32 * inv_rms_pe * b2_vecs_ref[1:2, nc0:nc1]).astype(
-                jnp.bfloat16
-            )
-            u_scratch_ref[:, nc0:nc1] = x_norm_bf16
-            amax_128 = jnp.maximum(
-                amax_128,
-                vpu_tree_max_128(jnp.abs(x_norm_bf16.astype(jnp.float32))),
-            )
-
-        row_amax = jnp.max(amax_128, axis=1, keepdims=True)
-        if emit_fp8_gmm:
-            row_sc_f32 = jnp.where(
-                row_amax == 0,
-                jnp.zeros_like(row_amax),
-                row_amax * jnp.float32(1.0 / 448.0),
-            )
-            inv_fp8 = jnp.where(
-                row_amax == 0,
-                jnp.zeros_like(row_amax),
-                jnp.float32(448.0) / jnp.maximum(row_amax, jnp.float32(1e-30)),
-            ).astype(jnp.bfloat16)
-            x_moe_sc_out_ref[:, :] = jnp.broadcast_to(row_sc_f32, (bm, LANE))
+        if use_static_fp8:
             if use_dbl_stream:
                 for k_c in range(he_dim // LANE):
+                    nc0, nc1 = k_c * LANE, (k_c + 1) * LANE
+                    u_f32 = u_scratch_ref[:, nc0:nc1].astype(jnp.float32)
+                    x_q = u_f32 * inv_rms_pe * b2_vecs_ref[1:2, nc0:nc1]
                     x_moe_fp8_out_ref[:, k_c, :] = jnp.clip(
-                        u_scratch_ref[:, k_c * LANE : (k_c + 1) * LANE] * inv_fp8,
-                        -448.0,
-                        448.0,
+                        x_q, -448.0, 448.0
                     ).astype(jnp.float8_e4m3fn)
             else:
                 for m0 in range(0, bm, 32):
-                    inv_m = inv_fp8[m0 : m0 + 32, :]
+                    inv_m = inv_rms_pe[m0 : m0 + 32, :]
                     q_parts = [
                         jnp.clip(
-                            u_scratch_ref[m0 : m0 + 32, kh * 2048 : (kh + 1) * 2048]
-                            * inv_m,
+                            u_scratch_ref[
+                                m0 : m0 + 32, kh * 2048 : (kh + 1) * 2048
+                            ].astype(jnp.float32)
+                            * inv_m
+                            * b2_vecs_ref[1:2, kh * 2048 : (kh + 1) * 2048],
                             -448.0,
                             448.0,
                         )
@@ -1815,28 +1833,85 @@ def pallas_fused_b1_b2_wpool_quant(
                         else jnp.concatenate(q_parts, axis=1)
                     )
         else:
-            row_sc = (row_amax * jnp.float32(1.0 / 127.0)).astype(jnp.bfloat16)
-            row_sc = jnp.where(row_amax == 0, jnp.zeros_like(row_sc), row_sc)
-            inv_sc = jnp.where(
-                row_amax == 0,
-                jnp.zeros_like(row_amax),
-                jnp.float32(127.0) / jnp.maximum(row_amax, jnp.float32(1e-12)),
-            ).astype(jnp.bfloat16)
-
-            sc_u16 = jax.lax.bitcast_convert_type(row_sc, jnp.uint16).astype(jnp.int32)
-            lo_i8 = (sc_u16 & jnp.int32(0xFF)).astype(jnp.int8)
-            hi_i8 = ((sc_u16 >> 8) & jnp.int32(0xFF)).astype(jnp.int8)
-            lane = jax.lax.broadcasted_iota(jnp.int32, (bm, LANE), 1)
-            x_moe_i8_out_ref[:, he_dim : he_dim + LANE] = jnp.where(
-                lane < 64,
-                jnp.broadcast_to(lo_i8, (bm, LANE)),
-                jnp.broadcast_to(hi_i8, (bm, LANE)),
-            )
+            amax_128 = jnp.zeros((bm, LANE), dtype=jnp.float32)
             for ns in range(he_dim // ep_sub_n):
                 nc0, nc1 = ns * ep_sub_n, (ns + 1) * ep_sub_n
-                x_moe_i8_out_ref[:, nc0:nc1] = jnp.rint(
-                    u_scratch_ref[:, nc0:nc1] * inv_sc
-                ).astype(jnp.int8)
+                u_f32 = u_scratch_ref[:, nc0:nc1].astype(jnp.float32)
+                x_norm_bf16 = (u_f32 * inv_rms_pe * b2_vecs_ref[1:2, nc0:nc1]).astype(
+                    jnp.bfloat16
+                )
+                u_scratch_ref[:, nc0:nc1] = x_norm_bf16
+                amax_128 = jnp.maximum(
+                    amax_128,
+                    vpu_tree_max_128(jnp.abs(x_norm_bf16.astype(jnp.float32))),
+                )
+
+            row_amax = jnp.max(amax_128, axis=1, keepdims=True)
+            if emit_fp8_gmm:
+                row_sc_f32 = jnp.where(
+                    row_amax == 0,
+                    jnp.zeros_like(row_amax),
+                    row_amax * jnp.float32(1.0 / 448.0),
+                )
+                inv_fp8 = jnp.where(
+                    row_amax == 0,
+                    jnp.zeros_like(row_amax),
+                    jnp.float32(448.0) / jnp.maximum(row_amax, jnp.float32(1e-30)),
+                ).astype(jnp.bfloat16)
+                x_moe_sc_out_ref[:, :] = jnp.broadcast_to(row_sc_f32, (bm, LANE))
+                if use_dbl_stream:
+                    for k_c in range(he_dim // LANE):
+                        x_moe_fp8_out_ref[:, k_c, :] = jnp.clip(
+                            u_scratch_ref[:, k_c * LANE : (k_c + 1) * LANE] * inv_fp8,
+                            -448.0,
+                            448.0,
+                        ).astype(jnp.float8_e4m3fn)
+                else:
+                    for m0 in range(0, bm, 32):
+                        inv_m = inv_fp8[m0 : m0 + 32, :]
+                        q_parts = [
+                            jnp.clip(
+                                u_scratch_ref[
+                                    m0 : m0 + 32, kh * 2048 : (kh + 1) * 2048
+                                ]
+                                * inv_m,
+                                -448.0,
+                                448.0,
+                            )
+                            .astype(jnp.float8_e4m3fn)
+                            .reshape(32, 16, LANE)
+                            for kh in range(he_dim // 2048)
+                        ]
+                        x_moe_fp8_out_ref[pl.ds(m0, 32), :, :] = (
+                            q_parts[0]
+                            if len(q_parts) == 1
+                            else jnp.concatenate(q_parts, axis=1)
+                        )
+            else:
+                row_sc = (row_amax * jnp.float32(1.0 / 127.0)).astype(jnp.bfloat16)
+                row_sc = jnp.where(row_amax == 0, jnp.zeros_like(row_sc), row_sc)
+                inv_sc = jnp.where(
+                    row_amax == 0,
+                    jnp.zeros_like(row_amax),
+                    jnp.float32(127.0) / jnp.maximum(row_amax, jnp.float32(1e-12)),
+                ).astype(jnp.bfloat16)
+
+                sc_u16 = jax.lax.bitcast_convert_type(row_sc, jnp.uint16).astype(
+                    jnp.int32
+                )
+                lo_i8 = (sc_u16 & jnp.int32(0xFF)).astype(jnp.int8)
+                hi_i8 = ((sc_u16 >> 8) & jnp.int32(0xFF)).astype(jnp.int8)
+                lane = jax.lax.broadcasted_iota(jnp.int32, (bm, LANE), 1)
+                x_moe_i8_out_ref[:, he_dim : he_dim + LANE] = jnp.where(
+                    lane < 64,
+                    jnp.broadcast_to(lo_i8, (bm, LANE)),
+                    jnp.broadcast_to(hi_i8, (bm, LANE)),
+                )
+                for ns in range(he_dim // ep_sub_n):
+                    nc0, nc1 = ns * ep_sub_n, (ns + 1) * ep_sub_n
+                    x_moe_i8_out_ref[:, nc0:nc1] = jnp.rint(
+                        u_scratch_ref[:, nc0:nc1] * inv_sc
+                    ).astype(jnp.int8)
 
         @pl.when(step == num_steps - 1)
         def _wait_last_smid():
@@ -1865,7 +1940,12 @@ def pallas_fused_b1_b2_wpool_quant(
     )
     w_lo_idx = 1 if (hilo_pre and not skip_zero_wlo) else 0
     tag_fp8 = "fp8" if fp8_wpool else "bf16"
-    tag_out = "_outfp8" if emit_fp8_gmm else ""
+    _sc_tag = (
+        f"_s{int(static_fp8_val) if static_fp8_val.is_integer() else str(static_fp8_val).replace('.', 'p')}"
+        if use_static_fp8
+        else ""
+    )
+    tag_out = f"_outfp8{_sc_tag}" if emit_fp8_gmm else ""
     smid_rows = (
         t_local if (full_stream_mid or stream_mid_prev is not None) else out_rows
     )
@@ -1878,23 +1958,41 @@ def pallas_fused_b1_b2_wpool_quant(
         kernel_fn = lambda *r: _fused_b1_b2_kernel(*r[:8], *r[9:])  # noqa: E731
         extra_in = (stream_mid_prev,)
         extra_specs = [pl.BlockSpec(memory_space=pltpu.HBM)]
-        aliases = {8: (2 if emit_fp8_gmm else 1)}
+        aliases = {8: (2 if (emit_fp8_gmm and not use_static_fp8) else 1)}
 
     if emit_fp8_gmm:
-        out_shape_b12: tuple[Any, ...] = (
-            jax.ShapeDtypeStruct((out_rows, he_dim // LANE, LANE), jnp.float8_e4m3fn),
-            jax.ShapeDtypeStruct((out_rows, LANE), jnp.float32),
-            jax.ShapeDtypeStruct((smid_rows, h_dim), jnp.float32),
-            jax.ShapeDtypeStruct((out_rows, LANE), jnp.int32),
-            jax.ShapeDtypeStruct((out_rows, LANE), jnp.bfloat16),
-        )
-        out_specs_b12 = [
-            pl.BlockSpec((bm, he_dim // LANE, LANE), lambda i: (i, 0, 0)),
-            pl.BlockSpec((bm, LANE), lambda i: (i, 0)),
-            pl.BlockSpec(memory_space=pltpu.HBM),
-            pl.BlockSpec((bm, LANE), lambda i: (i, 0)),
-            pl.BlockSpec((bm, LANE), lambda i: (i, 0)),
-        ]
+        if use_static_fp8:
+            out_shape_b12: tuple[Any, ...] = (
+                jax.ShapeDtypeStruct(
+                    (out_rows, he_dim // LANE, LANE), jnp.float8_e4m3fn
+                ),
+                jax.ShapeDtypeStruct((smid_rows, h_dim), jnp.float32),
+                jax.ShapeDtypeStruct((out_rows, LANE), jnp.int32),
+                jax.ShapeDtypeStruct((out_rows, LANE), jnp.bfloat16),
+            )
+            out_specs_b12 = [
+                pl.BlockSpec((bm, he_dim // LANE, LANE), lambda i: (i, 0, 0)),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+                pl.BlockSpec((bm, LANE), lambda i: (i, 0)),
+                pl.BlockSpec((bm, LANE), lambda i: (i, 0)),
+            ]
+        else:
+            out_shape_b12 = (
+                jax.ShapeDtypeStruct(
+                    (out_rows, he_dim // LANE, LANE), jnp.float8_e4m3fn
+                ),
+                jax.ShapeDtypeStruct((out_rows, LANE), jnp.float32),
+                jax.ShapeDtypeStruct((smid_rows, h_dim), jnp.float32),
+                jax.ShapeDtypeStruct((out_rows, LANE), jnp.int32),
+                jax.ShapeDtypeStruct((out_rows, LANE), jnp.bfloat16),
+            )
+            out_specs_b12 = [
+                pl.BlockSpec((bm, he_dim // LANE, LANE), lambda i: (i, 0, 0)),
+                pl.BlockSpec((bm, LANE), lambda i: (i, 0)),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+                pl.BlockSpec((bm, LANE), lambda i: (i, 0)),
+                pl.BlockSpec((bm, LANE), lambda i: (i, 0)),
+            ]
     else:
         out_shape_b12 = (
             jax.ShapeDtypeStruct((out_rows, out_cols), jnp.int8),
@@ -1957,12 +2055,17 @@ def pallas_fused_b1_b2_wpool_quant(
 
     ids_dtype = jnp.uint8 if num_experts <= 256 else jnp.uint16
     if emit_fp8_gmm:
-        x_moe_fp8, x_moe_sc_pad, stream_mid, ids_pad_out, ws_pad_out = res_b12
+        if use_static_fp8:
+            x_moe_fp8, stream_mid, ids_pad_out, ws_pad_out = res_b12
+            sc_out = None
+        else:
+            x_moe_fp8, x_moe_sc_pad, stream_mid, ids_pad_out, ws_pad_out = res_b12
+            sc_out = x_moe_sc_pad[:, 0]
         local_topk_ids_u8 = ids_pad_out[:, :topk].astype(ids_dtype)
         local_topk_weights = ws_pad_out[:, :topk]
         return (
             x_moe_fp8,
-            x_moe_sc_pad[:, 0],
+            sc_out,
             stream_mid,
             local_topk_ids_u8,
             local_topk_weights,

@@ -2138,9 +2138,22 @@ def fused_moe_full_bridge_and_ffn(
                 half_idx=half_idx,
             )
 
+        from sglang_tpu.moe.pallas.fused_rs_muse.prefill_gmm_opts import (
+            resolve_static_fp8_lhs_scale,
+        )
+
         hidden_states_scale = None
-        _pq_lhs_mode = int(
+        _pq_lhs_raw = int(
             envs.SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8.get() or 0
+        )
+        _static_fp8_lhs_scale = resolve_static_fp8_lhs_scale(
+            _pq_lhs_raw,
+            envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_LHS.get(),
+        )
+        _pq_lhs_mode = (
+            (_pq_lhs_raw if _pq_lhs_raw > 0 else 6)
+            if _static_fp8_lhs_scale > 0.0
+            else _pq_lhs_raw
         )
         _use_pq_lhs_fp8 = (
             _pq_lhs_mode >= 1
@@ -2159,8 +2172,19 @@ def fused_moe_full_bridge_and_ffn(
                 )
             )
         )
-        _b2_direct_fp8_1pass = _use_pq_lhs_fp8 and _pq_lhs_mode == 4
-        _b2_direct_fp8_2half = _use_pq_lhs_fp8 and _pq_lhs_mode == 5
+        _use_static_fp8_lhs = _use_pq_lhs_fp8 and _static_fp8_lhs_scale > 0.0
+        _b2_direct_fp8_1pass = _use_pq_lhs_fp8 and (
+            _pq_lhs_mode == 4
+            or (
+                _use_static_fp8_lhs
+                and (fused_b1_b2_mode in (1, 2) or (t_local % 256 != 0))
+            )
+        )
+        _b2_direct_fp8_2half = (
+            _use_pq_lhs_fp8
+            and not _b2_direct_fp8_1pass
+            and _pq_lhs_mode in (5, 6)
+        )
         _b2_pow2_env = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_B2_POW2_CHUNKS", None)
         _use_b2_pow2 = bool(
             _b2_direct_fp8_2half and _b2_pow2_env is not None and _b2_pow2_env.get()
@@ -2205,6 +2229,9 @@ def fused_moe_full_bridge_and_ffn(
                         half_idx=None,
                         topk=topk,
                         emit_fp8_gmm=True,
+                        static_fp8_scale=(
+                            _static_fp8_lhs_scale if _use_static_fp8_lhs else 0.0
+                        ),
                     )
                     i8_all = fp8_all.reshape(t_local * (he_dim // 128), 128)
                 else:
@@ -2237,7 +2264,7 @@ def fused_moe_full_bridge_and_ffn(
                 global_topk_u8 = jax.lax.all_gather(
                     local_topk_ids_u8, axis_name=expert_axis, axis=0, tiled=True
                 )
-                if _b2_direct_fp8_1pass:
+                if _b2_direct_fp8_1pass and sc_local_1d is not None:
                     hidden_states_scale = jax.lax.all_gather(
                         sc_local_1d, axis_name=expert_axis, axis=0, tiled=True
                     ).reshape(-1)
@@ -2350,6 +2377,9 @@ def fused_moe_full_bridge_and_ffn(
                             full_stream_mid=True,
                             topk=topk,
                             emit_fp8_gmm=True,
+                            static_fp8_scale=(
+                                _static_fp8_lhs_scale if _use_static_fp8_lhs else 0.0
+                            ),
                         )
                     )
                     i8_0 = fp8_0.reshape(c0_tok * (he_dim // 128), 128)
@@ -2399,6 +2429,9 @@ def fused_moe_full_bridge_and_ffn(
                             stream_mid_prev=smid_0_1,
                             topk=topk,
                             emit_fp8_gmm=True,
+                            static_fp8_scale=(
+                                _static_fp8_lhs_scale if _use_static_fp8_lhs else 0.0
+                            ),
                         )
                     )
                     i8_1 = fp8_1.reshape(c1_tok * (he_dim // 128), 128)
@@ -2430,7 +2463,7 @@ def fused_moe_full_bridge_and_ffn(
                 global_topk_u8 = jax.lax.all_gather(
                     local_topk_ids_u8, axis_name=expert_axis, axis=0, tiled=True
                 )
-                if _b2_direct_fp8_2half:
+                if _b2_direct_fp8_2half and sc_0 is not None:
                     if c0_tok != c1_tok:
                         ag_sc_0 = jax.lax.all_gather(
                             sc_0, axis_name=expert_axis, axis=0, tiled=True
@@ -3106,6 +3139,11 @@ def fused_moe_full_bridge_and_ffn(
                     precomputed_routing=precomputed_routing,
                     precomputed_chipmate_plan=pipe_cm_plan,
                     hidden_states_scale=hidden_states_scale,
+                    static_fp8_lhs_scale=(
+                        _static_fp8_lhs_scale
+                        if (_b2_direct_fp8_1pass or _b2_direct_fp8_2half)
+                        else 0.0
+                    ),
                 )
                 if active_cnt_local is not None:
                     safe_rows = min(1024, out_buf_3d.shape[0])

@@ -1202,6 +1202,7 @@ def kernel_main_fused_rs(
     pq_lhs_mode: int = 0,
     inter32_enabled: bool = False,
     tile_idx_smem_ref=None,
+    static_fp8_lhs: bool = False,
 ):
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write kernel.
 
@@ -2303,7 +2304,7 @@ def kernel_main_fused_rs(
         lhs_row_scales_ref, w2_fp8_cache_ref, rhs_fp8_strip_ref = w8_refs
     else:
         lhs_row_scales_ref = w2_fp8_cache_ref = rhs_fp8_strip_ref = None
-    has_ext_pq_lhs = lhs_row_scales_ref is not None
+    has_ext_pq_lhs = (lhs_row_scales_ref is not None) or static_fp8_lhs
 
     @jax.named_scope("compute_gmm1_tile")
     def compute_gmm1_tile(buf_id, n_id, k_id, gm_id, m_rows, bd_rows=0):
@@ -2406,6 +2407,7 @@ def kernel_main_fused_rs(
                 vectorized_dequant=vectorized_dequant,
                 w_strip_fp8_ref=eo_w_strip_fp8_ref,
                 prequant_lhs_ready=has_ext_pq_lhs,
+                skip_lhs_scale_mul=static_fp8_lhs,
             )
 
         if hot_interleave:
@@ -3790,7 +3792,7 @@ def kernel_main_fused_rs(
                 metadata_ref,
             )
 
-            if has_ext_pq_lhs:
+            if lhs_row_scales_ref is not None:
                 from .prefill_gmm_opts import fill_pq_lhs_scales_tree
 
                 _inter32_scale_kw = (
@@ -4599,6 +4601,7 @@ def kernel_main_fused_rs_fp8(
         "block_scatter",
         "chipmate_xor",
         "hot_interleave",
+        "static_fp8_lhs_scale",
     ],
 )
 def gmm_v2_fused_rs(
@@ -4635,6 +4638,7 @@ def gmm_v2_fused_rs(
     chipmate_xor: int = 1,
     hot_interleave: bool = False,
     hidden_states_scale: jax.Array | None = None,
+    static_fp8_lhs_scale: float = 0.0,
 ) -> jax.Array:
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write.
 
@@ -4728,11 +4732,44 @@ def gmm_v2_fused_rs(
         vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.95)
 
     num_lanes = pltpu.get_tpu_info().num_lanes
+    from .prefill_gmm_opts import resolve_static_fp8_lhs_scale
+
     lhs_in_dtype = jnp.dtype(hidden_states.dtype)
     has_ext_lhs_scales = (
         hidden_states_scale is not None and lhs_in_dtype == jnp.float8_e4m3fn
     )
-    out_dtype = jnp.dtype(jnp.bfloat16) if has_ext_lhs_scales else lhs_in_dtype
+    _raw_static_fp8_lhs = (
+        resolve_static_fp8_lhs_scale(None, static_fp8_lhs_scale)
+        if static_fp8_lhs_scale != 0.0
+        else resolve_static_fp8_lhs_scale(
+            envs.SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8.get(),
+            envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_LHS.get(),
+        )
+    )
+    eff_static_fp8_lhs = (
+        _raw_static_fp8_lhs
+        if (
+            _raw_static_fp8_lhs > 0.0
+            and not has_ext_lhs_scales
+            and lhs_in_dtype == jnp.float8_e4m3fn
+            and is_quantized
+            and size_m > _BLOCKDIAG_MAX_SIZE_M
+            and not fp8_direct_write
+            and not fp4_w4a16
+            and (static_fp8_lhs_scale != 0.0 or size_m >= _PREFILL_TILES_MIN_SIZE_M)
+        )
+        else 0.0
+    )
+    has_static_fp8_lhs = eff_static_fp8_lhs > 0.0
+    if has_static_fp8_lhs:
+        _inv_static_fp8_lhs = jnp.float32(1.0 / eff_static_fp8_lhs)
+        _w1_gs_gate = _w1_gs_gate * _inv_static_fp8_lhs
+        _w1_gs_up = _w1_gs_up * _inv_static_fp8_lhs
+    out_dtype = (
+        jnp.dtype(jnp.bfloat16)
+        if (has_ext_lhs_scales or has_static_fp8_lhs)
+        else lhs_in_dtype
+    )
     sls = pltpu.get_tpu_info().get_sublane_tiling(out_dtype)
     intermediate_size = size_n1 // 2
 
@@ -5121,9 +5158,14 @@ def gmm_v2_fused_rs(
     use_lhs_fp8_cache = (
         is_quantized
         and not use_w2_prequant_cache
-        and (has_ext_lhs_scales or size_m >= _PREFILL_TILES_MIN_SIZE_M)
         and (
             has_ext_lhs_scales
+            or has_static_fp8_lhs
+            or size_m >= _PREFILL_TILES_MIN_SIZE_M
+        )
+        and (
+            has_ext_lhs_scales
+            or has_static_fp8_lhs
             or bool(envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_FP8_GMM_TILES.get())
             or envs.SGLANG_TPU_MUSE_KERNEL_FP8_LAYERS.get()
             or envs.SGLANG_TPU_MUSE_KERNEL_FP4_LHS_QBS.get() > 0
@@ -5521,7 +5563,7 @@ def gmm_v2_fused_rs(
         and flatten_bs_meta
         and not pack_indices
         and not pack_u16_lhs
-        and tile_m == 256
+        and tile_m in (128, 256)
         and tile_m % ep_size == 0
         and (tile_m // ep_size) in (16, 32)
         and _rot_rs_val >= 2
@@ -5766,6 +5808,7 @@ def gmm_v2_fused_rs(
         and jnp.dtype(w1.dtype) == jnp.dtype(w2.dtype) == jnp.float4_e2m1fn
         and use_lhs_fp8_cache
         and not k256_tiles
+        and not has_static_fp8_lhs
         and not eff_hot_interleave
         and not fp8_direct_write
         and padded_k1 == tile_k1
@@ -5798,10 +5841,16 @@ def gmm_v2_fused_rs(
     eff_cm_defer = bool(
         enable_chipmate and envs.SGLANG_TPU_MUSE_KERNEL_CHIPMATE_DEFER_SEND.get()
     )
+    _pq_lhs_raw = int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8.get() or 0)
     _pq_lhs_env = (
-        max(1, int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8.get() or 1))
-        if has_ext_lhs_scales
-        else 0
+        6
+        if has_static_fp8_lhs
+        else (max(1, _pq_lhs_raw or 1) if has_ext_lhs_scales else 0)
+    )
+    _slh_tag = (
+        f"-slh{int(eff_static_fp8_lhs) if eff_static_fp8_lhs.is_integer() else str(eff_static_fp8_lhs).replace('.', 'p')}"
+        if has_static_fp8_lhs
+        else ""
     )
     _sfp8_tag = (
         f"-sfp8_{int(eff_static_fp8_rs) if eff_static_fp8_rs.is_integer() else str(eff_static_fp8_rs).replace('.', 'p')}"
@@ -5835,6 +5884,7 @@ def gmm_v2_fused_rs(
         f"{f'-i32_{_inter32_val}' if _use_inter32_cf else ''}"
         f"{f'-ds{_dsilu_val}' if _dsilu_val > 0 else ''}"
         f"{f'-pql{_pq_lhs_env}' if _pq_lhs_env > 0 else ''}"
+        f"{_slh_tag}"
         f"{f'-tlp{_tlp_val}k{_tlp_kstep}' if _tlp_val > 0 else ''}"
         f"{f'-sw{_sw_val}' if _sw_val > 0 else ''}"
         f"{f'-eo{eff_eo_mode}' if eff_eo_mode > 0 else ''}"
@@ -5860,7 +5910,7 @@ def gmm_v2_fused_rs(
         pack_indices=pack_indices,
         defer_writes=True,
         in_kernel_post_norm_size=in_kernel_pn_size,
-        has_w1_gs=w1_global_scale is not None,
+        has_w1_gs=(w1_global_scale is not None) or has_static_fp8_lhs,
         has_w2_gs=w2_global_scale is not None,
         block_scatter=block_scatter,
         vectorized_dequant=vectorized_dequant,
@@ -5878,6 +5928,7 @@ def gmm_v2_fused_rs(
         num_cm_slots=max(1, num_cm_slots),
         pq_lhs_mode=_pq_lhs_env,
         inter32_enabled=_use_inter32_cf,
+        static_fp8_lhs=has_static_fp8_lhs,
     )
     in_specs = [
         pl.BlockSpec(memory_space=pltpu.HBM),  # hidden_states_3d

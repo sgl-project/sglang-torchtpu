@@ -735,8 +735,13 @@ class TpuEnvs:
     # (0 = off; 1 = single-pass FP32 gate*up with fused GMM2 amax reduction; 2 = fast BF16 sigmoid).
     SGLANG_TPU_MUSE_KERNEL_GMM_DIRECT_SILU = EnvInt(0)
     # Muse prefill Wave-8 quantize MoE hidden states to FP8 once before/at AG instead of 8x in GMM1
-    # (0 = off; 1 = FP8 hidden states + per-token f32 scale passed into gmm_v2_fused_rs).
+    # (0 = off; 1 = FP8 hidden states + per-token f32 scale passed into gmm_v2_fused_rs;
+    # 4/5 = direct FP8 from fused b1_b2; 6 = static FP8 prefill LHS with zero row-scale AG).
     SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8 = EnvInt(0)
+    # Explicit static FP8 scale S for b1_b2 -> gmm_v2_fused_rs prefill LHS (0.0 = off;
+    # > 0 in (0, 32] e.g. 8.0 or 4.0 folds 1/S into w1_global_scale with zero row-scale AG/dequant;
+    # GMM_PREQUANT_LHS_FP8=6 defaults this to 8.0 when unset).
+    SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_LHS = EnvFloat(0.0)
     # Muse Wave-8 NVFP4 wider compact block scales (0 = off; 512/1024/2048/4096 = requantize at load;
     # -512/-1024/-2048/-4096 = zero-reload in-kernel scale-stride perf probe).
     SGLANG_TPU_MUSE_KERNEL_COMPACT_FP4_QBLOCK = EnvInt(0)

@@ -54,6 +54,29 @@ def resolve_static_fp8_rs_scale(raw_scale: float | int | None) -> tuple[float, b
     return abs_val, (val > 0.0)
 
 
+_DEFAULT_STATIC_FP8_LHS_SCALE = 8.0
+
+
+def resolve_static_fp8_lhs_scale(
+    pq_lhs_mode: int | None, raw_scale: float | int | None
+) -> float:
+    """Resolve static FP8 LHS quantization scale for prefill ``b1_b2 -> gmm_v2``.
+
+    Returns ``0.0`` when disabled (dynamic per-row scales), or ``S in (0, 32]``
+    when enabled via ``SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_LHS > 0`` or
+    shorthand ``SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8 == 6`` (defaults to ``8.0``).
+    """
+    val = 0.0 if raw_scale is None else float(raw_scale)
+    if val < 0.0 or val > 32.0:
+        raise ValueError(
+            "SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_LHS must be in [0, 32], "
+            f"got {val}"
+        )
+    if val > 0.0:
+        return val
+    return _DEFAULT_STATIC_FP8_LHS_SCALE if int(pq_lhs_mode or 0) == 6 else 0.0
+
+
 # =============================================================================
 # Pure-NumPy Reference Models (for fast deterministic CPU numerical tests)
 # =============================================================================
@@ -363,25 +386,30 @@ def fill_pq_lhs_scales_tree(
         q47 = jnp.where(b1, p67, p45)
         dst_scale_ref[scale_b_id, pl.ds(i0, 8), :] = jnp.where(b2, q47, q03)
 
+    tile_m_cap = dst_scale_ref.shape[1]
     if (
         bs_meta_ref is not None
         and tile_idx_smem_ref is not None
         and not packed_u16_lhs
-        and dst_scale_ref.shape[1] == 256
-        and 256 % ep_size == 0
-        and (256 // ep_size) % 8 == 0
+        and tile_m_cap in (128, 256)
+        and tile_m_cap % ep_size == 0
+        and (tile_m_cap // ep_size) % 8 == 0
     ):
-        blk_m = 256 // ep_size
+        blk_m = tile_m_cap // ep_size
         n_sub8 = blk_m // 8
         aux_base = (n_slots_gm + 1) * (3 * ep_size + 2) + gm_id * (1 + ep_size)
         gm_mode = bs_meta_ref[aux_base]
         n_qb = jnp.where(
             num_valid <= 32,
-            jnp.int32(32 // blk_m),
+            jnp.int32(min(32 // blk_m, ep_size)),
             jnp.where(
                 num_valid <= 64,
-                jnp.int32(64 // blk_m),
-                jnp.where(num_valid <= 128, jnp.int32(128 // blk_m), jnp.int32(ep_size)),
+                jnp.int32(min(64 // blk_m, ep_size)),
+                jnp.where(
+                    num_valid <= 128,
+                    jnp.int32(min(128 // blk_m, ep_size)),
+                    jnp.int32(ep_size),
+                ),
             ),
         )
 
@@ -751,6 +779,7 @@ def scoped_w4a8_strip_acc(
     w_fp8_cache_ref: Any = None,
     prequant_lhs_scale_ref: Any = None,
     pair_k512_unpack: bool = False,
+    skip_lhs_scale_mul: bool = False,
 ):
     """Scoped VMEM W4A8 strip matmul (`GMM_SCOPED_W4A8` modes 1, 2, 3).
 
@@ -878,8 +907,11 @@ def scoped_w4a8_strip_acc(
                     else:
                         sp = pop.astype(acc_dtype) * rhs_s_bf16.astype(acc_dtype)
                     sub_h = sp if sub_h is None else sub_h + sp
-                lhs_s_full = load_lhs_scale_strip_fn(l_bid, col_size)
-                term = sub_h.astype(acc_dtype) * lhs_s_full[m0:m1, :]
+                if skip_lhs_scale_mul:
+                    term = sub_h.astype(acc_dtype)
+                else:
+                    lhs_s_full = load_lhs_scale_strip_fn(l_bid, col_size)
+                    term = sub_h.astype(acc_dtype) * lhs_s_full[m0:m1, :]
                 acc_h = term if acc_h is None else acc_h + term
             acc_halves.append(acc_h)
         return (
@@ -943,14 +975,21 @@ def scoped_w4a8_strip_acc(
                         sub_halves_p[mh] = (
                             sp if sub_halves_p[mh] is None else sub_halves_p[mh] + sp
                         )
-            lhs_s_full = load_lhs_scale_strip_fn(l_bid, col_size)
-            for mh in range(num_m_halves):
-                m0 = mh * m_step
-                m1 = m0 + m_step
-                term = sub_halves_p[mh].astype(acc_dtype) * lhs_s_full[m0:m1, :]
-                acc_halves[mh] = (
-                    term if acc_halves[mh] is None else acc_halves[mh] + term
-                )
+            if skip_lhs_scale_mul:
+                for mh in range(num_m_halves):
+                    term = sub_halves_p[mh].astype(acc_dtype)
+                    acc_halves[mh] = (
+                        term if acc_halves[mh] is None else acc_halves[mh] + term
+                    )
+            else:
+                lhs_s_full = load_lhs_scale_strip_fn(l_bid, col_size)
+                for mh in range(num_m_halves):
+                    m0 = mh * m_step
+                    m1 = m0 + m_step
+                    term = sub_halves_p[mh].astype(acc_dtype) * lhs_s_full[m0:m1, :]
+                    acc_halves[mh] = (
+                        term if acc_halves[mh] is None else acc_halves[mh] + term
+                    )
         return (
             acc_halves[0] if num_m_halves == 1 else jnp.concatenate(acc_halves, axis=0)
         )
@@ -1006,12 +1045,21 @@ def scoped_w4a8_strip_acc(
                     sp = pop.astype(acc_dtype) * rhs_s_bf16.astype(acc_dtype)
                 sub_halves[mh] = sp if sub_halves[mh] is None else sub_halves[mh] + sp
 
-        lhs_s_full = load_lhs_scale_strip_fn(l_bid, col_size)
-        for mh in range(num_m_halves):
-            m0 = mh * m_step
-            m1 = m0 + m_step
-            term = sub_halves[mh].astype(acc_dtype) * lhs_s_full[m0:m1, :]
-            acc_halves[mh] = term if acc_halves[mh] is None else acc_halves[mh] + term
+        if skip_lhs_scale_mul:
+            for mh in range(num_m_halves):
+                term = sub_halves[mh].astype(acc_dtype)
+                acc_halves[mh] = (
+                    term if acc_halves[mh] is None else acc_halves[mh] + term
+                )
+        else:
+            lhs_s_full = load_lhs_scale_strip_fn(l_bid, col_size)
+            for mh in range(num_m_halves):
+                m0 = mh * m_step
+                m1 = m0 + m_step
+                term = sub_halves[mh].astype(acc_dtype) * lhs_s_full[m0:m1, :]
+                acc_halves[mh] = (
+                    term if acc_halves[mh] is None else acc_halves[mh] + term
+                )
 
     return acc_halves[0] if num_m_halves == 1 else jnp.concatenate(acc_halves, axis=0)
 
@@ -1040,6 +1088,7 @@ def scoped_w4a8_dual_strip_acc(
     mh_outer: bool = False,
     hoist_rhs_scale: bool = False,
     prequant_lhs_3d_fp8_ref: Any = None,
+    skip_lhs_scale_mul: bool = False,
 ):
     """Scoped VMEM dual gate+up strip matmul (`GMM_SCOPED_W4A8` modes 1..5)."""
     import jax.experimental.pallas as pl
@@ -1073,6 +1122,7 @@ def scoped_w4a8_dual_strip_acc(
             zero_spill_sub_m=zero_spill_sub_m,
             mh_outer=_dual_mh_outer,
             hoist_rhs_scale=hoist_rhs_scale,
+            skip_lhs_scale_mul=skip_lhs_scale_mul,
         )
         acc_u = scoped_w4a8_strip_acc(
             w_weight_ref=w_weight_ref,
@@ -1099,6 +1149,7 @@ def scoped_w4a8_dual_strip_acc(
             zero_spill_sub_m=zero_spill_sub_m,
             mh_outer=_dual_mh_outer,
             hoist_rhs_scale=hoist_rhs_scale,
+            skip_lhs_scale_mul=skip_lhs_scale_mul,
         )
         return acc_g, acc_u
 
@@ -1189,9 +1240,13 @@ def scoped_w4a8_dual_strip_acc(
                         sp_u = pop_u.astype(acc_dtype) * su_bf16.astype(acc_dtype)
                     sub_g = sp_g if sub_g is None else sub_g + sp_g
                     sub_u = sp_u if sub_u is None else sub_u + sp_u
-                lhs_s_full = load_lhs_scale_strip_fn(l_bid, col_size)
-                tg = sub_g.astype(acc_dtype) * lhs_s_full[m0:m1, :]
-                tu = sub_u.astype(acc_dtype) * lhs_s_full[m0:m1, :]
+                if skip_lhs_scale_mul:
+                    tg = sub_g.astype(acc_dtype)
+                    tu = sub_u.astype(acc_dtype)
+                else:
+                    lhs_s_full = load_lhs_scale_strip_fn(l_bid, col_size)
+                    tg = sub_g.astype(acc_dtype) * lhs_s_full[m0:m1, :]
+                    tu = sub_u.astype(acc_dtype) * lhs_s_full[m0:m1, :]
                 acc_g = tg if acc_g is None else acc_g + tg
                 acc_u = tu if acc_u is None else acc_u + tu
             acc_g_h.append(acc_g)
@@ -1244,14 +1299,21 @@ def scoped_w4a8_dual_strip_acc(
                 sub_g_h[mh] = sp_g if sub_g_h[mh] is None else sub_g_h[mh] + sp_g
                 sub_u_h[mh] = sp_u if sub_u_h[mh] is None else sub_u_h[mh] + sp_u
 
-        lhs_s_full = load_lhs_scale_strip_fn(l_bid, col_size)
-        for mh in range(num_m_halves):
-            m0 = mh * m_step
-            m1 = m0 + m_step
-            tg = sub_g_h[mh].astype(acc_dtype) * lhs_s_full[m0:m1, :]
-            tu = sub_u_h[mh].astype(acc_dtype) * lhs_s_full[m0:m1, :]
-            acc_g_h[mh] = tg if acc_g_h[mh] is None else acc_g_h[mh] + tg
-            acc_u_h[mh] = tu if acc_u_h[mh] is None else acc_u_h[mh] + tu
+        if skip_lhs_scale_mul:
+            for mh in range(num_m_halves):
+                tg = sub_g_h[mh].astype(acc_dtype)
+                tu = sub_u_h[mh].astype(acc_dtype)
+                acc_g_h[mh] = tg if acc_g_h[mh] is None else acc_g_h[mh] + tg
+                acc_u_h[mh] = tu if acc_u_h[mh] is None else acc_u_h[mh] + tu
+        else:
+            lhs_s_full = load_lhs_scale_strip_fn(l_bid, col_size)
+            for mh in range(num_m_halves):
+                m0 = mh * m_step
+                m1 = m0 + m_step
+                tg = sub_g_h[mh].astype(acc_dtype) * lhs_s_full[m0:m1, :]
+                tu = sub_u_h[mh].astype(acc_dtype) * lhs_s_full[m0:m1, :]
+                acc_g_h[mh] = tg if acc_g_h[mh] is None else acc_g_h[mh] + tg
+                acc_u_h[mh] = tu if acc_u_h[mh] is None else acc_u_h[mh] + tu
 
     if num_m_halves == 1:
         return acc_g_h[0], acc_u_h[0]
