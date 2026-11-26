@@ -90,6 +90,10 @@ _ENV_FIELDS_NOT_KEYED = frozenset(
         # PP chunk scheduling; the token buckets it picks are graph shapes.
         "SGLANG_TPU_PP_CHUNK_SLACK",
         "SGLANG_TPU_PP_DYNAMIC_CHUNKS",
+        # PP stage placement check at startup; the live device assignment is keyed.
+        "SGLANG_TPU_PP_ALLOW_DISTANT_STAGES",
+        # Device binding only; the live device assignment is keyed.
+        "SGLANG_TPU_PD_COLOCATED",
         # PP buffered hand-off: how many sends a stage queues, on the host.
         "SGLANG_TPU_PP_BUFFERED_SEND_DEPTH",
         # Profiler scope.

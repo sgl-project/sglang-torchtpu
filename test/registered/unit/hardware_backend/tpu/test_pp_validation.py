@@ -7,6 +7,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -20,7 +21,7 @@ from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state imp
     SpecAuxHiddenStateConfig,
 )
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu import pp_stage_chips
+from sglang_tpu import pp_stage_chips, shared_slice
 from sglang_tpu.envs import envs
 from sglang_tpu.hooks.pipeline_parallel import (
     check_pipeline_parallel_compat,
@@ -382,6 +383,12 @@ def _on(chip, core):
 
 
 class TestPipelineStageChips(CustomTestCase):
+    def setUp(self):
+        # Two-core chips, like the slices the ring orders are known on.
+        patcher = patch.object(pp_stage_chips, "_devices_per_chip", return_value=2)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_a_pair_must_hold_every_core_of_its_chip(self):
         """A pair split over two-device chips all-reduces over ICI and shares
         each chip with another stage, also when it uses core 0 of both."""
@@ -409,7 +416,257 @@ class TestPipelineStageChips(CustomTestCase):
                 patch.object(pp_stage_chips, "_devices_per_chip", return_value=None),
                 self.assertRaisesRegex(RuntimeError, "does not recognize"),
             ):
-                pp_stage_chips.validate_chips_for_pp(parallel)
+                pp_stage_chips.validate_chips_for_pp(parallel, ring_expected=True)
+
+    # One 2x2x2 slice over two hosts, chips in the order a stage-per-chip
+    # launch fills them: each host's four chips snake from the same corner, so
+    # 3->4 and the 7->0 relay each cross two hops.
+    SNAKE = [
+        (0, 0, 1), (0, 1, 1), (1, 1, 1), (1, 0, 1),
+        (0, 0, 0), (0, 1, 0), (1, 1, 0), (1, 0, 0),
+    ]  # fmt: skip
+
+    def _pipeline(self, *, pp_rank=0, tp_size=2):
+        return SimpleNamespace(
+            pp_size=8,
+            tp_size=tp_size,
+            pp_rank=pp_rank,
+            pp_group=_group(*range(0, 8 * tp_size, tp_size)),
+            tp_group=_group(*range(pp_rank * tp_size, (pp_rank + 1) * tp_size)),
+        )
+
+    def test_hops_count_chips_crossed_per_hand_off(self):
+        locations = [_on(chip, 0) for chip in self.SNAKE]
+        self.assertEqual(
+            [h for _, _, h in pp_stage_chips._boundary_hops(locations)],
+            [1, 1, 1, 2, 1, 1, 1, 2],
+        )
+        # Stages sharing a chip (one device per stage on two-device chips) hand
+        # off without ICI; another slice is not counted in hops.
+        self.assertEqual(pp_stage_chips._hops(_on((1, 0, 0), 0), _on((1, 0, 0), 1)), 0)
+        other_slice = pp_stage_chips.CoreLocation(
+            slice_index=1, coords=(1, 0, 0), core_on_chip=0
+        )
+        self.assertIsNone(pp_stage_chips._hops(_on((1, 0, 0), 0), other_slice))
+
+    def _check(self, parallel, column, *, ring_expected=True):
+        """Run the startup check with ``column`` as the cores of this rank's
+        pipeline column and each stage's TP group on one chip of SNAKE."""
+
+        def locate(ranks):
+            if list(ranks) == parallel.pp_group.ranks:
+                return column
+            return [_on(self.SNAKE[parallel.pp_rank % 8], c) for c in range(len(ranks))]
+
+        with (
+            patch.object(pp_stage_chips, "_stage_core_locations", side_effect=locate),
+        ):
+            pp_stage_chips.validate_chips_for_pp(parallel, ring_expected=ring_expected)
+
+    def test_single_chip_stages_refuse_a_far_hand_off_on_every_rank(self):
+        column = [_on(chip, 0) for chip in self.SNAKE]
+        for pp_rank in (0, 5):
+            with (
+                self.subTest(pp_rank=pp_rank),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    r"3->4: 2 \(chips \(1, 0, 1\) to \(0, 0, 0\)\), "
+                    r"7->0 \(relay\): 2 .*SGLANG_TPU_PP_ALLOW_DISTANT_STAGES=1",
+                ),
+            ):
+                self._check(self._pipeline(pp_rank=pp_rank), column)
+
+    def test_the_opt_out_downgrades_the_refusal_to_a_warning(self):
+        column = [_on(chip, 0) for chip in self.SNAKE]
+        with (
+            envs.SGLANG_TPU_PP_ALLOW_DISTANT_STAGES.override(True),
+            self.assertLogs(pp_stage_chips.logger, "INFO") as logs,
+        ):
+            self._check(self._pipeline(), column)
+        warnings = [r.getMessage() for r in logs.records if r.levelname == "WARNING"]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("7->0 (relay): 2", warnings[0])
+        self.assertIn("allowed by SGLANG_TPU_PP_ALLOW_DISTANT_STAGES", warnings[0])
+
+    def test_multi_chip_stages_warn_instead_of_refusing(self):
+        # TP4 on two-device chips: no rank order makes every column one hop.
+        parallel = SimpleNamespace(
+            pp_size=4,
+            tp_size=4,
+            pp_rank=0,
+            pp_group=_group(0, 4, 8, 12),
+            tp_group=_group(0, 1, 2, 3),
+        )
+        column = [_on(self.SNAKE[k], 0) for k in (0, 2, 4, 6)]
+
+        def locate(ranks):
+            if list(ranks) == parallel.pp_group.ranks:
+                return column
+            return [_on(self.SNAKE[c // 2], c % 2) for c in range(4)]
+
+        with (
+            patch.object(pp_stage_chips, "_stage_core_locations", side_effect=locate),
+            self.assertLogs(pp_stage_chips.logger, "INFO") as logs,
+        ):
+            pp_stage_chips.validate_chips_for_pp(parallel, ring_expected=True)
+        warnings = [r.getMessage() for r in logs.records if r.levelname == "WARNING"]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("only when each fits on one chip", warnings[0])
+
+    def test_layouts_the_launch_did_not_order_warn_instead_of_refusing(self):
+        column = [_on(chip, 0) for chip in self.SNAKE]
+        with self.assertLogs(pp_stage_chips.logger, "WARNING") as logs:
+            self._check(self._pipeline(), column, ring_expected=False)
+        (warning,) = [r.getMessage() for r in logs.records]
+        self.assertIn("3->4: 2", warning)
+        # Nor on chips of another core count, whose native order is not known.
+        with (
+            patch.object(pp_stage_chips, "_devices_per_chip", return_value=1),
+            patch.object(pp_stage_chips, "_stage_core_locations", return_value=column),
+            self.assertLogs(pp_stage_chips.logger, "WARNING"),
+        ):
+            pp_stage_chips.validate_chips_for_pp(
+                self._pipeline(tp_size=1), ring_expected=True
+            )
+
+    def test_hand_offs_to_another_slice_are_logged_not_warned(self):
+        def on(slice_index, x):
+            return pp_stage_chips.CoreLocation(
+                slice_index=slice_index, coords=(x, 0, 0), core_on_chip=0
+            )
+
+        # Two slices of four chips in a row: 3->4 and the relay change slice.
+        locations = [on(k // 4, k % 4 if k < 4 else 3 - k % 4) for k in range(8)]
+        with (
+            patch.object(
+                pp_stage_chips, "_stage_core_locations", return_value=locations
+            ),
+            self.assertLogs(pp_stage_chips.logger, "INFO") as logs,
+        ):
+            pp_stage_chips.validate_chips_for_pp(
+                self._pipeline(tp_size=1), ring_expected=True
+            )
+        self.assertEqual([r.levelname for r in logs.records], ["INFO"])
+        self.assertIn("3->4: other slice", logs.records[0].getMessage())
+
+    def test_only_the_first_stage_of_a_column_logs_the_hops(self):
+        ring = [_on(chip, 0) for chip in self.SNAKE[:4] + self.SNAKE[4:][::-1]]
+        with self.assertLogs(pp_stage_chips.logger, "INFO") as logs:
+            self._check(self._pipeline(pp_rank=3), ring)
+        self.assertNotIn("ICI hops", " ".join(r.getMessage() for r in logs.records))
+
+    def test_single_device_stages_are_reported_but_not_pair_checked(self):
+        locations = [_on(chip, core) for chip in self.SNAKE[:4] for core in (0, 1)]
+        with (
+            patch.object(pp_stage_chips, "_devices_per_chip", return_value=None),
+            patch.object(
+                pp_stage_chips, "_stage_core_locations", return_value=locations
+            ),
+            self.assertLogs(pp_stage_chips.logger, "INFO") as logs,
+        ):
+            pp_stage_chips.validate_chips_for_pp(
+                self._pipeline(tp_size=1), ring_expected=True
+            )
+        (line,) = [r.getMessage() for r in logs.records if r.levelname == "INFO"]
+        self.assertIn("0->1: 0, 1->2: 1", line)
+
+    def test_a_runtime_without_coordinates_skips_the_report(self):
+        with (
+            patch.object(
+                pp_stage_chips,
+                "_stage_core_locations",
+                # Any lookup error, not only the runtime's own RuntimeError.
+                side_effect=ValueError("no chip coordinates"),
+            ),
+            self.assertLogs(pp_stage_chips.logger, "WARNING") as logs,
+        ):
+            pp_stage_chips.validate_chips_for_pp(
+                self._pipeline(tp_size=1), ring_expected=True
+            )
+        (warning,) = [r.getMessage() for r in logs.records]
+        self.assertIn("not checked", warning)
+
+
+class TestPipelinePlacement(CustomTestCase):
+    # A 2x2x2 slice of two hosts, two cores per chip, ranks filling host 0
+    # first. Each host's native device order walks its four chips as a ring,
+    # as the startup log of such a slice shows (TestPipelineStageChips.SNAKE).
+    HOST_RING = [(0, 0), (0, 1), (1, 1), (1, 0)]
+
+    def _placement(self, rank, *, pp_size=8, tp_size=2, nnodes=2, env=None):
+        cfg = SimpleNamespace(
+            device="tpu",
+            tp_size=tp_size,
+            pp_size=pp_size,
+            nnodes=nnodes,
+            torch_tpu_topology=None,
+        )
+        # Only what the repo's launchers leave set: TPU_CHIPS_PER_HOST_BOUNDS
+        # and TORCH_TPU_TOPOLOGY are unset when a worker is prepared.
+        if env is None:
+            env = {"TPU_TOPOLOGY": "2x2x2"}
+        with patch.dict(os.environ, env, clear=True):
+            return pp_stage_chips.pipeline_placement(
+                cfg, tp_rank=rank % tp_size, pp_rank=rank // tp_size
+            )
+
+    def _core(self, rank, *, tp_size, mirror):
+        node, local = divmod(rank, 8)
+        placement = self._placement(rank, pp_size=16 // tp_size, tp_size=tp_size)
+        self.assertTrue(placement.ring_expected)
+        device = placement.local_device if mirror else None
+        chip, core = divmod(local if device is None else device, 2)
+        return _on((*self.HOST_RING[chip], 1 - node), core)
+
+    def _hops(self, *, tp_size, mirror):
+        column = [
+            self._core(rank, tp_size=tp_size, mirror=mirror)
+            for rank in range(0, 16, tp_size)
+        ]
+        return [h for _, _, h in pp_stage_chips._boundary_hops(column)]
+
+    def test_the_second_host_binds_its_chips_in_reverse_for_a_one_hop_ring(self):
+        self.assertIn(2, self._hops(tp_size=2, mirror=False))
+        self.assertEqual(self._hops(tp_size=2, mirror=True), [1] * 8)
+        # One device per stage: stage pairs share a chip, then step to the next.
+        self.assertEqual(self._hops(tp_size=1, mirror=True), [0, 1] * 8)
+
+    def test_each_tensor_parallel_pair_stays_on_one_chip(self):
+        for stage in range(8):
+            pair = [self._core(2 * stage + i, tp_size=2, mirror=True) for i in (0, 1)]
+            self.assertEqual(pair[0].coords, pair[1].coords)
+            self.assertEqual({c.core_on_chip for c in pair}, {0, 1})
+
+    def test_other_layouts_keep_the_native_order_and_are_not_refused(self):
+        native = pp_stage_chips.PipelinePlacement(
+            local_device=None, ring_expected=False
+        )
+        slice_env = {"TPU_TOPOLOGY": "2x2x2"}
+        cases = {
+            "no pipeline": dict(pp_size=1),
+            "multi-chip stages": dict(pp_size=4, tp_size=4),
+            "one core per chip": dict(pp_size=8, tp_size=1),
+            "four hosts": dict(nnodes=4, env={"TPU_TOPOLOGY": "2x2x4"}),
+            "two hosts side by side": dict(env={"TPU_TOPOLOGY": "4x2x1"}),
+            "unknown topology": dict(env={}),
+            "co-located P/D": dict(env={**slice_env, "SGLANG_TPU_PD_COLOCATED": "1"}),
+            "shared slice": dict(
+                env={**slice_env, shared_slice.ENV_VAR: "0,16,host:1234"}
+            ),
+        }
+        for name, args in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self._placement(9, **args), native)
+        # One host's native order is already the ring, but only stages filling
+        # all four chips close it.
+        for pp_size, tp_size, ring in ((8, 1, True), (4, 2, True), (3, 2, False)):
+            with self.subTest(one_host=(pp_size, tp_size)):
+                self.assertEqual(
+                    self._placement(1, pp_size=pp_size, tp_size=tp_size, nnodes=1),
+                    pp_stage_chips.PipelinePlacement(
+                        local_device=None, ring_expected=ring
+                    ),
+                )
 
 
 if __name__ == "__main__":
