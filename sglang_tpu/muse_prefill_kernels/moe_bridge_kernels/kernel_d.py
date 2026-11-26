@@ -223,6 +223,17 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                     jnp.concatenate(parts, axis=0)
                 )
 
+    def _load_mxu_tile_128x1024(buf_2x_ref, slot, m0, m1, c0, c1, c_grp):
+        vals_raw = buf_2x_ref[slot, m0:m1, c0:c1, :]
+        if in_buf_is_fp8:
+            vals_raw = vals_raw.astype(jnp.bfloat16)
+        # Scrub NaN/Inf (e.g. unwritten 0x7F fp8 out_buf padding rows) before the 16x128 MXU dot
+        # so off-diagonal 0.0 weights cannot propagate 0.0 * NaN/Inf = NaN within a 16-row block.
+        vals_raw = jnp.where(
+            jnp.isfinite(vals_raw.astype(jnp.float32)), vals_raw, jnp.bfloat16(0.0)
+        )
+        return vals_raw.reshape(16 * topk, c_grp * lanes)
+
     if use_zero_spill:
         t_sub = min(32, tok_tile_eff)
         vecs_3d = vecs_8x8192.reshape(8, num_slabs, slab_w).swapaxes(0, 1)
@@ -353,11 +364,8 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                     for c_blk in range(n2_cols // c_grp_zs):
                         c0, c1 = c_blk * c_grp_zs, (c_blk + 1) * c_grp_zs
                         u0, u1 = c0 * lanes, c1 * lanes
-                        vals_raw = buf_2x_ref[slot, m0:m1, c0:c1, :]
-                        if in_buf_is_fp8:
-                            vals_raw = vals_raw.astype(jnp.bfloat16)
-                        vals_128x1024 = vals_raw.reshape(
-                            16 * topk, c_grp_zs * lanes
+                        vals_128x1024 = _load_mxu_tile_128x1024(
+                            buf_2x_ref, slot, m0, m1, c0, c1, c_grp_zs
                         )
                         u_sub_bf16 = jnp.dot(
                             w_16x128,
@@ -805,11 +813,8 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                 for c_blk in range(n2_cols // c_grp):
                     c0, c1 = c_blk * c_grp, (c_blk + 1) * c_grp
                     u0, u1 = c0 * lanes, c1 * lanes
-                    vals_raw = buf_2x_ref[slot, m0:m1, c0:c1, :]
-                    if in_buf_is_fp8:
-                        vals_raw = vals_raw.astype(jnp.bfloat16)
-                    vals_128x1024 = vals_raw.reshape(
-                        16 * topk, c_grp * lanes
+                    vals_128x1024 = _load_mxu_tile_128x1024(
+                        buf_2x_ref, slot, m0, m1, c0, c1, c_grp
                     )
                     u_sub_bf16 = jnp.dot(
                         w_16x128,

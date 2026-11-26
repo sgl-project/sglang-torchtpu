@@ -2210,3 +2210,156 @@ def test_d_t256_zero_spill_and_b2_dbl_stream_parity_and_aot():
                 jax.ShapeDtypeStruct((4096,), jnp.float32),
                 jax.ShapeDtypeStruct((4096,), jnp.float32),
             ).lower(lowering_platforms=("tpu",)).compile()
+
+
+def test_d_mxu_combine_unwritten_nan_padding_and_l61_active_mask():
+    """Bug 1 regression: D_MXU_COMBINE scrubs NaN/Inf in padded out_buf rows; L61 masks inactive."""
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import pallas as pl
+    from jax.experimental import topologies
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels import kernel_d
+
+    real_pc = pl.pallas_call
+
+    def _nan_interp(*args, **kwargs):
+        kwargs["interpret"] = pltpu.InterpretParams(
+            detect_races=True, uninitialized_memory="nan"
+        )
+        return real_pc(*args, **kwargs)
+
+    rng = np.random.default_rng(4294)
+    with (
+        mock.patch(
+            "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+        ),
+        tpu_info_for_cpu_export(),
+        mock.patch.object(pl, "pallas_call", _nan_interp),
+        jax.default_device(jax.devices("cpu")[0]),
+    ):
+        for chunk_sz, qbs in ((128, 4096), (128, 512), (32, 4096)):
+            n_act = 6
+            act_rows = n_act * 8
+            ob_fp8 = np.full((chunk_sz * 8, 32, 128), 0x7F, dtype=np.uint8)
+            finite_u8 = np.asarray(
+                jnp.array(
+                    (rng.standard_normal((act_rows, 32, 128)) * 0.25).astype(np.float32)
+                )
+                .astype(jnp.float8_e4m3fn)
+                .view(jnp.uint8)
+            )
+            ob_fp8[:act_rows] = finite_u8
+            ob = jax.lax.bitcast_convert_type(jnp.array(ob_fp8), jnp.float8_e4m3fn)
+
+            ip_np = (np.arange(chunk_sz * 8, dtype=np.int32) % max(1, chunk_sz * 8 - act_rows)) + act_rows
+            ip_np[:act_rows] = np.arange(act_rows, dtype=np.int32)
+            ip = jnp.array(ip_np.reshape(chunk_sz, 8))
+
+            tw_np = np.zeros((chunk_sz, 8), dtype=np.float32)
+            tw_np[:n_act] = rng.uniform(0.05, 0.25, size=(n_act, 8)).astype(np.float32)
+            tw = jnp.array(tw_np).astype(jnp.bfloat16)
+
+            sm_np = np.zeros((chunk_sz, 8192), dtype=np.float32)
+            sm_np[:n_act] = rng.standard_normal((n_act, 8192)).astype(np.float32)
+            sm = jnp.array(sm_np)
+
+            wu = jnp.array(
+                (rng.standard_normal((4096, 8192)) * 0.2).astype(np.float32)
+            ).astype(jnp.float8_e4m3fn)
+            ws = jnp.array(rng.uniform(0.5, 1.5, (8192,)).astype(np.float32))
+            wv = jnp.array(rng.uniform(0.5, 1.5, (8192,)).astype(np.float32))
+
+            with mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_FP8_UNPOOL, "get", return_value=qbs):
+                with mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_MXU_COMBINE, "get", return_value=False):
+                    ns_ref, ni_ref = kernel_d.pallas_combine_unpool_residual_nextnorm_4slab(
+                        ob, ip, tw, sm, wu, ws, wv, wv, wv, wv,
+                        tok_tile=64, fp8_unpool=True, fp8_unpool_qbs=qbs,
+                        emit_static_fp8_attn_in=True,
+                    )
+                with mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_MXU_COMBINE, "get", return_value=True):
+                    ns_mxu, ni_mxu = kernel_d.pallas_combine_unpool_residual_nextnorm_4slab(
+                        ob, ip, tw, sm, wu, ws, wv, wv, wv, wv,
+                        tok_tile=64, fp8_unpool=True, fp8_unpool_qbs=qbs,
+                        emit_static_fp8_attn_in=True,
+                    )
+
+            assert np.all(np.isfinite(np.asarray(ns_mxu)))
+            assert np.all(np.isfinite(np.asarray(ni_mxu.astype(jnp.float32))))
+            np.testing.assert_array_equal(np.asarray(ns_mxu)[:n_act], np.asarray(ns_ref)[:n_act])
+            np.testing.assert_array_equal(
+                np.asarray(ni_mxu[:n_act].astype(jnp.float32)),
+                np.asarray(ni_ref[:n_act].astype(jnp.float32)),
+            )
+
+        # Also check bf16 out_buf with NaN and +/-Inf in unwritten padding rows.
+        ob_bf16 = np.full((32 * 8, 32, 128), np.nan, dtype=np.float32)
+        ob_bf16[48:128] = np.inf
+        ob_bf16[128:192] = -np.inf
+        ob_bf16[:48] = rng.standard_normal((48, 32, 128)).astype(np.float32) * 0.25
+        ob_bf16_j = jnp.array(ob_bf16).astype(jnp.bfloat16)
+        with (
+            mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_FP8_UNPOOL, "get", return_value=4096),
+            mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_MXU_COMBINE, "get", return_value=True),
+        ):
+            ns_bf, ni_bf = kernel_d.pallas_combine_unpool_residual_nextnorm_4slab(
+                ob_bf16_j, ip[:32], tw[:32], sm[:32], wu, ws, wv, wv, wv, wv,
+                tok_tile=64, fp8_unpool=True, fp8_unpool_qbs=4096,
+                emit_static_fp8_attn_in=True,
+            )
+            assert np.all(np.isfinite(np.asarray(ns_bf)))
+            assert np.all(np.isfinite(np.asarray(ni_bf.astype(jnp.float32))))
+
+    # TPU7x AOT compile verification for both 4slab (chunk=128) & 4slab_zs (chunk=32) with scrub.
+    with (
+        mock.patch(
+            "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+        ),
+        tpu_info_for_cpu_export(),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_OPT, "get", return_value=7),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_T128_FAST, "get", return_value=True),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_SALU_OVERLAP, "get", return_value=True),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_MXU_COMBINE, "get", return_value=True),
+    ):
+        topo = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x=2x2x2")
+        mesh = Mesh(np.array(topo.devices).reshape(16), ("model",))
+        for tok_loc, qbs in ((128, 4096), (128, 512), (32, 4096)):
+            tok_gl = tok_loc * 16
+            jax.clear_caches()
+            with mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_FP8_UNPOOL, "get", return_value=qbs):
+                sm_d = jax.jit(
+                    jax.shard_map(
+                        lambda ob_, ip_, tw_, sm_, w__, ws__, pf_, al__, be__, ni_: (
+                            kernel_d.pallas_combine_unpool_residual_nextnorm_4slab(
+                                ob_, ip_, tw_, sm_, w__, ws__, pf_, al__, be__, ni_,
+                                tok_tile=64, fp8_unpool=True, fp8_unpool_qbs=qbs,
+                                emit_static_fp8_attn_in=True,
+                            )
+                        ),
+                        mesh=mesh,
+                        in_specs=(P("model"),) * 4 + (P(),) * 6,
+                        out_specs=P("model"),
+                        check_vma=False,
+                    )
+                )
+                sm_d.trace(
+                    jax.ShapeDtypeStruct((tok_gl * 8, 32, 128), jnp.float8_e4m3fn),
+                    jax.ShapeDtypeStruct((tok_gl, 8), jnp.int32),
+                    jax.ShapeDtypeStruct((tok_gl, 8), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((tok_gl, 8192), jnp.float32),
+                    jax.ShapeDtypeStruct((4096, 8192), jnp.float8_e4m3fn),
+                    jax.ShapeDtypeStruct((8192,), jnp.float32),
+                    jax.ShapeDtypeStruct((8192,), jnp.float32),
+                    jax.ShapeDtypeStruct((8192,), jnp.float32),
+                    jax.ShapeDtypeStruct((8192,), jnp.float32),
+                    jax.ShapeDtypeStruct((8192,), jnp.float32),
+                ).lower(lowering_platforms=("tpu",)).compile()
+
+    repo = pathlib.Path(__file__).resolve().parents[5]
+    integ_src = (repo / "sglang_tpu/muse_prefill_kernels/integration.py").read_text()
+    ms_src = (repo / "sglang_tpu/models/muse_spark.py").read_text()
+    assert "torch.nn.functional.pad(active, (0, 128 - bs))" in integ_src
+    assert "valid_mask_128 = (" in integ_src
+    assert "torch.where(valid_mask_128, attn_proj, 0)" in ms_src

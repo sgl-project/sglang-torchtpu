@@ -5869,6 +5869,11 @@ class MuseSparkTextModel(nn.Module):
         attn_out = attn._per_head_normalize(out_128).to(torch.bfloat16)
         gated = torch.sigmoid(gate_128) * attn_out
         attn_proj = attn._forward_o_proj(gated, forward_batch)
+        valid_mask_128 = (
+            (torch.arange(128, device=attn_proj.device) < bs)
+            & torch.nn.functional.pad(active, (0, 128 - bs))
+        ).unsqueeze(1)
+        attn_proj = torch.where(valid_mask_128, attn_proj, 0)
         residual_128 = layer.post_attention_residual_gate(
             residual_128, layer.post_attention_layernorm(attn_proj)
         )

@@ -3321,7 +3321,8 @@ class MusePrefillKernels(torch.nn.Module):
             t_shard_moe = 128
             t_total_moe = t_shard_moe * self.tp_size
             valid_mask_128 = (
-                torch.arange(128, device=attn_proj.device) < bs
+                (torch.arange(128, device=attn_proj.device) < bs)
+                & torch.nn.functional.pad(active, (0, 128 - bs))
             ).unsqueeze(1)
             attn_128 = torch.where(valid_mask_128, attn_proj, 0)
             attn_pad = torch.nn.functional.pad(
