@@ -727,7 +727,8 @@ class SchedulerDisaggregationPrefillMixin:
         # later insert protects it. A call that computed nothing (the bootstrap
         # finalize) publishes every chunk the request still holds. A deferred chunk
         # must free its own SWA below the window or it stays out of eviction's
-        # reach; the last two flags stop that free during prefill.
+        # reach, so no chunk is deferred when out-of-window freeing is off or
+        # prefill chunk windows are kept: either stops that free during prefill.
         end = req.extend_end
         mid_prefill = (
             end is not None

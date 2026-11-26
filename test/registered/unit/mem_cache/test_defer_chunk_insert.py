@@ -75,7 +75,7 @@ class TestDeferChunkInsert(unittest.TestCase):
         self.assertEqual(calls, [("defer", 8192), ("checkpoint", 8192)])
 
 
-def _run_disagg(stride, start, end, prompt_len):
+def _run_disagg(stride, start, end, prompt_len, free_slots=True, keep_windows=False):
     req = SimpleNamespace(
         rid="r",
         finished=lambda: False,
@@ -87,7 +87,11 @@ def _run_disagg(stride, start, end, prompt_len):
         extend_end=end,
     )
     scheduler = SimpleNamespace(tree_cache=_Tree())
-    with envs.SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE.override(stride):
+    with (
+        envs.SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE.override(stride),
+        envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(free_slots),
+        envs.SGLANG_OPT_SWA_KEEP_PREFILL_CHUNK_WINDOWS.override(keep_windows),
+    ):
         SchedulerDisaggregationPrefillMixin.checkpoint_disagg_prefill(scheduler, req)
     return scheduler.tree_cache.calls, req.prefix_len
 
@@ -108,12 +112,9 @@ class TestDisaggPrefillChunkInsert(unittest.TestCase):
         self.assertEqual(calls, [("checkpoint", 20000)])
 
     def test_chunk_inserts_when_the_request_cannot_free_its_swa(self):
-        for flag, value in (
-            (envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS, False),
-            (envs.SGLANG_OPT_SWA_KEEP_PREFILL_CHUNK_WINDOWS, True),
-        ):
-            with self.subTest(flag=flag.name), flag.override(value):
-                calls, _ = _run_disagg(16384, 4096, 8192, prompt_len=20000)
+        for flags in (dict(free_slots=False), dict(keep_windows=True)):
+            with self.subTest(**flags):
+                calls, _ = _run_disagg(16384, 4096, 8192, prompt_len=20000, **flags)
                 self.assertEqual(calls, [("checkpoint", 8192)])
 
     def test_bootstrap_finalize_publishes_held_chunks(self):
