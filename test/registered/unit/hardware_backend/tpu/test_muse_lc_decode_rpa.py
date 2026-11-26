@@ -3204,6 +3204,235 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
                     if sw_e is None:
                         self.assertIn("c5120-w7auto", hlo)
 
+    def test_cand16_batch4_swabatch_parity_prestart_and_export(self):
+        """cand_w9_16: vectorized batch4/batch2 swabatch, prestarted DMA hook, v_scale, fallback, and AOT."""
+        from jax import export as jax_export
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
+            _run_rpad_vmem_core,
+            parse_decode_fast_config,
+            prepare_and_start_rpad_dmas,
+            run_decode_fast_rpa,
+        )
+
+        cfg_b4 = parse_decode_fast_config(
+            "w8,batchfull,g4k,foldcol,batch4",
+            sliding_window=2049,
+            pages_per_seq=4,
+            page_size=512,
+        )
+        self.assertEqual(cfg_b4.swabatch_group_size, 4)
+        cfg_w7 = parse_decode_fast_config(
+            "w8,noadapt,hoistkv,g4k,foldcol,batch4",
+            sliding_window=None,
+            pages_per_seq=17,
+            page_size=512,
+        )
+        self.assertEqual(cfg_w7.swabatch_group_size, 1)
+
+        rng = np.random.default_rng(1602)
+        ps = 512
+        cases = [
+            ("tp8_1k_swa_b4_n29_vsc", 64, 16, 2049, 4, 29, [120, 480, 513, 900, 1024] * 5 + [1, 300, 600, 950] + [1] * 35, "w8,batchfull,g4k,foldcol,batch4", 0.75, True),
+            ("tp16_q8_1k_full_b4", 32, 8, None, 2, 30, [64, 300, 512, 750] * 7 + [200, 880] + [1, 1], "tp16,w8,batchfull,g4k,foldcol,batch4", 1.25, True),
+            ("tp8_8k1k_swa_b4_s3", 32, 16, 2049, 10, 31, [400, 1100, 1800, 2200, 3500, 4500] * 5 + [2700, 1], "w8,s3,noadapt,g4k,foldcol,batch4", 1.0, True),
+            ("tp8_b16_8k1k_swa_b2", 16, 16, 2049, 10, 15, [500, 1400, 2600, 3900] * 3 + [100, 1500, 3100, 1], "w8,noadapt,g4k,foldcol,batch2", 1.0, True),
+            ("tp8_1k_nobatch4_noncontig", 32, 16, 2049, 2, 24, [200, 600, 900] * 8 + [1] * 8, "w8,batchfull,g4k,foldcol,batch4,nobatch4", 1.0, False),
+        ]
+        for tag, bs, nq, sw, pps, n_act, lens, mode, v_sc, contig_cuq in cases:
+            with self.subTest(case=tag):
+                s_u8 = np.full((bs * pps + 8, ps, 1, 4, 128), 0x7F, dtype=np.uint8)
+                pi_np = np.arange(bs * pps, dtype=np.int32).reshape(bs, pps)
+                rng.shuffle(pi_np.ravel())
+                cols = 64 if nq == 8 else 128
+                for s in range(n_act):
+                    old_l = lens[s] - 1
+                    n_u = (old_l + ps - 1) // ps
+                    for p_o in range(n_u):
+                        pg = int(pi_np[s, p_o])
+                        rh = min(ps, old_l - p_o * ps)
+                        if cols < 128:
+                            s_u8[pg, :rh, 0, :2, cols:] = 0
+                        s_u8[pg, :rh, 0, 0, :cols] = _rand_fp8_u8(rng, (rh, cols))
+                        s_u8[pg, :rh, 0, 1, :cols] = _rand_fp8_u8(rng, (rh, cols))
+                kvc = _u8_to_fp8(s_u8)
+                q16 = jnp.asarray((rng.standard_normal((bs, 8 if nq == 8 else 16, cols)) * 0.4).astype(np.float32), jnp.bfloat16)
+                k16 = _u8_to_fp8(_rand_fp8_u8(rng, (bs, 1, cols)))
+                v16 = _u8_to_fp8(_rand_fp8_u8(rng, (bs, 1, cols)))
+                if nq == 8:
+                    q_raw = jnp.pad(q16, ((0, 0), (0, 8), (0, 64)))
+                    kv_p = jnp.pad(jnp.concatenate([k16, v16], axis=1), ((0, 0), (0, 2), (0, 64))).reshape(bs, 1, 4, 128)
+                else:
+                    q_raw = q16
+                    kv_p = jnp.pad(jnp.concatenate([k16, v16], axis=1), ((0, 0), (0, 2), (0, 0))).reshape(bs, 1, 4, 128)
+                gate = jnp.asarray((rng.standard_normal((bs, nq * 64)) * 0.4).astype(np.float32), jnp.bfloat16)
+                pi = jnp.asarray(pi_np.ravel(), jnp.int32)
+                if contig_cuq:
+                    cuq_np = np.arange(bs + 1, dtype=np.int32)
+                else:
+                    # One skipped zero-qlen entry in the middle triggers cu_q_lens_ref[n_active] != n_active fallback
+                    cuq_np = np.arange(bs + 1, dtype=np.int32)
+                    cuq_np[3:] -= 1
+                    cuq_np[-1] = cuq_np[-2]
+                cuq = jnp.asarray(cuq_np, jnp.int32)
+                cukv = jnp.arange(bs + 1, dtype=np.int32) * (pps * ps)
+                dist = jnp.asarray([n_act, n_act, n_act], jnp.int32)
+                kvl = jnp.asarray(lens, dtype=jnp.int32)
+
+                ref_mode = mode.replace(",batch4", "").replace(",batch2", "")
+                o_ref, kv_ref = run_decode_fast_rpa(
+                    q_raw.reshape(1, bs, 8, 2, 128), kv_p, None, kvc, kvl, pi, cuq, cukv, dist,
+                    sm_scale=float(cols ** -0.5), sliding_window=sw, k_scale=1.0, v_scale=v_sc,
+                    mode_str=ref_mode, decode_query_size=1, fused_out_pack=2, prepared_inputs=True,
+                    gate=gate, out_norm_eps=1e-5, force_native_tp16=(nq == 8), interpret=True,
+                )
+                o_b4, kv_b4 = run_decode_fast_rpa(
+                    q_raw.reshape(1, bs, 8, 2, 128), kv_p, None, kvc, kvl, pi, cuq, cukv, dist,
+                    sm_scale=float(cols ** -0.5), sliding_window=sw, k_scale=1.0, v_scale=v_sc,
+                    mode_str=mode, decode_query_size=1, fused_out_pack=2, prepared_inputs=True,
+                    gate=gate, out_norm_eps=1e-5, force_native_tp16=(nq == 8), interpret=True,
+                )
+                act_toks = int(cuq_np[n_act])
+                a_r = np.asarray(o_ref[:act_toks], np.float32)
+                a_4 = np.asarray(o_b4[:act_toks], np.float32)
+                self.assertTrue(np.all(np.isfinite(np.asarray(o_b4, np.float32))))
+                self.assertGreater(_cosine(a_4, a_r), 0.99999)
+                self.assertLessEqual(float(np.max(np.abs(a_4 - a_r))), 1e-2)
+                self.assertTrue(np.all(np.asarray(o_b4[act_toks:], np.float32) == 0.0))
+                self.assertTrue(np.array_equal(np.asarray(kv_b4).view(np.uint8), np.asarray(kv_ref).view(np.uint8)))
+
+        # Prestarted DMA hook parity with batch4 (Step c + b4_s3 6 MiB config)
+        bs, nq, sw, pps, n_act = 32, 16, 2049, 4, 29
+        mode_pre = "w8,s3,batchfull,g4k,foldcol,batch4"
+        cfg_pre = parse_decode_fast_config(mode_pre, sliding_window=sw, pages_per_seq=pps, page_size=ps, decode_query_size=1)
+        lens_p = [120, 480, 513, 900, 1024] * 5 + [1, 300, 600, 950] + [1, 1, 1]
+        s_u8 = np.full((bs * pps + 8, ps, 1, 4, 128), 0x7F, dtype=np.uint8)
+        pi_np = np.arange(bs * pps, dtype=np.int32).reshape(bs, pps)
+        rng.shuffle(pi_np.ravel())
+        for s in range(n_act):
+            old_l = lens_p[s] - 1
+            for p_o in range((old_l + ps - 1) // ps):
+                pg = int(pi_np[s, p_o])
+                rh = min(ps, old_l - p_o * ps)
+                s_u8[pg, :rh, 0, 0, :] = _rand_fp8_u8(rng, (rh, 128))
+                s_u8[pg, :rh, 0, 1, :] = _rand_fp8_u8(rng, (rh, 128))
+        kvc = _u8_to_fp8(s_u8)
+        q_raw = jnp.asarray((rng.standard_normal((bs, 16, 128)) * 0.4).astype(np.float32), jnp.bfloat16)
+        k16 = _u8_to_fp8(_rand_fp8_u8(rng, (bs, 1, 128)))
+        v16 = _u8_to_fp8(_rand_fp8_u8(rng, (bs, 1, 128)))
+        kv_p = jnp.pad(jnp.concatenate([k16, v16], axis=1), ((0, 0), (0, 2), (0, 0))).reshape(bs, 1, 4, 128)
+        gate = jnp.asarray((rng.standard_normal((bs, 1024)) * 0.4).astype(np.float32), jnp.bfloat16)
+        pi = jnp.asarray(pi_np.ravel(), jnp.int32)
+        cuq = jnp.arange(bs + 1, dtype=jnp.int32)
+        cukv = jnp.arange(bs + 1, dtype=np.int32) * (pps * ps)
+        dist = jnp.asarray([n_act, n_act, n_act], jnp.int32)
+        kvl = jnp.asarray(lens_p, dtype=jnp.int32)
+
+        o_std, kv_std = run_decode_fast_rpa(
+            q_raw.reshape(1, bs, 8, 2, 128), kv_p, None, kvc, kvl, pi, cuq, cukv, dist,
+            sm_scale=128.0 ** -0.5, sliding_window=sw, k_scale=1.0, v_scale=1.0,
+            mode_str=mode_pre, decode_query_size=1, fused_out_pack=2, prepared_inputs=True,
+            gate=gate, out_norm_eps=1e-5, interpret=True,
+        )
+
+        def _pre_kern(klr, pir, cqr, ckvr, dr, q_r, kv_r, g_r, chbm, oout, upd, bkv_r, st_r, o_r, init_r, sm_r, s1, s2):
+            pre_st = prepare_and_start_rpad_dmas(
+                kv_lens_ref=klr, page_indices_ref=pir, cu_q_lens_ref=cqr, cu_kv_lens_ref=ckvr,
+                distribution_ref=dr, kv_cache_hbm_ref=chbm, bkv_vmem_ref=bkv_r, bkv_sems=s1,
+                sliding_window=sw, cfg=cfg_pre, one_block_per_seq=True, decode_query_size=1,
+                kv_pack_dense2=False, interpret_mode=True,
+            )
+            _run_rpad_vmem_core(
+                kv_lens_ref=klr, page_indices_ref=pir, cu_q_lens_ref=cqr, cu_kv_lens_ref=ckvr,
+                distribution_ref=dr, q_vmem_ref=q_r, kv_merged_vmem_ref=kv_r, gate_vmem_ref=g_r,
+                kv_cache_hbm_ref=chbm, o_out_vmem_ref=oout, updated_kv_cache_hbm_ref=upd,
+                bkv_vmem_ref=bkv_r, state_vmem_ref=st_r, o_vmem_ref=o_r, kv_write_vmem_ref=None,
+                init_sv_vmem_ref=init_r, written_cnt_smem_ref=sm_r, bkv_sems=s1, cache_write_sem=s2,
+                sm_scale=128.0 ** -0.5, sliding_window=sw, k_scale=1.0, v_scale=1.0, cfg=cfg_pre,
+                one_block_per_seq=True, decode_query_size=1, in_kernel_pack2=True, has_gate=True,
+                out_norm_eps=1e-5, kv_pack_dense2=False, interpret_mode=True, prestarted_bkv_state=pre_st,
+            )
+
+        o_pre, kv_pre = pl.pallas_call(
+            _pre_kern,
+            out_shape=[jax.ShapeDtypeStruct((bs, 1024), jnp.bfloat16), jax.ShapeDtypeStruct(kvc.shape, kvc.dtype)],
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=5,
+                in_specs=[
+                    pl.BlockSpec(q_raw.shape, lambda *_: (0, 0, 0), memory_space=pltpu.VMEM),
+                    pl.BlockSpec(kv_p.shape, lambda *_: (0, 0, 0, 0), memory_space=pltpu.VMEM),
+                    pl.BlockSpec(gate.shape, lambda *_: (0, 0), memory_space=pltpu.VMEM),
+                    pl.BlockSpec(memory_space=pltpu.HBM),
+                ],
+                out_specs=[
+                    pl.BlockSpec((bs, 1024), lambda *_: (0, 0), memory_space=pltpu.VMEM),
+                    pl.BlockSpec(memory_space=pltpu.HBM),
+                ],
+                grid=(1,),
+                scratch_shapes=[
+                    pltpu.VMEM((cfg_pre.num_slots, 4 * cfg_pre.max_ring_pages, 512, 1, 4, 128), kvc.dtype),
+                    pltpu.VMEM((3, 16, 128), jnp.float32),
+                    pltpu.VMEM((bs, 16, 128), jnp.bfloat16),
+                    pltpu.VMEM((2, bs, 16, 128), jnp.float32),
+                    pltpu.SMEM((2 + cfg_pre.num_slots,), jnp.int32),
+                    pltpu.SemaphoreType.DMA((cfg_pre.num_slots,)),
+                    pltpu.SemaphoreType.DMA((1,)),
+                ],
+            ),
+            input_output_aliases={8: 1},
+            interpret=pltpu.InterpretParams(detect_races=True, uninitialized_memory="nan"),
+        )(kvl, pi, cuq, cukv, dist, q_raw, kv_p, gate, kvc)
+        self.assertTrue(np.array_equal(np.asarray(o_pre).view(np.uint16), np.asarray(o_std).view(np.uint16)))
+        self.assertTrue(np.array_equal(np.asarray(kv_pre).view(np.uint8), np.asarray(kv_std).view(np.uint8)))
+
+        try:
+            from jax._src import tpu_info  # noqa: F401
+        except ImportError:
+            self.skipTest("jax._src.tpu_info not available")
+        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+        with (
+            patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+            tpu_info_for_cpu_export(),
+        ):
+            for tag_e, bs_e, nq_e, sw_e, pps_e, mode_e in (
+                ("tp8_1k_b4_s4", 64, 16, 2049, 2, "w8,batchfull,g4k,foldcol,batch4"),
+                ("tp8_1k_adapt_pps4_b4", 64, 16, 2049, 4, "w8,batchfull,g4k,foldcol,batch4"),
+                ("tp16_q8_1k_b4_s4", 64, 8, None, 2, "tp16,w8,batchfull,g4k,foldcol,batch4"),
+                ("tp8_8k1k_swa_b4_s3", 64, 16, 2049, 5, "w8,s3,noadapt,g4k,foldcol,batch4"),
+                ("tp16_b16_8k1k_swa_b2", 16, 8, 2049, 5, "tp16,w8,noadapt,g4k,foldcol,batch2"),
+            ):
+                with self.subTest(export=tag_e):
+                    hlo = jax_export.export(
+                        jax.jit(
+                            lambda q_, kv_, g_, c_, kl_, pi_, cq_, ckv_, d_: run_decode_fast_rpa(
+                                q_, kv_, None, c_, kl_, pi_, cq_, ckv_, d_,
+                                sm_scale=(64.0 if nq_e == 8 else 128.0) ** -0.5,
+                                sliding_window=sw_e, k_scale=1.0, v_scale=1.0,
+                                mode_str=mode_e, decode_query_size=1, fused_out_pack=2,
+                                prepared_inputs=True, gate=g_, out_norm_eps=1e-5,
+                                force_native_tp16=(nq_e == 8),
+                            )
+                        ),
+                        platforms=["tpu"],
+                    )(
+                        jax.ShapeDtypeStruct((1, bs_e, 8, 2, 128), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((bs_e, 1, 4, 128), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((bs_e, nq_e * 64), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((bs_e * pps_e + 8, 512, 1, 4, 128), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((bs_e,), jnp.int32),
+                        jax.ShapeDtypeStruct((bs_e * pps_e,), jnp.int32),
+                        jax.ShapeDtypeStruct((bs_e + 1,), jnp.int32),
+                        jax.ShapeDtypeStruct((bs_e + 1,), jnp.int32),
+                        jax.ShapeDtypeStruct((3,), jnp.int32),
+                    ).mlir_module()
+                    self.assertIn("tpu_custom_call", hlo.lower())
+                    self.assertIn("-b2" if "batch2" in mode_e else "-b4", hlo)
+                    if tag_e == "tp8_1k_adapt_pps4_b4":
+                        self.assertIn("RPAd_fast-s4-c2048-swabatch-mp5", hlo)
+                        self.assertNotIn("c1024-swabatch-mp2", hlo)
+
 
 if __name__ == "__main__":
     unittest.main()
