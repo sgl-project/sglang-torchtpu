@@ -1650,10 +1650,16 @@ def _resolve_b2_pipe_chunks(spec: str, t_local: int) -> tuple[int, ...] | None:
     if not clean:
         return None
     if clean.lower() == "auto":
-        if t_local == 3072:
-            return (512, 1024, 1024, 512)
+        if t_local == 1024:
+            return (512, 512)
         if t_local == 1536:
             return (512, 512, 512)
+        if t_local == 2048:
+            return (512, 512, 512, 512)
+        if t_local >= 2560 and t_local % 512 == 0:
+            rem = t_local - 1024
+            mid = (1024,) * (rem // 1024) + ((512,) if (rem % 1024) else ())
+            return (512, *mid, 512)
         return None
     parts = [p.strip() for p in clean.split(",") if p.strip()]
     if len(parts) < 2:
