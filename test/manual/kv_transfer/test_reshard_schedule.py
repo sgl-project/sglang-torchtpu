@@ -231,6 +231,57 @@ class ReceiverRequestTest(unittest.TestCase):
         self.assertEqual(req.shard_push_schedules[5].entries[0].dst_block_id, 1)
 
 
+class LandRequestTest(unittest.TestCase):
+    """fp8, 8 kv heads at TP8 -> TP4: odd prefill ranks land in scratch."""
+
+    def setUp(self):
+        layout = rs.KVLayoutGeometry(rs.TOKEN_MAJOR, 4, 1, 2, 128, 64)
+        self.geom = rs.ReshardGeometry.from_layout(8, 4, layout, 8, land=True)
+
+    def sender(self, rank, **kw):
+        return rs.build_sender_request(
+            _Pb2, uuid=1, req_id="1", peer="p", prefill_rank=rank,
+            decode_rank=rank // 2, geom=self.geom, src_block_ids=[1, 2],
+            dst_block_ids=[20, 21], live_tokens=[64, 9], **kw,
+        )  # fmt: skip
+
+    def test_landing_sources_target_scratch(self):
+        req = rs.build_receiver_request(
+            _Pb2, uuid=1, req_id="1", peer="p", decode_rank=1, geom=self.geom,
+            sources=[(2, [1, 2]), (3, [1, 2])], dst_block_ids=[20, 21],
+            live_tokens=[64, 9], scratch_block_ids=[30, 31],
+        )  # fmt: skip
+        self.assertEqual(req.expected_block_count, 4)
+        recv = {
+            k: [(e.dst_block_id, e.src_block_id, e.count) for e in v.entries]
+            for k, v in req.shard_push_schedules.items()
+        }
+        self.assertEqual(
+            recv, {2: [(20, 1, 64), (21, 2, 9)], 3: [(30, 1, 64), (31, 2, 9)]}
+        )
+        # Each sender names the blocks its receiver schedule expects.
+        for rank in (2, 3):
+            sent = self.sender(rank, scratch_block_ids=[30, 31])
+            entries = sent.shard_push_schedules[0].entries
+            self.assertEqual(
+                [(e.dst_block_id, e.src_block_id, e.count) for e in entries], recv[rank]
+            )
+            self.assertEqual(
+                [e.dst_offset_bytes for e in entries],
+                [e.dst_offset_bytes for e in req.shard_push_schedules[rank].entries],
+            )
+
+    def test_scratch_ids_required_for_landing_only(self):
+        with self.assertRaisesRegex(ValueError, "scratch_block_ids"):
+            self.sender(3)
+        with self.assertRaisesRegex(ValueError, "equal length"):
+            self.sender(3, scratch_block_ids=[30])
+        direct = self.sender(2)
+        self.assertEqual(
+            [e.dst_block_id for e in direct.shard_push_schedules[0].entries], [20, 21]
+        )
+
+
 class PackedKVScheduleTest(unittest.TestCase):
     @staticmethod
     def packed_page(heads, packing, itemsize, page, dim, block=None):
