@@ -734,8 +734,6 @@ def get_b1_moe_chip_sharded_op(
         raise ValueError(
             f"b1_moe superkernel requires world_size in {SUPPORTED_WORLD_SIZES}, got {world_size}"
         )
-    if world_size == 16 and not return_sharded:
-        raise ValueError("b1_moe superkernel on world_size=16 requires return_sharded=True")
     key = (
         int(world_size),
         bool(bf16_router),
@@ -846,15 +844,17 @@ def prewarm_b1_moe_superkernel_ops(
         )
         if b1_key not in seen_b1:
             seen_b1.add(b1_key)
-            get_b1_moe_chip_sharded_op(
-                world_size,
-                bf16_router=bf16_router,
-                num_replicas=num_replicas,
-                has_spec_slot=has_spec_slot,
-                replica_cost_mode=cost_mode,
-                return_sharded=True,
-                has_free_params=has_free_params,
-            )
+            ret_sh_opts = (True, False) if world_size == 16 else (True,)
+            for ret_sh in ret_sh_opts:
+                get_b1_moe_chip_sharded_op(
+                    world_size,
+                    bf16_router=bf16_router,
+                    num_replicas=num_replicas,
+                    has_spec_slot=has_spec_slot,
+                    replica_cost_mode=cost_mode,
+                    return_sharded=ret_sh,
+                    has_free_params=has_free_params,
+                )
         epi_modes = (False, True) if bridge_qkv_epi else (False,)
         for use_epi in epi_modes:
             rope_opts = has_rope_variants if use_epi else (False,)

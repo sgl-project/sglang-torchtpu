@@ -42,6 +42,8 @@ from sglang_tpu.kernels.decode_collective_bridges_w8 import (
     _dma_wait,
     _run_chip_b1_vmem_core,
     _run_chip_b2_vmem_core,
+    _signal_barrier,
+    _wait_barrier,
 )
 from sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_sparse import (
     SparseDecodeConfig,
@@ -129,6 +131,12 @@ def _b1_moe_b2_chip_sharded_impl(
     step_c_n_b1_scope1: int = 0,
     step_c_scope1_shapes: tuple = (),
     step_c_scope2_shapes: tuple = (),
+    step_b3_n_moe_outer: int = 0,
+    step_b3_moe_is_scope2: tuple[bool, ...] = (),
+    step_b3_scope1_shapes: tuple = (),
+    step_b3_scope2_shapes: tuple = (),
+    step_b3_scope3_shapes: tuple = (),
+    use_3scope: bool = False,
 ) -> None:
     """Shared Pallas kernel body for Step (b) and 2-scope Step (c) (``+ RPAd``)."""
     from jax.experimental import pallas as pl
@@ -537,6 +545,7 @@ def _b1_moe_b2_chip_sharded_impl(
         written_cnt_smem_ref=None,
         rpad_bkv_sems=None,
         rpad_cache_write_sem=None,
+        sync_entry_barrier: bool = False,
     ) -> None:
         qkv_vmem_slice = mate_recv.at[:, pl.ds(0, qkv_cols)]
         mate_tok_slice = send_half.at[pl.ds(0, rows_per_rank), :]
@@ -662,8 +671,8 @@ def _b1_moe_b2_chip_sharded_impl(
             v_scale=v_scale,
             has_rope=has_rope,
             interpret_mode=interpret_mode,
-            skip_barrier_signal=True,
-            skip_barrier_wait=True,
+            skip_barrier_signal=not sync_entry_barrier,
+            skip_barrier_wait=not sync_entry_barrier,
             skip_stream_load=True,
             skip_stream_store=False,
             prestarted_w_post_dma=True,
@@ -733,7 +742,7 @@ def _b1_moe_b2_chip_sharded_impl(
             )
             _dma_wait(out_stream_chip_hbm, sems["s_out_sem"].at[0])
 
-    if not has_rpad:
+    if (not has_rpad) and (not use_3scope):
         msc = _unpack_muse_sparse_scratch(
             it,
             ep=world_size,
@@ -855,6 +864,330 @@ def _b1_moe_b2_chip_sharded_impl(
             sems=sems,
             rpad_refs=None,
         )
+        return
+
+    if (not has_rpad) and use_3scope:
+        # 3-Scope Step (b) for rows > 128 (TP=16 B=256): keeps peak VMEM < 60 MiB.
+        moe_outer_refs = [next(it) for _ in range(step_b3_n_moe_outer)]
+        w_pre_pair_buf = next(it)
+        s_buf = next(it)
+        my_pair_bf16 = next(it)
+        recv_pair_bf16 = next(it)
+        ffn_pair_buf = next(it)
+        exp_3d_buf = next(it)
+        logits_vmem = next(it)
+        moe_sh_vmem = next(it) if sharded_moe_in else None
+        b2_scalar_dummy_post = next(it)
+        b2_scalar_dummy_cols = next(it)
+
+        o_it_b3 = iter(moe_outer_refs)
+        stitched_outer_b3 = [
+            None if flg else next(o_it_b3) for flg in step_b3_moe_is_scope2
+        ]
+        msc_outer_b3 = _unpack_muse_sparse_scratch(
+            iter(stitched_outer_b3),
+            ep=world_size,
+            scale_block=scale_block,
+            num_replicas=num_replicas,
+            return_sharded=sharded_moe_in,
+            cfg=cfg,
+        )
+        sems = _unpack_sems(
+            it,
+            rs_pair_ssem=msc_outer_b3["rs_pair_ssem"],
+            rs_chip_ssem=msc_outer_b3["rs_chip_ssem"],
+            fan_send_sem=msc_outer_b3["fan_send_sem"],
+        )
+        if interpret_mode:
+            w_pre_core_buf = w_pre_pair_buf
+            w_post_buf, w_qkv_buf, w_gate_buf = next(it), next(it), next(it)
+        else:
+            w_pre_core_buf = (
+                w_pre_pair_buf
+                if w_pre_pair_buf.shape[1] == pre_pair_cols
+                else w_pre_pair_buf.at[:, pl.ds(0, pre_pair_cols)]
+            )
+            w_post_buf, w_qkv_buf, w_gate_buf = _alias_b2_weights(
+                msc_outer_b3["w1_buf"],
+                w_pre_pair_buf,
+                w_mode=msc_outer_b3["w_mode"],
+                qkv_cols=qkv_cols,
+                gate_cols=gate_cols,
+            )
+
+        plan_holder_b3 = []
+
+        def _run_b3_scope1(*s1_refs) -> None:
+            s1_it = iter(s1_refs)
+            w_router_buf = next(s1_it)
+            own_half = next(s1_it)
+            send_half = next(s1_it)
+            mate_recv = next(s1_it)
+            rs1_a_s1 = next(s1_it)
+            rs1_b_s1 = next(s1_it)
+            rs2_a_s1 = next(s1_it)
+            rs2_b_recv = next(s1_it)
+            sq_pair_pa_buf = next(s1_it)
+            router_pair_buf = next(s1_it)
+            pre_my_half = next(s1_it)
+            pre_mate_half = next(s1_it)
+            sq_pair_pre_buf = next(s1_it)
+            wo_buf = (
+                next(s1_it)
+                if interpret_mode
+                else _alias_wo_buf(
+                    msc_outer_b3["w1_buf"],
+                    msc_outer_b3["w2_buf"],
+                    w_mode=msc_outer_b3["w_mode"],
+                    o_in=o_in,
+                    half=half,
+                )
+            )
+
+            def _during_ag_exp_ici_b3() -> None:
+                plan_res = plan_and_prime_muse_sparse_from_vmem(
+                    me,
+                    logits_vmem,
+                    bias_ref,
+                    post_exp_norm_ref,
+                    w1_u32,
+                    s1_ref,
+                    w2_u32,
+                    s2_ref,
+                    d_scratch=msc_outer_b3["d_scratch"],
+                    r_scratch=msc_outer_b3["r_scratch"],
+                    w1_buf=msc_outer_b3["w1_buf"],
+                    s1_buf=msc_outer_b3["s1_buf"],
+                    w2_buf=msc_outer_b3["w2_buf"],
+                    s2_buf=msc_outer_b3["s2_buf"],
+                    w1_sem=msc_outer_b3["w1_sem"],
+                    w2_sem=msc_outer_b3["w2_sem"],
+                    misc_sem=msc_outer_b3["misc_sem"],
+                    gain_f32_buf=msc_outer_b3["gain_f32_buf"],
+                    accum_3d=None,
+                    io_3d_buf=None,
+                    accum_2d=None,
+                    rep_w1_u32=rep_w1_u32,
+                    rep_s1_ref=rep_s1_ref,
+                    rep_w2_u32=rep_w2_u32,
+                    rep_s2_ref=rep_s2_ref,
+                    replica_meta_ref=replica_meta_ref,
+                    owner_load_smem=msc_outer_b3["owner_load_smem"],
+                    moved_flag_smem=msc_outer_b3["moved_flag_smem"],
+                    local_suppress_smem=msc_outer_b3["local_suppress_smem"],
+                    holder_slot_expert_smem=msc_outer_b3["holder_slot_expert_smem"],
+                    holder_cand_smem=msc_outer_b3["holder_cand_smem"],
+                    spec_slot_ref=spec_slot_ref,
+                    free_params_ref=free_params_ref,
+                    ep=world_size,
+                    batch_size=rows,
+                    scale_block=scale_block,
+                    num_replicas=num_replicas,
+                    replica_cost_mode=replica_cost_mode,
+                    cfg=cfg,
+                    zero_and_pack=False,
+                )
+                plan_holder_b3.append(plan_res)
+
+            _run_chip_b1_vmem_core(
+                stream_chip_hbm,
+                gated_ref,
+                wo_hbm,
+                wo_scale_ref,
+                pa_alpha_ref,
+                pa_beta_ref,
+                pre_ff_gain_ref,
+                w_pre_pair_hbm,
+                w_pre_pair_scale_ref,
+                w_router_hbm,
+                pre_exp_gain_ref,
+                out_stream_chip_hbm,
+                logits_vmem,
+                None,
+                wo_buf,
+                w_pre_core_buf,
+                w_router_buf,
+                s_buf,
+                send_half,
+                mate_recv,
+                own_half,
+                rs1_a_s1,
+                rs1_b_s1,
+                rs2_a_s1,
+                rs2_b_recv,
+                my_pair_bf16,
+                recv_pair_bf16,
+                sq_pair_pa_buf,
+                ffn_pair_buf,
+                router_pair_buf,
+                pre_my_half,
+                pre_mate_half,
+                sq_pair_pre_buf,
+                exp_3d_buf,
+                msc_outer_b3["w1_sem"],
+                sems["w_pre_sem"],
+                sems["w_router_sem"],
+                sems["s_in_sem"],
+                sems["s_out_sem"],
+                sems["c1a_send"],
+                sems["c1a_recv"],
+                sems["rs1_send"],
+                sems["rs1_recv"],
+                sems["rs2_send"],
+                sems["rs2_recv"],
+                sems["rs3_send"],
+                sems["rs3_recv"],
+                sems["c1c_send"],
+                sems["c1c_recv"],
+                sems["pre_send"],
+                sems["pre_recv"],
+                sems["ag_exp_send"],
+                sems["ag_exp_recv"],
+                sems["ag_exp_d2d_send"],
+                sems["ag_exp_d2d_recv"],
+                sems["ag_log_send"],
+                sems["ag_log_recv"],
+                world_size=world_size,
+                pa_eps=pa_eps,
+                pre_ff_eps=pre_ff_eps,
+                pre_ff_scale_input=pre_ff_scale_input,
+                router_multiplier=router_multiplier,
+                pre_exp_eps=pre_exp_eps,
+                pre_exp_scale_input=pre_exp_scale_input,
+                skip_barrier_signal=False,
+                skip_barrier_wait=False,
+                skip_stream_load=False,
+                skip_stream_store=True,
+                early_router_and_log_ag=True,
+                during_ag_exp_ici_fn=_during_ag_exp_ici_b3,
+                during_ag_exp_d2d2_fn=None,
+                out_expert_3d_ref=msc_outer_b3["x_3d_buf"],
+            )
+            p_b3 = plan_holder_b3[0]
+            return (
+                p_b3.num_exec,
+                jnp.int32(0) if p_b3.spec_slot is None else p_b3.spec_slot,
+                p_b3.spec_enabled,
+            )
+
+        b3_num_exec, b3_spec_slot, b3_spec_en = pl.run_scoped(
+            _run_b3_scope1, *step_b3_scope1_shapes
+        )
+
+        def _on_experts_done_b3() -> None:
+            pltpu.make_async_copy(w_post_hbm, w_post_buf, sems["w_post_sem"].at[0]).start()
+            pltpu.make_async_copy(next_w_qkv_hbm, w_qkv_buf, sems["w_qkv_sem"].at[0]).start()
+            pltpu.make_async_copy(next_w_gate_hbm, w_gate_buf, sems["w_gate_sem"].at[0]).start()
+
+        def _run_b3_scope2(*s2_refs) -> None:
+            o_it_s2 = iter(moe_outer_refs)
+            s2_it = iter(s2_refs)
+            stitched_s2 = [next(s2_it) if flg else next(o_it_s2) for flg in step_b3_moe_is_scope2]
+            msc_s2 = _unpack_muse_sparse_scratch(
+                iter(stitched_s2),
+                ep=world_size,
+                scale_block=scale_block,
+                num_replicas=num_replicas,
+                return_sharded=sharded_moe_in,
+                cfg=cfg,
+            )
+            p_tmpl = plan_holder_b3[0]
+            plan_s2 = dataclasses.replace(
+                p_tmpl,
+                num_exec=b3_num_exec,
+                spec_slot=None if p_tmpl.spec_slot is None else b3_spec_slot,
+                spec_enabled=b3_spec_en,
+            )
+            _signal_barrier(me, world_size)
+            zero_and_pack_muse_sparse_from_vmem(
+                plan_s2,
+                r_scratch=msc_s2["r_scratch"],
+                accum_3d=msc_s2["accum_3d"],
+                io_3d_buf=msc_s2["io_3d_buf"],
+                accum_2d=msc_s2["accum_2d"],
+                batch_size=rows,
+                cfg=cfg,
+            )
+            _wait_barrier(world_size)
+            run_muse_sparse_experts_and_rs_from_vmem(
+                me,
+                None,
+                plan_s2,
+                d_scratch=msc_s2["d_scratch"],
+                r_scratch=msc_s2["r_scratch"],
+                w1_buf=msc_s2["w1_buf"],
+                s1_buf=msc_s2["s1_buf"],
+                w2_buf=msc_s2["w2_buf"],
+                s2_buf=msc_s2["s2_buf"],
+                w1_acc_buf=msc_s2["w1_acc_buf"],
+                x_3d_buf=msc_s2["x_3d_buf"],
+                io_3d_buf=msc_s2["io_3d_buf"],
+                lhs_2d_buf=msc_s2["lhs_2d_buf"],
+                act_2d_buf=msc_s2["act_2d_buf"],
+                y_stage_buf=msc_s2["y_stage_buf"],
+                lhs_fp8_buf=msc_s2["lhs_fp8_buf"],
+                lhs_sc_buf=msc_s2["lhs_sc_buf"],
+                masked_x_buf=msc_s2["masked_x_buf"],
+                bd_sc_buf=msc_s2["bd_sc_buf"],
+                gain_f32_buf=msc_s2["gain_f32_buf"],
+                accum_3d=msc_s2["accum_3d"],
+                accum_2d=msc_s2["accum_2d"],
+                fan_3d_buf=msc_s2["fan_3d_buf"],
+                rs_send_bf16=msc_s2["rs_send_bf16"],
+                rs_pair_recv=msc_s2["rs_pair_recv"],
+                rs_chip_send=msc_s2["rs_chip_send"],
+                rs_chip_recv=msc_s2["rs_chip_recv"],
+                rs_pair_ssem=msc_s2["rs_pair_ssem"],
+                rs_pair_rsem=msc_s2["rs_pair_rsem"],
+                rs_chip_ssem=msc_s2["rs_chip_ssem"],
+                rs_chip_rsem=msc_s2["rs_chip_rsem"],
+                rs_recv_3d=msc_s2["rs_recv_3d"],
+                rs_send_sem=msc_s2["rs_send_sem"],
+                rs_recv_sem=msc_s2["rs_recv_sem"],
+                owner_3d=msc_s2["owner_3d"],
+                fan_send_sem=msc_s2["fan_send_sem"],
+                fan_recv_sem=msc_s2["fan_recv_sem"],
+                fan_s2_send_sem=msc_s2["fan_s2_send_sem"],
+                fan_s2_recv_sem=msc_s2["fan_s2_recv_sem"],
+                barrier_sem=None,
+                output_ref=moe_sh_vmem,
+                ep=world_size,
+                batch_size=rows,
+                scale_block=scale_block,
+                return_sharded=sharded_moe_in,
+                ep_axis_name=ep_axis_name,
+                cfg=cfg,
+                x_is_3d=True,
+                wait_entry_barrier=False,
+                write_output_ref=True,
+                on_experts_done_fn=_on_experts_done_b3,
+            )
+
+        pl.run_scoped(_run_b3_scope2, *step_b3_scope2_shapes)
+
+        def _run_b3_scope3(*s3_refs) -> None:
+            next_in_vmem, mate_recv_b2, mate_tok_b2 = s3_refs
+            _run_stage5_6_b2_rpad(
+                moe_dst_vmem=moe_sh_vmem,
+                w_post_buf=w_post_buf,
+                w_qkv_buf=w_qkv_buf,
+                w_gate_buf=w_gate_buf,
+                s_buf=s_buf,
+                next_in_vmem=next_in_vmem,
+                send_half=mate_tok_b2,
+                mate_recv=mate_recv_b2,
+                my_pair_bf16=my_pair_bf16,
+                recv_pair_bf16=recv_pair_bf16,
+                ffn_pair_buf=ffn_pair_buf,
+                b2_scalar_dummy_post=b2_scalar_dummy_post,
+                b2_scalar_dummy_cols=b2_scalar_dummy_cols,
+                exp_3d_buf=exp_3d_buf,
+                sems=sems,
+                rpad_refs=None,
+                sync_entry_barrier=True,
+            )
+
+        pl.run_scoped(_run_b3_scope3, *step_b3_scope3_shapes)
         return
 
     # 2-Scope Step (c): Outer (live + sems) -> Scope 1 (Stage 1..4) -> Scope 2 (b2 + RPAd)
@@ -1121,7 +1454,7 @@ def _prepare_chip_b1_moe_b2_setup(
     _, qkv_cols = next_w_qkv_w8k.shape
     _, gate_cols = next_w_gate_w8k.shape
 
-    valid_rows = (32, 64, 128) if world_size == 8 else (64, 128)
+    valid_rows = (32, 64, 128) if world_size == 8 else (64, 128, 256)
     if (
         rows not in valid_rows
         or rows != n_chips * r_pair
@@ -1202,9 +1535,11 @@ def _prepare_chip_b1_moe_b2_setup(
         config=config,
     )
     use_3d_x = config.row_mode != "dense"
+    use_3scope = (not has_rpad) and (rows > 128)
     w_pre_cols_buf = pre_pair_cols if interpret_mode else max(pre_pair_cols, qkv_cols + gate_cols)
     alias_mate_recv = (
         (not has_rpad)
+        and (not use_3scope)
         and (not interpret_mode)
         and config.row_mode != "dense"
         and config.norm_f32_stage
@@ -1228,6 +1563,7 @@ def _prepare_chip_b1_moe_b2_setup(
     )
     v_rs1_b = vmem((two_pair, q_cols) if use_xy else (two_pair, half), jnp.bfloat16)
     v_rs2_a = vmem((r_pair, q_cols) if use_xy else (r_pair, half), jnp.bfloat16)
+    v_rs_slice_shapes = [v_rs1_a, v_rs1_b, v_rs2_a]
     v_rs2_b = vmem(
         (r_pair, q_cols) if use_xy else ((r_pair, half) if r_pair == 8 else (8, 128)),
         jnp.bfloat16,
@@ -1314,9 +1650,7 @@ def _prepare_chip_b1_moe_b2_setup(
         v_next_in_vmem,
         *v_mate_recv,
         *v_interp_halves,
-        v_rs1_a,
-        v_rs1_b,
-        v_rs2_a,
+        *v_rs_slice_shapes,
         v_rs2_b,
         v_my_pair_bf16,
         v_recv_pair_bf16,
@@ -1337,6 +1671,71 @@ def _prepare_chip_b1_moe_b2_setup(
         *v_interp_wo,
         *v_interp_b2,
     ]
+
+    b3_idx_map = _unpack_muse_sparse_scratch(
+        iter(range(len(moe_scratch))),
+        ep=world_size,
+        scale_block=scale_block,
+        num_replicas=num_replicas,
+        return_sharded=sharded_moe_in,
+        cfg=config,
+    )
+    b3_n_route_sc = 6 if config.row_mode == "dense" else 12
+    b3_keep_outer = {
+        *range(b3_n_route_sc),
+        b3_idx_map["w1_buf"],
+        b3_idx_map["s1_buf"],
+        b3_idx_map["w2_buf"],
+        b3_idx_map["s2_buf"],
+        b3_idx_map["gain_f32_buf"],
+        b3_idx_map["x_3d_buf"],
+    }
+    step_b3_moe_is_scope2 = tuple(
+        (idx not in b3_keep_outer) and (getattr(sp, "memory_space", None) == vmem)
+        for idx, sp in enumerate(moe_scratch)
+    )
+    step_b3_moe_outer = [
+        sp for sp, flg in zip(moe_scratch, step_b3_moe_is_scope2) if not flg
+    ]
+    step_b3_moe_scope2 = tuple(
+        sp for sp, flg in zip(moe_scratch, step_b3_moe_is_scope2) if flg
+    )
+    step_b3_outer_scratch = [
+        *step_b3_moe_outer,
+        v_w_pre_pair_buf,
+        v_s_buf,
+        v_my_pair_bf16,
+        v_recv_pair_bf16,
+        v_ffn_pair,
+        v_exp_3d,
+        v_logits,
+        *v_moe_sh,
+        v_b2_dummy_post,
+        v_b2_dummy_cols,
+        *outer_sems,
+        *v_interp_b2,
+    ]
+    step_b3_scope1_shapes = tuple(
+        [
+            v_w_router_buf,
+            vmem((rows, half), jnp.bfloat16),
+            vmem((rows, half), jnp.bfloat16),
+            vmem((rows, half), jnp.bfloat16),
+            *v_rs_slice_shapes,
+            v_rs2_b,
+            v_sq_pair_pa,
+            v_router_pair,
+            v_pre_my,
+            v_pre_mate,
+            v_sq_pair_pre,
+            *v_interp_wo,
+        ]
+    )
+    step_b3_scope3_shapes = (
+        vmem((rows, hidden), jnp.bfloat16),
+        vmem((rows, half), jnp.bfloat16),
+        vmem((rows_per_rank, _H), jnp.bfloat16),
+    )
 
     is_dense_cfg = config.row_mode == "dense"
     n_route_sc = 6 if is_dense_cfg else 12
@@ -1463,6 +1862,13 @@ def _prepare_chip_b1_moe_b2_setup(
         in_specs=in_specs,
         base_call_tensors=(*b1_args, *moe_args, *b2_args),
         scratch_shapes=moe_scratch + shared_scratch,
+        use_3scope=use_3scope,
+        step_b3_outer_scratch=step_b3_outer_scratch,
+        step_b3_moe_is_scope2=step_b3_moe_is_scope2,
+        step_b3_n_moe_outer=len(step_b3_moe_outer),
+        step_b3_scope1_shapes=step_b3_scope1_shapes,
+        step_b3_scope2_shapes=step_b3_moe_scope2,
+        step_b3_scope3_shapes=step_b3_scope3_shapes,
         step_c_outer_scratch=moe_outer + outer_shared_vmem + outer_sems + v_interp_b2,
         step_c_moe_is_scope1=moe_is_scope1,
         step_c_n_moe_outer=len(moe_outer),
@@ -1600,6 +2006,12 @@ def b1_moe_b2_chip_sharded_jax(
         has_free_params_arg=st["has_free_params_arg"],
         interpret_mode=st["interpret_mode"],
         alias_mate_recv=st["alias_mate_recv"],
+        use_3scope=st["use_3scope"],
+        step_b3_n_moe_outer=st["step_b3_n_moe_outer"],
+        step_b3_moe_is_scope2=st["step_b3_moe_is_scope2"],
+        step_b3_scope1_shapes=st["step_b3_scope1_shapes"],
+        step_b3_scope2_shapes=st["step_b3_scope2_shapes"],
+        step_b3_scope3_shapes=st["step_b3_scope3_shapes"],
     )
 
     res = pl.pallas_call(
@@ -1610,7 +2022,9 @@ def b1_moe_b2_chip_sharded_jax(
             grid=(1,),
             in_specs=st["in_specs"],
             out_specs=out_specs,
-            scratch_shapes=st["scratch_shapes"],
+            scratch_shapes=(
+                st["step_b3_outer_scratch"] if st["use_3scope"] else st["scratch_shapes"]
+            ),
         ),
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=(64 if rows > 64 else 60) * 1024**2,

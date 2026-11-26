@@ -3750,7 +3750,7 @@ class MuseSparkDecoderLayer(nn.Module):
         if not bool(self.__dict__.get("_w9_b1_moe_b2_superkernel", False)) or not is_dec_step:
             return False
         mlp = self.mlp
-        valid_b = (16,) if replicated else ((32, 64, 128) if tp == 8 else (64, 128))
+        valid_b = (16,) if replicated else ((32, 64, 128) if tp == 8 else (64, 128, 256))
         pre_buf_key = "_w7_wpre_w8k" if replicated else "_w8_wpre_pair_w8k"
         if (
             n_tok not in valid_b
@@ -4295,11 +4295,11 @@ class MuseSparkDecoderLayer(nn.Module):
                 *epi_scalars,
             )
 
+        ret_sh_step_a = (n_tok // tp) >= 8 and (n_tok // tp) % 8 == 0
         if (
             b2_kind in (1, 2)
             and "_w7_wpost_w8k" in mlp._buffers
-            and (n_tok // tp) >= 8
-            and (n_tok // tp) % 8 == 0
+            and (ret_sh_step_a or (tp == 16 and n_tok == 64))
         ):
             from sglang_tpu.kernels.decode_collective_bridges_w8 import (
                 get_moe_post_chip_sharded_final_norm_op,
@@ -4318,13 +4318,13 @@ class MuseSparkDecoderLayer(nn.Module):
                     **cs_kw,
                 )
             )
-            stream_mid, moe_sh = get_b1_moe_chip_sharded_op(
+            stream_mid, moe_out_a = get_b1_moe_chip_sharded_op(
                 tp,
                 bf16_router=bf16_router,
                 num_replicas=num_rep,
                 has_spec_slot=has_spec,
                 replica_cost_mode=cost_mode,
-                return_sharded=True,
+                return_sharded=ret_sh_step_a,
                 has_free_params=(fp_buf is not None),
             )(
                 mlp._fused_decode_rank,
@@ -4365,10 +4365,10 @@ class MuseSparkDecoderLayer(nn.Module):
                 fin_gain = final_layernorm.gain()
                 assert fin_gain is not None
                 hid_f = get_moe_post_chip_sharded_final_norm_op(
-                    tp, sharded_moe_in=True, return_stream_too=False
+                    tp, sharded_moe_in=ret_sh_step_a, return_stream_too=False
                 )(
                     stream_mid,
-                    moe_sh,
+                    moe_out_a,
                     w_post_p,
                     s_post_p,
                     post_ff_gain,
@@ -4385,10 +4385,10 @@ class MuseSparkDecoderLayer(nn.Module):
                 next_in_gain = next_input_layernorm.gain()
                 assert next_in_gain is not None
                 return get_moe_post_chip_sharded_final_norm_op(
-                    tp, sharded_moe_in=True, return_stream_too=True
+                    tp, sharded_moe_in=ret_sh_step_a, return_stream_too=True
                 )(
                     stream_mid,
-                    moe_sh,
+                    moe_out_a,
                     w_post_p,
                     s_post_p,
                     post_ff_gain,
