@@ -1494,6 +1494,8 @@ class TpuEnvs:
     # and Entry on BOTH TP=8 (B=32..384) and TP=16 (B=64..384), eliminating intra-chip stream
     # split/re-gather D2D barriers and concat loops.
     SGLANG_TPU_MUSE_DECODE_CHIP_SHARDED_BRIDGES = EnvBool(False)
+    # Opt-in parallel orthogonal 3-slab XYZ reduce-scatter in TP=16 B=64 chip-sharded Bridge 1b.
+    SGLANG_TPU_MUSE_DECODE_TP16_PARALLEL_RS = EnvBool(False)
     # Wave-9 opt-in TP_chip=2 W_post [4096, 4096] in chip-sharded Bridge 2b & L61 Final Norm on TP=8,
     # eliminating both tok_s2 and post_ici inter-chip ICI collectives (+0.97 GiB/rank HBM).
     SGLANG_TPU_MUSE_DECODE_CHIP_B2_TP2_WPOST = EnvBool(False)
