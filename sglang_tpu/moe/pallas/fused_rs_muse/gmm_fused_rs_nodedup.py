@@ -888,10 +888,14 @@ def _precompute_block_scatter_meta_closed_form(
     ep_size: int,
     perm_gm: jax.Array | None = None,
     rotate_rs: bool = False,
+    inter32_min_kf: int = 0,
+    smem_base_offset: jax.Array | int = 0,
 ) -> jax.Array:
     go = group_offset[0]
     my_id = go // size_group
+    local_start = group_start_raw[0] - jnp.asarray(smem_base_offset, dtype=jnp.int32)
     sizes = lax.dynamic_slice_in_dim(group_sizes, go, size_group).astype(jnp.int32)
+    exp_starts = jnp.cumsum(sizes) - sizes
     tiles = jnp.where(sizes > 0, (sizes + tile_m - 1) // tile_m, 0)
     tiles_end = jnp.cumsum(tiles)
     num_gm = tiles_end[-1]
@@ -914,32 +918,110 @@ def _precompute_block_scatter_meta_closed_form(
     )
     counts_gc = counts_flat.reshape(size_group, ep_size)
     expert_chip_base = chip_before[None, :] + jnp.cumsum(counts_gc, axis=0) - counts_gc
-    if rotate_rs:
+    _blk = tile_m // ep_size
+    if inter32_min_kf > 0 and rotate_rs and (tile_m % ep_size == 0):
         c_iota = jnp.arange(ep_size, dtype=jnp.int32)
         rot_order = jnp.mod(my_id + 1 + c_iota, ep_size)
         inv_rot = jnp.mod(c_iota + ep_size - 1 - my_id, ep_size)
-        counts_rot = counts_gc[:, rot_order]
-        intra_start = (jnp.cumsum(counts_rot, axis=1) - counts_rot)[:, inv_rot]
+        raw_kf = jnp.min(counts_gc // jnp.int32(_blk), axis=1)
+        k_full_g = jnp.where(
+            raw_kf >= jnp.int32(inter32_min_kf), raw_kf, jnp.int32(0)
+        )
+        counts_rot_full = counts_gc[:, rot_order]
+        rot_smem_base = (
+            local_start
+            + exp_starts[:, None]
+            + (jnp.cumsum(counts_rot_full, axis=1) - counts_rot_full)
+        )
+        rem_cnt_gc = counts_gc - k_full_g[:, None] * jnp.int32(_blk)
+        rem_rot = rem_cnt_gc[:, rot_order]
+        intra_start = (jnp.cumsum(rem_rot, axis=1) - rem_rot)[:, inv_rot]
+        combined_table = jnp.concatenate(
+            [
+                expert_chip_base,
+                intra_start,
+                rem_cnt_gc,
+                rot_smem_base,
+                k_full_g[:, None],
+            ],
+            axis=1,
+        )
+        sel_33 = jnp.sum(
+            jnp.where(onehot[:, :, None], combined_table[None, :, :], 0), axis=1
+        )
+        base_gc = sel_33[:, :ep_size]
+        ist_gc = sel_33[:, ep_size : 2 * ep_size]
+        cnt_gc = sel_33[:, 2 * ep_size : 3 * ep_size]
+        r_smem_gm = sel_33[:, 3 * ep_size : 4 * ep_size]
+        kf_gm = sel_33[:, 4 * ep_size]
+        is_inter = jnp.logical_and(valid, tile_in_group < kf_gm)
+        is_tail = jnp.logical_and(
+            valid, jnp.logical_and(kf_gm > 0, tile_in_group >= kf_gm)
+        )
+        rem_ti = tile_in_group - kf_gm
+        rel_st = rem_ti * tile_m
+        rel_en = jnp.minimum(rel_st + tile_m, _select(sizes) - kf_gm * tile_m)
+        in_st = jnp.clip(rel_st[:, None] - ist_gc, 0, cnt_gc)
+        in_en = jnp.clip(rel_en[:, None] - ist_gc, 0, cnt_gc)
+        dst_tail = jnp.where(
+            valid[:, None], base_gc + kf_gm[:, None] * jnp.int32(_blk) + in_st, 0
+        )
+        len_tail = jnp.where(valid[:, None], in_en - in_st, 0)
+        len_rot = len_tail[:, rot_order]
+        src_tail = (jnp.cumsum(len_rot, axis=1) - len_rot)[:, inv_rot]
+        len_c = jnp.where(is_inter[:, None], jnp.int32(_blk), len_tail)
+        dst_off = jnp.where(
+            is_inter[:, None],
+            base_gc + tile_in_group[:, None] * jnp.int32(_blk),
+            dst_tail,
+        )
+        src_off = jnp.where(
+            is_inter[:, None], inv_rot[None, :] * jnp.int32(_blk), src_tail
+        )
+        m_st_plain = local_start + _select(exp_starts) + tile_in_group * tile_m
+        smem_plain = m_st_plain[:, None] + c_iota[None, :] * jnp.int32(_blk)
+        smem_inter = r_smem_gm + tile_in_group[:, None] * jnp.int32(_blk)
+        in_st_rot = in_st[:, rot_order]
+        smem_tail = r_smem_gm + kf_gm[:, None] * jnp.int32(_blk) + in_st_rot
+        tile_mode = jnp.where(
+            is_inter, jnp.int32(1), jnp.where(is_tail, jnp.int32(2), jnp.int32(0))
+        )
+        smem_rot_8 = jnp.where(
+            is_inter[:, None],
+            smem_inter,
+            jnp.where(is_tail[:, None], smem_tail, smem_plain),
+        )
+        aux_body = jnp.concatenate([tile_mode[:, None], smem_rot_8], axis=1)
     else:
-        intra_start = jnp.cumsum(counts_gc, axis=1) - counts_gc
-    combined_table = jnp.concatenate([expert_chip_base, intra_start, counts_gc], axis=1)
-    sel_24 = jnp.sum(
-        jnp.where(onehot[:, :, None], combined_table[None, :, :], 0), axis=1
-    )
-    base_gc = sel_24[:, :ep_size]
-    ist_gc = sel_24[:, ep_size : 2 * ep_size]
-    cnt_gc = sel_24[:, 2 * ep_size : 3 * ep_size]
-    rel_st = tile_in_group * tile_m
-    rel_en = jnp.minimum(rel_st + tile_m, _select(sizes))
-    in_st = jnp.clip(rel_st[:, None] - ist_gc, 0, cnt_gc)
-    in_en = jnp.clip(rel_en[:, None] - ist_gc, 0, cnt_gc)
-    dst_off = jnp.where(valid[:, None], base_gc + in_st, 0)
-    len_c = jnp.where(valid[:, None], in_en - in_st, 0)
-    if rotate_rs:
-        len_rot = len_c[:, rot_order]
-        src_off = (jnp.cumsum(len_rot, axis=1) - len_rot)[:, inv_rot]
-    else:
-        src_off = jnp.cumsum(len_c, axis=1) - len_c
+        if rotate_rs:
+            c_iota = jnp.arange(ep_size, dtype=jnp.int32)
+            rot_order = jnp.mod(my_id + 1 + c_iota, ep_size)
+            inv_rot = jnp.mod(c_iota + ep_size - 1 - my_id, ep_size)
+            counts_rot = counts_gc[:, rot_order]
+            intra_start = (jnp.cumsum(counts_rot, axis=1) - counts_rot)[:, inv_rot]
+        else:
+            intra_start = jnp.cumsum(counts_gc, axis=1) - counts_gc
+        combined_table = jnp.concatenate(
+            [expert_chip_base, intra_start, counts_gc], axis=1
+        )
+        sel_24 = jnp.sum(
+            jnp.where(onehot[:, :, None], combined_table[None, :, :], 0), axis=1
+        )
+        base_gc = sel_24[:, :ep_size]
+        ist_gc = sel_24[:, ep_size : 2 * ep_size]
+        cnt_gc = sel_24[:, 2 * ep_size : 3 * ep_size]
+        rel_st = tile_in_group * tile_m
+        rel_en = jnp.minimum(rel_st + tile_m, _select(sizes))
+        in_st = jnp.clip(rel_st[:, None] - ist_gc, 0, cnt_gc)
+        in_en = jnp.clip(rel_en[:, None] - ist_gc, 0, cnt_gc)
+        dst_off = jnp.where(valid[:, None], base_gc + in_st, 0)
+        len_c = jnp.where(valid[:, None], in_en - in_st, 0)
+        if rotate_rs:
+            len_rot = len_c[:, rot_order]
+            src_off = (jnp.cumsum(len_rot, axis=1) - len_rot)[:, inv_rot]
+        else:
+            src_off = jnp.cumsum(len_c, axis=1) - len_c
+        aux_body = None
     has_c = (len_c > 0).astype(jnp.int32)
     total_blks_gm = jnp.sum(has_c, axis=1, keepdims=True)
     is_my_chip = jnp.arange(ep_size, dtype=jnp.int32)[None, :] == my_id
@@ -956,7 +1038,14 @@ def _precompute_block_scatter_meta_closed_form(
     )
     if perm_gm is not None:
         body = body[perm_gm]
-    return jnp.concatenate([body, trailer], axis=0).astype(jnp.int32)
+        if aux_body is not None:
+            aux_body = aux_body[perm_gm]
+    res_flat = jnp.concatenate([body, trailer], axis=0).astype(jnp.int32)
+    if aux_body is not None:
+        return jnp.concatenate(
+            [res_flat.reshape(-1), aux_body.astype(jnp.int32).reshape(-1)], axis=0
+        )
+    return res_flat
 
 
 def _precompute_block_scatter_meta(
@@ -1111,6 +1200,8 @@ def kernel_main_fused_rs(
     num_cm_slots: int = 1,
     eo_refs=None,
     pq_lhs_mode: int = 0,
+    inter32_enabled: bool = False,
+    tile_idx_smem_ref=None,
 ):
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write kernel.
 
@@ -1179,6 +1270,21 @@ def kernel_main_fused_rs(
     @jax.named_scope("sync_barrier_signal")
     def sync_barrier_signal():
         barrier_sem = pltpu.get_barrier_semaphore()
+        if inter32_enabled:
+            lax.fori_loop(
+                0,
+                ep_size,
+                lambda _i, _u: (
+                    pl.semaphore_signal(
+                        barrier_sem,
+                        device_id={ep_axis_name: _i},
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ),
+                    _u,
+                )[1],
+                jnp.int32(0),
+            )
+            return
         for i in range(ep_size):
             pl.semaphore_signal(
                 barrier_sem,
@@ -2942,6 +3048,16 @@ def kernel_main_fused_rs(
     _wla1 = int(use_weight_lookahead) == 1
     _wla2 = int(use_weight_lookahead) == 2
     _gather_divisor_top = top_k if pack_indices else 1
+    _inter32_gather_kw = (
+        {
+            "bs_meta_ref": topk_indices_ref,
+            "ep_size": ep_size,
+            "my_id": my_id,
+            "tile_idx_smem_ref": tile_idx_smem_ref,
+        }
+        if inter32_enabled
+        else {}
+    )
     _w_base_idx = 17 + 2 * ep_size
     _la_started_idx = 18 + 2 * ep_size
     _next_act_grp_off = (1 + 2 * eff_cm_slots) if enable_chipmate else 1
@@ -2954,16 +3070,34 @@ def kernel_main_fused_rs(
         @jax.named_scope("dma_gather_prologue_2ahead")
         @pl.when(local_num_gm > 0)
         def _():
-            dma_gather_gm_start(
-                hidden_states_ref,
-                gathered_lhs_2x_ref.at[0],
-                lhs_indices_ref,
-                gather_sem_ref.at[0],
-                0,
-                metadata_ref,
-                divisor=_gather_divisor_top,
-                packed_u16=packed_u16_lhs,
-            )
+            if inter32_enabled:
+
+                def _pro_g(gi, _u):
+                    dma_gather_gm_start(
+                        hidden_states_ref,
+                        gathered_lhs_2x_ref.at[gi],
+                        lhs_indices_ref,
+                        gather_sem_ref.at[gi],
+                        gi,
+                        metadata_ref,
+                        divisor=_gather_divisor_top,
+                        packed_u16=packed_u16_lhs,
+                        **_inter32_gather_kw,
+                    )
+                    return _u
+
+                lax.fori_loop(0, jnp.minimum(local_num_gm, 2), _pro_g, jnp.int32(0))
+            else:
+                dma_gather_gm_start(
+                    hidden_states_ref,
+                    gathered_lhs_2x_ref.at[0],
+                    lhs_indices_ref,
+                    gather_sem_ref.at[0],
+                    0,
+                    metadata_ref,
+                    divisor=_gather_divisor_top,
+                    packed_u16=packed_u16_lhs,
+                )
             if _prologue_w_dma:
                 _e0_pro = metadata_ref.gm_id_to_group_id[0]
                 _total_w1_pro = num_n1 * num_k1
@@ -2986,18 +3120,20 @@ def kernel_main_fused_rs(
                     for _i in range(min(num_w2_bufs, _total_w2_pro)):
                         _start_w2_dma_local(_i, _e0_pro, _i // num_k2, _i % num_k2)
 
-        @pl.when(local_num_gm > 1)
-        def _():
-            dma_gather_gm_start(
-                hidden_states_ref,
-                gathered_lhs_2x_ref.at[1],
-                lhs_indices_ref,
-                gather_sem_ref.at[1],
-                1,
-                metadata_ref,
-                divisor=_gather_divisor_top,
-                packed_u16=packed_u16_lhs,
-            )
+        if not inter32_enabled:
+
+            @pl.when(local_num_gm > 1)
+            def _():
+                dma_gather_gm_start(
+                    hidden_states_ref,
+                    gathered_lhs_2x_ref.at[1],
+                    lhs_indices_ref,
+                    gather_sem_ref.at[1],
+                    1,
+                    metadata_ref,
+                    divisor=_gather_divisor_top,
+                    packed_u16=packed_u16_lhs,
+                )
 
     if _split_entry_barrier:
         sync_barrier_wait()
@@ -3397,6 +3533,7 @@ def kernel_main_fused_rs(
                         metadata_ref,
                         divisor=_gather_divisor,
                         packed_u16=packed_u16_lhs,
+                        **_inter32_gather_kw,
                     )
 
             # --- Weight DMA (overlapped with gather) ---
@@ -3656,6 +3793,17 @@ def kernel_main_fused_rs(
             if has_ext_pq_lhs:
                 from .prefill_gmm_opts import fill_pq_lhs_scales_tree
 
+                _inter32_scale_kw = (
+                    {
+                        "bs_meta_ref": topk_indices_ref,
+                        "gm_id": gm_id,
+                        "n_slots_gm": _n_slots_gm,
+                        "ep_size": ep_size,
+                        "tile_idx_smem_ref": tile_idx_smem_ref,
+                    }
+                    if inter32_enabled
+                    else {}
+                )
                 fill_pq_lhs_scales_tree(
                     partial_out2_ref,
                     lhs_row_scales_ref,
@@ -3668,6 +3816,7 @@ def kernel_main_fused_rs(
                     gather_divisor=_gather_divisor,
                     scale_b_id=0,
                     unroll_m_rows=(tile_m if pq_lhs_mode >= 3 else None),
+                    **_inter32_scale_kw,
                 )
 
             _tile_real = num_valid
@@ -3829,6 +3978,7 @@ def kernel_main_fused_rs(
                             metadata_ref,
                             divisor=_gather_divisor,
                             packed_u16=packed_u16_lhs,
+                            **_inter32_gather_kw,
                         )
 
                 if step + num_w1_bufs < total_w1_steps:
@@ -3885,6 +4035,7 @@ def kernel_main_fused_rs(
                             metadata_ref,
                             divisor=_gather_divisor,
                             packed_u16=packed_u16_lhs,
+                            **_inter32_gather_kw,
                         )
             else:
 
@@ -3900,6 +4051,7 @@ def kernel_main_fused_rs(
                         metadata_ref,
                         divisor=_gather_divisor,
                         packed_u16=packed_u16_lhs,
+                        **_inter32_gather_kw,
                     )
 
             if not _wla1 and not _wla2:
@@ -4081,7 +4233,12 @@ def kernel_main_fused_rs(
                     ),
                 ),
             )
-        elif _USE_BUCKETS and _prefill_rb_mode in (2, 3, 4) and tile_m >= 128:
+        elif (
+            _USE_BUCKETS
+            and _prefill_rb_mode in (2, 3, 4)
+            and tile_m >= 128
+            and not inter32_enabled
+        ):
             _n_sl_last = metadata_ref.gm_id_to_group_id.shape[0]
             _last_en = (
                 metadata_ref.gm_id_to_m_offset[_n_sl_last + last_gm]
@@ -4123,28 +4280,52 @@ def kernel_main_fused_rs(
         _do_direct_write(last_gm, last_stg)
 
     if block_scatter:
+        _n_sl_bs = metadata_ref.gm_id_to_group_id.shape[0]
         _meta_last = (
-            topk_indices_ref.shape[0] - (3 * ep_size + 2)
+            _n_sl_bs * (3 * ep_size + 2)
             if topk_indices_ref.ndim == 1
             else topk_indices_ref.shape[0] - 1
         )
         if rotate_rs_mode >= 1 and (ep_size & (ep_size - 1)) == 0:
-            for _step in range(1, ep_size):
-                _tgt_ex = lax.bitwise_xor(my_id, jnp.int32(_step))
-                _extra = (
-                    topk_indices_ref[_meta_last + _tgt_ex]
-                    if topk_indices_ref.ndim == 1
-                    else topk_indices_ref[_meta_last, _tgt_ex]
-                )
+            if inter32_enabled:
 
-                @pl.when(_extra > 0)
-                def _(_target=_tgt_ex, _delta=_extra):
-                    pl.semaphore_signal(
-                        recv_sem_ref.at[0],
-                        _delta,
-                        device_id={ep_axis_name: _target},
-                        device_id_type=pl.DeviceIdType.MESH,
+                def _sig_ex(_step, _u):
+                    _tgt_ex = lax.bitwise_xor(my_id, _step)
+                    _extra = (
+                        topk_indices_ref[_meta_last + _tgt_ex]
+                        if topk_indices_ref.ndim == 1
+                        else topk_indices_ref[_meta_last, _tgt_ex]
                     )
+
+                    @pl.when(_extra > 0)
+                    def _():
+                        pl.semaphore_signal(
+                            recv_sem_ref.at[0],
+                            _extra,
+                            device_id={ep_axis_name: _tgt_ex},
+                            device_id_type=pl.DeviceIdType.MESH,
+                        )
+
+                    return _u
+
+                lax.fori_loop(1, ep_size, _sig_ex, jnp.int32(0))
+            else:
+                for _step in range(1, ep_size):
+                    _tgt_ex = lax.bitwise_xor(my_id, jnp.int32(_step))
+                    _extra = (
+                        topk_indices_ref[_meta_last + _tgt_ex]
+                        if topk_indices_ref.ndim == 1
+                        else topk_indices_ref[_meta_last, _tgt_ex]
+                    )
+
+                    @pl.when(_extra > 0)
+                    def _(_target=_tgt_ex, _delta=_extra):
+                        pl.semaphore_signal(
+                            recv_sem_ref.at[0],
+                            _delta,
+                            device_id={ep_axis_name: _target},
+                            device_id_type=pl.DeviceIdType.MESH,
+                        )
         else:
             for _c in range(ep_size):
                 _extra = (
@@ -4164,8 +4345,16 @@ def kernel_main_fused_rs(
 
     if defer_writes:
         # Drain the active staging slots before the cross-rank barrier.
-        for _s in range(num_stg_slots):
-            wait_staging_slot_writes(_s)
+        if inter32_enabled:
+            lax.fori_loop(
+                0,
+                num_stg_slots,
+                lambda _s, _u: (wait_staging_slot_writes(_s), _u)[1],
+                jnp.int32(0),
+            )
+        else:
+            for _s in range(num_stg_slots):
+                wait_staging_slot_writes(_s)
 
     if hot_interleave:
 
@@ -5314,6 +5503,33 @@ def gmm_v2_fused_rs(
             # Pass only (local_start, local_end, total_recv): the kernel tiles in its scalar
             # prologue as stock fused_rs does, and XLA drops the unused vector tiling.
             group_start = group_start[:3]
+    if smem_rows < size_m:
+        _raw_base_w = (group_start[0] // _LOCAL_ROWS_ALIGN) * _LOCAL_ROWS_ALIGN
+        _base_w = jnp.minimum(_raw_base_w, jnp.int32(size_m - smem_rows))
+    else:
+        _base_w = jnp.int32(0)
+
+    _inter32_val = (
+        int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_INTERLEAVE_RS.get() or 0)
+        if size_m > _BLOCKDIAG_MAX_SIZE_M
+        else 0
+    )
+    _use_inter32_cf = bool(
+        _inter32_val > 0
+        and block_scatter
+        and group_start_raw.shape[0] >= 2 + ep_size + size_group * ep_size
+        and flatten_bs_meta
+        and not pack_indices
+        and not pack_u16_lhs
+        and tile_m == 256
+        and tile_m % ep_size == 0
+        and (tile_m // ep_size) in (16, 32)
+        and _rot_rs_val >= 2
+        and (ep_size & (ep_size - 1)) == 0
+        and not eff_hot_interleave
+        and not fp8_direct_write
+        and int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_EXPERT_OUTER_FP8.get() or 0) <= 0
+    )
     if block_scatter:
         if group_start_raw.shape[0] >= 2 + ep_size + size_group * ep_size:
             secondary_idx_ref = _precompute_block_scatter_meta_closed_form(
@@ -5326,6 +5542,8 @@ def gmm_v2_fused_rs(
                 ep_size=ep_size,
                 perm_gm=perm_gm_opt,
                 rotate_rs=(_rot_rs_val >= 2),
+                inter32_min_kf=(_inter32_val if _use_inter32_cf else 0),
+                smem_base_offset=_base_w,
             )
         else:
             _hdr_len = 5 if eff_hot_interleave else 4
@@ -5344,8 +5562,6 @@ def gmm_v2_fused_rs(
 
     if smem_rows < size_m:
         _hdr_len_w = 5 if eff_hot_interleave else 4
-        _raw_base_w = (group_start[0] // _LOCAL_ROWS_ALIGN) * _LOCAL_ROWS_ALIGN
-        _base_w = jnp.minimum(_raw_base_w, jnp.int32(size_m - smem_rows))
         if group_start.shape[0] > 3:
             _shift_w = (
                 jnp.zeros_like(group_start)
@@ -5616,6 +5832,7 @@ def gmm_v2_fused_rs(
         f"{'-wla2' if eff_wla2 else ('-wla1' if eff_weight_lookahead else '')}"
         f"{'-w2c1' if use_dedicated_w2_fp8_cache else ''}"
         f"{f'-rrs{_rot_rs_val}' if _rot_rs_val > 0 else ''}"
+        f"{f'-i32_{_inter32_val}' if _use_inter32_cf else ''}"
         f"{f'-ds{_dsilu_val}' if _dsilu_val > 0 else ''}"
         f"{f'-pql{_pq_lhs_env}' if _pq_lhs_env > 0 else ''}"
         f"{f'-tlp{_tlp_val}k{_tlp_kstep}' if _tlp_val > 0 else ''}"
@@ -5660,6 +5877,7 @@ def gmm_v2_fused_rs(
         cm_defer_send=eff_cm_defer,
         num_cm_slots=max(1, num_cm_slots),
         pq_lhs_mode=_pq_lhs_env,
+        inter32_enabled=_use_inter32_cf,
     )
     in_specs = [
         pl.BlockSpec(memory_space=pltpu.HBM),  # hidden_states_3d
@@ -5702,7 +5920,13 @@ def gmm_v2_fused_rs(
     has_w8_ext = (
         has_ext_lhs_scales or use_dedicated_w2_fp8_cache or use_rhs_fp8_strip_buf
     )
-    if enable_chipmate or eff_hot_interleave or has_w8_ext or eff_eo_mode >= 1:
+    if (
+        enable_chipmate
+        or eff_hot_interleave
+        or has_w8_ext
+        or eff_eo_mode >= 1
+        or _use_inter32_cf
+    ):
         assert not fp8_direct_write, (
             "prefill chipmate/hot_interleave/w8_ext/eo does not support fp8_direct_write"
         )
@@ -5833,6 +6057,8 @@ def gmm_v2_fused_rs(
                 ]
             )
             n_eo_scratch = 5
+        if _use_inter32_cf:
+            ext_scratch.append(pltpu.SMEM((4, tile_m), jnp.int32))
 
         if enable_chipmate:
             _w1_p_rows = (
@@ -5928,6 +6154,11 @@ def gmm_v2_fused_rs(
                 cur += n_eo_scratch
             else:
                 eo_bundle = None
+            if _use_inter32_cf:
+                tile_idx_smem_r = all_refs[cur]
+                cur += 1
+            else:
+                tile_idx_smem_r = None
             return kernel_main_fused_rs(
                 *sp_in,
                 out_r,
@@ -5937,6 +6168,7 @@ def gmm_v2_fused_rs(
                 hot_refs=hot_bundle,
                 w8_refs=w8_bundle,
                 eo_refs=eo_bundle,
+                tile_idx_smem_ref=tile_idx_smem_r,
                 **kernel_kwargs,
             )
 

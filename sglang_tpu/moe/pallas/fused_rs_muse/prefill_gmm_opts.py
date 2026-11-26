@@ -326,6 +326,11 @@ def fill_pq_lhs_scales_tree(
     gather_divisor: int,
     scale_b_id: int = 0,
     unroll_m_rows: int | None = None,
+    bs_meta_ref: Any = None,
+    gm_id: Any = 0,
+    n_slots_gm: int = 0,
+    ep_size: int = 8,
+    tile_idx_smem_ref: Any = None,
 ):
     """Populate `dst_scale_ref[scale_b_id, 0:num_valid, :]` using a 3-level binary `vselect` tree."""
     import jax.experimental.pallas as pl
@@ -349,15 +354,76 @@ def fill_pq_lhs_scales_tree(
                 tok_k = tok_k // gather_divisor
         return lhs_row_scales_ref[tok_k].astype(jnp.float32)
 
-    def _pack_8(i0):
-        s = [_load_sc(jnp.minimum(m_st + i0 + k, max_r)) for k in range(8)]
-        p01 = jnp.where(b0, s[1], s[0])
-        p23 = jnp.where(b0, s[3], s[2])
-        p45 = jnp.where(b0, s[5], s[4])
-        p67 = jnp.where(b0, s[7], s[6])
+    def _pack_8_vals(i0, s_vals):
+        p01 = jnp.where(b0, s_vals[1], s_vals[0])
+        p23 = jnp.where(b0, s_vals[3], s_vals[2])
+        p45 = jnp.where(b0, s_vals[5], s_vals[4])
+        p67 = jnp.where(b0, s_vals[7], s_vals[6])
         q03 = jnp.where(b1, p23, p01)
         q47 = jnp.where(b1, p67, p45)
         dst_scale_ref[scale_b_id, pl.ds(i0, 8), :] = jnp.where(b2, q47, q03)
+
+    if (
+        bs_meta_ref is not None
+        and tile_idx_smem_ref is not None
+        and not packed_u16_lhs
+        and dst_scale_ref.shape[1] == 256
+        and 256 % ep_size == 0
+        and (256 // ep_size) % 8 == 0
+    ):
+        blk_m = 256 // ep_size
+        n_sub8 = blk_m // 8
+        aux_base = (n_slots_gm + 1) * (3 * ep_size + 2) + gm_id * (1 + ep_size)
+        gm_mode = bs_meta_ref[aux_base]
+        n_qb = jnp.where(
+            num_valid <= 32,
+            jnp.int32(32 // blk_m),
+            jnp.where(
+                num_valid <= 64,
+                jnp.int32(64 // blk_m),
+                jnp.where(num_valid <= 128, jnp.int32(128 // blk_m), jnp.int32(ep_size)),
+            ),
+        )
+
+        def _do_mode01():
+            is_m1 = gm_mode == 1
+
+            def _fb(qb, _u):
+                bb = bs_meta_ref[aux_base + 1 + qb]
+                mr = jnp.where(is_m1, bb + (blk_m - 1), max_r)
+                for sub in range(n_sub8):
+                    i0 = qb * blk_m + sub * 8
+                    b8 = bb + sub * 8
+                    _pack_8_vals(i0, [_load_sc(jnp.minimum(b8 + k, mr)) for k in range(8)])
+                return _u
+
+            lax.fori_loop(0, n_qb, _fb, jnp.int32(0))
+            return jnp.int32(0)
+
+        def _do_mode2():
+            slot_t = gm_id % 4
+            max_t = jnp.maximum(num_valid - 1, 0)
+
+            def _ld_t(rk):
+                tok_v = tile_idx_smem_ref[slot_t, rk]
+                if gather_divisor != 1:
+                    tok_v = tok_v // gather_divisor
+                return lhs_row_scales_ref[tok_v].astype(jnp.float32)
+
+            def _dyn_b(qb, _u):
+                for sub in range(n_sub8):
+                    i0 = qb * blk_m + sub * 8
+                    _pack_8_vals(i0, [_ld_t(jnp.minimum(i0 + k, max_t)) for k in range(8)])
+                return _u
+
+            lax.fori_loop(0, n_qb, _dyn_b, jnp.int32(0))
+            return jnp.int32(0)
+
+        lax.cond(gm_mode == 2, _do_mode2, _do_mode01)
+        return
+
+    def _pack_8(i0):
+        _pack_8_vals(i0, [_load_sc(jnp.minimum(m_st + i0 + k, max_r)) for k in range(8)])
 
     if unroll_m_rows is not None and unroll_m_rows % 8 == 0:
         for i0 in range(0, unroll_m_rows, 8):

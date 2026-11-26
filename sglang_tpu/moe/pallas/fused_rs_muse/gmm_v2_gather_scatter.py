@@ -2486,6 +2486,10 @@ def dma_gather_gm_start(
     metadata_ref,
     divisor: int = 1,
     packed_u16: bool = False,
+    bs_meta_ref=None,
+    ep_size: int = 8,
+    my_id: int = 0,
+    tile_idx_smem_ref=None,
 ):
     """Start gathering rows for a specific gm tile via DMA.
 
@@ -2509,6 +2513,24 @@ def dma_gather_gm_start(
     )
     num_rows = m_end - m_start
 
+    def _emit_8_copies(dst_off, s8):
+        if divisor != 1:
+            s8 = [s // divisor for s in s8]
+        for k in range(8):
+            pltpu.make_async_copy(
+                src_ref=src_ref.at[pl.ds(s8[k], 1), :, :],
+                dst_ref=dst_ref.at[pl.ds(dst_off + k, 1), :, :],
+                sem=sem_ref,
+            ).start()
+
+    def _emit_single_copy(dst_row, raw_idx):
+        src_row = raw_idx // divisor if divisor != 1 else raw_idx
+        pltpu.make_async_copy(
+            src_ref=src_ref.at[pl.ds(src_row, 1), :, :],
+            dst_ref=dst_ref.at[pl.ds(dst_row, 1), :, :],
+            sem=sem_ref,
+        ).start()
+
     def _load_u16_8(pos):
         odd = pos & jnp.int32(1)
         wb = lax.shift_right_logical(pos, jnp.int32(1))
@@ -2522,6 +2544,97 @@ def dma_gather_gm_start(
             out.append(jnp.where(odd == 0, hi_j, next_lo_j))
         return out
 
+    if bs_meta_ref is not None and tile_idx_smem_ref is not None and not packed_u16:
+        _aux_base = (_n_slots + 1) * (3 * ep_size + 2) + gm_id * (1 + ep_size)
+        _bs_base = gm_id * (3 * ep_size + 2)
+        _gm_mode = bs_meta_ref[_aux_base]
+
+        def _gather_mode01():
+            if ep_size == 8:
+
+                def _g32_blk(c, _):
+                    i0 = c * 32
+                    base = bs_meta_ref[_aux_base + 1 + c]
+                    for sub in range(4):
+                        off = sub * 8
+                        _emit_8_copies(i0 + off, [indices_ref[base + off + k] for k in range(8)])
+                    return _
+
+                num_32 = num_rows >> 5
+                lax.fori_loop(0, num_32, _g32_blk, 0)
+                rem_st = num_32 << 5
+            else:
+
+                def _g16_blk(h, _):
+                    i0 = h * 16
+                    base = bs_meta_ref[_aux_base + 1 + h]
+                    for sub in range(2):
+                        off = sub * 8
+                        _emit_8_copies(i0 + off, [indices_ref[base + off + k] for k in range(8)])
+                    return _
+
+                num_16 = num_rows >> 4
+                lax.fori_loop(0, num_16, _g16_blk, 0)
+                rem_st = num_16 << 4
+
+            def _g_body(i, _):
+                _emit_single_copy(i, indices_ref[m_start + i])
+                return _
+
+            lax.fori_loop(rem_st, num_rows, _g_body, 0)
+            return jnp.int32(0)
+
+        def _gather_mode2():
+            _slot_t = gm_id % 4
+
+            def _chip_copy(r_i, dst_pos):
+                _c_tgt = jnp.mod(my_id + 1 + r_i, ep_size)
+                _c_len = bs_meta_ref[_bs_base + 2 * ep_size + _c_tgt]
+                _c_st = bs_meta_ref[_aux_base + 1 + r_i]
+                n8 = _c_len >> 3
+
+                def _cp8(k8, _u):
+                    b = k8 * 8
+                    vs = [indices_ref[_c_st + b + t] for t in range(8)]
+                    for t in range(8):
+                        tile_idx_smem_ref[_slot_t, dst_pos + b + t] = vs[t]
+                    return _u
+
+                lax.fori_loop(0, n8, _cp8, jnp.int32(0))
+
+                def _row_cp(j, _u):
+                    tile_idx_smem_ref[_slot_t, dst_pos + j] = indices_ref[_c_st + j]
+                    return _u
+
+                lax.fori_loop(n8 << 3, _c_len, _row_cp, jnp.int32(0))
+                return dst_pos + _c_len
+
+            lax.fori_loop(0, ep_size, _chip_copy, jnp.int32(0))
+
+            num_16 = num_rows >> 4
+
+            def _g16_t(h, _u):
+                i0 = h * 16
+                for sub in range(2):
+                    off = sub * 8
+                    _emit_8_copies(
+                        i0 + off,
+                        [tile_idx_smem_ref[_slot_t, i0 + off + k] for k in range(8)],
+                    )
+                return _u
+
+            lax.fori_loop(0, num_16, _g16_t, jnp.int32(0))
+
+            def _row_cp_dma(i, _u):
+                _emit_single_copy(i, tile_idx_smem_ref[_slot_t, i])
+                return _u
+
+            lax.fori_loop(num_16 << 4, num_rows, _row_cp_dma, jnp.int32(0))
+            return jnp.int32(0)
+
+        lax.cond(_gm_mode == 2, _gather_mode2, _gather_mode01)
+        return
+
     def _gather_16_spillfree(h, _):
         i0 = h * 16
         base = m_start + i0
@@ -2531,14 +2644,7 @@ def dma_gather_gm_start(
                 s8 = _load_u16_8(base + off)
             else:
                 s8 = [indices_ref[base + off + k] for k in range(8)]
-            if divisor != 1:
-                s8 = [s // divisor for s in s8]
-            for k in range(8):
-                pltpu.make_async_copy(
-                    src_ref=src_ref.at[pl.ds(s8[k], 1), :, :],
-                    dst_ref=dst_ref.at[pl.ds(i0 + off + k, 1), :, :],
-                    sem=sem_ref,
-                ).start()
+            _emit_8_copies(i0 + off, s8)
         return _
 
     def _gather_body(i, _):
@@ -2549,13 +2655,7 @@ def dma_gather_gm_start(
             src_row = lax.shift_right_logical(w, sh) & jnp.int32(0xFFFF)
         else:
             src_row = indices_ref[row]
-        if divisor != 1:
-            src_row = src_row // divisor
-        pltpu.make_async_copy(
-            src_ref=src_ref.at[pl.ds(src_row, 1), :, :],
-            dst_ref=dst_ref.at[pl.ds(i, 1), :, :],
-            sem=sem_ref,
-        ).start()
+        _emit_single_copy(i, src_row)
         return _
 
     num_16 = num_rows >> 4
@@ -2567,14 +2667,7 @@ def dma_gather_gm_start(
             s8 = _load_u16_8(m_start + rem_start)
         else:
             s8 = [indices_ref[m_start + rem_start + k] for k in range(8)]
-        if divisor != 1:
-            s8 = [s // divisor for s in s8]
-        for k in range(8):
-            pltpu.make_async_copy(
-                src_ref=src_ref.at[pl.ds(s8[k], 1), :, :],
-                dst_ref=dst_ref.at[pl.ds(rem_start + k, 1), :, :],
-                sem=sem_ref,
-            ).start()
+        _emit_8_copies(rem_start, s8)
         return jnp.int32(0)
 
     has_mid_8 = (num_rows - rem_start) >= 8

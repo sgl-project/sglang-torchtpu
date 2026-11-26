@@ -723,6 +723,10 @@ class TpuEnvs:
     # Muse prefill Wave-8 gmm_v2_fused_rs sender-rotated ICI direct-write schedule
     # (0 = off; 1 = XOR send order; 2 = XOR send order + within-expert rotated chip order).
     SGLANG_TPU_MUSE_KERNEL_GMM_ROTATE_RS = EnvInt(0)
+    # Muse prefill Wave-9 gmm_v2_fused_rs intra-tile EP-chip interleaving for rotated RS
+    # (0 = off; >0 = min full (tile_m // ep_size)-row blocks per chip required to interleave
+    # full 256-row tiles across EP chips in rot_order, avoiding single-link ICI scatter stalls).
+    SGLANG_TPU_MUSE_KERNEL_GMM_INTERLEAVE_RS = EnvInt(0)
     # Muse prefill Wave-8 gmm_v2_fused_rs direct SiLU epilogue without VMEM/bf16 round-trip
     # (0 = off; 1 = single-pass FP32 gate*up with fused GMM2 amax reduction; 2 = fast BF16 sigmoid).
     SGLANG_TPU_MUSE_KERNEL_GMM_DIRECT_SILU = EnvInt(0)
