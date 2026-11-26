@@ -51,6 +51,8 @@ def dflash_write_draft_kv(
         raise NotImplementedError("DFLASH draft KV writes need an unpacked KV pool")
     if getattr(kv_pool, "kv_pack_dense2", False):
         raise NotImplementedError("DFLASH draft KV writes need a non-dense2 KV pool")
+    if getattr(kv_pool, "kv_pack_bd4", False):
+        raise NotImplementedError("DFLASH draft KV writes need a non-bd4 KV pool")
     # kv_fused_rope_write imports jax eagerly; keep the span math and the rope
     # gather above importable without it.
     from sglang_tpu.kv_fused_rope_write import (
@@ -178,6 +180,8 @@ def _scatter_layer_kv(
         raise NotImplementedError("DFLASH draft KV writes need an unpacked KV pool")
     if getattr(kv_pool, "kv_pack_dense2", False):
         raise NotImplementedError("DFLASH draft KV writes need a non-dense2 KV pool")
+    if getattr(kv_pool, "kv_pack_bd4", False):
+        raise NotImplementedError("DFLASH draft KV writes need a non-bd4 KV pool")
     buf = kv_pool.get_fused_kv_buffer(layer_idx)
     num_tokens = int(loc.shape[0])
     head_dim = kv_pool.head_dim

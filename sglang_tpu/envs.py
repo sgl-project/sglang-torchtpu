@@ -754,6 +754,10 @@ class TpuEnvs:
     # ([K_even, V_even, K_odd, V_odd]), halving KV pool HBM (512 -> 256 B/tok/layer/TC)
     # and halving KV page DMA bytes in RPAd_fast, RPAm, and write_kv_only_rpa_v3.
     SGLANG_TPU_KV_PACK_DENSE2 = EnvBool(False)
+    # On TP=16 (1 KV head x head_dim 64 FP8, zero-padded to 128 lanes), pack 4 consecutive
+    # tokens into each 32-bit (1, 4, 128) word ([K0|K1, V0|V1, K2|K3, V2|V3] across lanes
+    # [0..63 | 64..127]), cutting KV pool HBM & page DMA by 4x (512 -> 128 B/tok/layer).
+    SGLANG_TPU_KV_PACK_BD4 = EnvBool(False)
     # Route uniform-width speculative TARGET_VERIFY (decode_query_size in 2..8, e.g.
     # DFlash dq=5/6) through RPAd_fast batched [16*dq, 128] single-MXU-pass verify.
     SGLANG_TPU_RPA_V3_DECODE_FAST_VERIFY = EnvBool(False)

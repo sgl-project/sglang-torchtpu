@@ -4134,6 +4134,13 @@ class MuseSparkDecoderLayer(nn.Module):
                             getattr(backend, "_kv_pack_dense2", False),
                         )
                     )
+                    bd4 = bool(
+                        getattr(
+                            sub_pool,
+                            "kv_pack_bd4",
+                            getattr(backend, "_kv_pack_bd4", False),
+                        )
+                    )
                     phys_rows = int(kv_cache.shape[1 if kv_layer_idx is None else 2])
                     pages_per_seq = int(page_indices.shape[0]) // max(
                         1, int(kv_lens.shape[0])
@@ -4147,7 +4154,7 @@ class MuseSparkDecoderLayer(nn.Module):
                         b_tokens=n_tok,
                         max_num_seqs=int(kv_lens.shape[0]),
                     )
-                    if step_c_rpa_ok and (tp != 16 or cfg_rpa.num_slots <= 4):
+                    if not bd4 and step_c_rpa_ok and (tp != 16 or cfg_rpa.num_slots <= 4):
                         op_c = get_b1_moe_b2_rpad_chip_sharded_op(
                             tp,
                             bf16_router=bf16_router,

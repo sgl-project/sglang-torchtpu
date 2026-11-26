@@ -1918,6 +1918,8 @@ def maybe_forward_m2m_decode(
     cu_q = _contig(md.cu_q_lens)
     cu_kv = _contig(md.cu_kv_lens)
     dense2 = bool(getattr(backend, "_kv_pack_dense2", False))
+    if bool(getattr(backend, "_kv_pack_bd4", False)):
+        return None
     max_full_ctx = int(tpu_envs.SGLANG_TPU_MUSE_MK_M2M_MAX_FULL_CTX.get())
     has_shared_prefix = getattr(md, "decode_shared_prefix_pages", None) is not None
 
@@ -1956,6 +1958,8 @@ def maybe_forward_m2m_decode(
             if pool_obj is not None
             else None
         )
+        if sub_pool is not None and bool(getattr(sub_pool, "kv_pack_bd4", False)):
+            return None
         lyr_dense2 = (
             bool(sub_pool.kv_pack_dense2)
             if sub_pool is not None and hasattr(sub_pool, "kv_pack_dense2")

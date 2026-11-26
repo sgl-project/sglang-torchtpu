@@ -3654,6 +3654,812 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
             ).mlir_module()
             self.assertNotIn("stablehlo.case", hlo_direct)
 
+    def test_cand17_tp16_bd4_full_chain_parity_and_export(self):
+        """Verify TP=16 bd4_128B (4x KV pack) pool, RMW cache writes, RPAm, RPAd_fast (b4/b2/w7_pps17/LC/StepC), and v7 AOT export."""
+        import os
+        from unittest.mock import patch
+
+        import jax
+        from jax import export as jax_export
+        import jax.numpy as jnp
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        import numpy as np
+        import torch
+
+        from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import (
+            ragged_paged_attention,
+            write_kv_only_rpa_v3,
+        )
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
+            _run_rpad_vmem_core,
+            parse_decode_fast_config,
+            prepare_and_start_rpad_dmas,
+            run_decode_fast_rpa,
+        )
+        from sglang_tpu.attention_pallas_rpa_v3 import (
+            RPA_V3_SPEC,
+            _get_write_kv_only_op,
+            _pool_kv_pack_bd4,
+        )
+        from sglang_tpu.envs import envs
+        from sglang_tpu.kv_pool import (
+            TpuDraftFusedMHATokenToKVPool,
+            TpuFusedMHATokenToKVPool,
+        )
+
+        # 1. Pool metadata, default-OFF guard, TP=8 guard, _logical_kv_view round-trip, & _invoke_v3_kernel
+        self.assertFalse(envs.SGLANG_TPU_KV_PACK_BD4.get())
+        pool_off = TpuFusedMHATokenToKVPool(
+            size=1024, page_size=512, dtype=torch.float8_e4m3fn,
+            head_num=1, head_dim=64, layer_num=1, device="cpu", enable_memory_saver=False,
+        )
+        self.assertFalse(pool_off.kv_pack_bd4)
+        self.assertFalse(_pool_kv_pack_bd4(pool_off))
+        self.assertEqual(pool_off.kv_buffer[0].shape, (3, 512, 1, 4, 128))
+        self.assertEqual(
+            TpuFusedMHATokenToKVPool.kv_bytes_per_token_per_layer(
+                num_kv_heads=1, head_dim=64, v_head_dim=64, store_dtype=torch.float8_e4m3fn,
+            ),
+            512,
+        )
+
+        with patch.dict(os.environ, {"SGLANG_TPU_KV_PACK_BD4": "1"}):
+            self.assertEqual(
+                TpuFusedMHATokenToKVPool.kv_bytes_per_token_per_layer(
+                    num_kv_heads=1, head_dim=64, v_head_dim=64, store_dtype=torch.float8_e4m3fn,
+                ),
+                128,
+            )
+            self.assertEqual(
+                TpuFusedMHATokenToKVPool.kv_bytes_per_token_per_layer(
+                    num_kv_heads=2, head_dim=64, v_head_dim=64, store_dtype=torch.float8_e4m3fn,
+                ),
+                512,
+            )
+            pool_bd4 = TpuFusedMHATokenToKVPool(
+                size=1024, page_size=512, dtype=torch.float8_e4m3fn,
+                head_num=1, head_dim=64, layer_num=1, device="cpu", enable_memory_saver=False,
+            )
+            pool_tp8 = TpuFusedMHATokenToKVPool(
+                size=1024, page_size=512, dtype=torch.float8_e4m3fn,
+                head_num=2, head_dim=64, layer_num=1, device="cpu", enable_memory_saver=False,
+            )
+            pool_draft = TpuDraftFusedMHATokenToKVPool(
+                size=1024, page_size=512, dtype=torch.float8_e4m3fn,
+                head_num=1, head_dim=64, layer_num=1, device="cpu", enable_memory_saver=False,
+            )
+            self.assertTrue(pool_bd4.kv_pack_bd4)
+            self.assertFalse(pool_bd4.kv_pack_dense2)
+            self.assertTrue(_pool_kv_pack_bd4(pool_bd4))
+            self.assertEqual(pool_bd4.kv_buffer[0].shape, (3, 128, 1, 4, 128))
+            self.assertTrue(pool_bd4.kv_layout_tag().endswith("-bd4"))
+            self.assertFalse(pool_tp8.kv_pack_bd4)
+            self.assertFalse(pool_draft.kv_pack_bd4)
+            self.assertIsNotNone(_get_write_kv_only_op(False, True))
+
+            # Verify _logical_kv_view ordering against bd4 packing
+            k_ref_u8 = np.random.default_rng(17).integers(1, 50, size=(3 * 512, 64), dtype=np.uint8)
+            v_ref_u8 = np.random.default_rng(18).integers(51, 100, size=(3 * 512, 64), dtype=np.uint8)
+            bd4_u8 = np.zeros((3, 128, 1, 4, 128), dtype=np.uint8)
+            k_4 = k_ref_u8.reshape(3 * 128, 4, 64)
+            v_4 = v_ref_u8.reshape(3 * 128, 4, 64)
+            bd4_u8[:, :, 0, 0, :64] = k_4[:, 0, :].reshape(3, 128, 64)
+            bd4_u8[:, :, 0, 0, 64:] = k_4[:, 1, :].reshape(3, 128, 64)
+            bd4_u8[:, :, 0, 1, :64] = v_4[:, 0, :].reshape(3, 128, 64)
+            bd4_u8[:, :, 0, 1, 64:] = v_4[:, 1, :].reshape(3, 128, 64)
+            bd4_u8[:, :, 0, 2, :64] = k_4[:, 2, :].reshape(3, 128, 64)
+            bd4_u8[:, :, 0, 2, 64:] = k_4[:, 3, :].reshape(3, 128, 64)
+            bd4_u8[:, :, 0, 3, :64] = v_4[:, 2, :].reshape(3, 128, 64)
+            bd4_u8[:, :, 0, 3, 64:] = v_4[:, 3, :].reshape(3, 128, 64)
+            pool_bd4.kv_buffer[0].copy_(torch.from_numpy(bd4_u8).view(torch.float8_e4m3fn))
+            k_got, v_got = pool_bd4.get_kv_buffer(0)
+            self.assertTrue(np.array_equal(k_got.view(torch.uint8).numpy().reshape(-1, 64), k_ref_u8))
+            self.assertTrue(np.array_equal(v_got.view(torch.uint8).numpy().reshape(-1, 64), v_ref_u8))
+
+            seen = {}
+            def _stub_rpa(*args, **kwargs):
+                seen["kwargs"] = kwargs
+                return args[0], args[3]
+            RPA_V3_SPEC.invoke_kernel(
+                _stub_rpa,
+                queries=jax.ShapeDtypeStruct((4, 8, 64), jnp.bfloat16),
+                keys=jax.ShapeDtypeStruct((4, 8, 64), jnp.bfloat16),
+                values=jax.ShapeDtypeStruct((4, 8, 64), jnp.bfloat16),
+                kv_cache_fused=jax.ShapeDtypeStruct((8, 128, 1, 4, 128), jnp.float8_e4m3fn),
+                kv_lens=jax.ShapeDtypeStruct((4,), jnp.int32),
+                page_indices=jax.ShapeDtypeStruct((8,), jnp.int32),
+                cu_q_lens=jax.ShapeDtypeStruct((5,), jnp.int32),
+                cu_kv_lens=jax.ShapeDtypeStruct((5,), jnp.int32),
+                distribution=jax.ShapeDtypeStruct((3,), jnp.int32),
+                attention_sink=None,
+                sm_scale=64.0 ** -0.5,
+                sliding_window=2049,
+                soft_cap=None,
+                k_scale=1.0,
+                v_scale=1.0,
+            )
+            self.assertTrue(seen["kwargs"].get("_kv_pack_bd4"))
+            self.assertNotIn("_kv_pack_dense2", seen["kwargs"])
+
+        def _pack_bd4_u8_from_512(s512_u8: np.ndarray) -> np.ndarray:
+            nb, ps_l = s512_u8.shape[0], s512_u8.shape[1]
+            r = ps_l // 4
+            x = s512_u8.reshape(nb, r, 4, 4, 128)
+            out = np.empty((nb, r, 1, 4, 128), dtype=np.uint8)
+            out[:, :, 0, 0, :64] = x[:, :, 0, 0, :64]
+            out[:, :, 0, 0, 64:] = x[:, :, 1, 0, :64]
+            out[:, :, 0, 1, :64] = x[:, :, 0, 1, :64]
+            out[:, :, 0, 1, 64:] = x[:, :, 1, 1, :64]
+            out[:, :, 0, 2, :64] = x[:, :, 2, 0, :64]
+            out[:, :, 0, 2, 64:] = x[:, :, 3, 0, :64]
+            out[:, :, 0, 3, :64] = x[:, :, 2, 1, :64]
+            out[:, :, 0, 3, 64:] = x[:, :, 3, 1, :64]
+            return out
+
+        def _unpack_bd4_u8_to_kv64(bd4_u8: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            nb, r = bd4_u8.shape[0], bd4_u8.shape[1]
+            k_out = np.empty((nb, r * 4, 64), dtype=np.uint8)
+            v_out = np.empty((nb, r * 4, 64), dtype=np.uint8)
+            k_out[:, 0::4, :] = bd4_u8[:, :, 0, 0, :64]
+            k_out[:, 1::4, :] = bd4_u8[:, :, 0, 0, 64:]
+            k_out[:, 2::4, :] = bd4_u8[:, :, 0, 2, :64]
+            k_out[:, 3::4, :] = bd4_u8[:, :, 0, 2, 64:]
+            v_out[:, 0::4, :] = bd4_u8[:, :, 0, 1, :64]
+            v_out[:, 1::4, :] = bd4_u8[:, :, 0, 1, 64:]
+            v_out[:, 2::4, :] = bd4_u8[:, :, 0, 3, :64]
+            v_out[:, 3::4, :] = bd4_u8[:, :, 0, 3, 64:]
+            return k_out, v_out
+
+        rng = np.random.default_rng(1707)
+        ps = 512
+
+        # 2. Multi-step sequential RMW cache-write parity (kv_len mod 4 cycling 1->2->3->0) & write_kv_only
+        bs_rmw, pps_rmw = 8, 2
+        pre_lens = [509, 510, 511, 512, 1, 2, 3, 4]  # off_lo mod 4 in {1,2,3,0} & page cross
+        s512_u8 = np.full((bs_rmw * pps_rmw + 4, ps, 1, 4, 128), 0x7F, dtype=np.uint8)
+        pi_rmw = np.arange(bs_rmw * pps_rmw, dtype=np.int32).reshape(bs_rmw, pps_rmw)
+        rng.shuffle(pi_rmw.ravel())
+        for s_i, pl_i in enumerate(pre_lens):
+            for p_o in range((pl_i + ps - 1) // ps):
+                pg = int(pi_rmw[s_i, p_o])
+                rh = min(ps, pl_i - p_o * ps)
+                s512_u8[pg, :rh, 0, :, :] = 0
+                s512_u8[pg, :rh, 0, 0, :64] = _rand_fp8_u8(rng, (rh, 64))
+                s512_u8[pg, :rh, 0, 1, :64] = _rand_fp8_u8(rng, (rh, 64))
+        kvc_512 = _u8_to_fp8(s512_u8)
+        kvc_bd4 = _u8_to_fp8(_pack_bd4_u8_from_512(s512_u8))
+        pi_j = jnp.asarray(pi_rmw.ravel(), jnp.int32)
+        cukv_j = jnp.arange(bs_rmw + 1, dtype=np.int32) * (pps_rmw * ps)
+        cuq_j = jnp.arange(bs_rmw + 1, dtype=np.int32)
+        dist_j = jnp.asarray([bs_rmw, bs_rmw, bs_rmw], jnp.int32)
+
+        cur_lens = list(pre_lens)
+        for step_i in range(4):
+            cur_lens = [x + 1 for x in cur_lens]
+            kvl_j = jnp.asarray(cur_lens, dtype=jnp.int32)
+            q_s = jnp.asarray((rng.standard_normal((bs_rmw, 8, 64)) * 0.4).astype(np.float32), jnp.bfloat16)
+            k_s = _u8_to_fp8(_rand_fp8_u8(rng, (bs_rmw, 1, 64)))
+            v_s = _u8_to_fp8(_rand_fp8_u8(rng, (bs_rmw, 1, 64)))
+            o_512, kvc_512 = run_decode_fast_rpa(
+                q_s, k_s, v_s, kvc_512, kvl_j, pi_j, cuq_j, cukv_j, dist_j,
+                sm_scale=64.0 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                mode_str="tp16,w7,c1024,g4k,foldcol", decode_query_size=1,
+                kv_pack_bd4=False, interpret=True,
+            )
+            o_bd4, kvc_bd4 = run_decode_fast_rpa(
+                q_s, k_s, v_s, kvc_bd4, kvl_j, pi_j, cuq_j, cukv_j, dist_j,
+                sm_scale=64.0 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                mode_str="tp16,w7,c1024,g4k,foldcol", decode_query_size=1,
+                kv_pack_bd4=True, interpret=True,
+            )
+            a5 = np.asarray(o_512, np.float32)
+            ab = np.asarray(o_bd4, np.float32)
+            self.assertTrue(np.all(np.isfinite(ab)))
+            self.assertGreater(_cosine(ab, a5), 0.99999, f"step={step_i}")
+            self.assertLessEqual(float(np.max(np.abs(ab - a5))), 1e-2, f"step={step_i}")
+            u512 = np.asarray(kvc_512).view(np.uint8)
+            k_b, v_b = _unpack_bd4_u8_to_kv64(np.asarray(kvc_bd4).view(np.uint8))
+            for s_i, cl in enumerate(cur_lens):
+                for tok in range(cl):
+                    pg = int(pi_rmw[s_i, tok // ps])
+                    off = tok % ps
+                    self.assertTrue(np.array_equal(k_b[pg, off], u512[pg, off, 0, 0, :64]))
+                    self.assertTrue(np.array_equal(v_b[pg, off], u512[pg, off, 0, 1, :64]))
+
+        # write_kv_only_rpa_v3 across off_lo % 4 in {1, 2, 3, 0} + multi-page boundary
+        q_lens_wk = [3, 5, 7, 2]
+        pre_wk = [510, 509, 511, 512]
+        tot_wk = [p + q for p, q in zip(pre_wk, q_lens_wk)]
+        s_wk_512 = np.full((12, ps, 1, 4, 128), 0x7F, dtype=np.uint8)
+        pi_wk = np.arange(8, dtype=np.int32).reshape(4, 2)
+        rng.shuffle(pi_wk.ravel())
+        for s_i, pl_i in enumerate(pre_wk):
+            pg = int(pi_wk[s_i, 0])
+            s_wk_512[pg, :pl_i, 0, :, :] = 0
+            s_wk_512[pg, :pl_i, 0, 0, :64] = _rand_fp8_u8(rng, (pl_i, 64))
+            s_wk_512[pg, :pl_i, 0, 1, :64] = _rand_fp8_u8(rng, (pl_i, 64))
+        t_tot = sum(q_lens_wk)
+        kv_new_u8 = np.zeros((t_tot, 1, 4, 128), dtype=np.uint8)
+        kv_new_u8[:, 0, 0, :64] = _rand_fp8_u8(rng, (t_tot, 64))
+        kv_new_u8[:, 0, 1, :64] = _rand_fp8_u8(rng, (t_tot, 64))
+        cuq_wk = jnp.asarray([0] + list(np.cumsum(q_lens_wk)), jnp.int32)
+        cukv_wk = jnp.arange(5, dtype=jnp.int32) * (2 * ps)
+        kvl_wk = jnp.asarray(tot_wk, jnp.int32)
+        pi_wk_j = jnp.asarray(pi_wk.ravel(), jnp.int32)
+        dist_wk = jnp.asarray([4, 4, 4], jnp.int32)
+        wk_512 = write_kv_only_rpa_v3(
+            _u8_to_fp8(kv_new_u8), _u8_to_fp8(s_wk_512), kvl_wk, pi_wk_j, cuq_wk, cukv_wk, dist_wk,
+            interpret=True, kv_pack_bd4=False,
+        )
+        wk_bd4 = write_kv_only_rpa_v3(
+            _u8_to_fp8(kv_new_u8), _u8_to_fp8(_pack_bd4_u8_from_512(s_wk_512)), kvl_wk, pi_wk_j, cuq_wk, cukv_wk, dist_wk,
+            interpret=True, kv_pack_bd4=True,
+        )
+        u_wk512 = np.asarray(wk_512).view(np.uint8)
+        k_wkb, v_wkb = _unpack_bd4_u8_to_kv64(np.asarray(wk_bd4).view(np.uint8))
+        for s_i, tl in enumerate(tot_wk):
+            for tok in range(tl):
+                pg = int(pi_wk[s_i, tok // ps])
+                off = tok % ps
+                self.assertTrue(np.array_equal(k_wkb[pg, off], u_wk512[pg, off, 0, 0, :64]))
+                self.assertTrue(np.array_equal(v_wkb[pg, off], u_wk512[pg, off, 0, 1, :64]))
+
+        # 3. RPAd_fast bd4 across batch4 SWA, batch2 SWA, Mix Full w_pg=17/33 (pps=17 non-mult-of-8), LC shared16, & Step (c)
+        for case_tag, bs_c, sw_c, pps_c, mode_c, lens_c, n_act_c, shared_c in (
+            (
+                "swa_1k_batch4", 16, 2049, 2, "w8,batchfull,g4k,foldcol,batch4",
+                [1, 3, 255, 511, 512, 513, 600, 750, 999, 1001, 1020, 1024, 333, 1, 1, 1], 13, None,
+            ),
+            (
+                "swa_8k1k_batch2", 8, 2049, 5, "w8,s3,noadapt,g4k,foldcol,batch2",
+                [515, 1111, 2049, 2300, 2559, 15, 7, 1], 7, None,
+            ),
+            (
+                "full_w7_pps17", 4, None, 17, "tp16,w7,g4k,foldcol",
+                [1201, 4097, 5123, 8600], 4, None,
+            ),
+            (
+                "full_dyn_pps17", 4, None, 17, "tp16,v2,streamdyn,c512,foldcol",
+                [513, 1205, 5121, 8600], 4, None,
+            ),
+            (
+                "lc_shared16", 16, None, 4, "s4,c1024,shared16,q256,shsplit,pbf16,batchfull,foldcol,shfp8",
+                [1500, 1503, 1511, 1601, 1700, 1800, 1900, 2001, 1400, 1300, 1200, 1100, 1025, 1026, 1, 1],
+                14, 2,
+            ),
+        ):
+            with self.subTest(regime=case_tag):
+                s_c_u8 = np.full((bs_c * pps_c + 8, ps, 1, 4, 128), 0x7F, dtype=np.uint8)
+                pi_c = np.arange(bs_c * pps_c, dtype=np.int32).reshape(bs_c, pps_c)
+                if shared_c is not None:
+                    sh_pgs = np.arange(shared_c, dtype=np.int32) + (bs_c * pps_c)
+                    pi_c[:, :shared_c] = sh_pgs[None, :]
+                    s_c_u8[sh_pgs, :, 0, :, :] = 0
+                    s_c_u8[sh_pgs, :, 0, 0, :64] = _rand_fp8_u8(rng, (shared_c, ps, 64))
+                    s_c_u8[sh_pgs, :, 0, 1, :64] = _rand_fp8_u8(rng, (shared_c, ps, 64))
+                for s_i in range(n_act_c):
+                    old_l = lens_c[s_i] - 1
+                    p0 = shared_c if shared_c is not None else 0
+                    for p_o in range(p0, (old_l + ps - 1) // ps):
+                        pg = int(pi_c[s_i, p_o])
+                        rh = min(ps, old_l - p_o * ps)
+                        s_c_u8[pg, :rh, 0, :, :] = 0
+                        s_c_u8[pg, :rh, 0, 0, :64] = _rand_fp8_u8(rng, (rh, 64))
+                        s_c_u8[pg, :rh, 0, 1, :64] = _rand_fp8_u8(rng, (rh, 64))
+                kvc_5 = _u8_to_fp8(s_c_u8)
+                kvc_4 = _u8_to_fp8(_pack_bd4_u8_from_512(s_c_u8))
+                q8 = jnp.asarray((rng.standard_normal((bs_c, 8, 64)) * 0.4).astype(np.float32), jnp.bfloat16)
+                k8 = _u8_to_fp8(_rand_fp8_u8(rng, (bs_c, 1, 64)))
+                v8 = _u8_to_fp8(_rand_fp8_u8(rng, (bs_c, 1, 64)))
+                pi_cj = jnp.asarray(pi_c.ravel(), jnp.int32)
+                cuq_cj = jnp.arange(bs_c + 1, dtype=jnp.int32)
+                cukv_cj = jnp.arange(bs_c + 1, dtype=jnp.int32) * (pps_c * ps)
+                dist_cj = (
+                    jnp.asarray([n_act_c, n_act_c, n_act_c, shared_c], jnp.int32)
+                    if shared_c is not None
+                    else jnp.asarray([n_act_c, n_act_c, n_act_c], jnp.int32)
+                )
+                kvl_cj = jnp.asarray(lens_c, jnp.int32)
+                sh_arg = jnp.asarray([shared_c], jnp.int32) if shared_c is not None else None
+                gate_c = jnp.asarray((rng.standard_normal((bs_c, 512)) * 0.4).astype(np.float32), jnp.bfloat16)
+                q_prep = jnp.pad(q8, ((0, 0), (0, 0), (0, 64))).reshape(1, bs_c, 2, 4, 128)
+                kv_prep = jnp.pad(jnp.concatenate([k8, v8], axis=1), ((0, 0), (0, 2), (0, 64))).reshape(bs_c, 1, 4, 128)
+
+                ref_m = mode_c.replace(",batch4", "").replace(",batch2", "")
+                if shared_c is not None:
+                    q16_r = jnp.pad(q8, ((0, 0), (0, 8), (0, 64))).reshape(1, bs_c, 8, 2, 128)
+                    o_5, _ = run_decode_fast_rpa(
+                        q16_r, kv_prep, None, kvc_5, kvl_cj, pi_cj, cuq_cj, cukv_cj, dist_cj,
+                        sm_scale=64.0 ** -0.5, sliding_window=sw_c, k_scale=1.0, v_scale=1.0,
+                        mode_str=mode_c, decode_query_size=1,
+                        fused_out_pack=2, prepared_inputs=True, gate=gate_c, out_norm_eps=1e-5,
+                        shared_pages=sh_arg, force_native_tp16=True, interpret=True,
+                    )
+                else:
+                    o_5, _ = run_decode_fast_rpa(
+                        q8, k8, v8, kvc_5, kvl_cj, pi_cj, cuq_cj, cukv_cj, dist_cj,
+                        sm_scale=64.0 ** -0.5, sliding_window=sw_c, k_scale=1.0, v_scale=1.0,
+                        mode_str=ref_m if "tp16" in ref_m else f"tp16,{ref_m}",
+                        decode_query_size=1, fused_out_pack=2, prepared_inputs=False,
+                        gate=gate_c, out_norm_eps=1e-5, kv_pack_bd4=False, interpret=True,
+                    )
+                o_4, _ = run_decode_fast_rpa(
+                    q_prep, kv_prep, None, kvc_4, kvl_cj, pi_cj, cuq_cj, cukv_cj, dist_cj,
+                    sm_scale=64.0 ** -0.5, sliding_window=sw_c, k_scale=1.0, v_scale=1.0,
+                    mode_str=mode_c, decode_query_size=1, fused_out_pack=2, prepared_inputs=True,
+                    gate=gate_c, out_norm_eps=1e-5, shared_pages=sh_arg, kv_pack_bd4=True, interpret=True,
+                )
+                a5 = np.asarray(o_5[:n_act_c], np.float32)
+                a4 = np.asarray(o_4[:n_act_c], np.float32)
+                self.assertTrue(np.all(np.isfinite(np.asarray(o_4, np.float32))))
+                self.assertGreater(_cosine(a4, a5), 0.99995, case_tag)
+                self.assertLessEqual(float(np.max(np.abs(a4 - a5))), 2e-2, case_tag)
+
+        # 4. RPAm prefill round-trip with bd4 (512 q tokens after 259 cached tokens -> off_lo%4=3 + multi-page RMW on 0x7F cache)
+        interp_pm = pltpu.InterpretParams(detect_races=True, uninitialized_memory="nan")
+        t_pm, q_pm, cache_pm_l = 512, 512, 259
+        kv_pm_l = cache_pm_l + q_pm
+        s_pm_512 = np.full((4, ps, 1, 4, 128), 0x7F, dtype=np.uint8)
+        s_pm_512[0, :cache_pm_l, 0, :, :] = 0
+        s_pm_512[0, :cache_pm_l, 0, 0, :64] = _rand_fp8_u8(rng, (cache_pm_l, 64))
+        s_pm_512[0, :cache_pm_l, 0, 1, :64] = _rand_fp8_u8(rng, (cache_pm_l, 64))
+        q_pm_np = (rng.standard_normal((1, t_pm, 4, 2, 128)) * 0.4).astype(np.float32)
+        q_pm_np[..., 64:] = 0.0
+        q_pm_arr = jnp.asarray(q_pm_np, jnp.bfloat16)
+        kv_pm_u8 = np.zeros((t_pm, 1, 4, 128), dtype=np.uint8)
+        kv_pm_u8[:, 0, 0, :64] = _rand_fp8_u8(rng, (t_pm, 64))
+        kv_pm_u8[:, 0, 1, :64] = _rand_fp8_u8(rng, (t_pm, 64))
+        kv_pm_arr = _u8_to_fp8(kv_pm_u8)
+        pm_opts = frozenset(
+            {"stationary_q_m0_ring_fuse", "skip_empty_cdma", "mixed_s3", "tp16_sq", "mk128", "la2", "sub8_l", "bf16_pop", "unroll_up", "fp8_qk"}
+        )
+        o_pm5, c_pm5 = ragged_paged_attention(
+            q_pm_arr, kv_pm_arr, None, _u8_to_fp8(s_pm_512),
+            jnp.asarray([kv_pm_l], jnp.int32), jnp.asarray([0, 1], jnp.int32),
+            jnp.asarray([0, q_pm], jnp.int32), jnp.asarray([0, 2 * ps], jnp.int32),
+            jnp.asarray([0, 1, 1], jnp.int32), None,
+            sm_scale=64.0 ** -0.5, sliding_window=2049, chunk_prefill_size=None,
+            m_block_sizes=(512, 2048, 256, 512), _prefill_opts=pm_opts,
+            _fused_out_pack=-2, _prepared_inputs=True, _skip_decode=True, _a3_out_layout=True,
+            _kv_pack_bd4=False, _interpret=interp_pm,
+        )
+        o_pm4, c_pm4 = ragged_paged_attention(
+            q_pm_arr, kv_pm_arr, None, _u8_to_fp8(_pack_bd4_u8_from_512(s_pm_512)),
+            jnp.asarray([kv_pm_l], jnp.int32), jnp.asarray([0, 1], jnp.int32),
+            jnp.asarray([0, q_pm], jnp.int32), jnp.asarray([0, 2 * ps], jnp.int32),
+            jnp.asarray([0, 1, 1], jnp.int32), None,
+            sm_scale=64.0 ** -0.5, sliding_window=2049, chunk_prefill_size=None,
+            m_block_sizes=(512, 2048, 256, 512), _prefill_opts=pm_opts,
+            _fused_out_pack=-2, _prepared_inputs=True, _skip_decode=True, _a3_out_layout=True,
+            _kv_pack_bd4=True, _interpret=interp_pm,
+        )
+        self.assertTrue(np.all(np.isfinite(np.asarray(o_pm4, np.float32))))
+        self.assertGreater(_cosine(np.asarray(o_pm4, np.float32), np.asarray(o_pm5, np.float32)), 0.99999)
+        self.assertLessEqual(float(np.max(np.abs(np.asarray(o_pm4, np.float32) - np.asarray(o_pm5, np.float32)))), 1e-2)
+        u_pm5 = np.asarray(c_pm5).view(np.uint8)
+        k_pm4, v_pm4 = _unpack_bd4_u8_to_kv64(np.asarray(c_pm4).view(np.uint8))
+        for tok in range(kv_pm_l):
+            pg, off = tok // ps, tok % ps
+            self.assertTrue(np.array_equal(k_pm4[pg, off], u_pm5[pg, off, 0, 0, :64]))
+            self.assertTrue(np.array_equal(v_pm4[pg, off], u_pm5[pg, off, 0, 1, :64]))
+
+        # 5. Prestarted Step (c) parity with bd4
+        bs_s, pps_s, n_act_s = 16, 2, 13
+        mode_s = "w8,s3,batchfull,g4k,foldcol,batch4"
+        cfg_s = parse_decode_fast_config(
+            mode_s, sliding_window=2049, pages_per_seq=pps_s, page_size=ps,
+            decode_query_size=1, kv_pack_bd4=True,
+        )
+        lens_s = [120, 480, 513, 900, 1024] * 2 + [1, 300, 600] + [1, 1, 1]
+        s5_u8 = np.full((bs_s * pps_s + 4, ps, 1, 4, 128), 0x7F, dtype=np.uint8)
+        pi_s = np.arange(bs_s * pps_s, dtype=np.int32).reshape(bs_s, pps_s)
+        for s_i in range(n_act_s):
+            old_l = lens_s[s_i] - 1
+            for p_o in range((old_l + ps - 1) // ps):
+                pg = int(pi_s[s_i, p_o])
+                rh = min(ps, old_l - p_o * ps)
+                s5_u8[pg, :rh, 0, :, :] = 0
+                s5_u8[pg, :rh, 0, 0, :64] = _rand_fp8_u8(rng, (rh, 64))
+                s5_u8[pg, :rh, 0, 1, :64] = _rand_fp8_u8(rng, (rh, 64))
+        kvc_s4 = _u8_to_fp8(_pack_bd4_u8_from_512(s5_u8))
+        q8_s = jnp.asarray((rng.standard_normal((bs_s, 8, 64)) * 0.4).astype(np.float32), jnp.bfloat16)
+        q_bd_s = jnp.concatenate([jnp.pad(q8_s, ((0, 0), (0, 0), (0, 64))), jnp.pad(q8_s, ((0, 0), (0, 0), (64, 0)))], axis=1)
+        k8_s = _u8_to_fp8(_rand_fp8_u8(rng, (bs_s, 1, 64)))
+        v8_s = _u8_to_fp8(_rand_fp8_u8(rng, (bs_s, 1, 64)))
+        kv_p_s = jnp.pad(jnp.concatenate([k8_s, v8_s], axis=1), ((0, 0), (0, 2), (0, 64))).reshape(bs_s, 1, 4, 128)
+        gate_s = jnp.asarray((rng.standard_normal((bs_s, 512)) * 0.4).astype(np.float32), jnp.bfloat16)
+        pi_sj = jnp.asarray(pi_s.ravel(), jnp.int32)
+        cuq_sj = jnp.arange(bs_s + 1, dtype=jnp.int32)
+        cukv_sj = jnp.arange(bs_s + 1, dtype=np.int32) * (pps_s * ps)
+        dist_sj = jnp.asarray([n_act_s, n_act_s, n_act_s], jnp.int32)
+        kvl_sj = jnp.asarray(lens_s, jnp.int32)
+        o_std_s, kv_std_s = run_decode_fast_rpa(
+            q8_s, k8_s, v8_s, kvc_s4, kvl_sj, pi_sj, cuq_sj, cukv_sj, dist_sj,
+            sm_scale=64.0 ** -0.5, sliding_window=2049, k_scale=1.0, v_scale=1.0,
+            mode_str=mode_s, decode_query_size=1, fused_out_pack=2,
+            gate=gate_s, out_norm_eps=1e-5, kv_pack_bd4=True, interpret=True,
+        )
+
+        def _pre_bd4(klr, pir, cqr, ckvr, dr, q_r, kv_r, g_r, chbm, oout, upd, bkv_r, st_r, o_r, kw_r, init_r, sm_r, s1, s2):
+            pre_st = prepare_and_start_rpad_dmas(
+                kv_lens_ref=klr, page_indices_ref=pir, cu_q_lens_ref=cqr, cu_kv_lens_ref=ckvr,
+                distribution_ref=dr, kv_cache_hbm_ref=chbm, bkv_vmem_ref=bkv_r, bkv_sems=s1,
+                sliding_window=2049, cfg=cfg_s, one_block_per_seq=True, decode_query_size=1,
+                kv_pack_bd4=True, interpret_mode=True,
+            )
+            _run_rpad_vmem_core(
+                kv_lens_ref=klr, page_indices_ref=pir, cu_q_lens_ref=cqr, cu_kv_lens_ref=ckvr,
+                distribution_ref=dr, q_vmem_ref=q_r, kv_merged_vmem_ref=kv_r, gate_vmem_ref=g_r,
+                kv_cache_hbm_ref=chbm, o_out_vmem_ref=oout, updated_kv_cache_hbm_ref=upd,
+                bkv_vmem_ref=bkv_r, state_vmem_ref=st_r, o_vmem_ref=o_r, kv_write_vmem_ref=kw_r,
+                init_sv_vmem_ref=init_r, written_cnt_smem_ref=sm_r, bkv_sems=s1, cache_write_sem=s2,
+                sm_scale=64.0 ** -0.5, sliding_window=2049, k_scale=1.0, v_scale=1.0, cfg=cfg_s,
+                one_block_per_seq=True, decode_query_size=1, in_kernel_pack2=True, has_gate=True,
+                out_norm_eps=1e-5, kv_pack_bd4=True, interpret_mode=True, prestarted_bkv_state=pre_st,
+            )
+
+        o_pre_s, kv_pre_s = pl.pallas_call(
+            _pre_bd4,
+            out_shape=[jax.ShapeDtypeStruct((bs_s, 512), jnp.bfloat16), jax.ShapeDtypeStruct(kvc_s4.shape, kvc_s4.dtype)],
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=5,
+                in_specs=[
+                    pl.BlockSpec(q_bd_s.shape, lambda *_: (0, 0, 0), memory_space=pltpu.VMEM),
+                    pl.BlockSpec(kv_p_s.shape, lambda *_: (0, 0, 0, 0), memory_space=pltpu.VMEM),
+                    pl.BlockSpec(gate_s.shape, lambda *_: (0, 0), memory_space=pltpu.VMEM),
+                    pl.BlockSpec(memory_space=pltpu.HBM),
+                ],
+                out_specs=[
+                    pl.BlockSpec((bs_s, 512), lambda *_: (0, 0), memory_space=pltpu.VMEM),
+                    pl.BlockSpec(memory_space=pltpu.HBM),
+                ],
+                grid=(1,),
+                scratch_shapes=[
+                    pltpu.VMEM((cfg_s.num_slots, 4 * cfg_s.max_ring_pages, 128, 1, 4, 128), kvc_s4.dtype),
+                    pltpu.VMEM((3, 8, 128), jnp.float32),
+                    pltpu.VMEM((bs_s, 8, 128), jnp.bfloat16),
+                    pltpu.VMEM((bs_s * 3, 8, 1, 4, 128), kvc_s4.dtype),
+                    pltpu.VMEM((2, ((bs_s + 31) // 32) * 32, 8, 128), jnp.float32),
+                    pltpu.SMEM((2 + cfg_s.num_slots,), jnp.int32),
+                    pltpu.SemaphoreType.DMA((cfg_s.num_slots,)),
+                    pltpu.SemaphoreType.DMA((1,)),
+                ],
+            ),
+            input_output_aliases={8: 1},
+            interpret=pltpu.InterpretParams(detect_races=True, uninitialized_memory="nan"),
+        )(kvl_sj, pi_sj, cuq_sj, cukv_sj, dist_sj, q_bd_s, kv_p_s, gate_s, kvc_s4)
+        self.assertTrue(np.array_equal(np.asarray(o_pre_s).view(np.uint16), np.asarray(o_std_s).view(np.uint16)))
+        self.assertTrue(np.array_equal(np.asarray(kv_pre_s).view(np.uint8), np.asarray(kv_std_s).view(np.uint8)))
+
+        # 6. TPU v7 AOT export across all bd4 regimes + write_kv_only_rpa_v3
+        try:
+            from jax._src import tpu_info  # noqa: F401
+        except ImportError:
+            self.skipTest("jax._src.tpu_info not available")
+        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+        with (
+            patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+            tpu_info_for_cpu_export(),
+        ):
+            for tag_e, bs_e, sw_e, pps_e, mode_e, sh_e in (
+                ("bd4_swa_1k_b4", 64, 2049, 2, "w8,batchfull,g4k,foldcol,batch4", False),
+                ("bd4_swa_8k1k_b2", 64, 2049, 5, "w8,s3,noadapt,g4k,foldcol,batch2", False),
+                ("bd4_full_w7_pps17", 64, None, 17, "tp16,w7,g4k,foldcol", False),
+                ("bd4_lc_sh64", 64, None, 256, "s4,c2048,shared64,q1024,shsplit,pbf16,batchfull,foldcol,shfp8", True),
+            ):
+                with self.subTest(export=tag_e):
+                    d_len = 4 if sh_e else 3
+                    hlo = jax_export.export(
+                        jax.jit(
+                            lambda q_, kv_, g_, c_, kl_, pi_, cq_, ckv_, d_: run_decode_fast_rpa(
+                                q_, kv_, None, c_, kl_, pi_, cq_, ckv_, d_,
+                                sm_scale=64.0 ** -0.5, sliding_window=sw_e, k_scale=1.0, v_scale=1.0,
+                                mode_str=mode_e, decode_query_size=1, fused_out_pack=2,
+                                prepared_inputs=True, gate=g_, out_norm_eps=1e-5, kv_pack_bd4=True,
+                            )
+                        ),
+                        platforms=["tpu"],
+                    )(
+                        jax.ShapeDtypeStruct((1, bs_e, 2, 4, 128), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((bs_e, 1, 4, 128), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((bs_e, 512), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((bs_e * pps_e + 8, 128, 1, 4, 128), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((bs_e,), jnp.int32),
+                        jax.ShapeDtypeStruct((bs_e * pps_e,), jnp.int32),
+                        jax.ShapeDtypeStruct((bs_e + 1,), jnp.int32),
+                        jax.ShapeDtypeStruct((bs_e + 1,), jnp.int32),
+                        jax.ShapeDtypeStruct((d_len,), jnp.int32),
+                    ).mlir_module()
+                    self.assertIn("tpu_custom_call", hlo.lower())
+                    self.assertIn("-bd4", hlo)
+            hlo_wk = jax_export.export(
+                jax.jit(
+                    lambda kvn_, c_, kl_, pi_, cq_, ckv_, d_: write_kv_only_rpa_v3(
+                        kvn_, c_, kl_, pi_, cq_, ckv_, d_, kv_pack_bd4=True,
+                    )
+                ),
+                platforms=["tpu"],
+            )(
+                jax.ShapeDtypeStruct((64, 1, 4, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((128, 128, 1, 4, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((16,), jnp.int32),
+                jax.ShapeDtypeStruct((64,), jnp.int32),
+                jax.ShapeDtypeStruct((17,), jnp.int32),
+                jax.ShapeDtypeStruct((17,), jnp.int32),
+                jax.ShapeDtypeStruct((3,), jnp.int32),
+            ).mlir_module()
+            self.assertIn("RPA_write_kv_only_bd4-p_512", hlo_wk)
+
+            # 7d (AOT). TPU v7 export for fp8dp / streamdyn c128 (pad_rows) / clean1p ps=128
+            for tag_e2, ps_e2, sw_e2, pps_e2, mode_e2 in (
+                ("bd4_w7_fp8dp", 512, None, 5, "tp16,w7,g4k,foldcol,fp8dp"),
+                ("bd4_streamdyn_c128", 128, None, 4, "tp16,v2,streamdyn,c128,foldcol,fp8dp"),
+                ("bd4_clean1p_ps128", 128, 2049, 17, "tp16,clean1p"),
+            ):
+                with self.subTest(export=tag_e2):
+                    hlo2 = jax_export.export(
+                        jax.jit(
+                            lambda q_, kv_, g_, c_, kl_, pi_, cq_, ckv_, d_, m_=mode_e2, sw_=sw_e2: run_decode_fast_rpa(
+                                q_, kv_, None, c_, kl_, pi_, cq_, ckv_, d_,
+                                sm_scale=64.0 ** -0.5, sliding_window=sw_, k_scale=1.0, v_scale=1.0,
+                                mode_str=m_, decode_query_size=1, fused_out_pack=2,
+                                prepared_inputs=True, gate=g_, out_norm_eps=1e-5, kv_pack_bd4=True,
+                            )
+                        ),
+                        platforms=["tpu"],
+                    )(
+                        jax.ShapeDtypeStruct((1, 8, 2, 4, 128), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((8, 1, 4, 128), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((8, 512), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((8 * pps_e2 + 4, ps_e2 // 4, 1, 4, 128), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((8,), jnp.int32),
+                        jax.ShapeDtypeStruct((8 * pps_e2,), jnp.int32),
+                        jax.ShapeDtypeStruct((9,), jnp.int32),
+                        jax.ShapeDtypeStruct((9,), jnp.int32),
+                        jax.ShapeDtypeStruct((3,), jnp.int32),
+                    ).mlir_module()
+                    self.assertIn("tpu_custom_call", hlo2.lower())
+                    self.assertIn("-bd4", hlo2)
+
+        # 7a. kv_merged with 0x7F NaNs in padded lanes 64..127 (hoistkv & nohoistkv & dq=2)
+        for tag_nan, mode_nan, dq_nan in (
+            ("hoist_b4", "w8,batchfull,g4k,foldcol,batch4", 1),
+            ("nohoist_w7", "tp16,w7,nohoistkv,c1024,g4k,foldcol", 1),
+            ("multiq_dq2", "tp16,v2,multiq,stream1p,verify", 2),
+        ):
+            with self.subTest(nan_pad=tag_nan):
+                bs_n, pps_n = 4, 2
+                n_tok_n = bs_n * dq_nan
+                s_n_u8 = np.zeros((bs_n * pps_n + 4, ps, 1, 4, 128), dtype=np.uint8)
+                lens_n = [10 * dq_nan + i * 31 for i in range(bs_n)]
+                pi_n = np.arange(bs_n * pps_n, dtype=np.int32).reshape(bs_n, pps_n)
+                for s_i, cl in enumerate(lens_n):
+                    rh = cl - dq_nan
+                    s_n_u8[pi_n[s_i, 0], :rh, 0, 0, :64] = _rand_fp8_u8(rng, (rh, 64))
+                    s_n_u8[pi_n[s_i, 0], :rh, 0, 1, :64] = _rand_fp8_u8(rng, (rh, 64))
+                kvc_n = _u8_to_fp8(_pack_bd4_u8_from_512(s_n_u8))
+                q_n = jnp.asarray((rng.standard_normal((n_tok_n, 8, 64)) * 0.4).astype(np.float32), jnp.bfloat16)
+                q_n_prep = jnp.pad(q_n, ((0, 0), (0, 0), (0, 64))).reshape(1, n_tok_n, 2, 4, 128)
+                kv_clean_u8 = np.zeros((n_tok_n, 1, 4, 128), dtype=np.uint8)
+                kv_clean_u8[:, 0, 0, :64] = _rand_fp8_u8(rng, (n_tok_n, 64))
+                kv_clean_u8[:, 0, 1, :64] = _rand_fp8_u8(rng, (n_tok_n, 64))
+                kv_nan_u8 = kv_clean_u8.copy()
+                kv_nan_u8[:, 0, :2, 64:] = 0x7F
+                pi_nj = jnp.asarray(pi_n.ravel(), jnp.int32)
+                cuq_nj = jnp.arange(bs_n + 1, dtype=jnp.int32) * dq_nan
+                cukv_nj = jnp.arange(bs_n + 1, dtype=jnp.int32) * (pps_n * ps)
+                dist_nj = jnp.asarray([bs_n, bs_n, bs_n], jnp.int32)
+                kvl_nj = jnp.asarray(lens_n, jnp.int32)
+                o_clean, _ = run_decode_fast_rpa(
+                    q_n_prep, _u8_to_fp8(kv_clean_u8), None, kvc_n, kvl_nj, pi_nj, cuq_nj, cukv_nj, dist_nj,
+                    sm_scale=64.0 ** -0.5, sliding_window=2049, k_scale=1.0, v_scale=1.0,
+                    mode_str=mode_nan, decode_query_size=dq_nan, prepared_inputs=True,
+                    kv_pack_bd4=True, interpret=True,
+                )
+                o_nan, _ = run_decode_fast_rpa(
+                    q_n_prep, _u8_to_fp8(kv_nan_u8), None, kvc_n, kvl_nj, pi_nj, cuq_nj, cukv_nj, dist_nj,
+                    sm_scale=64.0 ** -0.5, sliding_window=2049, k_scale=1.0, v_scale=1.0,
+                    mode_str=mode_nan, decode_query_size=dq_nan, prepared_inputs=True,
+                    kv_pack_bd4=True, interpret=True,
+                )
+                self.assertTrue(np.all(np.isfinite(np.asarray(o_nan, np.float32))))
+                self.assertTrue(np.array_equal(np.asarray(o_nan).view(np.uint16), np.asarray(o_clean).view(np.uint16)))
+
+        # 7b. u4flat guard + fp8dp (w7auto & streamdyn c128) + clean1p (ps=128)
+        for tag_f, ps_f, sw_f, pps_f, mode_f, lens_f in (
+            ("u4flat_guard", 512, 2049, 2, "tp16,w8,s4,u4flat", [100, 513, 700, 1024]),
+            ("w7_fp8dp", 512, None, 5, "tp16,w7,g4k,foldcol,fp8dp", [200, 700, 1200, 2100]),
+            ("streamdyn_c128_fp8dp", 128, None, 4, "tp16,v2,streamdyn,c128,foldcol,fp8dp", [65, 193, 321, 500]),
+            ("clean1p_ps128", 128, 2049, 17, "tp16,clean1p", [129, 1025, 2049, 2176]),
+        ):
+            with self.subTest(fix_regime=tag_f):
+                bs_f = len(lens_f)
+                s_f_u8 = np.full((bs_f * pps_f + 4, ps_f, 1, 4, 128), 0x7F, dtype=np.uint8)
+                pi_f = np.arange(bs_f * pps_f, dtype=np.int32).reshape(bs_f, pps_f)
+                for s_i, cl in enumerate(lens_f):
+                    old_l = cl - 1
+                    for p_o in range((old_l + ps_f - 1) // ps_f):
+                        pg = int(pi_f[s_i, p_o])
+                        rh = min(ps_f, old_l - p_o * ps_f)
+                        s_f_u8[pg, :rh, 0, :, :] = 0
+                        s_f_u8[pg, :rh, 0, 0, :64] = _rand_fp8_u8(rng, (rh, 64))
+                        s_f_u8[pg, :rh, 0, 1, :64] = _rand_fp8_u8(rng, (rh, 64))
+                kvc_f5 = _u8_to_fp8(s_f_u8)
+                kvc_f4 = _u8_to_fp8(_pack_bd4_u8_from_512(s_f_u8))
+                q_f = jnp.asarray((rng.standard_normal((bs_f, 8, 64)) * 0.4).astype(np.float32), jnp.bfloat16)
+                k_f = _u8_to_fp8(_rand_fp8_u8(rng, (bs_f, 1, 64)))
+                v_f = _u8_to_fp8(_rand_fp8_u8(rng, (bs_f, 1, 64)))
+                pi_fj = jnp.asarray(pi_f.ravel(), jnp.int32)
+                cuq_fj = jnp.arange(bs_f + 1, dtype=jnp.int32)
+                cukv_fj = jnp.arange(bs_f + 1, dtype=jnp.int32) * (pps_f * ps_f)
+                dist_fj = jnp.asarray([bs_f, bs_f, bs_f], jnp.int32)
+                kvl_fj = jnp.asarray(lens_f, jnp.int32)
+                o_f5, c_f5 = run_decode_fast_rpa(
+                    q_f, k_f, v_f, kvc_f5, kvl_fj, pi_fj, cuq_fj, cukv_fj, dist_fj,
+                    sm_scale=64.0 ** -0.5, sliding_window=sw_f, k_scale=1.0, v_scale=1.0,
+                    mode_str=mode_f, decode_query_size=1, kv_pack_bd4=False, interpret=True,
+                )
+                o_f4, c_f4 = run_decode_fast_rpa(
+                    q_f, k_f, v_f, kvc_f4, kvl_fj, pi_fj, cuq_fj, cukv_fj, dist_fj,
+                    sm_scale=64.0 ** -0.5, sliding_window=sw_f, k_scale=1.0, v_scale=1.0,
+                    mode_str=mode_f, decode_query_size=1, kv_pack_bd4=True, interpret=True,
+                )
+                self.assertTrue(np.all(np.isfinite(np.asarray(o_f4, np.float32))))
+                self.assertGreater(_cosine(np.asarray(o_f4, np.float32), np.asarray(o_f5, np.float32)), 0.999 if "fp8dp" in tag_f else 0.99995, tag_f)
+                self.assertLessEqual(float(np.max(np.abs(np.asarray(o_f4, np.float32) - np.asarray(o_f5, np.float32)))), 0.1 if "fp8dp" in tag_f else 2e-2, tag_f)
+                u_f5 = np.asarray(c_f5).view(np.uint8)
+                k_f4, v_f4 = _unpack_bd4_u8_to_kv64(np.asarray(c_f4).view(np.uint8))
+                for s_i, cl in enumerate(lens_f):
+                    for tok in range(cl):
+                        pg, off = int(pi_f[s_i, tok // ps_f]), tok % ps_f
+                        self.assertTrue(np.array_equal(k_f4[pg, off], u_f5[pg, off, 0, 0, :64]), tag_f)
+                        self.assertTrue(np.array_equal(v_f4[pg, off], u_f5[pg, off, 0, 1, :64]), tag_f)
+
+        # 7c. shared16 use_flat_priv=False mixed _only_shared (pos%4 != 0) + _private group
+        bs_sh, n_act_sh, pps_sh, sh_pgs_n = 16, 4, 3, 1
+        mode_sh = "s4,c1024,shared16,q256,shsplit,pbf16,batchfull,foldcol"
+        cfg_sh = parse_decode_fast_config(
+            mode_sh, sliding_window=None, pages_per_seq=pps_sh, page_size=ps,
+            decode_query_size=1, shared_group=16, kv_pack_bd4=True,
+        )
+        lens_sh = [510, 1500, 700, 900] + [1] * (bs_sh - n_act_sh)  # Seq 0: total_pgs=1<=shared=1 with (kv_len-1)%4==1; Seq 1..3: private
+        s_sh_u8 = np.full((bs_sh * pps_sh + 4, ps, 1, 4, 128), 0x7F, dtype=np.uint8)
+        pi_sh = np.arange(bs_sh * pps_sh, dtype=np.int32).reshape(bs_sh, pps_sh)
+        sh_pg_id = bs_sh * pps_sh
+        pi_sh[:, 0] = sh_pg_id
+        s_sh_u8[sh_pg_id, :, 0, :, :] = 0
+        s_sh_u8[sh_pg_id, :, 0, 0, :64] = _rand_fp8_u8(rng, (ps, 64))
+        s_sh_u8[sh_pg_id, :, 0, 1, :64] = _rand_fp8_u8(rng, (ps, 64))
+        for s_i in range(n_act_sh):
+            old_l = lens_sh[s_i] - 1
+            for p_o in range(1, (old_l + ps - 1) // ps):
+                pg = int(pi_sh[s_i, p_o])
+                rh = min(ps, old_l - p_o * ps)
+                s_sh_u8[pg, :rh, 0, :, :] = 0
+                s_sh_u8[pg, :rh, 0, 0, :64] = _rand_fp8_u8(rng, (rh, 64))
+                s_sh_u8[pg, :rh, 0, 1, :64] = _rand_fp8_u8(rng, (rh, 64))
+        kvc_sh5 = _u8_to_fp8(s_sh_u8)
+        kvc_sh4 = _u8_to_fp8(_pack_bd4_u8_from_512(s_sh_u8))
+        q_sh = jnp.asarray((rng.standard_normal((bs_sh, 8, 64)) * 0.4).astype(np.float32), jnp.bfloat16)
+        q_sh_bd = jnp.concatenate([jnp.pad(q_sh, ((0, 0), (0, 0), (0, 64))), jnp.pad(q_sh, ((0, 0), (0, 0), (64, 0)))], axis=1)
+        q_sh_16 = jnp.pad(q_sh, ((0, 0), (0, 8), (0, 64))).reshape(1, bs_sh, 8, 2, 128)
+        k_sh = _u8_to_fp8(_rand_fp8_u8(rng, (bs_sh, 1, 64)))
+        v_sh = _u8_to_fp8(_rand_fp8_u8(rng, (bs_sh, 1, 64)))
+        kv_sh_p = jnp.pad(jnp.concatenate([k_sh, v_sh], axis=1), ((0, 0), (0, 2), (0, 64))).reshape(bs_sh, 1, 4, 128)
+        kv_sh_pad32 = jnp.pad(kv_sh_p, ((0, 32 - bs_sh), (0, 0), (0, 0), (0, 0)))
+        pi_shj = jnp.asarray(pi_sh.ravel(), jnp.int32)
+        cuq_shj = jnp.arange(bs_sh + 1, dtype=jnp.int32)
+        cukv_shj = jnp.arange(bs_sh + 1, dtype=jnp.int32) * (pps_sh * ps)
+        dist_shj = jnp.asarray([n_act_sh, n_act_sh, n_act_sh, sh_pgs_n], jnp.int32)
+        kvl_shj = jnp.asarray(lens_sh, jnp.int32)
+        o_sh5, _ = run_decode_fast_rpa(
+            q_sh_16, kv_sh_p, None, kvc_sh5, kvl_shj, pi_shj, cuq_shj, cukv_shj, dist_shj,
+            sm_scale=64.0 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+            mode_str=mode_sh, decode_query_size=1, prepared_inputs=True,
+            shared_pages=jnp.asarray([sh_pgs_n], jnp.int32), force_native_tp16=True, interpret=True,
+        )
+
+        def _sh_no_flat(klr, pir, cqr, ckvr, dr, q_r, kv_r, chbm, oout, upd, bkv_r, st_r, o_r, kw_r, sm_r, s1, s2):
+            _run_rpad_vmem_core(
+                kv_lens_ref=klr, page_indices_ref=pir, cu_q_lens_ref=cqr, cu_kv_lens_ref=ckvr,
+                distribution_ref=dr, q_vmem_ref=q_r, kv_merged_vmem_ref=kv_r, gate_vmem_ref=None,
+                kv_cache_hbm_ref=chbm, o_out_vmem_ref=oout, updated_kv_cache_hbm_ref=upd,
+                bkv_vmem_ref=bkv_r, state_vmem_ref=st_r, o_vmem_ref=o_r, kv_write_vmem_ref=kw_r,
+                init_sv_vmem_ref=None, written_cnt_smem_ref=sm_r, bkv_sems=s1, cache_write_sem=s2,
+                sm_scale=64.0 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0, cfg=cfg_sh,
+                one_block_per_seq=False, decode_query_size=1, in_kernel_pack2=False, has_gate=False,
+                out_norm_eps=None, kv_pack_bd4=True, interpret_mode=True,
+            )
+
+        o_sh4, c_sh4 = pl.pallas_call(
+            _sh_no_flat,
+            out_shape=[jax.ShapeDtypeStruct((bs_sh, 8, 128), jnp.bfloat16), jax.ShapeDtypeStruct(kvc_sh4.shape, kvc_sh4.dtype)],
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=5,
+                in_specs=[
+                    pl.BlockSpec(q_sh_bd.shape, lambda *_: (0, 0, 0), memory_space=pltpu.VMEM),
+                    pl.BlockSpec(kv_sh_pad32.shape, lambda *_: (0, 0, 0, 0), memory_space=pltpu.VMEM),
+                    pl.BlockSpec(memory_space=pltpu.HBM),
+                ],
+                out_specs=[
+                    pl.BlockSpec((bs_sh, 8, 128), lambda *_: (0, 0, 0), memory_space=pltpu.VMEM),
+                    pl.BlockSpec(memory_space=pltpu.HBM),
+                ],
+                grid=(1,),
+                scratch_shapes=[
+                    pltpu.VMEM((cfg_sh.num_slots, cfg_sh.max_ring_pages, ps // 4, 1, 4, 128), kvc_sh4.dtype),
+                    pltpu.VMEM((3, cfg_sh.shared_group_size * 8, 128), jnp.float32),
+                    pltpu.VMEM((bs_sh, 8, 128), jnp.bfloat16),
+                    pltpu.VMEM((bs_sh * 3, 8, 1, 4, 128), kvc_sh4.dtype),
+                    pltpu.SMEM((2 + cfg_sh.num_slots,), jnp.int32),  # priv_smem_cap==0 -> forces use_flat_priv=False
+                    pltpu.SemaphoreType.DMA((cfg_sh.num_slots,)),
+                    pltpu.SemaphoreType.DMA((1,)),
+                ],
+            ),
+            input_output_aliases={7: 1},
+            interpret=pltpu.InterpretParams(detect_races=True, uninitialized_memory="nan"),
+        )(kvl_shj, pi_shj, cuq_shj, cukv_shj, dist_shj, q_sh_bd, kv_sh_pad32, kvc_sh4)
+        o_sh4_s = np.asarray(o_sh4[:n_act_sh, :, :64], np.float32)
+        o_sh5_s = np.asarray(o_sh5, np.float32).reshape(bs_sh, 8, 64)[:n_act_sh]
+        self.assertGreater(_cosine(o_sh4_s, o_sh5_s), 0.99995)
+        k_sh4, v_sh4 = _unpack_bd4_u8_to_kv64(np.asarray(c_sh4).view(np.uint8))
+        kv_np = np.asarray(kv_sh_p).view(np.uint8)
+        for s_i in range(n_act_sh):
+            cl = lens_sh[s_i]
+            pg, off = int(pi_sh[s_i, (cl - 1) // ps]), (cl - 1) % ps
+            self.assertTrue(np.array_equal(k_sh4[pg, off], kv_np[s_i, 0, 0, :64]))
+            self.assertTrue(np.array_equal(v_sh4[pg, off], kv_np[s_i, 0, 1, :64]))
+        self.assertTrue(np.array_equal(k_sh4[sh_pg_id, 508], s_sh_u8[sh_pg_id, 508, 0, 0, :64]))
+        self.assertTrue(np.array_equal(v_sh4[sh_pg_id, 508], s_sh_u8[sh_pg_id, 508, 0, 1, :64]))
+
+        # 7d. Cross-caller bd4 guards: dflash_draft_kv_write & maybe_forward_m2m_decode
+        from unittest.mock import MagicMock
+        from sglang_tpu.dflash_draft_kv_write import _scatter_layer_kv, dflash_write_draft_kv
+        from sglang_tpu.muse_megakernel.decode.m2m.ops import maybe_forward_m2m_decode
+
+        mock_pool = MagicMock(kv_pack_heads=1, kv_pack_dense2=False, kv_pack_bd4=True)
+        with self.assertRaisesRegex(NotImplementedError, "non-bd4"):
+            dflash_write_draft_kv(
+                draft_model=MagicMock(), kv_pool=mock_pool, ctx_hidden=torch.zeros(1, 8),
+                ctx_positions=torch.zeros(1, dtype=torch.long), ctx_cache_loc=torch.zeros(1, dtype=torch.long),
+                cache_loc_2d=None, commit_lens=None, max_num_reqs=1,
+            )
+        with self.assertRaisesRegex(NotImplementedError, "non-bd4"):
+            _scatter_layer_kv(
+                kv_pool=mock_pool, layer_idx=0, loc=torch.zeros(1, dtype=torch.long),
+                k=torch.zeros(1, 1, 64), v=torch.zeros(1, 1, 64),
+            )
+        mock_m2m_model = MagicMock()
+        mock_m2m_model.pp_group.is_first_rank = True
+        mock_m2m_model.pp_group.is_last_rank = True
+        mock_m2m_model.layers_to_capture = None
+        mock_m2m_model.__dict__["_decode_col_bridges"] = 3
+        mock_m2m_model.start_layer = 0
+        mock_m2m_model.end_layer = 1
+        mock_m2m_backend = MagicMock(
+            _dcp=1, kv_cache_quant_dtype=torch.float8_e4m3fn, _kv_pack_dense2=False, _kv_pack_bd4=True,
+        )
+        mock_m2m_backend.forward_metadata.decode_query_size = 1
+        mock_m2m_backend.forward_metadata.cp_write_segments = None
+        mock_m2m_backend._kv_lens.return_value = torch.ones(16, dtype=torch.int32)
+        with (
+            patch("sglang_tpu.decode_qkv_epilogue_tpu._resolve_decode_attn_backend", return_value=mock_m2m_backend),
+            patch("sglang_tpu.models.muse_spark._layer_tp_size", return_value=16),
+        ):
+            self.assertIsNone(
+                maybe_forward_m2m_decode(
+                    mock_m2m_model,
+                    positions=torch.arange(16, dtype=torch.int32),
+                    stream=torch.zeros(16, 128),
+                    carried_attn_input=None,
+                    cos_sin_step=None,
+                    forward_batch=MagicMock(),
+                    tok_sharded_stream=False,
+                )
+            )
+            mock_m2m_backend._kv_lens.assert_called_once()
 
 if __name__ == "__main__":
     unittest.main()

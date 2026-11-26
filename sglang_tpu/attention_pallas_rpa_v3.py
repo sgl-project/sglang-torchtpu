@@ -89,6 +89,29 @@ def _pool_kv_pack_dense2(pool) -> bool:
     return flags.pop()
 
 
+def _pool_kv_pack_bd4(pool) -> bool:
+    """True when the fused pool packs 4 TP=16 FP8 tokens per 32-bit row (``kv_pack_bd4``)."""
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+    from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+
+    pools = (
+        (pool.full_kv_pool, pool.swa_kv_pool)
+        if isinstance(pool, SWAKVPool)
+        else (pool,)
+    )
+    flags = {
+        bool(getattr(p, "kv_pack_bd4", False))
+        if isinstance(p, TpuFusedMHATokenToKVPool)
+        else False
+        for p in pools
+    }
+    if len(flags) != 1:
+        raise NotImplementedError(
+            f"SWA sub-pools set kv_pack_bd4 differently: {flags}"
+        )
+    return flags.pop()
+
+
 def _pool_is_tp16_sq_64(pool) -> bool:
     """True when the fused pool holds 1 local KV head of dim 64 (Muse TP=16)."""
     from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -137,11 +160,32 @@ def _invoke_v3_kernel(
     decode_gate_in_values=False,
     decode_tp16_prepared=False,
     kv_pack_dense2=False,
+    kv_pack_bd4=False,
 ):
     extra = {}
     long_prefill_tiles = False
+    q_shape = getattr(queries, "shape", ()) if queries is not None else ()
+    is_tp16_q = (
+        len(q_shape) == 5
+        and q_shape[0] == 1
+        and (q_shape[2] * q_shape[3]) == 8
+        and q_shape[4] == 128
+    ) or (len(q_shape) == 3 and q_shape[1] == 8 and q_shape[2] == 64)
+    bd4_env = getattr(envs, "SGLANG_TPU_KV_PACK_BD4", None)
+    use_bd4 = bool(
+        kv_pack_bd4
+        or (
+            bd4_env is not None
+            and bd4_env.get()
+            and is_tp16_q
+            and kv_cache_fused is not None
+            and len(kv_cache_fused.shape) == 5
+            and kv_cache_fused.shape[1] >= 4
+            and kv_cache_fused.shape[2:] == (1, 4, 128)
+        )
+    )
     dense2_env = getattr(envs, "SGLANG_TPU_KV_PACK_DENSE2", None)
-    use_dense2 = bool(
+    use_dense2 = (not use_bd4) and bool(
         kv_pack_dense2
         or (
             dense2_env is not None
@@ -153,11 +197,17 @@ def _invoke_v3_kernel(
         )
     )
     logical_page_size = (
-        kv_cache_fused.shape[1] * 2
-        if (use_dense2 and kv_cache_fused is not None)
-        else (kv_cache_fused.shape[1] if kv_cache_fused is not None else 128)
+        kv_cache_fused.shape[1] * 4
+        if (use_bd4 and kv_cache_fused is not None)
+        else (
+            kv_cache_fused.shape[1] * 2
+            if (use_dense2 and kv_cache_fused is not None)
+            else (kv_cache_fused.shape[1] if kv_cache_fused is not None else 128)
+        )
     )
-    if use_dense2:
+    if use_bd4:
+        extra["_kv_pack_bd4"] = True
+    elif use_dense2:
         extra["_kv_pack_dense2"] = True
     allow_verify_q = decode_query_size == 1 or (
         decode_query_size > 1 and envs.SGLANG_TPU_MUSE_KERNEL_VERIFY_RPA_FAST.get()
@@ -932,6 +982,15 @@ def _tp16_prepared_spec(spec: RpaKernelSpec) -> RpaKernelSpec:
     )
 
 
+def _bd4_spec(spec: RpaKernelSpec) -> RpaKernelSpec:
+    """Mark ``spec`` as using 4-token-per-row ``bd4`` KV cache packing."""
+    return dataclasses.replace(
+        spec,
+        op_name=f"{spec.op_name}_bd4",
+        invoke_kernel=functools.partial(spec.invoke_kernel, kv_pack_bd4=True),
+    )
+
+
 def _import_muse_batched_kernel():
     from sglang_tpu.attention.pallas.batched_rpa_muse.wrapper import (
         ragged_paged_attention,
@@ -1011,9 +1070,15 @@ class TpuPallasRpaV3AttnBackend(BaseTpuPallasRpaAttnBackend):
             else None
         )
         pack = _pool_kv_pack_heads(self.token_to_kv_pool)
-        self._kv_pack_dense2 = _pool_kv_pack_dense2(self.token_to_kv_pool)
+        self._kv_pack_bd4 = _pool_kv_pack_bd4(self.token_to_kv_pool)
+        self._kv_pack_dense2 = (not self._kv_pack_bd4) and _pool_kv_pack_dense2(
+            self.token_to_kv_pool
+        )
+        _wrap_bd4 = _bd4_spec if self._kv_pack_bd4 else (lambda spec: spec)
+        if self._kv_pack_bd4:
+            self._op = _build_pallas_kernel_op(_bd4_spec(self.kernel_spec))
         self._fused_out_op = (
-            _build_pallas_kernel_op(_fused_out_spec(pack))
+            _build_pallas_kernel_op(_wrap_bd4(_fused_out_spec(pack)))
             if envs.SGLANG_TPU_RPA_V3_PREFILL_FUSED_OUT.get()
             and pack > 1
             and self._dcp == 1
@@ -1021,10 +1086,12 @@ class TpuPallasRpaV3AttnBackend(BaseTpuPallasRpaAttnBackend):
         )
         self._skip_decode_op = (
             _build_pallas_kernel_op(
-                _skip_decode_spec(
-                    _fused_out_spec(pack)
-                    if self._fused_out_op is not None
-                    else RPA_V3_SPEC
+                _wrap_bd4(
+                    _skip_decode_spec(
+                        _fused_out_spec(pack)
+                        if self._fused_out_op is not None
+                        else RPA_V3_SPEC
+                    )
                 )
             )
             if envs.SGLANG_TPU_RPA_V3_SKIP_EMPTY_DECODE.get() and self._dcp == 1
@@ -1051,7 +1118,7 @@ class TpuPallasRpaV3AttnBackend(BaseTpuPallasRpaAttnBackend):
             )
             if want_skip_mixed:
                 dec_spec = _skip_mixed_spec(dec_spec)
-            self._decode_op = _build_pallas_kernel_op(dec_spec)
+            self._decode_op = _build_pallas_kernel_op(_wrap_bd4(dec_spec))
         else:
             self._decode_op = None
         decode_qkv_epi_env = getattr(envs, "SGLANG_TPU_MUSE_DECODE_QKV_EPILOGUE", None)
@@ -1078,7 +1145,7 @@ class TpuPallasRpaV3AttnBackend(BaseTpuPallasRpaAttnBackend):
             if is_tp16_sq_pool:
                 dec_prep_spec = _tp16_prepared_spec(dec_prep_spec)
             self._decode_prepared_op = _build_pallas_kernel_op(
-                _prepared_spec(_skip_mixed_spec(dec_prep_spec))
+                _wrap_bd4(_prepared_spec(_skip_mixed_spec(dec_prep_spec)))
             )
             if decode_gate_fuse_env is not None and decode_gate_fuse_env.get():
                 norm_eps = float(
@@ -1090,9 +1157,11 @@ class TpuPallasRpaV3AttnBackend(BaseTpuPallasRpaAttnBackend):
                 if is_tp16_sq_pool:
                     gated_base = _tp16_prepared_spec(gated_base)
                 self._decode_prepared_gated_op = _build_pallas_kernel_op(
-                    _decode_gated_spec(
-                        _prepared_spec(_skip_mixed_spec(gated_base)),
-                        norm_eps,
+                    _wrap_bd4(
+                        _decode_gated_spec(
+                            _prepared_spec(_skip_mixed_spec(gated_base)),
+                            norm_eps,
+                        )
                     )
                 )
             else:
@@ -1119,15 +1188,17 @@ class TpuPallasRpaV3AttnBackend(BaseTpuPallasRpaAttnBackend):
         prep_pack = -2 if is_tp16_sq_pool else pack
         self._prepared_op = (
             _build_pallas_kernel_op(
-                _prepared_a3_layout_spec(prep_pack)
-                if use_rpa_a3_layout
-                else _prepared_spec(
-                    _fused_out_spec(prep_pack)
-                    if (
-                        (self._fused_out_op is not None or is_tp16_sq_pool)
-                        and not (a3_rpa_out_env is not None and a3_rpa_out_env.get())
+                _wrap_bd4(
+                    _prepared_a3_layout_spec(prep_pack)
+                    if use_rpa_a3_layout
+                    else _prepared_spec(
+                        _fused_out_spec(prep_pack)
+                        if (
+                            (self._fused_out_op is not None or is_tp16_sq_pool)
+                            and not (a3_rpa_out_env is not None and a3_rpa_out_env.get())
+                        )
+                        else RPA_V3_SPEC
                     )
-                    else RPA_V3_SPEC
                 )
             )
             if (a1_rpa_layout_env is not None and a1_rpa_layout_env.get())
@@ -1138,7 +1209,9 @@ class TpuPallasRpaV3AttnBackend(BaseTpuPallasRpaAttnBackend):
         # Prewarm custom_op outside torch.compile so Dynamo never traces custom_jax_kernel (#1454).
         try:
             self._write_kv_only_op = (
-                _get_write_kv_only_op(self._kv_pack_dense2) if self._dcp == 1 else None
+                _get_write_kv_only_op(self._kv_pack_dense2, self._kv_pack_bd4)
+                if self._dcp == 1
+                else None
             )
         except ImportError:
             self._write_kv_only_op = None
@@ -1238,11 +1311,12 @@ class TpuPallasRpaV3AttnBackend(BaseTpuPallasRpaAttnBackend):
         else:
             page_indices = self._layer_page_indices(layer.layer_id, is_swa_layer=is_swa)
             kv_lens = self._kv_lens(forward_batch)
-        dense2 = bool(getattr(self, "_kv_pack_dense2", False))
+        bd4 = bool(getattr(self, "_kv_pack_bd4", False))
+        dense2 = (not bd4) and bool(getattr(self, "_kv_pack_dense2", False))
         op = getattr(self, "_write_kv_only_op", None)
         if op is None:
-            cached = _WRITE_KV_ONLY_OPS.get(dense2)
-            op = cached if cached is not None else _get_write_kv_only_op(dense2)
+            cached = _WRITE_KV_ONLY_OPS.get((dense2, bd4))
+            op = cached if cached is not None else _get_write_kv_only_op(dense2, bd4)
         op(
             kv,
             kv_cache,
@@ -1470,11 +1544,14 @@ class TpuPallasRpaV3AttnBackend(BaseTpuPallasRpaAttnBackend):
         pass
 
 
-_WRITE_KV_ONLY_OPS: dict[bool, object] = {}
+_WRITE_KV_ONLY_OPS: dict[tuple[bool, bool], object] = {}
 
 
-def _get_write_kv_only_op(kv_pack_dense2: bool = False):
-    cached = _WRITE_KV_ONLY_OPS.get(kv_pack_dense2)
+def _get_write_kv_only_op(kv_pack_dense2: bool = False, kv_pack_bd4: bool = False):
+    if kv_pack_bd4:
+        kv_pack_dense2 = False
+    key = (bool(kv_pack_dense2), bool(kv_pack_bd4))
+    cached = _WRITE_KV_ONLY_OPS.get(key)
     if cached is not None:
         return cached
 
@@ -1487,9 +1564,13 @@ def _get_write_kv_only_op(kv_pack_dense2: bool = False):
     from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
     op_name = (
-        "sglang_tpu_pallas::rpa_v3_write_kv_only_d2"
-        if kv_pack_dense2
-        else "sglang_tpu_pallas::rpa_v3_write_kv_only"
+        "sglang_tpu_pallas::rpa_v3_write_kv_only_bd4"
+        if kv_pack_bd4
+        else (
+            "sglang_tpu_pallas::rpa_v3_write_kv_only_d2"
+            if kv_pack_dense2
+            else "sglang_tpu_pallas::rpa_v3_write_kv_only"
+        )
     )
 
     def _wrapped(
@@ -1518,6 +1599,7 @@ def _get_write_kv_only_op(kv_pack_dense2: bool = False):
             cu_kv_lens,
             distribution,
             kv_pack_dense2=kv_pack_dense2,
+            kv_pack_bd4=kv_pack_bd4,
         )
         return updated.reshape(kv_cache_fused.shape)
 
@@ -1568,5 +1650,5 @@ def _get_write_kv_only_op(kv_pack_dense2: bool = False):
     def _(*args, **kwargs) -> None:
         return None
 
-    _WRITE_KV_ONLY_OPS[kv_pack_dense2] = write_kv_only_op
+    _WRITE_KV_ONLY_OPS[key] = write_kv_only_op
     return write_kv_only_op
