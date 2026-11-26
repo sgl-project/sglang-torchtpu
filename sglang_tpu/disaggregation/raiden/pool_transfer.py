@@ -21,6 +21,12 @@ from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import NetworkAddress
 from sglang_tpu.disaggregation.raiden import pool_side_engine
+from sglang_tpu.disaggregation.raiden.common import (
+    _NULL_CONTEXT,
+    is_profiler_enabled,
+    record_trace_meta,
+    trace_transfer_span,
+)
 from sglang_tpu.disaggregation.raiden.host_pool import (
     StagingAdmission,
     ranks_per_node,
@@ -791,13 +797,21 @@ class RaidenPoolTransfer:
                 draft_swa_total_kv_heads=self.draft_swa_kv_heads,
                 with_swa=with_side,
             )
-            self.client.register_request_blocks(
+            with trace_transfer_span(
+                self.manager,
+                "KV_Cache_Prefill_Register_Blocks",
+                room=room,
                 req_id=req_id,
                 uuid=uuid,
-                unit=self.unit,
-                block_ids=full,
-                pool_spans=spans,
-            )
+                num_blocks=len(full),
+            ):
+                self.client.register_request_blocks(
+                    req_id=req_id,
+                    uuid=uuid,
+                    unit=self.unit,
+                    block_ids=full,
+                    pool_spans=spans,
+                )
             if with_side:
                 pool_side_engine.register_twin(
                     self, req_id=req_id, uuid=uuid, blocks=side, dst_attn_tp=dst_attn_tp
@@ -956,6 +970,7 @@ class RaidenPoolTransfer:
             ):
                 return
             entry["registered"] = True
+            record_trace_meta(mgr, str(room), room, len(entry["full"]))
         payload = self._source_metadata(
             stage=True,
             group=group,
@@ -1177,6 +1192,12 @@ class RaidenPoolTransfer:
                 self.retired.add(room)
                 return
             item["registered"] = True
+            record_trace_meta(
+                self.manager,
+                str(room),
+                room,
+                int(item.get("start", 0)) + len(item["full"]),
+            )
         payload = self._source_metadata(
             full=len(item["full"]),
             start=item["start"],
@@ -1209,6 +1230,7 @@ class RaidenPoolTransfer:
                     for info in infos
                 ),
             )
+        record_trace_meta(mgr, str(room), room, len(full))
         endpoint = NetworkAddress(mgr.local_ip, mgr.rank_port).to_tcp()
         consumer = json.dumps(
             dict(attn_tp_size=mgr.attn_tp_size, attn_tp_rank=mgr.attn_tp_rank)
@@ -1517,7 +1539,24 @@ class RaidenPoolTransfer:
         clients = self._thread_clients.__dict__.setdefault("by_address", {})
         if address not in clients:
             clients[address] = self.client_type(address)
-        return clients[address].coordinate_transfer(**kwargs)
+        span = _NULL_CONTEXT
+        if is_profiler_enabled():
+            req_id = str(kwargs.get("req_id", ""))
+            try:
+                room: int | None = parse_req_id(req_id.removeprefix("swa:"))[0]
+            except ValueError:
+                room = None
+            span = trace_transfer_span(
+                self.manager,
+                "KV_Cache_Decode_Submit_Load",
+                room=room,
+                req_id=req_id,
+                uuid=int(kwargs.get("uuid", 0)),
+                # dst_block_counts is per-layer; max gives the KV page count.
+                num_blocks=max(kwargs.get("dst_block_counts") or (), default=0),
+            )
+        with span:
+            return clients[address].coordinate_transfer(**kwargs)
 
     def _start_stages(self, room, request) -> bool:
         """Start each stage group's transfer once all of its stages have

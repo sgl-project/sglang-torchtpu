@@ -99,6 +99,9 @@ from sglang_tpu.hooks.pipeline_parallel import (
     skip_spec_op_precompile_without_draft,
 )
 from sglang_tpu.hooks.pp_buffered_kv_budget import reserve_pp_buffered_handoff
+from sglang_tpu.hooks.raiden_trace_request_ids import (
+    hook_specs as raiden_trace_request_ids_hooks,
+)
 from sglang_tpu.hooks.row_select import concat_rows as concat_merged_rows
 from sglang_tpu.hooks.row_select import select_rows as select_kept_rows
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
@@ -484,6 +487,8 @@ HOOKS.extend(hook_specs())
 HOOKS.extend(padded_logits_sampling_hooks())
 
 HOOKS.extend(logprob_grid_hooks())
+
+HOOKS.extend(raiden_trace_request_ids_hooks())
 
 if envs.SGLANG_TPU_ENABLE_TRUE_ON_POLICY.get():
     # Imported only with the mode on: the package registers its Pallas kernels at import.

@@ -56,6 +56,7 @@ from sglang.srt.runtime_context import get_disagg, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
 from sglang_tpu.disaggregation.raiden.common import (
+    _NULL_CONTEXT,
     CHUNK_ANNOUNCE_TOKENS,
     DEFAULT_KV_PORT,
     DRAFT_PORT_OFFSET,
@@ -65,8 +66,10 @@ from sglang_tpu.disaggregation.raiden.common import (
     RaidenKVCacheGroups,
     _tcp_endpoint,
     get_raiden_kv_caches,
+    is_profiler_enabled,
     kv_layout_of,
     logger,
+    trace_transfer_span,
 )
 from sglang_tpu.disaggregation.raiden.dram_offload_channel import DramOffloadChannel
 from sglang_tpu.disaggregation.raiden.host_pool import (
@@ -304,6 +307,13 @@ class RaidenKVManager(
         self._send_done_at: Dict[str, float] = {}
         self._completed_recv: Set[str] = set()
         self._failed: Set[str] = set()
+        # Scheduler request IDs keyed by bootstrap room (bound by the
+        # raiden_trace_request_ids hook and cleared in _drop_room_state).
+        self._room_request_ids: Dict[int, str] = {}
+        # Per-transfer (uuid, num_tokens) captured while profiling is active so
+        # settled completion spans carry matching attributes; always accessed
+        # under _state_lock.
+        self._transfer_trace_meta: Dict[str, Tuple[int, int]] = {}
         # Transfer ids the engine reported failed. Only these mean raiden has
         # released the transfer's staging; a room failed for a logical reason
         # (abort, timeout, peer death) shares its id with its closing read, so
@@ -974,11 +984,19 @@ class RaidenKVManager(
         if self._pipeline is not None:
             sent, received, failed = self._pipeline.poll()
             with self._state_lock:
+                newly_sent = sent - self._completed_send
+                newly_received = received - self._completed_recv
+                newly_failed = failed - self._native_failed
                 self._completed_send.update(sent)
                 self._completed_recv.update(received)
                 self._native_failed.update(failed)
                 self._failed.update(failed)
-            self._log_settled_transfers(sent=sent, received=received)
+                trace_meta = self._pop_settled_trace_meta_locked(
+                    newly_sent, newly_received, newly_failed
+                )
+            self._log_settled_transfers(
+                sent=newly_sent, received=newly_received, trace_meta=trace_meta
+            )
             return
         engines = (
             ("full", self._engine),
@@ -996,15 +1014,14 @@ class RaidenKVManager(
                 continue
             done_send, done_recv, failed = status
             if done_send or done_recv or failed:
+                sent_rids = [self._norm_req_id(t.req_id) for t in done_send]
+                recv_rids = [self._norm_req_id(t.req_id) for t in done_recv]
                 with self._state_lock:
-                    for t in done_send:
-                        rid = self._norm_req_id(t.req_id)
+                    for t, rid in zip(done_send, sent_rids):
                         self._completed_send.add(rid)
                         if t.completed_ns is not None:
                             self._send_done_at[rid] = t.completed_ns / 1e9
-                    self._completed_recv.update(
-                        self._norm_req_id(t.req_id) for t in done_recv
-                    )
+                    self._completed_recv.update(recv_rids)
                     norm_failed = {self._norm_req_id(t.req_id) for t in failed}
                     superseded = self._superseded_sender_reads
                     real_failed = norm_failed - superseded
@@ -1017,11 +1034,15 @@ class RaidenKVManager(
                     self._release_pull_slots_locked()
                     self._settle_sender_reads_locked()
                     settled_plans = self._settled_cleared_plans_locked()
+                    trace_meta = self._pop_settled_trace_meta_locked(
+                        sent_rids, recv_rids, norm_failed
+                    )
                 for uuid in settled_plans:
                     self._unregister_plan(uuid)
                 self._log_settled_transfers(
-                    sent=[self._norm_req_id(t.req_id) for t in done_send],
-                    received=[self._norm_req_id(t.req_id) for t in done_recv],
+                    sent=sent_rids,
+                    received=recv_rids,
+                    trace_meta=trace_meta,
                 )
                 for failure in failures:
                     logger.error(
@@ -1067,23 +1088,72 @@ class RaidenKVManager(
                     self.failure_records.setdefault(room, failure)
         return list(earliest.values()), later
 
+    def register_trace_request_id(self, room: int, req_id: Any) -> None:
+        """Bind a scheduler request ID to ``room`` for KV-transfer trace spans."""
+        lock = getattr(self, "_state_lock", None)
+        with lock if lock is not None else _NULL_CONTEXT:
+            room_ids = getattr(self, "_room_request_ids", None)
+            if room_ids is None:
+                room_ids = {}
+                self._room_request_ids = room_ids
+            room_ids[room] = str(req_id)
+
+    def _pop_settled_trace_meta_locked(
+        self,
+        sent: Iterable[str],
+        received: Iterable[str],
+        failed: Iterable[str] = (),
+    ) -> Dict[str, Tuple[int, int]]:
+        meta = getattr(self, "_transfer_trace_meta", None)
+        if not meta:
+            return {}
+        popped: Dict[str, Tuple[int, int]] = {}
+        for rid in (*sent, *received):
+            entry = meta.pop(rid, None)
+            if entry is not None:
+                popped[rid] = entry
+        for rid in failed:
+            meta.pop(rid, None)
+        return popped
+
     def _log_settled_transfers(
-        self, *, sent: Iterable[str], received: Iterable[str]
+        self,
+        *,
+        sent: Iterable[str],
+        received: Iterable[str],
+        trace_meta: Optional[Dict[str, Tuple[int, int]]] = None,
     ) -> None:
         # Per-transfer, per-rank lines are DEBUG: at INFO they dominate server
         # logs (several lines per request on every rank). Failures stay ERROR.
-        for rid in sent:
-            logger.debug(
+        profiling = is_profiler_enabled()
+        meta = trace_meta or {}
+        for rids, span_name, msg in (
+            (
+                sent,
+                "KV_Cache_Prefill_Send_Complete",
                 "RaidenKVManager rank%d prefill read served | req_id=%s",
-                self.attn_tp_rank,
-                rid,
-            )
-        for rid in received:
-            logger.debug(
+            ),
+            (
+                received,
+                "KV_Cache_Decode_Recv_Complete",
                 "RaidenKVManager rank%d decode pull done | req_id=%s",
-                self.attn_tp_rank,
-                rid,
-            )
+            ),
+        ):
+            for rid in rids:
+                if not profiling:
+                    logger.debug(msg, self.attn_tp_rank, rid)
+                    continue
+                room = self._room_of(rid)
+                uuid, num_tokens = meta.get(rid, (room if room is not None else 0, 0))
+                with trace_transfer_span(
+                    self,
+                    span_name,
+                    room=room,
+                    req_id=rid,
+                    uuid=uuid,
+                    num_tokens=num_tokens,
+                ):
+                    logger.debug(msg, self.attn_tp_rank, rid)
 
     def _poll_engine_status(
         self, *, name: str, engine: Any
@@ -1630,6 +1700,13 @@ class RaidenKVManager(
             )
             for key in [k for k in self._send_done_at if belongs(k)]:
                 del self._send_done_at[key]
+            room_ids = getattr(self, "_room_request_ids", None)
+            if room_ids:
+                room_ids.pop(room, None)
+            trace_meta = getattr(self, "_transfer_trace_meta", None)
+            if trace_meta:
+                for key in [k for k in trace_meta if belongs(k) and k not in held]:
+                    del trace_meta[key]
             for ids in (self._completed_recv, self._failed, self._native_failed):
                 ids.difference_update([k for k in ids if belongs(k) and k not in held])
             announced = self._decode.announced_at if self._decode is not None else None

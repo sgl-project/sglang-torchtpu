@@ -49,6 +49,7 @@ import time
 from types import SimpleNamespace
 from typing import Any, Optional
 
+from sglang_tpu.disaggregation.raiden.common import trace_transfer_span
 from sglang_tpu.disaggregation.raiden.host_pool import slot_host_bytes
 from sglang_tpu.disaggregation.raiden.pool_spans import (
     _derived_uuid,
@@ -495,14 +496,24 @@ def register_twin(
     if link is None or not blocks:
         return
     family = link.family
+    twin_req_id = family.twin_req_id(req_id)
+    twin_uuid = family.twin_uuid(req_id)
     try:
-        link.client.register_request_blocks(
-            req_id=family.twin_req_id(req_id),
-            uuid=family.twin_uuid(req_id),
-            unit=link.unit,
-            block_ids=list(blocks),
-            pool_spans=family.spans(transfer, link, blocks, dst_attn_tp),
-        )
+        with trace_transfer_span(
+            transfer.manager,
+            "KV_Cache_Prefill_Register_Blocks",
+            room=parse_req_id(req_id)[0],
+            req_id=twin_req_id,
+            uuid=twin_uuid,
+            num_blocks=len(blocks),
+        ):
+            link.client.register_request_blocks(
+                req_id=twin_req_id,
+                uuid=twin_uuid,
+                unit=link.unit,
+                block_ids=list(blocks),
+                pool_spans=family.spans(transfer, link, blocks, dst_attn_tp),
+            )
     except Exception:
         try:
             transfer.client.cancel_request_blocks_if_unclaimed(req_id, uuid)
