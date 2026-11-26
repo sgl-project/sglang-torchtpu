@@ -588,6 +588,8 @@ class TpuEnvs:
     SGLANG_TPU_MUSE_KERNEL_DECODE_EP_TP2_PAIR_RS = EnvBool(False)
     # Opt-in B=16 (LC 8K/1K) sparse execution (m_buckets=(8, 16) vs dense) unlocking FREE/MIN_P.
     SGLANG_TPU_MUSE_KERNEL_DECODE_B16_SPARSE = EnvBool(False)
+    # Opt-in native B=8 decode MoE compile bucket on TP=8 (ep=8).
+    SGLANG_TPU_MUSE_KERNEL_DECODE_B8 = EnvBool(False)
     # Opt-in non-uniform per-layer FREE/MIN_P preset or spec ("" = uniform off).
     SGLANG_TPU_MUSE_DECODE_NONUNIFORM_FREE = EnvStr("")
     # Opt-in (#3035): allow SPEC_PRIME (>0) alongside ROUTE_FAST + FAST_PLAN=2 and optional home slot hint (-1=auto).
@@ -596,6 +598,8 @@ class TpuEnvs:
     # Opt-in DFlash verify (B >= 128) routing-pruning & W4A8/tile overrides ("" / -1 / False = inherit decode):
     SGLANG_TPU_MUSE_DECODE_VERIFY_FREE_EXPERT_ROWS = EnvStr("")
     SGLANG_TPU_MUSE_DECODE_VERIFY_MIN_P_TOPK = EnvFloat(-1.0)
+    # Opt-in d=1 scaled FREE/MIN_P at B >= 128 (e.g. c256 concurrency when speculative_algorithm is None).
+    SGLANG_TPU_MUSE_DECODE_D1_LARGE_BATCH_FREE = EnvBool(False)
     SGLANG_TPU_MUSE_KERNEL_DECODE_TILE_M128 = EnvBool(False)
     # Muse Wave-7B: allow DECODE_REPLICA_SLOTS > 0 alongside PREFILL_EPLB_STATS_PATH when
     # PrefillEplbManager._refresh_decode_replicas keeps _fused_decode_rep_* synchronized.
@@ -727,12 +731,21 @@ class TpuEnvs:
     # Muse prefill Wave-8 gmm_v2_fused_rs sender-rotated ICI direct-write schedule
     # (0 = off; 1 = XOR send order; 2 = XOR send order + within-expert rotated chip order).
     SGLANG_TPU_MUSE_KERNEL_GMM_ROTATE_RS = EnvInt(0)
+    # Muse prefill Wave-9 gmm_v2_fused_rs intra-tile EP-chip interleaving for rotated RS
+    # (0 = off; >0 = min full (tile_m // ep_size)-row blocks per chip required to interleave
+    # full 256-row tiles across EP chips in rot_order, avoiding single-link ICI scatter stalls).
+    SGLANG_TPU_MUSE_KERNEL_GMM_INTERLEAVE_RS = EnvInt(0)
     # Muse prefill Wave-8 gmm_v2_fused_rs direct SiLU epilogue without VMEM/bf16 round-trip
     # (0 = off; 1 = single-pass FP32 gate*up with fused GMM2 amax reduction; 2 = fast BF16 sigmoid).
     SGLANG_TPU_MUSE_KERNEL_GMM_DIRECT_SILU = EnvInt(0)
     # Muse prefill Wave-8 quantize MoE hidden states to FP8 once before/at AG instead of 8x in GMM1
-    # (0 = off; 1 = FP8 hidden states + per-token f32 scale passed into gmm_v2_fused_rs).
+    # (0 = off; 1 = FP8 hidden states + per-token f32 scale passed into gmm_v2_fused_rs;
+    # 4/5 = direct FP8 from fused b1_b2; 6 = static FP8 prefill LHS with zero row-scale AG).
     SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8 = EnvInt(0)
+    # Explicit static FP8 scale S for b1_b2 -> gmm_v2_fused_rs prefill LHS (0.0 = off;
+    # > 0 in (0, 32] e.g. 8.0 or 4.0 folds 1/S into w1_global_scale with zero row-scale AG/dequant;
+    # GMM_PREQUANT_LHS_FP8=6 defaults this to 8.0 when unset).
+    SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_LHS = EnvFloat(0.0)
     # Muse Wave-8 NVFP4 wider compact block scales (0 = off; 512/1024/2048/4096 = requantize at load;
     # -512/-1024/-2048/-4096 = zero-reload in-kernel scale-stride perf probe).
     SGLANG_TPU_MUSE_KERNEL_COMPACT_FP4_QBLOCK = EnvInt(0)
@@ -758,6 +771,15 @@ class TpuEnvs:
     # tokens into each 32-bit (1, 4, 128) word ([K0|K1, V0|V1, K2|K3, V2|V3] across lanes
     # [0..63 | 64..127]), cutting KV pool HBM & page DMA by 4x (512 -> 128 B/tok/layer).
     SGLANG_TPU_KV_PACK_BD4 = EnvBool(False)
+    # Enable vectorized batch4/batch2 swabatch group execution on dense2-packed KV pools
+    # (also selectable via "d2grp" token in SGLANG_TPU_RPA_V3_DECODE_FAST).
+    SGLANG_TPU_RPA_V3_DENSE2_GROUP = EnvBool(False)
+    # Enable hoisted whole-batch new-KV precompute on shared16/32/64 LC Full decode
+    # (also selectable via "hoistkv" token in SGLANG_TPU_RPA_V3_DECODE_FAST).
+    SGLANG_TPU_RPA_V3_SHARED_HOISTKV = EnvBool(False)
+    # Allow fused Step (c) (b1_moe_b2_rpad) on SWA layers during shared-prefix LC steps
+    # (decode_shared_prefix_pages is Full-only; SWA uses standard per-seq distribution).
+    SGLANG_TPU_MUSE_MK_STEP_C_LC_SWA = EnvBool(False)
     # Route uniform-width speculative TARGET_VERIFY (decode_query_size in 2..8, e.g.
     # DFlash dq=5/6) through RPAd_fast batched [16*dq, 128] single-MXU-pass verify.
     SGLANG_TPU_RPA_V3_DECODE_FAST_VERIFY = EnvBool(False)
@@ -1480,6 +1502,9 @@ class TpuEnvs:
     SGLANG_TPU_MUSE_KERNEL_A1_SUB_N = EnvInt(0)
     # Wave-8 prefill Kernel A1 single-butterfly 6-roll dual-head 64-lane RMSNorm in VREGs.
     SGLANG_TPU_MUSE_KERNEL_A1_FAST_NORM = EnvBool(False)
+    # Wave-18 opt-in BF16 reverse all-to-all in Ulysses attention (A1_VARIANT="v10_sp"):
+    # sends bf16 across rev-A2A and applies 1x final static-FP8 quant inside gate-fuse, matching v6.
+    SGLANG_TPU_MUSE_KERNEL_ULYSSES_REV_BF16 = EnvBool(False)
     # Wave-8 prefill SP Entry: Pallas async remote-copy A2A + fused Pallas embed RMSNorm.
     SGLANG_TPU_MUSE_KERNEL_ENTRY_ASYNC_A2A = EnvBool(False)
     # Wave-8 prefill Kernel A3 (v16 opt_wo): unlock bn=2048 at T=16384 (num_t_half=2, 60 MiB VMEM).
@@ -1551,6 +1576,9 @@ class TpuEnvs:
     # Wave-16 opt-in double-buffered stream HBM->VMEM prefetch + direct (bm, 32, 128) FP8 store
     # inside pallas_fused_b1_b2_wpool_quant (-0.73..-0.96 ms/61L on 4c Ghostfish, 0-ULP bit-exact).
     SGLANG_TPU_MUSE_KERNEL_B2_DBL_STREAM = EnvBool(False)
+    # Wave-18 opt-in multi-chunk pow2 B1+B2 + cat_sc pipeline ("auto" -> (512,1024,1024,512) at
+    # t_local=3072, (512,512,512) at t_local=1536; or explicit CSV) overlapping SparseCore AG_i8.
+    SGLANG_TPU_MUSE_KERNEL_B2_PIPE_CHUNKS = EnvStr("")
 
     @classmethod
     def names(cls) -> list[str]:

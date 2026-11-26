@@ -400,6 +400,7 @@ def inner_kernel(
     vectorized_dequant: bool = False,
     w_strip_fp8_ref=None,
     prequant_lhs_ready: bool = False,
+    skip_lhs_scale_mul: bool = False,
 ):
     """Inner kernel invoked by emit_pipeline to perform matmul.
 
@@ -779,6 +780,7 @@ def inner_kernel(
                 and (prequant_lhs_fp8_ref is not None or _has_ext_pq_lhs_3d)
                 and prequant_lhs_scale_ref is not None
             )
+            _skip_lhs_sc = bool(skip_lhs_scale_mul and prequant_lhs_ready)
             _flq_zero_rmw = (
                 int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_FLQ_ZERO_RMW.get() or 0)
                 if cfgs.dims.size_m > 4096
@@ -1139,6 +1141,7 @@ def inner_kernel(
                         ),
                         prequant_lhs_scale_ref=prequant_lhs_scale_ref,
                         pair_k512_unpack=(scoped_w4a8_mode == 7),
+                        skip_lhs_scale_mul=_skip_lhs_sc,
                     )
                 if use_scoped_w4a8_refs:
                     if _two_level_pow2 >= 1:
@@ -1239,10 +1242,15 @@ def inner_kernel(
                                         preferred_element_type=jnp.float32,
                                     )
                                     sub_acc = pop if sub_acc is None else sub_acc + pop
-                            lhs_s_c = _load_lhs_scale_strip(l_bid, col_size)
-                            term = sub_acc.astype(acc_ref.dtype) * (
-                                col_sc_f32.astype(acc_ref.dtype) * lhs_s_c
-                            )
+                            if _skip_lhs_sc:
+                                term = sub_acc.astype(acc_ref.dtype) * col_sc_f32.astype(
+                                    acc_ref.dtype
+                                )
+                            else:
+                                lhs_s_c = _load_lhs_scale_strip(l_bid, col_size)
+                                term = sub_acc.astype(acc_ref.dtype) * (
+                                    col_sc_f32.astype(acc_ref.dtype) * lhs_s_c
+                                )
                             acc_c = term if acc_c is None else acc_c + term
                         return acc_c
 
@@ -1286,8 +1294,11 @@ def inner_kernel(
                             sub_acc = (
                                 scaled_pop if sub_acc is None else sub_acc + scaled_pop
                             )
-                        lhs_s_c = _load_lhs_scale_strip(l_bid, col_size)
-                        term = sub_acc.astype(acc_ref.dtype) * lhs_s_c
+                        if _skip_lhs_sc:
+                            term = sub_acc.astype(acc_ref.dtype)
+                        else:
+                            lhs_s_c = _load_lhs_scale_strip(l_bid, col_size)
+                            term = sub_acc.astype(acc_ref.dtype) * lhs_s_c
                         acc_c = term if acc_c is None else acc_c + term
                     return acc_c
 
@@ -1442,16 +1453,19 @@ def inner_kernel(
                                 block_lhs_for_matmul = _read_pq_lhs_slice(
                                     start_k, end_k
                                 )
-                                s128 = prequant_lhs_scale_ref[b_id_pq, :, :]
-                                if (
-                                    col_size > s128.shape[1]
-                                    and col_size % s128.shape[1] == 0
-                                ):
-                                    lhs_scale = jnp.concatenate(
-                                        [s128] * (col_size // s128.shape[1]), axis=1
-                                    )
+                                if _skip_lhs_sc:
+                                    lhs_scale = None
                                 else:
-                                    lhs_scale = s128[:, :col_size]
+                                    s128 = prequant_lhs_scale_ref[b_id_pq, :, :]
+                                    if (
+                                        col_size > s128.shape[1]
+                                        and col_size % s128.shape[1] == 0
+                                    ):
+                                        lhs_scale = jnp.concatenate(
+                                            [s128] * (col_size // s128.shape[1]), axis=1
+                                        )
+                                    else:
+                                        lhs_scale = s128[:, :col_size]
                             else:
                                 block_lhs = tiled_lhs[:, start_k:end_k]
                                 block_lhs_for_matmul, lhs_scale = _online_quantize(
@@ -1471,7 +1485,8 @@ def inner_kernel(
                     ).astype(acc_ref.dtype)
 
                     if fp8_activation_quant:
-                        block_acc *= lhs_scale.astype(acc_ref.dtype)
+                        if lhs_scale is not None:
+                            block_acc *= lhs_scale.astype(acc_ref.dtype)
                         if rhs_online_scale is not None:
                             if rhs_online_scale.shape[0] == 8:
                                 block_acc = (
@@ -1538,6 +1553,7 @@ def inner_kernel(
                         zero_spill_sub_m=scoped_w4a8_mode in (2, 3, 4, 5, 6, 7),
                         mh_outer=scoped_w4a8_mode in (3, 4, 5, 6),
                         hoist_rhs_scale=scoped_w4a8_mode >= 4,
+                        skip_lhs_scale_mul=_skip_lhs_sc,
                     )
                 col_size = g_e - g_s
                 use_bf16_inner = fp4_acc_mode == 3
@@ -1580,9 +1596,13 @@ def inner_kernel(
                             )
                         sub_g = sp_g if sub_g is None else sub_g + sp_g
                         sub_u = sp_u if sub_u is None else sub_u + sp_u
-                    lhs_s_c = _load_lhs_scale_strip(l_bid, col_size)
-                    tg = sub_g.astype(acc_ref.dtype) * lhs_s_c
-                    tu = sub_u.astype(acc_ref.dtype) * lhs_s_c
+                    if _skip_lhs_sc:
+                        tg = sub_g.astype(acc_ref.dtype)
+                        tu = sub_u.astype(acc_ref.dtype)
+                    else:
+                        lhs_s_c = _load_lhs_scale_strip(l_bid, col_size)
+                        tg = sub_g.astype(acc_ref.dtype) * lhs_s_c
+                        tu = sub_u.astype(acc_ref.dtype) * lhs_s_c
                     acc_g = tg if acc_g is None else acc_g + tg
                     acc_u = tu if acc_u is None else acc_u + tu
                 return acc_g, acc_u
@@ -2486,6 +2506,10 @@ def dma_gather_gm_start(
     metadata_ref,
     divisor: int = 1,
     packed_u16: bool = False,
+    bs_meta_ref=None,
+    ep_size: int = 8,
+    my_id: int = 0,
+    tile_idx_smem_ref=None,
 ):
     """Start gathering rows for a specific gm tile via DMA.
 
@@ -2509,6 +2533,24 @@ def dma_gather_gm_start(
     )
     num_rows = m_end - m_start
 
+    def _emit_8_copies(dst_off, s8):
+        if divisor != 1:
+            s8 = [s // divisor for s in s8]
+        for k in range(8):
+            pltpu.make_async_copy(
+                src_ref=src_ref.at[pl.ds(s8[k], 1), :, :],
+                dst_ref=dst_ref.at[pl.ds(dst_off + k, 1), :, :],
+                sem=sem_ref,
+            ).start()
+
+    def _emit_single_copy(dst_row, raw_idx):
+        src_row = raw_idx // divisor if divisor != 1 else raw_idx
+        pltpu.make_async_copy(
+            src_ref=src_ref.at[pl.ds(src_row, 1), :, :],
+            dst_ref=dst_ref.at[pl.ds(dst_row, 1), :, :],
+            sem=sem_ref,
+        ).start()
+
     def _load_u16_8(pos):
         odd = pos & jnp.int32(1)
         wb = lax.shift_right_logical(pos, jnp.int32(1))
@@ -2522,6 +2564,100 @@ def dma_gather_gm_start(
             out.append(jnp.where(odd == 0, hi_j, next_lo_j))
         return out
 
+    if bs_meta_ref is not None and tile_idx_smem_ref is not None and not packed_u16:
+        _aux_base = (_n_slots + 1) * (3 * ep_size + 2) + gm_id * (1 + ep_size)
+        _bs_base = gm_id * (3 * ep_size + 2)
+        _gm_mode = bs_meta_ref[_aux_base]
+
+        def _gather_mode01():
+            _blk_m_g = dst_ref.shape[0] // ep_size
+            if _blk_m_g == 32:
+
+                def _g32_blk(c, _):
+                    i0 = c * 32
+                    base = bs_meta_ref[_aux_base + 1 + c]
+                    for sub in range(4):
+                        off = sub * 8
+                        _emit_8_copies(i0 + off, [indices_ref[base + off + k] for k in range(8)])
+                    return _
+
+                num_32 = num_rows >> 5
+                lax.fori_loop(0, num_32, _g32_blk, 0)
+                rem_st = num_32 << 5
+            elif _blk_m_g == 16:
+
+                def _g16_blk(h, _):
+                    i0 = h * 16
+                    base = bs_meta_ref[_aux_base + 1 + h]
+                    for sub in range(2):
+                        off = sub * 8
+                        _emit_8_copies(i0 + off, [indices_ref[base + off + k] for k in range(8)])
+                    return _
+
+                num_16 = num_rows >> 4
+                lax.fori_loop(0, num_16, _g16_blk, 0)
+                rem_st = num_16 << 4
+            else:
+                rem_st = 0
+
+            def _g_body(i, _):
+                _emit_single_copy(i, indices_ref[m_start + i])
+                return _
+
+            lax.fori_loop(rem_st, num_rows, _g_body, 0)
+            return jnp.int32(0)
+
+        def _gather_mode2():
+            _slot_t = gm_id % 4
+
+            def _chip_copy(r_i, dst_pos):
+                _c_tgt = jnp.mod(my_id + 1 + r_i, ep_size)
+                _c_len = bs_meta_ref[_bs_base + 2 * ep_size + _c_tgt]
+                _c_st = bs_meta_ref[_aux_base + 1 + r_i]
+                n8 = _c_len >> 3
+
+                def _cp8(k8, _u):
+                    b = k8 * 8
+                    vs = [indices_ref[_c_st + b + t] for t in range(8)]
+                    for t in range(8):
+                        tile_idx_smem_ref[_slot_t, dst_pos + b + t] = vs[t]
+                    return _u
+
+                lax.fori_loop(0, n8, _cp8, jnp.int32(0))
+
+                def _row_cp(j, _u):
+                    tile_idx_smem_ref[_slot_t, dst_pos + j] = indices_ref[_c_st + j]
+                    return _u
+
+                lax.fori_loop(n8 << 3, _c_len, _row_cp, jnp.int32(0))
+                return dst_pos + _c_len
+
+            lax.fori_loop(0, ep_size, _chip_copy, jnp.int32(0))
+
+            num_16 = num_rows >> 4
+
+            def _g16_t(h, _u):
+                i0 = h * 16
+                for sub in range(2):
+                    off = sub * 8
+                    _emit_8_copies(
+                        i0 + off,
+                        [tile_idx_smem_ref[_slot_t, i0 + off + k] for k in range(8)],
+                    )
+                return _u
+
+            lax.fori_loop(0, num_16, _g16_t, jnp.int32(0))
+
+            def _row_cp_dma(i, _u):
+                _emit_single_copy(i, tile_idx_smem_ref[_slot_t, i])
+                return _u
+
+            lax.fori_loop(num_16 << 4, num_rows, _row_cp_dma, jnp.int32(0))
+            return jnp.int32(0)
+
+        lax.cond(_gm_mode == 2, _gather_mode2, _gather_mode01)
+        return
+
     def _gather_16_spillfree(h, _):
         i0 = h * 16
         base = m_start + i0
@@ -2531,14 +2667,7 @@ def dma_gather_gm_start(
                 s8 = _load_u16_8(base + off)
             else:
                 s8 = [indices_ref[base + off + k] for k in range(8)]
-            if divisor != 1:
-                s8 = [s // divisor for s in s8]
-            for k in range(8):
-                pltpu.make_async_copy(
-                    src_ref=src_ref.at[pl.ds(s8[k], 1), :, :],
-                    dst_ref=dst_ref.at[pl.ds(i0 + off + k, 1), :, :],
-                    sem=sem_ref,
-                ).start()
+            _emit_8_copies(i0 + off, s8)
         return _
 
     def _gather_body(i, _):
@@ -2549,13 +2678,7 @@ def dma_gather_gm_start(
             src_row = lax.shift_right_logical(w, sh) & jnp.int32(0xFFFF)
         else:
             src_row = indices_ref[row]
-        if divisor != 1:
-            src_row = src_row // divisor
-        pltpu.make_async_copy(
-            src_ref=src_ref.at[pl.ds(src_row, 1), :, :],
-            dst_ref=dst_ref.at[pl.ds(i, 1), :, :],
-            sem=sem_ref,
-        ).start()
+        _emit_single_copy(i, src_row)
         return _
 
     num_16 = num_rows >> 4
@@ -2567,14 +2690,7 @@ def dma_gather_gm_start(
             s8 = _load_u16_8(m_start + rem_start)
         else:
             s8 = [indices_ref[m_start + rem_start + k] for k in range(8)]
-        if divisor != 1:
-            s8 = [s // divisor for s in s8]
-        for k in range(8):
-            pltpu.make_async_copy(
-                src_ref=src_ref.at[pl.ds(s8[k], 1), :, :],
-                dst_ref=dst_ref.at[pl.ds(rem_start + k, 1), :, :],
-                sem=sem_ref,
-            ).start()
+        _emit_8_copies(rem_start, s8)
         return jnp.int32(0)
 
     has_mid_8 = (num_rows - rem_start) >= 8

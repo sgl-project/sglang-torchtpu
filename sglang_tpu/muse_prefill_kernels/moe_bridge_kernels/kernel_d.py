@@ -66,6 +66,7 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
     num_rows: int | None = None,
     stream_out: jax.Array | None = None,
     salu_overlap: bool = False,
+    scrub_mxu_nan: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
     """Design D1 (4-Slab Pipelined VMEM Cache): Single-kernel fused combine + unpool + norms.
 
@@ -140,8 +141,13 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
         or tok_tile_eff > 64
         or (tok_tile_eff >= 32 and chunk_size <= 32)
     ) and not (emit_fp8_attn_in or use_blk_fp8_unpool)
-    if chunk_size <= 32 and not use_zero_spill and chunk_size % 16 == 0:
-        tok_tile_eff = min(tok_tile_eff, 16)
+    if not use_zero_spill:
+        # _d_4slab_kernel with t128+fp8q512+c16h+bf16 next_in exceeds 63 MiB (63.51M>63.00M),
+        # while emit_static_fp8_attn_in=True fits cleanly at t128.
+        if chunk_size <= 32 and chunk_size % 16 == 0:
+            tok_tile_eff = min(tok_tile_eff, 16)
+        elif not emit_static_fp8_attn_in:
+            tok_tile_eff = min(tok_tile_eff, 64)
 
     num_rows = chunk_size - row_start if num_rows is None else num_rows
     assert row_start % tok_tile_eff == 0 and num_rows % tok_tile_eff == 0, (
@@ -227,11 +233,14 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
         vals_raw = buf_2x_ref[slot, m0:m1, c0:c1, :]
         if in_buf_is_fp8:
             vals_raw = vals_raw.astype(jnp.bfloat16)
-        # Scrub NaN/Inf (e.g. unwritten 0x7F fp8 out_buf padding rows) before the 16x128 MXU dot
-        # so off-diagonal 0.0 weights cannot propagate 0.0 * NaN/Inf = NaN within a 16-row block.
-        vals_raw = jnp.where(
-            jnp.isfinite(vals_raw.astype(jnp.float32)), vals_raw, jnp.bfloat16(0.0)
-        )
+            if scrub_mxu_nan:
+                # float8_e4m3fn has no Inf (only 0x7F/0xFF NaN); bf16 self-compare avoids the f32 cast tax.
+                vals_raw = jnp.where(vals_raw == vals_raw, vals_raw, jnp.bfloat16(0.0))
+        elif scrub_mxu_nan:
+            # Scrub NaN/Inf on bfloat16 inputs so 0.0 * NaN/Inf cannot propagate within a 16-row block.
+            vals_raw = jnp.where(
+                jnp.isfinite(vals_raw.astype(jnp.float32)), vals_raw, jnp.bfloat16(0.0)
+            )
         return vals_raw.reshape(16 * topk, c_grp * lanes)
 
     if use_zero_spill:
@@ -647,7 +656,7 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
         fp8_tag = "_fp8u" if fp8_unpool else ""
         fast_tag = "_c16so" if use_d_t128_fast else ""
         do_tag = f"_do{eff_d_opt}" if eff_d_opt else ""
-        mxu_tag = "_mxuc" if eff_mxu_combine else ""
+        mxu_tag = (("_mxuc" if scrub_mxu_nan else "_mxuc_ns") if eff_mxu_combine else "")
         sfp8_tag = "_sfp8" if emit_static_fp8_attn_in else ""
         zs_in_specs = [
             pl.BlockSpec(memory_space=pltpu.HBM),
@@ -1181,7 +1190,7 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
             + (f"_sn{t64_sub_n}" if t64_sub_n != 512 else "")
             + (f"_fp8q{eff_fp8_qbs}" if eff_fp8_qbs > 0 else "")
             + (f"_do{eff_d_opt}" if eff_d_opt else "")
-            + ("_mxuc" if eff_mxu_combine else "")
+            + (("_mxuc" if scrub_mxu_nan else "_mxuc_ns") if eff_mxu_combine else "")
         ),
         input_output_aliases=aliases,
     )(

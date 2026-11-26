@@ -427,7 +427,7 @@ def default_sparse_decode_config(
 
     # Compact K256/K512: dense fast-path at B=16 (unless DECODE_B16_SPARSE=1, or B<=64 when fast_b64==3),
     # 2/3-bucket sparse at B in (16/32, 64), 3-bucket (16, 32, 64) at B >= 128 (~38 MiB VMEM).
-    b16_sparse = _read_b16_sparse_knob()
+    b16_sparse = _read_b16_sparse_knob() or (batch_size < 16)
     if (batch_size <= 16 and not b16_sparse) or (fast_b64 == 3 and batch_size <= 64):
         return SparseDecodeConfig(
             row_mode="dense",
@@ -4876,9 +4876,13 @@ def fused_decode_sparse_from_logits(
     if ep not in (8, 16):
         raise ValueError(f"Sparse fused decode supports ep in (8, 16), got {ep}")
     batch_size = x.shape[0]
-    if batch_size not in (16, 32, 64, 128, 256, 384):
+    if batch_size not in (8, 16, 32, 64, 128, 256, 384):
         raise ValueError(
-            f"Sparse fused decode requires B in (16, 32, 64, 128, 256, 384), got {batch_size}"
+            f"Sparse fused decode requires B in (8, 16, 32, 64, 128, 256, 384), got {batch_size}"
+        )
+    if batch_size < ep:
+        raise ValueError(
+            f"Sparse fused decode requires batch_size ({batch_size}) >= ep ({ep})"
         )
     if logits.shape != (batch_size, _E_TOTAL):
         raise ValueError(

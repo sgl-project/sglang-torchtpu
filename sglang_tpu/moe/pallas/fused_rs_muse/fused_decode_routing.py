@@ -456,7 +456,7 @@ def route_dense_and_counts_in_kernel(
     batch_size, num_experts = logits_ref.shape
     eff_chunk = (
         max(route_chunk_rows, min(batch_size, 64))
-        if (free_max_rows > 0 and batch_size <= 64)
+        if free_max_rows > 0
         else route_chunk_rows
     )
     rb = min(batch_size, eff_chunk)

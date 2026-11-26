@@ -65,6 +65,7 @@ class DecodeFastConfig:
     fold_col: bool = False
     no_mask0: bool = False
     swabatch_group_size: int = 1
+    dense2_group: bool = False
 
 
 def _uses_swabatch_group(
@@ -82,9 +83,10 @@ def _uses_swabatch_group(
         and cfg.loop_kind == "swabatch"
         and one_block_per_seq
         and decode_query_size == 1
-        and not kv_pack_dense2
+        and (not kv_pack_dense2 or cfg.dense2_group)
         and not cfg.fp8_dots
         and probe is None
+        and b_tokens >= 32
         and b_tokens % cfg.swabatch_group_size == 0
         and max_num_seqs == b_tokens
     )
@@ -354,6 +356,8 @@ def parse_decode_fast_config(
 ) -> DecodeFastConfig:
     if kv_pack_bd4:
         kv_pack_dense2 = False
+    from sglang_tpu.envs import envs
+
     raw = mode_str.strip().lower()
     if raw == "shared16_host" and sliding_window is None and shared_group > 0:
         # Two 2048-token DMA buffers independent of serving context capacity.
@@ -609,10 +613,16 @@ def parse_decode_fast_config(
         lazy_slot_zero = False
 
     num_slots = max(2, num_slots)
+    d2_grp_env = getattr(envs, "SGLANG_TPU_RPA_V3_DENSE2_GROUP", None)
+    dense2_group = ("d2grp" in toks_cfg) or bool(d2_grp_env is not None and d2_grp_env.get())
+    sh_hkv_env = getattr(envs, "SGLANG_TPU_RPA_V3_SHARED_HOISTKV", None)
+    shared_hoistkv = bool(sh_hkv_env is not None and sh_hkv_env.get())
     eff_shared_group = shared_group if (sliding_window is None and loop_kind.startswith("shared")) else 0
+    if eff_shared_group > 0 and decode_query_size == 1 and shared_hoistkv and "nohoistkv" not in toks_cfg:
+        hoist_new_kv = True
     eff_swabatch_grp = (
         swabatch_group_size
-        if (loop_kind == "swabatch" and decode_query_size == 1 and not kv_pack_dense2 and not fp8_dots)
+        if (loop_kind == "swabatch" and decode_query_size == 1 and (not kv_pack_dense2 or dense2_group) and not fp8_dots)
         else 1
     )
 
@@ -677,6 +687,7 @@ def parse_decode_fast_config(
         fold_col=fold_col,
         no_mask0=no_mask0,
         swabatch_group_size=eff_swabatch_grp,
+        dense2_group=dense2_group,
     )
 
 
@@ -1011,22 +1022,22 @@ def _load_new_kv_1row_f32(
     interpret_mode: bool = False,
     mask_lo64: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
-    aligned32 = (q_row // 32) * 32
-    sub32 = q_row - aligned32
+    n_rows = kv_merged_vmem_ref.shape[0]
+    step_r = min(32, n_rows)
+    aligned_r = (q_row // step_r) * step_r
+    sub_r = q_row - aligned_r
     if interpret_mode:
-        blk = kv_merged_vmem_ref[pl.ds(aligned32, 32)].reshape(32, 4, 128)
+        blk = kv_merged_vmem_ref[pl.ds(aligned_r, step_r)].reshape(step_r, 4, 128)
         u8 = lax.bitcast_convert_type(blk, jnp.uint8)
         u32 = u8[:, 0, :].astype(jnp.uint32) | (u8[:, 1, :].astype(jnp.uint32) << 8)
     else:
-        u32_ref = kv_merged_vmem_ref.bitcast(jnp.uint32).reshape(
-            kv_merged_vmem_ref.shape[0], 128
-        )
-        u32 = u32_ref[pl.ds(pl.multiple_of(aligned32, 32), 32)]
-    row_iota = lax.broadcasted_iota(jnp.int32, (32, 128), 0)
-    row_mask = row_iota == sub32
+        u32_ref = kv_merged_vmem_ref.bitcast(jnp.uint32).reshape(n_rows, 128)
+        u32 = u32_ref[pl.ds(pl.multiple_of(aligned_r, step_r), step_r)]
+    row_iota = lax.broadcasted_iota(jnp.int32, (step_r, 128), 0)
+    row_mask = row_iota == sub_r
     if mask_lo64:
         # bd4 zero-pads d=64..127 in Q; scrub padded KV lanes before FP8->F32 to avoid 0.0*NaN.
-        row_mask = row_mask & (lax.broadcasted_iota(jnp.int32, (32, 128), 1) < 64)
+        row_mask = row_mask & (lax.broadcasted_iota(jnp.int32, (step_r, 128), 1) < 64)
     u32_m = jnp.where(row_mask, u32, jnp.uint32(0))
     k_f8 = _u8_to_fp8(u32_m.astype(jnp.uint8), interpret_mode=interpret_mode)
     v_f8 = _u8_to_fp8((u32_m >> 8).astype(jnp.uint8), interpret_mode=interpret_mode)
@@ -1902,7 +1913,7 @@ def _run_rpad_vmem_core(
                     prev_u16 = jnp.zeros((1, 128), jnp.uint32)
                 elif interpret_mode:
                     loc_clamped = jnp.maximum(prev_loc_tok, 0)
-                    slot_pg = jnp.clip(loc_clamped // page_size, 0, max_ring_pages - 1)
+                    slot_pg = slot_pg_off + jnp.clip(loc_clamped // page_size, 0, max_ring_pages - 1)
                     pg_u32 = _get_page_u32(slot, slot_pg)
                     r_io = lax.broadcasted_iota(jnp.int32, (phys_page_rows, 128), 0)
                     prev_u16 = jnp.sum(
@@ -1916,13 +1927,13 @@ def _run_rpad_vmem_core(
                     ).astype(jnp.uint32)
                 else:
                     loc_clamped = jnp.maximum(prev_loc_tok, 0)
-                    slot_pg = jnp.clip(loc_clamped // page_size, 0, max_ring_pages - 1)
+                    slot_pg = slot_pg_off + jnp.clip(loc_clamped // page_size, 0, max_ring_pages - 1)
                     sub_base = (pair_r0 // 8) * 8
                     sub_off = pair_r0 & 7
                     u32_ref = (
                         bkv_vmem_ref.bitcast(jnp.uint32)
                         .at[slot]
-                        .reshape(max_ring_pages, phys_page_rows, 128)
+                        .reshape(bkv_slot_pages, phys_page_rows, 128)
                     )
                     sub_u32 = u32_ref[slot_pg, pl.ds(pl.multiple_of(sub_base, 8), 8)]
                     r_sub = lax.broadcasted_iota(jnp.int32, (8, 128), 0)
@@ -4944,6 +4955,28 @@ def _run_rpad_vmem_core(
 
                     def _san_grp_pg(sl, pg_idx_sl, lo, hi):
                         br = (sl * bkv_slot_pages + pg_idx_sl) * phys_page_rows
+                        if kv_pack_dense2:
+                            e_base = 2 * iota_128
+                            o_base = e_base + 1
+                            for si_sub in range(n_san_subs):
+                                ro = si_sub * 128
+                                tok_off = 2 * ro
+                                so = pl.multiple_of(br + ro, 128)
+                                blk = flat_u32[pl.ds(so, 128)]
+                                lo_loc = lo - tok_off
+                                hi_loc = hi - tok_off
+                                e_m = jnp.where(
+                                    (e_base >= lo_loc) & (e_base < hi_loc),
+                                    jnp.uint32(0x0000FFFF),
+                                    jnp.uint32(0),
+                                )
+                                o_m = jnp.where(
+                                    (o_base >= lo_loc) & (o_base < hi_loc),
+                                    jnp.uint32(0xFFFF0000),
+                                    jnp.uint32(0),
+                                )
+                                flat_u32[pl.ds(so, 128)] = blk & (e_m | o_m)
+                            return
                         for si_sub in range(n_san_subs):
                             ro = si_sub * 128
                             so = pl.multiple_of(br + ro, 128)
@@ -5001,7 +5034,7 @@ def _run_rpad_vmem_core(
                         act_list.append(act)
                         pg_base_sl = sub * w_pg
                         if not skip_kv_write and probe != "nokvwrite":
-                            if kv_pack_bd4:
+                            if kv_pack_bd4 or kv_pack_dense2:
                                 enqueue_kv_write(
                                     seq,
                                     q_r,
@@ -5055,6 +5088,29 @@ def _run_rpad_vmem_core(
                         [init_sv_vmem_ref[1, grp_sz * g_i + sub] for sub in range(grp_sz)],
                         axis=0,
                     )
+                    def _finish_grp_out(pv_g, l_flat, m_flat):
+                        if v_scale is not None and v_scale_val != 1.0:
+                            pv_g = pv_g * v_scale_val
+                        p_new = jnp.exp2((s_new_g - m_flat) * exp2_scale)
+                        acc_g = pv_g + p_new * acc0_g
+                        lt_g = (
+                            _broadcast_minor_128(jnp.sum(l_flat, axis=1, keepdims=True))
+                            + p_new
+                        )
+                        out_2d = (
+                            (acc_g / lt_g).astype(jnp.bfloat16)
+                            if interpret_mode
+                            else (acc_g * pltpu.reciprocal(lt_g, approx=True)).astype(
+                                jnp.bfloat16
+                            )
+                        )
+                        for sub in range(grp_sz):
+                            o_vmem_ref[grp_sz * g_i + sub] = jnp.where(
+                                act_list[sub],
+                                out_2d[sub * q_out_rows : (sub + 1) * q_out_rows],
+                                z_out_sub,
+                            )
+
                     if kv_pack_bd4:
                         n_u32 = w_tok // 4
                         half_w = w_tok // 2
@@ -5127,27 +5183,92 @@ def _run_rpad_vmem_core(
                             ],
                             axis=0,
                         )
-                        if v_scale is not None and v_scale_val != 1.0:
-                            pv_g = pv_g * v_scale_val
-                        p_new = jnp.exp2((s_new_g - m_flat) * exp2_scale)
-                        acc_g = pv_g + p_new * acc0_g
-                        lt_g = (
-                            _broadcast_minor_128(jnp.sum(l_flat, axis=1, keepdims=True))
-                            + p_new
+                        _finish_grp_out(pv_g, l_flat, m_flat)
+                        return wr_cnt
+                    if kv_pack_dense2:
+                        half_w = w_tok // 2
+                        k_e_g, k_o_g = _load_bkv_fp8_split(
+                            bkv_vmem_ref,
+                            sl,
+                            0,
+                            grp_sz * w_tok,
+                            kind="k",
+                            page_size=page_size,
+                            interpret_mode=interpret_mode,
                         )
-                        out_2d = (
-                            (acc_g / lt_g).astype(jnp.bfloat16)
-                            if interpret_mode
-                            else (acc_g * pltpu.reciprocal(lt_g, approx=True)).astype(
-                                jnp.bfloat16
-                            )
+                        k_e_g = k_e_g.reshape(grp_sz, half_w, 128)
+                        k_o_g = k_o_g.reshape(grp_sz, half_w, 128)
+                        col_sub_e = 2 * lax.broadcasted_iota(
+                            jnp.int32, (q_out_rows, half_w), 1
                         )
+                        col_sub_o = col_sub_e + 1
+                        se_list, so_list = [], []
                         for sub in range(grp_sz):
-                            o_vmem_ref[grp_sz * g_i + sub] = jnp.where(
-                                act_list[sub],
-                                out_2d[sub * q_out_rows : (sub + 1) * q_out_rows],
-                                z_out_sub,
+                            se_s = jnp.matmul(
+                                q_g[sub],
+                                k_e_g[sub].T,
+                                preferred_element_type=jnp.float32,
                             )
+                            so_s = jnp.matmul(
+                                q_g[sub],
+                                k_o_g[sub].T,
+                                preferred_element_type=jnp.float32,
+                            )
+                            if sliding_window is not None:
+                                se_s = jnp.where(
+                                    (col_sub_e >= rf_list[sub]) & (col_sub_e < re_list[sub]),
+                                    se_s,
+                                    _MASK_LOGIT,
+                                )
+                                so_s = jnp.where(
+                                    (col_sub_o >= rf_list[sub]) & (col_sub_o < re_list[sub]),
+                                    so_s,
+                                    _MASK_LOGIT,
+                                )
+                            else:
+                                se_s = jnp.where(col_sub_e < re_list[sub], se_s, _MASK_LOGIT)
+                                so_s = jnp.where(col_sub_o < re_list[sub], so_s, _MASK_LOGIT)
+                            se_list.append(se_s)
+                            so_list.append(so_s)
+                        m_flat, _, pe_flat, po_flat, l_flat = _bd4_softmax_reduce(
+                            jnp.concatenate(se_list, axis=0),
+                            jnp.concatenate(so_list, axis=0),
+                            s_new_g,
+                            exp2_scale,
+                            half_w,
+                            grp_sz * q_out_rows,
+                            use_page_reduce=True,
+                        )
+                        v_e_g, v_o_g = _load_bkv_fp8_split(
+                            bkv_vmem_ref,
+                            sl,
+                            0,
+                            grp_sz * w_tok,
+                            kind="v",
+                            page_size=page_size,
+                            interpret_mode=interpret_mode,
+                        )
+                        v_e_g = v_e_g.reshape(grp_sz, half_w, 128)
+                        v_o_g = v_o_g.reshape(grp_sz, half_w, 128)
+                        pe_dot = pe_flat.astype(jnp.bfloat16) if cfg.pv_bf16 else pe_flat
+                        po_dot = po_flat.astype(jnp.bfloat16) if cfg.pv_bf16 else po_flat
+                        pv_g = jnp.concatenate(
+                            [
+                                jnp.matmul(
+                                    pe_dot[sub * q_out_rows : (sub + 1) * q_out_rows],
+                                    v_e_g[sub],
+                                    preferred_element_type=jnp.float32,
+                                )
+                                + jnp.matmul(
+                                    po_dot[sub * q_out_rows : (sub + 1) * q_out_rows],
+                                    v_o_g[sub],
+                                    preferred_element_type=jnp.float32,
+                                )
+                                for sub in range(grp_sz)
+                            ],
+                            axis=0,
+                        )
+                        _finish_grp_out(pv_g, l_flat, m_flat)
                         return wr_cnt
                     k_all = _bkv_fp8_chunk(sl, 0, grp_sz * w_tok, kind="k")
                     s_list = []
@@ -5197,26 +5318,11 @@ def _run_rpad_vmem_core(
                         ],
                         axis=0,
                     )
-                    if v_scale is not None and v_scale_val != 1.0:
-                        pv_g = pv_g * v_scale_val
-                    p_new = jnp.exp2((s_new_g - m_flat) * exp2_scale)
-                    acc_g = pv_g + p_new * acc0_g
-                    lt_g = _broadcast_minor_128(jnp.sum(l_flat, axis=1, keepdims=True)) + p_new
-                    out_2d = (
-                        (acc_g / lt_g).astype(jnp.bfloat16)
-                        if interpret_mode
-                        else (acc_g * pltpu.reciprocal(lt_g, approx=True)).astype(jnp.bfloat16)
-                    )
-                    for sub in range(grp_sz):
-                        o_vmem_ref[grp_sz * g_i + sub] = jnp.where(
-                            act_list[sub],
-                            out_2d[sub * q_rows : (sub + 1) * q_rows],
-                            z_out_sub,
-                        )
+                    _finish_grp_out(pv_g, l_flat, m_flat)
                     return wr_cnt
 
                 wr_res = lax.fori_loop(0, n_grp, _grp_body, jnp.int32(0))
-                if not kv_pack_bd4:
+                if not (kv_pack_bd4 or kv_pack_dense2):
                     written_cnt_smem_ref[0] = wr_res
 
             if can_grp_vec:

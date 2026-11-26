@@ -74,6 +74,14 @@ class _Ops(NamedTuple):
     a3_pro_a2a_chunk: object = None
     a3_pro_last_chunk: object = None
     a3_kdeep_ccs: object = None
+    # Wave-9 Static-FP8 Ulysses sequence-parallel ops (`A1_VARIANT="v10_sp"`, TP=8 / TP=16).
+    a1_ulysses_qkv_chunk: object = None
+    a1_ulysses_a2a_pack_chunk: object = None
+    a1_ulysses_gate_chunk: object = None
+    a3_ulysses_rev_a2a_chunk: object = None
+    a3_ulysses_gate_fuse_chunk: object = None
+    a3_ulysses_wo: object = None
+    a3_ulysses_wo_2chunk: object = None
 
 
 _HYBRID_A1_VARIANTS = (
@@ -82,7 +90,7 @@ _HYBRID_A1_VARIANTS = (
     "v6_s8grp128_bf16kv",
     "v6_s8str128_bf16kv",
 )
-_A1_VARIANTS = ("v1", "v5", "v6", "v5x4", "v5x8", *_HYBRID_A1_VARIANTS)
+_A1_VARIANTS = ("v1", "v5", "v6", "v5x4", "v5x8", "v10_sp", *_HYBRID_A1_VARIANTS)
 _A3_VARIANTS = ("v3", "v4_3d", "v16")
 
 
@@ -1073,6 +1081,7 @@ def _ops(
     ccs_fuse_ag_a1: int = 0,
     overlap_deq0_routing_ag: bool = False,
     carb_tag: str = "",
+    ulysses_rev_bf16: bool = False,
 ) -> _Ops:
     """Per-rank torch ops: every tensor is this rank's block (P("model") on dim 0)."""
     import jax
@@ -1508,7 +1517,7 @@ def _ops(
         + a1_w8_tag
     )
     agd_ops = {}
-    if a1_ag_under_d or causal_chunk_stream:
+    if (a1_ag_under_d or causal_chunk_stream) and a1_variant != "v10_sp":
         if causal_chunk_stream:
             from sglang_tpu.muse_prefill_kernels.causal_chunk_stream import (
                 resolve_causal_chunks,
@@ -1564,7 +1573,168 @@ def _ops(
     ag_chunk_op = None
     a1_chunk_op = None
     a1_chunk_agd_op = None
-    if causal_chunk_stream:
+    a1_ulysses_qkv_chunk_op = None
+    a1_ulysses_a2a_pack_chunk_op = None
+    a1_ulysses_gate_chunk_op = None
+    a3_ulysses_rev_a2a_chunk_op = None
+    a3_ulysses_gate_fuse_chunk_op = None
+    a3_ulysses_wo_op = None
+    a3_ulysses_wo_2chunk_op = None
+    if causal_chunk_stream and a1_variant == "v10_sp":
+        import jax.numpy as jnp
+        from sglang_tpu.muse_prefill_kernels.attn_kernels import kernel_a1, kernel_a3
+
+        tp_d_ul = mesh.shape[_AXIS]
+
+        def _prep_ul_fp8_slice(x_slice):
+            if x_slice.dtype != jnp.float8_e4m3fn:
+                return (
+                    jnp.clip(
+                        x_slice.astype(jnp.float32) * kernel_a1.STATIC_A1_ACT_MULT,
+                        -_FP8_MAX,
+                        _FP8_MAX,
+                    ).astype(jnp.float8_e4m3fn)
+                    if x_slice.shape[0] > 0
+                    else x_slice.astype(jnp.float8_e4m3fn)
+                )
+            return x_slice
+
+        def a1_ul_qkv_body(attn_in_k, wqkvg, wqkvg_sc3d, cos_k, sin_k):
+            c_k = attn_in_k.shape[0]
+            # Avoid outer stablehlo.partition_id; TorchTPU GSPMD rejects it in cpu_export_jax_op.
+            me = kernel_a1.pallas_axis_index_1d(_AXIS)[0]
+            x_fp8_k = _prep_ul_fp8_slice(attn_in_k)
+            cos_own = lax.dynamic_index_in_dim(
+                cos_k.reshape(tp_d_ul, c_k, 128), me, axis=0, keepdims=False
+            )
+            sin_own = lax.dynamic_index_in_dim(
+                sin_k.reshape(tp_d_ul, c_k, 128), me, axis=0, keepdims=False
+            )
+            q_3d, kv_3d = kernel_a1.pallas_a1_ulysses_qkv_local(
+                x_fp8_k,
+                wqkvg,
+                wqkvg_sc3d * kernel_a1.STATIC_A1_ACT_SCALE,
+                cos_own,
+                sin_own,
+                h_q_local=h_q_local,
+                h_kv_local=h_kv_local,
+            )
+            return q_3d, kv_3d, x_fp8_k
+
+        def a1_ul_a2a_pack_body(q_3d, kv_3d):
+            tp_d_p, c_k, q_cols = q_3d.shape
+            c_tok = tp_d_p * c_k
+            q_2d = lax.all_to_all(
+                q_3d, _AXIS, split_axis=0, concat_axis=0, tiled=False
+            ).reshape(c_tok, q_cols)
+            kv_2d = lax.all_to_all(
+                kv_3d, _AXIS, split_axis=0, concat_axis=0, tiled=False
+            ).reshape(c_tok, kv_3d.shape[-1])
+            return kernel_a1.pallas_pack_ulysses_qkv_for_rpa(
+                q_2d, kv_2d, h_q_local=h_q_local, h_kv_local=h_kv_local, tm=512
+            )
+
+        def a1_ul_gate_body(x_k, w_gate, w_gate_sc):
+            x_fp8_k = _prep_ul_fp8_slice(x_k)
+            return kernel_a1.pallas_ulysses_local_gate(
+                x_fp8_k,
+                w_gate,
+                w_gate_sc * kernel_a1.STATIC_A1_ACT_SCALE,
+            )
+
+        def a3_ul_rev_a2a_body(raw_attn_k):
+            c_tok, q_loc = raw_attn_k.shape
+            c_k = c_tok // tp_d_ul
+            q_3d = kernel_a3.pallas_ulysses_norm_fp8_for_rev_a2a(
+                raw_attn_k,
+                head_norm_eps=head_norm_eps,
+                quantize_fp8=not ulysses_rev_bf16,
+            ).reshape(tp_d_ul, c_k, q_loc)
+            return lax.all_to_all(
+                q_3d, _AXIS, split_axis=0, concat_axis=0, tiled=False
+            ).reshape(tp_d_ul, c_k, q_loc)
+
+        def a3_ul_gate_fuse_body(attn_3d, gate_k):
+            return kernel_a3.pallas_ulysses_gate_fuse(
+                attn_3d, gate_k, input_is_prescaled=not ulysses_rev_bf16
+            )
+
+        def a3_ul_wo_body(q_fp8, wo_in, wo_sc):
+            return kernel_a3.pallas_ulysses_wo_local(q_fp8, wo_in, wo_sc)
+
+        def a3_ul_wo_2chunk_body(q0_fp8, q1_fp8, wo_in, wo_sc):
+            return kernel_a3.pallas_ulysses_wo_local((q0_fp8, q1_fp8), wo_in, wo_sc)
+
+        a1_ul_qkv_sm = shard(a1_ul_qkv_body, 5, 3)
+        a1_ul_a2a_pack_sm = shard(a1_ul_a2a_pack_body, 2, 2)
+        a1_ul_gate_sm = shard(a1_ul_gate_body, 3, 1)
+        a3_ul_rev_a2a_sm = shard(a3_ul_rev_a2a_body, 1, 1)
+        a3_ul_gate_fuse_sm = shard(a3_ul_gate_fuse_body, 2, 1)
+        a3_ul_wo_sm = shard(a3_ul_wo_body, 3, 1)
+        a3_ul_wo_2c_sm = shard(a3_ul_wo_2chunk_body, 4, 1)
+
+        def a1_ul_qkv(
+            attn_in_k: jax.Array,
+            wqkvg: jax.Array,
+            wqkvg_sc3d: jax.Array,
+            cos_k: jax.Array,
+            sin_k: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            return a1_ul_qkv_sm(attn_in_k, wqkvg, wqkvg_sc3d, cos_k, sin_k)
+
+        def a1_ul_a2a_pack(
+            q_3d: jax.Array, kv_3d: jax.Array
+        ) -> tuple[jax.Array, jax.Array]:
+            return a1_ul_a2a_pack_sm(q_3d, kv_3d)
+
+        def a1_ul_gate(
+            x_k: jax.Array, w_gate: jax.Array, w_gate_sc: jax.Array
+        ) -> jax.Array:
+            return a1_ul_gate_sm(x_k, w_gate, w_gate_sc)
+
+        def a3_ul_rev_a2a(raw_attn_k: jax.Array) -> jax.Array:
+            return a3_ul_rev_a2a_sm(raw_attn_k)
+
+        def a3_ul_gate_fuse(attn_fp8_3d: jax.Array, gate_k: jax.Array) -> jax.Array:
+            return a3_ul_gate_fuse_sm(attn_fp8_3d, gate_k)
+
+        def a3_ul_wo(
+            q_fp8: jax.Array, wo_in: jax.Array, wo_sc: jax.Array
+        ) -> jax.Array:
+            return a3_ul_wo_sm(q_fp8, wo_in, wo_sc)
+
+        def a3_ul_wo_2chunk(
+            q0_fp8: jax.Array,
+            q1_fp8: jax.Array,
+            wo_in: jax.Array,
+            wo_sc: jax.Array,
+        ) -> jax.Array:
+            return a3_ul_wo_2c_sm(q0_fp8, q1_fp8, wo_in, wo_sc)
+
+        a1_ulysses_qkv_chunk_op = export(
+            "a1_ulysses_qkv_2op" + a1_w8_tag, a1_ul_qkv, 5, 3
+        )
+        a1_ulysses_a2a_pack_chunk_op = export(
+            "a1_ulysses_a2a_pack_2op", a1_ul_a2a_pack, 2, 2
+        )
+        a1_ulysses_gate_chunk_op = export("a1_ulysses_gate", a1_ul_gate, 3, 1)
+        rev_bf16_sfx = "_bf16" if ulysses_rev_bf16 else ""
+        a3_ulysses_rev_a2a_chunk_op = export(
+            "a3_ulysses_rev_a2a_e"
+            + f"{head_norm_eps:g}".replace("-", "m").replace(".", "p")
+            + rev_bf16_sfx,
+            a3_ul_rev_a2a,
+            1,
+            1,
+        )
+        a3_ulysses_gate_fuse_chunk_op = export(
+            "a3_ulysses_gate_fuse" + rev_bf16_sfx, a3_ul_gate_fuse, 2, 1
+        )
+        a3_ulysses_wo_op = export("a3_ulysses_wo", a3_ul_wo, 3, 1)
+        a3_ulysses_wo_2chunk_op = export(
+            "a3_ulysses_wo_2chunk", a3_ul_wo_2chunk, 4, 1
+        )
+    if causal_chunk_stream and a1_variant != "v10_sp":
         import jax.numpy as jnp
         from sglang_tpu.muse_prefill_kernels.attn_kernels import kernel_a1
 
@@ -1707,7 +1877,12 @@ def _ops(
     a3_pro_chunk_op = None
     a3_wo_op = None
     a3_wo_2chunk_op = None
-    if causal_chunk_stream and a3_variant == "v16" and ccs_chunk_a3_prologue:
+    if (
+        causal_chunk_stream
+        and a3_variant == "v16"
+        and ccs_chunk_a3_prologue
+        and a1_variant != "v10_sp"
+    ):
         from sglang_tpu.muse_prefill_kernels.attn_kernels import kernel_a3
 
         eff_h_eps = head_norm_eps if (fused_glue or a3_rpa_out) else None
@@ -1845,7 +2020,12 @@ def _ops(
     a3_kdeep_mode = int(tpu_envs.SGLANG_TPU_MUSE_KERNEL_A3_KDEEP_WO.get() or 0)
     w4_wo_mode = int(tpu_envs.SGLANG_TPU_MUSE_KERNEL_W4_WO.get() or 0)
     a3_bn2k = _env_bool("SGLANG_TPU_MUSE_KERNEL_A3_BN2048")
-    if causal_chunk_stream and a3_variant == "v16" and a3_kdeep_mode >= 2:
+    if (
+        causal_chunk_stream
+        and a3_variant == "v16"
+        and a3_kdeep_mode >= 2
+        and a1_variant != "v10_sp"
+    ):
         from sglang_tpu.muse_prefill_kernels.attn_kernels import kernel_a3
         from sglang_tpu.muse_prefill_kernels.prefill_w8_radicals import (
             pallas_a3_wo_kdeep_ccs_last_a2a,
@@ -2032,6 +2212,13 @@ def _ops(
         a3_pro_a2a_chunk=a3_pro_a2a_chunk_op,
         a3_pro_last_chunk=a3_pro_last_chunk_op,
         a3_kdeep_ccs=a3_kdeep_ccs_op,
+        a1_ulysses_qkv_chunk=a1_ulysses_qkv_chunk_op,
+        a1_ulysses_a2a_pack_chunk=a1_ulysses_a2a_pack_chunk_op,
+        a1_ulysses_gate_chunk=a1_ulysses_gate_chunk_op,
+        a3_ulysses_rev_a2a_chunk=a3_ulysses_rev_a2a_chunk_op,
+        a3_ulysses_gate_fuse_chunk=a3_ulysses_gate_fuse_chunk_op,
+        a3_ulysses_wo=a3_ulysses_wo_op,
+        a3_ulysses_wo_2chunk=a3_ulysses_wo_2chunk_op,
         **agd_ops,
     )
 
@@ -2094,7 +2281,12 @@ def _fp8_k_major(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def _prepare_wo(
-    o_proj_weight: torch.Tensor, *, a3_variant: str, gather, tp_rank: int
+    o_proj_weight: torch.Tensor,
+    *,
+    a3_variant: str,
+    gather,
+    tp_rank: int,
+    skip_v16_perm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]:
     """A3's fp8 Wo, ``[N]`` scales and the shape A3 reads Wo in.
 
@@ -2104,7 +2296,7 @@ def _prepare_wo(
         wo, wo_scale = _fp8_k_major(o_proj_weight)
         return wo, wo_scale, tuple(wo.shape)
     w_kn = gather(o_proj_weight.t().contiguous())
-    if a3_variant == "v16":
+    if a3_variant == "v16" and not skip_v16_perm:
         from sglang_tpu.muse_prefill_kernels.attn_kernels import kernel_a3
 
         # [tp, K / tp, N]: v16 step d multiplies the block from peer(tp_rank, d) by slice d.
@@ -2197,6 +2389,30 @@ class _LayerWeights(torch.nn.Module):
                 "a1_gain": a1_gain,
                 "a1_inv_gain": a1_inv_gain,
             }
+        elif a1_variant == "v10_sp":
+            # Static-FP8 Ulysses: replicated QKV ([tp, H, Q+2*KV]) + replicated Gate ([H, H]),
+            # gathered from pre-quantized per-rank FP8 columns for 0-ULP weight identity vs v6.
+            wqkv_loc, wqkv_sc_loc = _fp8_k_major(torch.cat([q, k, v], dim=0))
+            hidden_w, qkv_cols = wqkv_loc.shape
+            wqkvg = (
+                gather(wqkv_loc.view(torch.uint8))
+                .view(torch.float8_e4m3fn)
+                .reshape(-1, hidden_w, qkv_cols)
+                .contiguous()
+            )
+            wqkvg_scale = gather(wqkv_sc_loc[None]).contiguous()
+            wg_loc, wg_sc_loc = _fp8_k_major(attn.gate_proj.weight)
+            w_gate = (
+                gather(wg_loc.t().contiguous().view(torch.uint8))
+                .view(torch.float8_e4m3fn)
+                .t()
+                .contiguous()
+            )
+            w_gate_scale = gather(wg_sc_loc).contiguous()
+            hybrid_buffers = {
+                "w_gate": w_gate,
+                "w_gate_scale": w_gate_scale,
+            }
         else:
             # A1 reads its columns as [q | gate | k | v].
             wqkvg, wqkvg_scale = _fp8_k_major(
@@ -2212,10 +2428,19 @@ class _LayerWeights(torch.nn.Module):
             )
             wqkvg_scale = gather(wqkvg_scale[None])
         wo, wo_scale, self.wo_shape = _prepare_wo(
-            attn.o_proj.weight, a3_variant=a3_variant, gather=gather, tp_rank=tp_rank
+            attn.o_proj.weight,
+            a3_variant=a3_variant,
+            gather=gather,
+            tp_rank=tp_rank,
+            skip_v16_perm=(a1_variant == "v10_sp"),
         )
         w4_wo_qbs = int(tpu_envs.SGLANG_TPU_MUSE_KERNEL_W4_WO.get() or 0)
-        if a3_variant == "v16" and w4_wo_qbs == 256 and _ccs_wo_uses_kdeep_nvfp4():
+        if (
+            a3_variant == "v16"
+            and a1_variant != "v10_sp"
+            and w4_wo_qbs == 256
+            and _ccs_wo_uses_kdeep_nvfp4()
+        ):
             from sglang_tpu.muse_prefill_kernels.prefill_w8_radicals import (
                 quantize_dense_fp8_to_nvfp4_torch,
             )
@@ -2306,6 +2531,42 @@ class _LayerWeights(torch.nn.Module):
         return sum(b.numel() * b.element_size() for b in self.buffers())
 
 
+def _v10_sp_config_error(
+    tp_size: int,
+    *,
+    h_q_local: int,
+    h_kv_local: int,
+    causal_chunk_stream: bool,
+    a3_variant: str,
+    a1_rpa_layout: bool,
+    a3_rpa_out: bool,
+    kv_pack_heads: bool,
+    skip_pad_attn_tokens: bool,
+    ep_tp2_mode: bool = False,
+) -> Optional[str]:
+    """Validate Static-FP8 Ulysses (`A1_VARIANT='v10_sp'`) requirements across TP=8 and TP=16."""
+    expected_kv_pack = tp_size == 8
+    expected_heads = (16, 2) if tp_size == 8 else (8, 1)
+    if (
+        tp_size not in (8, 16)
+        or (h_q_local, h_kv_local) != expected_heads
+        or not causal_chunk_stream
+        or not a1_rpa_layout
+        or a3_variant != "v16"
+        or ep_tp2_mode
+        or a3_rpa_out
+        or skip_pad_attn_tokens
+        or kv_pack_heads != expected_kv_pack
+    ):
+        kv_pack_str = "1" if expected_kv_pack else "0"
+        return (
+            f"native TP{tp_size} A1_VARIANT='v10_sp' requires (h_q_local, h_kv_local)={expected_heads}, "
+            f"CAUSAL_CHUNK_STREAM=1, A1_RPA_LAYOUT=1, A3_VARIANT='v16', pure EP, "
+            f"KV_PACK_HEADS={kv_pack_str}, A3_RPA_OUT=0, and SKIP_PAD_ATTN_TOKENS=0"
+        )
+    return None
+
+
 class MusePrefillKernels(torch.nn.Module):
     """Sequence-parallel kernel run of decoder layers ``[start, end)`` on eligible batches."""
 
@@ -2344,7 +2605,7 @@ class MusePrefillKernels(torch.nn.Module):
             and not ep_tp2_mode
             and (
                 tpu_envs.SGLANG_TPU_KV_PACK_HEADS.get()
-                or (tp_size == 16 and self.a1_variant == "v6")
+                or (tp_size == 16 and self.a1_variant in ("v6", "v10_sp"))
             )
         )
         self.a3_rpa_out = (
@@ -2365,6 +2626,7 @@ class MusePrefillKernels(torch.nn.Module):
         self._a1_skip = self.skip_pad_attn_tokens and self.a1_variant not in (
             "v1",
             "v6",
+            "v10_sp",
         )
         self._a3_skip = self.skip_pad_attn_tokens and self.a3_variant == "v16"
         self.sharded_rope = tpu_envs.SGLANG_TPU_MUSE_KERNEL_SHARDED_ROPE.get()
@@ -2373,7 +2635,11 @@ class MusePrefillKernels(torch.nn.Module):
             for w in tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_PARTS.get().split(",")
             if w
         )
-        self.a1_ag_under_d = tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_AG_UNDER_D.get()
+        self.a1_ag_under_d = (
+            False
+            if self.a1_variant == "v10_sp"
+            else tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_AG_UNDER_D.get()
+        )
         self.causal_chunk_stream = (
             tpu_envs.SGLANG_TPU_MUSE_KERNEL_CAUSAL_CHUNK_STREAM.get()
         )
@@ -2397,15 +2663,30 @@ class MusePrefillKernels(torch.nn.Module):
             and self.a1_variant == "v1"
             and tpu_envs.SGLANG_TPU_MUSE_KERNEL_TP16_OWNER_A1.get()
         )
+        if self.a1_variant == "v10_sp":
+            v10_err = _v10_sp_config_error(
+                self.tp_size,
+                h_q_local=attn.num_heads,
+                h_kv_local=attn.num_kv_heads,
+                causal_chunk_stream=self.causal_chunk_stream,
+                a3_variant=self.a3_variant,
+                a1_rpa_layout=self.a1_rpa_layout,
+                a3_rpa_out=self.a3_rpa_out,
+                kv_pack_heads=tpu_envs.SGLANG_TPU_KV_PACK_HEADS.get(),
+                skip_pad_attn_tokens=self.skip_pad_attn_tokens,
+                ep_tp2_mode=self.ep_tp2_mode,
+            )
+            if v10_err is not None:
+                raise ValueError(v10_err)
         if self.causal_chunk_stream and (
-            self.a1_variant != "v6"
+            self.a1_variant not in ("v6", "v10_sp")
             or (self.tp_size != 16 and not self.a1_rpa_layout)
             or self.ep_tp2_mode
             or self.tp16_owner_a1
             or self.skip_pad_attn_tokens
         ):
             raise ValueError(
-                "CAUSAL_CHUNK_STREAM requires A1_VARIANT='v6', "
+                "CAUSAL_CHUNK_STREAM requires A1_VARIANT in ('v6', 'v10_sp'), "
                 "(A1_RPA_LAYOUT=1 or TP=16), pure EP, and SKIP_PAD_ATTN_TOKENS=0"
             )
         self.ops = _ops(
@@ -2454,6 +2735,7 @@ class MusePrefillKernels(torch.nn.Module):
             tpu_envs.SGLANG_TPU_MUSE_KERNEL_CCS_FUSE_AG_A1.get(),
             tpu_envs.SGLANG_TPU_MUSE_KERNEL_OVERLAP_DEQ0_ROUTING_AG.get(),
             _w8_carb_cache_tag(),
+            tpu_envs.SGLANG_TPU_MUSE_KERNEL_ULYSSES_REV_BF16.get(),
         )
         self.a3_kdeep_wo = int(
             tpu_envs.SGLANG_TPU_MUSE_KERNEL_A3_KDEEP_WO.get() or 0
@@ -2663,15 +2945,33 @@ class MusePrefillKernels(torch.nn.Module):
             )
         ):
             reason = "hybrid EP8xTP2 TP16 needs unpacked A1 v1 and A3 v3"
+        elif ((pure_ep_prefill or ep_tp2_prefill) and tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_VARIANT.get() == "v10_sp") and (
+            v10_reason := _v10_sp_config_error(
+                tp,
+                h_q_local=cfg.num_attention_heads // tp,
+                h_kv_local=cfg.num_key_value_heads // tp,
+                causal_chunk_stream=tpu_envs.SGLANG_TPU_MUSE_KERNEL_CAUSAL_CHUNK_STREAM.get(),
+                a3_variant=tpu_envs.SGLANG_TPU_MUSE_KERNEL_A3_VARIANT.get(),
+                a1_rpa_layout=tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT.get(),
+                a3_rpa_out=tpu_envs.SGLANG_TPU_MUSE_KERNEL_A3_RPA_OUT.get(),
+                kv_pack_heads=tpu_envs.SGLANG_TPU_KV_PACK_HEADS.get(),
+                skip_pad_attn_tokens=tpu_envs.SGLANG_TPU_MUSE_KERNEL_SKIP_PAD_ATTN_TOKENS.get(),
+                ep_tp2_mode=ep_tp2_prefill,
+            )
+        ) is not None:
+            reason = v10_reason
         elif native_tp16 and (
-            tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_VARIANT.get() not in ("v1", "v6")
+            tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_VARIANT.get() not in ("v1", "v6", "v10_sp")
             or tpu_envs.SGLANG_TPU_MUSE_KERNEL_A3_VARIANT.get() not in ("v3", "v16")
             or (
                 tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT.get()
-                and tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_VARIANT.get() != "v6"
+                and tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_VARIANT.get() not in ("v6", "v10_sp")
             )
         ):
-            reason = "native TP16 needs A1 v1/v6 (v6 for A1_RPA_LAYOUT) and A3 v3/v16"
+            reason = (
+                "native TP16 needs A1 v1/v6/v10_sp (v6/v10_sp for A1_RPA_LAYOUT) "
+                "and A3 v3/v16"
+            )
         elif parallel.attn_dcp_size != 1 or is_dp_attention_enabled():
             reason = "does not support DCP or DP attention"
         elif decoder.pp_group.world_size != 1:
@@ -2922,7 +3222,9 @@ class MusePrefillKernels(torch.nn.Module):
             t_shard=t_shard,
             t_total=t_total,
         )
-        use_agd_out = self.a1_ag_under_d or (chunk_metas is not None)
+        use_agd_out = (
+            self.a1_ag_under_d or (chunk_metas is not None)
+        ) and self.a1_variant != "v10_sp"
         use_l61_prune = (
             getattr(self, "l61_prune", False)
             and exit_last_index is not None
@@ -3139,7 +3441,28 @@ class MusePrefillKernels(torch.nn.Module):
         eff_idx = torch.where(active, exit_last_index, 0).clamp(0, t_total - 1)
         idx_128 = torch.nn.functional.pad(eff_idx.long(), (0, 128 - bs))
         q_tok_dim = 1 if self.a1_rpa_layout else 0
-        if chunk_metas is not None and chunks is not None and rope_chunks is not None:
+        if self.a1_variant == "v10_sp":
+            q_pruned, gate_pruned, kv_pruned = self._l61_pruned_ulysses_v10_attn_inputs(
+                weights=weights,
+                attn_in=attn_in,
+                rope=rope,
+                chunks=chunks,
+                rope_chunks=rope_chunks,
+                chunk_metas=chunk_metas,
+                forward_batch=forward_batch,
+                attn=attn,
+                be=be,
+                idx_128=idx_128,
+                eff_idx=eff_idx,
+                active=active,
+                bs=bs,
+                q_size=q_size,
+                t_shard=t_shard,
+                inv_cm_perm=inv_cm_perm,
+                trap_ctx=trap_ctx,
+                layer_idx=layer_idx,
+            )
+        elif chunk_metas is not None and chunks is not None and rope_chunks is not None:
             if isinstance(attn_in, tuple):
                 ag_cur, rest_in = attn_in
                 rest_off = 0
@@ -3631,7 +3954,22 @@ class MusePrefillKernels(torch.nn.Module):
         a3_extra = (valid_tokens,) if self._a3_skip else ()
         q_tok_dim = 1 if self.a1_rpa_layout else 0
         attn_out_shard = None
-        if (
+        if self.a1_variant == "v10_sp":
+            attn_out_shard = self._forward_ulysses_v10(
+                attn=attn,
+                weights=weights,
+                wo=wo,
+                wo_scale=wo_scale,
+                attn_in=attn_in,
+                rope=rope,
+                chunks=chunks,
+                rope_chunks=rope_chunks,
+                chunk_metas=chunk_metas,
+                forward_batch=forward_batch,
+                trap_ctx=trap_ctx,
+                layer_idx=layer_idx,
+            )
+        elif (
             chunk_metas is not None
             and chunks is not None
             and rope_chunks is not None
@@ -3878,6 +4216,231 @@ class MusePrefillKernels(torch.nn.Module):
         return self._moe_op(is_fp8_expert=is_fp8_expert, gather_next=False)(
             *moe_args, *self._moe_real_tokens_arg()
         )
+
+    def _prepare_ulysses_chunks(
+        self, weights, attn_in, rope, chunks, rope_chunks, chunk_metas
+    ):
+        """Returns `(eff_chunks, eff_rope_chunks, eff_metas, in_slices, wqkvg_sc3d, w_gate, w_gate_sc)`."""
+        if chunk_metas is not None and chunks is not None and rope_chunks is not None:
+            eff_chunks = chunks
+            eff_rope_chunks = rope_chunks
+            eff_metas = chunk_metas
+        else:
+            eff_chunks = (attn_in.shape[0],)
+            eff_rope_chunks = (rope,)
+            eff_metas = (None,)
+        in_slices = []
+        r_off = 0
+        for c_k in eff_chunks:
+            in_slices.append(attn_in[r_off : r_off + c_k])
+            r_off += c_k
+        return (
+            eff_chunks,
+            eff_rope_chunks,
+            eff_metas,
+            in_slices,
+            weights.wqkvg_scale[:, None, :],
+            weights.w_gate,
+            weights.w_gate_scale[None],
+        )
+
+    def _forward_ulysses_v10(
+        self,
+        *,
+        attn,
+        weights,
+        wo,
+        wo_scale,
+        attn_in,
+        rope,
+        chunks,
+        rope_chunks,
+        chunk_metas,
+        forward_batch,
+        trap_ctx=None,
+        layer_idx: int = -1,
+    ) -> torch.Tensor:
+        """Static-FP8 Ulysses sequence-parallel CCS (and single-chunk fallback) path."""
+        be = get_attn_backend()
+        (
+            eff_chunks,
+            eff_rope_chunks,
+            eff_metas,
+            in_slices,
+            wqkvg_sc3d,
+            w_gate,
+            w_gate_sc,
+        ) = self._prepare_ulysses_chunks(
+            weights, attn_in, rope, chunks, rope_chunks, chunk_metas
+        )
+
+        q3_cur, kv3_cur, x_fp8_cur = self.ops.a1_ulysses_qkv_chunk(
+            in_slices[0],
+            weights.wqkvg,
+            wqkvg_sc3d,
+            eff_rope_chunks[0][0],
+            eff_rope_chunks[0][1],
+        )
+        q_parts = []
+        attn_fp8_prev = None
+        gate_prev = None
+        c_off = 0
+        for k, c_k in enumerate(eff_chunks):
+            has_next = k + 1 < len(eff_chunks)
+            q_k, kv_k = self.ops.a1_ulysses_a2a_pack_chunk(q3_cur, kv3_cur)
+            gate_k = self.ops.a1_ulysses_gate_chunk(x_fp8_cur, w_gate, w_gate_sc)
+            if attn_fp8_prev is not None:
+                q_parts.append(
+                    self.ops.a3_ulysses_gate_fuse_chunk(attn_fp8_prev, gate_prev)
+                )
+                attn_fp8_prev = None
+            if has_next:
+                q3_next, kv3_next, x_fp8_next = self.ops.a1_ulysses_qkv_chunk(
+                    in_slices[k + 1],
+                    weights.wqkvg,
+                    wqkvg_sc3d,
+                    eff_rope_chunks[k + 1][0],
+                    eff_rope_chunks[k + 1][1],
+                )
+            out_k = be.forward_prepared(
+                q_k, kv_k, attn.attn, forward_batch, chunk_meta=eff_metas[k]
+            )
+            out_tok = (
+                out_k.squeeze(0)
+                if (out_k.ndim > 2 and out_k.shape[0] == 1)
+                else out_k
+            )
+            if trap_ctx is not None:
+                c_tok = self.tp_size * c_k
+                c_real = trap_ctx["full_real"][c_off : c_off + c_tok]
+                c_orig = trap_ctx["orig_full"][c_off : c_off + c_tok]
+                _record_nan_trap(
+                    trap_ctx, layer_idx, 1, ((q_k, 1), (kv_k, 0)), c_real, c_orig
+                )
+                _record_nan_trap(
+                    trap_ctx, layer_idx, 2, ((out_tok, 0),), c_real, c_orig
+                )
+                c_off += c_tok
+            attn_fp8_k = self.ops.a3_ulysses_rev_a2a_chunk(out_tok)
+            if has_next:
+                attn_fp8_prev = attn_fp8_k
+                gate_prev = gate_k
+                q3_cur, kv3_cur, x_fp8_cur = q3_next, kv3_next, x_fp8_next
+            else:
+                q_parts.append(self.ops.a3_ulysses_gate_fuse_chunk(attn_fp8_k, gate_k))
+
+        if len(q_parts) == 2 and self.ops.a3_ulysses_wo_2chunk is not None:
+            return self.ops.a3_ulysses_wo_2chunk(q_parts[0], q_parts[1], wo, wo_scale)
+        q_all_fp8 = q_parts[0] if len(q_parts) == 1 else torch.cat(q_parts, dim=0)
+        return self.ops.a3_ulysses_wo(q_all_fp8, wo, wo_scale)
+
+    def _l61_pruned_ulysses_v10_attn_inputs(
+        self,
+        *,
+        weights,
+        attn_in,
+        rope,
+        chunks,
+        rope_chunks,
+        chunk_metas,
+        forward_batch,
+        attn,
+        be,
+        idx_128,
+        eff_idx,
+        active,
+        bs: int,
+        q_size: int,
+        t_shard: int,
+        inv_cm_perm,
+        trap_ctx=None,
+        layer_idx: int = -1,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Writes KV & gathers pruned L61 `(q_pruned, gate_pruned, kv_pruned)` for `v10_sp`."""
+        (
+            eff_chunks,
+            eff_rope_chunks,
+            eff_metas,
+            in_slices,
+            wqkvg_sc3d,
+            w_gate,
+            w_gate_sc,
+        ) = self._prepare_ulysses_chunks(
+            weights, attn_in, rope, chunks, rope_chunks, chunk_metas
+        )
+
+        q3_cur, kv3_cur, x_fp8_cur = self.ops.a1_ulysses_qkv_chunk(
+            in_slices[0],
+            weights.wqkvg,
+            wqkvg_sc3d,
+            eff_rope_chunks[0][0],
+            eff_rope_chunks[0][1],
+        )
+        q_pruned = None
+        kv_pruned_u8 = None
+        kv_dtype = None
+        gate_parts = []
+        c_off = 0
+        for k, c_k in enumerate(eff_chunks):
+            has_next = k + 1 < len(eff_chunks)
+            q_k, kv_k = self.ops.a1_ulysses_a2a_pack_chunk(q3_cur, kv3_cur)
+            gate_parts.append(self.ops.a1_ulysses_gate_chunk(x_fp8_cur, w_gate, w_gate_sc))
+            if has_next:
+                q3_cur, kv3_cur, x_fp8_cur = self.ops.a1_ulysses_qkv_chunk(
+                    in_slices[k + 1],
+                    weights.wqkvg,
+                    wqkvg_sc3d,
+                    eff_rope_chunks[k + 1][0],
+                    eff_rope_chunks[k + 1][1],
+                )
+            be.write_kv_only(kv_k, attn.attn, forward_batch, chunk_meta=eff_metas[k])
+            c_tok = self.tp_size * c_k
+            if trap_ctx is not None:
+                _record_nan_trap(
+                    trap_ctx,
+                    layer_idx,
+                    1,
+                    ((q_k, 1), (kv_k, 0)),
+                    trap_ctx["full_real"][c_off : c_off + c_tok],
+                    trap_ctx["orig_full"][c_off : c_off + c_tok],
+                )
+            loc_idx = (idx_128 - c_off).clamp(0, c_tok - 1)
+            q_sel = q_k.index_select(1, loc_idx)
+            kv_dtype = kv_k.dtype
+            kv_sel_u8 = kv_k.view(torch.uint8).index_select(0, loc_idx)
+            if k == 0:
+                q_pruned = q_sel
+                kv_pruned_u8 = kv_sel_u8
+            else:
+                in_c = (idx_128 >= c_off) & (idx_128 < c_off + c_tok)
+                in_q = in_c.view(1, -1, *([1] * (q_sel.ndim - 2)))
+                in_kv = in_c.view(-1, *([1] * (kv_sel_u8.ndim - 1)))
+                q_pruned = torch.where(in_q, q_sel, q_pruned)
+                kv_pruned_u8 = torch.where(in_kv, kv_sel_u8, kv_pruned_u8)
+            c_off += c_tok
+
+        assert q_pruned is not None and kv_pruned_u8 is not None
+        kv_pruned = kv_pruned_u8.view(kv_dtype)
+        gate_shard = gate_parts[0] if len(gate_parts) == 1 else torch.cat(gate_parts, dim=0)
+        cm_idx = (
+            inv_cm_perm.index_select(0, eff_idx.long())
+            if inv_cm_perm is not None
+            else eff_idx.long()
+        )
+        t_start = self.tp_rank * t_shard
+        in_range = (cm_idx >= t_start) & (cm_idx < t_start + t_shard) & active
+        local_idx = (cm_idx - t_start).clamp(0, t_shard - 1)
+        local_gate_rows = torch.where(
+            in_range.unsqueeze(1),
+            gate_shard.index_select(0, local_idx),
+            0.0,
+        )
+        gate_bs_full = self.ops.sum_stream(local_gate_rows)
+        gate_pruned = torch.nn.functional.pad(
+            gate_bs_full[:, self.tp_rank * q_size : (self.tp_rank + 1) * q_size],
+            (0, 0, 0, 128 - bs),
+        )
+        return q_pruned, gate_pruned, kv_pruned
 
     def _forward_ccs_kdeep_a3(
         self,
@@ -4236,7 +4799,9 @@ class MusePrefillKernels(torch.nn.Module):
             self.eplb_moe_fp8_op = build_moe_op(
                 op_extra_tag=eplb_extra + "_fp8" + fp8_extra
             )
-        if self.a1_ag_under_d or self.causal_chunk_stream:
+        if (
+            self.a1_ag_under_d or self.causal_chunk_stream
+        ) and self.a1_variant != "v10_sp":
             a1_ch_tag = (
                 f"_ch_{self.a1_chunks.replace('+', 'p').replace(',', '_')}"
                 if self.a1_chunks

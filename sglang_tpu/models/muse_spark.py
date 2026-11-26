@@ -2150,11 +2150,12 @@ class MuseSparkMoE(nn.Module):
                 return
 
         from sglang_tpu.fp8_moe import _own_storage
-        from sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_op import (
-            SUPPORTED_FUSE_ALL_BATCHES,
-            get_muse_ep_tp2_fallback_op,
-            get_muse_fuse_all_decode_op,
-        )
+        import sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_op as _fdo_mod
+
+        SUPPORTED_FUSE_ALL_BATCHES = _fdo_mod.SUPPORTED_FUSE_ALL_BATCHES
+        get_muse_ep_tp2_fallback_op = _fdo_mod.get_muse_ep_tp2_fallback_op
+        get_muse_fuse_all_decode_op = _fdo_mod.get_muse_fuse_all_decode_op
+        _batches_fn = getattr(_fdo_mod, "supported_fuse_all_batches", None)
 
         self._register_fused_decode_vecs(norm)
         self.register_buffer("_fused_decode_rank", rank_t, persistent=False)
@@ -2164,10 +2165,15 @@ class MuseSparkMoE(nn.Module):
                 _own_storage(pre_gain.detach().reshape(1, -1).contiguous()),
                 persistent=False,
             )
-        ext_batches = (
-            (*SUPPORTED_FUSE_ALL_BATCHES, 384)
-            if (_decode_max_tokens() >= 384 and 384 not in SUPPORTED_FUSE_ALL_BATCHES)
+        base_batches = (
+            _batches_fn(ep=ep_owners)
+            if (mode == "sparse" and _batches_fn is not None)
             else SUPPORTED_FUSE_ALL_BATCHES
+        )
+        ext_batches = (
+            (*base_batches, 384)
+            if (_decode_max_tokens() >= 384 and 384 not in base_batches)
+            else base_batches
         )
         self._fused_decode_batches = (
             ext_batches
@@ -2679,6 +2685,7 @@ class MuseSparkMoE(nn.Module):
         from sglang_tpu.fp8_moe import _own_storage
         from sglang_tpu.moe.pallas.fused_rs_muse.decode_hbm_breakers import (
             parse_nonuniform_free_spec,
+            read_d1_large_batch_free,
             resolve_nonuniform_free_for_layer,
         )
         from sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_routing import (
@@ -2694,6 +2701,7 @@ class MuseSparkMoE(nn.Module):
         if parse_nonuniform_free_spec(raw_spec) is None:
             return False
 
+        d1_large_batch = read_d1_large_batch_free()
         (
             _,
             _,
@@ -2722,6 +2730,7 @@ class MuseSparkMoE(nn.Module):
                 parse_free_spec_fn=parse_free_expert_rows_spec,
                 ep=ep_owners,
                 spec=raw_spec,
+                d1_large_batch=d1_large_batch,
             )
             vec = torch.tensor(
                 [float(mp), float(f_rows), float(f_max_w), float(f_min_slot)],
@@ -4094,13 +4103,22 @@ class MuseSparkDecoderLayer(nn.Module):
                 backend = _resolve_decode_attn_backend(forward_batch)
                 md = getattr(backend, "forward_metadata", None) if backend is not None else None
                 rpa_mode_str = str(tpu_envs.SGLANG_TPU_RPA_V3_DECODE_FAST.get()).strip()
+                sw = getattr(next_layer_attn.attn, "sliding_window_size", None)
+                if sw is not None and sw <= 0:
+                    sw = None
+                elif sw is not None:
+                    sw = int(sw) + 1
+                lc_swa_step_c = bool(tpu_envs.SGLANG_TPU_MUSE_MK_STEP_C_LC_SWA.get())
                 if (
                     rpa_mode_str
                     and backend is not None
                     and md is not None
                     and getattr(backend, "_decode_prepared_gated_op", None) is not None
                     and getattr(md, "decode_query_size", 0) == 1
-                    and getattr(md, "decode_shared_prefix_pages", None) is None
+                    and (
+                        (lc_swa_step_c and sw is not None)
+                        or getattr(md, "decode_shared_prefix_pages", None) is None
+                    )
                     and backend.can_forward_decode_prepared(
                         next_layer_attn.attn, forward_batch
                     )
@@ -4108,11 +4126,6 @@ class MuseSparkDecoderLayer(nn.Module):
                     kv_cache, kv_layer_idx = _fused_kv_operands(
                         backend.token_to_kv_pool, next_layer_attn.attn.layer_id
                     )
-                    sw = getattr(next_layer_attn.attn, "sliding_window_size", None)
-                    if sw is not None and sw <= 0:
-                        sw = None
-                    elif sw is not None:
-                        sw = int(sw) + 1
                     kv_lens = backend._kv_lens(forward_batch)
                     page_indices = backend._layer_page_indices(
                         next_layer_attn.attn.layer_id, is_swa_layer=(sw is not None)

@@ -23,6 +23,7 @@ _TOUCHED_FLAGS = (
     "SGLANG_TPU_MUSE_KERNEL_XOR1_AG_B2",
     "SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT",
     "SGLANG_TPU_MUSE_KERNEL_CCS_FUSE_AG_A1",
+    "SGLANG_TPU_MUSE_KERNEL_B2_PIPE_CHUNKS",
 )
 
 
@@ -59,6 +60,7 @@ def test_w9_prefill_glue_flags_default_off_and_ast_get_hygiene():
     assert tpu_envs.SGLANG_TPU_MUSE_KERNEL_XOR1_AG_B2.get() == 0
     assert tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT.get() is False
     assert tpu_envs.SGLANG_TPU_MUSE_KERNEL_CCS_FUSE_AG_A1.get() == 0
+    assert tpu_envs.SGLANG_TPU_MUSE_KERNEL_B2_PIPE_CHUNKS.get() == ""
 
     repo = pathlib.Path(__file__).resolve().parents[5]
     rel_paths = (
@@ -2044,6 +2046,245 @@ def test_b2_row_range_and_pow2_dus_parity_and_aot():
                 jax.ShapeDtypeStruct((8192,), jnp.float32),
                 jax.ShapeDtypeStruct((8192,), jnp.float32),
             ).lower(lowering_platforms=("tpu",)).compile()
+
+
+def test_b2_pipe_chunks_resolver_0ulp_parity_and_aot():
+    """Verify B2_PIPE_CHUNKS resolver, full Stage-1+2 0-ULP parity under race-detecting interpret, and TPU7x AOT."""
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import pallas as pl
+    from jax.experimental import topologies
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels import pipeline
+
+    assert tpu_envs.SGLANG_TPU_MUSE_KERNEL_B2_PIPE_CHUNKS.get() == ""
+
+    # 1. Resolver contract (auto, CSV, bucket fallback, invalid specs)
+    assert pipeline._resolve_b2_pipe_chunks("", 3072) is None
+    assert pipeline._resolve_b2_pipe_chunks("auto", 3072) == (512, 1024, 1024, 512)
+    assert pipeline._resolve_b2_pipe_chunks("auto", 1536) == (512, 512, 512)
+    assert pipeline._resolve_b2_pipe_chunks("auto", 1024) is None
+    assert pipeline._resolve_b2_pipe_chunks("auto", 2048) is None
+    assert pipeline._resolve_b2_pipe_chunks("512,1024,1024,512", 3072) == (512, 1024, 1024, 512)
+    assert pipeline._resolve_b2_pipe_chunks("512,1024,1024,512", 1024) is None
+    for bad in ("512", "100,284", "0,384", "abc,128"):
+        with pytest.raises(ValueError):
+            pipeline._resolve_b2_pipe_chunks(bad, 384)
+
+    # 2. Full Stage 1+2 fused_moe_full_bridge_and_ffn 0-ULP parity under race-detecting interpret
+    real_pc = pl.pallas_call
+
+    def _nan_interp(*args, **kwargs):
+        kwargs["interpret"] = pltpu.InterpretParams(
+            detect_races=True, uninitialized_memory="nan"
+        )
+        return real_pc(*args, **kwargs)
+
+    rng = np.random.default_rng(18042)
+    ep_size, t_loc, h_dim, he_dim, n_exp = 4, 384, 8192, 4096, 256
+    n_loc_exp = n_exp // ep_size
+    tot_tok = ep_size * t_loc
+    attn = jnp.array((rng.standard_normal((tot_tok, h_dim)) * 0.25).astype(np.float32)).astype(jnp.bfloat16)
+    stream = jnp.array((rng.standard_normal((tot_tok, h_dim)) * 0.3).astype(np.float32))
+    v8k = jnp.array(rng.uniform(0.5, 1.5, (h_dim,)).astype(np.float32))
+    wr = jnp.array((rng.standard_normal((h_dim, n_exp)) * 0.05).astype(np.float32))
+    eb = jnp.zeros((n_exp,), dtype=jnp.float32)
+    wp = jnp.array((rng.standard_normal((h_dim, he_dim)) * 0.2).astype(np.float32)).astype(jnp.float8_e4m3fn)
+    v4k_f = jnp.array(rng.uniform(0.5, 1.5, (he_dim,)).astype(np.float32))
+    v4k_b = jnp.array(rng.uniform(0.5, 1.5, (he_dim,)).astype(np.float32)).astype(jnp.bfloat16)
+    w1_l = jnp.zeros((n_loc_exp, he_dim, h_dim), dtype=jnp.float8_e4m3fn)
+    w2_l = jnp.zeros((n_loc_exp, he_dim, he_dim), dtype=jnp.float8_e4m3fn)
+    w1_sc = jnp.ones((n_loc_exp, 1, h_dim), dtype=jnp.float32)
+    w2_sc = jnp.ones((n_loc_exp, 1, he_dim), dtype=jnp.float32)
+    wunp = jnp.zeros((he_dim, h_dim), dtype=jnp.float8_e4m3fn)
+    go_arr = jnp.arange(ep_size, dtype=jnp.int32) * n_loc_exp
+
+    captured: dict[int, dict[str, np.ndarray]] = {}
+
+    def _capture_gmm(
+        hs, w1, w1s, _w1_q, w2, w2s, _w2_q, _g_s, _g_z, go_v, tw, g_ids, pnw, **kwargs
+    ):
+        r_idx = jax.lax.axis_index("model")
+        pr = kwargs["precomputed_routing"]
+        hs_sc = kwargs["hidden_states_scale"]
+
+        def _rec(r, h, sc, gi, li, gs):
+            captured[int(r)] = {
+                "hs": np.asarray(h),
+                "sc": np.asarray(sc),
+                "g_ids": np.asarray(gi),
+                "lhs_idx": np.asarray(li),
+                "gs": np.asarray(gs),
+            }
+
+        jax.debug.callback(
+            _rec,
+            r_idx,
+            jax.lax.bitcast_convert_type(hs, jnp.uint8),
+            hs_sc,
+            g_ids,
+            pr[0],
+            pr[1],
+        )
+        return jnp.zeros((t_loc * 8, he_dim // 128, 128), dtype=jnp.bfloat16)
+
+    def _fake_d(out_buf, inv_perm, topk_w, smid, *_a, **_k):
+        return smid, jnp.zeros((t_loc, h_dim), dtype=jnp.bfloat16)
+
+    cpu_devs = jax.devices("cpu")
+
+    def _run_pipe(pipe_spec: str):
+        captured.clear()
+        with (
+            mock.patch(
+                "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+            ),
+            tpu_info_for_cpu_export(),
+            mock.patch.object(pl, "pallas_call", _nan_interp),
+            mock.patch.object(pipeline, "moe_gmm_local_rs_nodedup", side_effect=_capture_gmm),
+            mock.patch.object(
+                pipeline, "pallas_combine_unpool_residual_nextnorm_4slab", side_effect=_fake_d
+            ),
+            mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_FUSED_B1_B2, "get", return_value=4),
+            mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_B1_B2_FAST, "get", return_value=True),
+            mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_B2_DBL_STREAM, "get", return_value=True),
+            mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8, "get", return_value=5),
+            mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_FP8_LHS_QBS, "get", return_value=4096),
+            mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_B2_POW2_CHUNKS, "get", return_value=True),
+            mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_B2_PIPE_CHUNKS, "get", return_value=pipe_spec),
+            mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_SORTFREE_PREFILL, "get", return_value=True),
+            mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_COMPACT_LOCAL_SORT, "get", return_value=1),
+        ):
+            res = jax.jit(
+                jax.shard_map(
+                    lambda *a: pipeline.fused_moe_full_bridge_and_ffn(
+                        *a,
+                        mesh=cpu_mesh,
+                        router_mode="bf16_hilo",
+                        b2_layout="nstream",
+                        b2_two_half=True,
+                        hoist_routing=True,
+                        d_layout="4slab",
+                        d_tok_tile=64,
+                        d_fp8_unpool=True,
+                        d_emit_static_fp8_attn_in=True,
+                        in_shard_map=True,
+                    ),
+                    mesh=cpu_mesh,
+                    in_specs=(
+                        P("model", None), P("model", None),
+                        P(), P(), P(), P(), P(), P(), P(), P(),
+                        P("model"), P("model"), P("model"), P("model"),
+                        P(), P("model"), P(), P(), P(), P(), P(), P(),
+                    ),
+                    out_specs=(P("model", None),) * 4,
+                    check_vma=False,
+                )
+            )(
+                attn, stream, v8k, v8k, v8k, wr, eb, wp, v4k_f, v4k_b,
+                w1_l, w2_l, w1_sc, w2_sc, v4k_b, go_arr, wunp, v8k, v8k, v8k, v8k, v8k,
+            )
+            jax.block_until_ready(res)
+        return (np.asarray(res[0]), np.asarray(res[2]), np.asarray(res[3])), dict(captured)
+
+    if len(cpu_devs) >= ep_size:
+        cpu_mesh = Mesh(np.array(cpu_devs[:ep_size]), ("model",))
+        (smid_ref, rtk_ref, ltw_ref), cap_ref = _run_pipe("")
+        (smid_pipe, rtk_pipe, ltw_pipe), cap_pipe = _run_pipe("128,128,128")
+        np.testing.assert_array_equal(smid_pipe, smid_ref)
+        np.testing.assert_array_equal(rtk_pipe, rtk_ref)
+        np.testing.assert_array_equal(np.asarray(ltw_pipe, dtype=np.float32), np.asarray(ltw_ref, dtype=np.float32))
+        assert sorted(cap_pipe.keys()) == list(range(ep_size))
+        for r in range(ep_size):
+            for k in ("hs", "sc", "g_ids", "lhs_idx", "gs"):
+                np.testing.assert_array_equal(cap_pipe[r][k], cap_ref[r][k])
+
+    # 3. TPU7x AOT HLO compile checks on TP=8 (2x2x1, T=3072 -> 4-chunk) and TP=16 (2x2x2, T=1536 -> 3-chunk)
+    with (
+        mock.patch(
+            "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+        ),
+        tpu_info_for_cpu_export(),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_FUSED_B1_B2, "get", return_value=4),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_B1_B2_FAST, "get", return_value=True),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_B2_DBL_STREAM, "get", return_value=True),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8, "get", return_value=5),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_FP8_LHS_QBS, "get", return_value=4096),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_B2_POW2_CHUNKS, "get", return_value=True),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_B2_PIPE_CHUNKS, "get", return_value="auto"),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_COMPACT_LOCAL_SORT, "get", return_value=1),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_SORTFREE_PREFILL, "get", return_value=True),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_FLATTEN_BS_META, "get", return_value=True),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_OPT, "get", return_value=7),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_T128_FAST, "get", return_value=True),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_FP8_UNPOOL, "get", return_value=512),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_RS, "get", return_value=6.0),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_SALU_OVERLAP, "get", return_value=True),
+    ):
+        for topo_name, tp_d, t_loc_aot, expected_tags in (
+            ("tpu7x=2x2x1", 8, 3072, ("_r0_512_", "_r512_1536_", "_r1536_2560_", "_r2560_3072_")),
+            ("tpu7x=2x2x2", 16, 1536, ("_r0_512_", "_r512_1024_", "_r1024_1536_")),
+        ):
+            topo = topologies.get_topology_desc(platform="tpu", topology_name=topo_name)
+            aot_mesh = Mesh(np.array(topo.devices).reshape(tp_d), ("model",))
+            sm_aot = jax.jit(
+                jax.shard_map(
+                    lambda *a: pipeline.fused_moe_full_bridge_and_ffn(
+                        *a,
+                        mesh=aot_mesh,
+                        router_mode="bf16_hilo",
+                        b2_layout="nstream",
+                        b2_two_half=True,
+                        hoist_routing=True,
+                        d_layout="4slab",
+                        d_tok_tile=128,
+                        d_fp8_unpool=True,
+                        d_emit_static_fp8_attn_in=True,
+                        in_shard_map=True,
+                    ),
+                    mesh=aot_mesh,
+                    in_specs=(
+                        P("model", None), P("model", None),
+                        P(), P(), P(), P(), P(), P(), P(), P(),
+                        P("model"), P("model"), P("model"), P("model"),
+                        P(), P("model"), P(), P(), P(), P(), P(), P(),
+                    ),
+                    out_specs=(P("model", None),) * 4,
+                    check_vma=False,
+                )
+            )
+            c_aot = sm_aot.trace(
+                jax.ShapeDtypeStruct((tp_d * t_loc_aot, 8192), jnp.bfloat16),
+                jax.ShapeDtypeStruct((tp_d * t_loc_aot, 8192), jnp.float32),
+                jax.ShapeDtypeStruct((8192,), jnp.float32),
+                jax.ShapeDtypeStruct((8192,), jnp.float32),
+                jax.ShapeDtypeStruct((8192,), jnp.float32),
+                jax.ShapeDtypeStruct((8192, 256), jnp.float32),
+                jax.ShapeDtypeStruct((256,), jnp.float32),
+                jax.ShapeDtypeStruct((8192, 4096), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((4096,), jnp.float32),
+                jax.ShapeDtypeStruct((4096,), jnp.bfloat16),
+                jax.ShapeDtypeStruct((256, 4096, 8192), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((256, 4096, 4096), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((256, 1, 8192), jnp.float32),
+                jax.ShapeDtypeStruct((256, 1, 4096), jnp.float32),
+                jax.ShapeDtypeStruct((4096,), jnp.bfloat16),
+                jax.ShapeDtypeStruct((tp_d,), jnp.int32),
+                jax.ShapeDtypeStruct((4096, 8192), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((8192,), jnp.float32),
+                jax.ShapeDtypeStruct((8192,), jnp.float32),
+                jax.ShapeDtypeStruct((8192,), jnp.float32),
+                jax.ShapeDtypeStruct((8192,), jnp.float32),
+                jax.ShapeDtypeStruct((8192,), jnp.float32),
+            ).lower(lowering_platforms=("tpu",)).compile()
+            hlo_txt = c_aot.as_text()
+            assert "pad_maximum_fusion" not in hlo_txt
+            assert "dynamic-update-slice" in hlo_txt
+            for tag in expected_tags:
+                assert tag in hlo_txt, f"Missing {tag} in compiled HLO for {topo_name}"
+
             hlo_txt = c_aot.as_text()
             assert "pad_maximum_fusion" not in hlo_txt
             assert "dynamic-update-slice" in hlo_txt
@@ -2153,35 +2394,36 @@ def test_d_t256_zero_spill_and_b2_dbl_stream_parity_and_aot():
         topo_221 = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x=2x2x1")
         mesh_221 = Mesh(np.array(topo_221.devices).reshape(8), ("model",))
         for fp8_qbs in (4096, 512):
-            jax.clear_caches()
-            with mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_FP8_UNPOOL, "get", return_value=fp8_qbs):
-                sm_d = jax.jit(
-                    jax.shard_map(
-                        lambda ob_, ip_, tw_, sm_, w__, ws__, pf_, al__, be__, ni_: (
-                            kernel_d.pallas_combine_unpool_residual_nextnorm_4slab(
-                                ob_, ip_, tw_, sm_, w__, ws__, pf_, al__, be__, ni_,
-                                tok_tile=64, fp8_unpool=True, fp8_unpool_qbs=fp8_qbs,
-                                emit_static_fp8_attn_in=True,
-                            )
-                        ),
-                        mesh=mesh_221,
-                        in_specs=(P("model"),) * 4 + (P(),) * 6,
-                        out_specs=P("model"),
-                        check_vma=False,
+            for static_fp8 in (True, False):
+                jax.clear_caches()
+                with mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_FP8_UNPOOL, "get", return_value=fp8_qbs):
+                    sm_d = jax.jit(
+                        jax.shard_map(
+                            lambda ob_, ip_, tw_, sm_, w__, ws__, pf_, al__, be__, ni_, sf8=static_fp8: (
+                                kernel_d.pallas_combine_unpool_residual_nextnorm_4slab(
+                                    ob_, ip_, tw_, sm_, w__, ws__, pf_, al__, be__, ni_,
+                                    tok_tile=64, fp8_unpool=True, fp8_unpool_qbs=fp8_qbs,
+                                    emit_static_fp8_attn_in=sf8,
+                                )
+                            ),
+                            mesh=mesh_221,
+                            in_specs=(P("model"),) * 4 + (P(),) * 6,
+                            out_specs=P("model"),
+                            check_vma=False,
+                        )
                     )
-                )
-                sm_d.trace(
-                    jax.ShapeDtypeStruct((256 * 8, 32, 128), jnp.float8_e4m3fn),
-                    jax.ShapeDtypeStruct((256, 8), jnp.int32),
-                    jax.ShapeDtypeStruct((256, 8), jnp.bfloat16),
-                    jax.ShapeDtypeStruct((256, 8192), jnp.float32),
-                    jax.ShapeDtypeStruct((4096, 8192), jnp.float8_e4m3fn),
-                    jax.ShapeDtypeStruct((8192,), jnp.float32),
-                    jax.ShapeDtypeStruct((8192,), jnp.float32),
-                    jax.ShapeDtypeStruct((8192,), jnp.float32),
-                    jax.ShapeDtypeStruct((8192,), jnp.float32),
-                    jax.ShapeDtypeStruct((8192,), jnp.float32),
-                ).lower(lowering_platforms=("tpu",)).compile()
+                    sm_d.trace(
+                        jax.ShapeDtypeStruct((256 * 8, 32, 128), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((256, 8), jnp.int32),
+                        jax.ShapeDtypeStruct((256, 8), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((256, 8192), jnp.float32),
+                        jax.ShapeDtypeStruct((4096, 8192), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((8192,), jnp.float32),
+                        jax.ShapeDtypeStruct((8192,), jnp.float32),
+                        jax.ShapeDtypeStruct((8192,), jnp.float32),
+                        jax.ShapeDtypeStruct((8192,), jnp.float32),
+                        jax.ShapeDtypeStruct((8192,), jnp.float32),
+                    ).lower(lowering_platforms=("tpu",)).compile()
 
         for topo_name, tp_d, t_loc_aot in (("tpu7x=2x2x1", 8, 3072), ("tpu7x=2x2x2", 16, 1536)):
             jax.clear_caches()
@@ -2312,7 +2554,40 @@ def test_d_mxu_combine_unwritten_nan_padding_and_l61_active_mask():
             assert np.all(np.isfinite(np.asarray(ns_bf)))
             assert np.all(np.isfinite(np.asarray(ni_bf.astype(jnp.float32))))
 
-    # TPU7x AOT compile verification for both 4slab (chunk=128) & 4slab_zs (chunk=32) with scrub.
+        # Verify scrub_mxu_nan=False matches scrub_mxu_nan=True on finite inputs (pipeline L0..60 path).
+        fin_only = jax.lax.bitcast_convert_type(
+            jnp.array(
+                np.asarray(
+                    jnp.array((rng.standard_normal((128 * 8, 32, 128)) * 0.25).astype(np.float32))
+                    .astype(jnp.float8_e4m3fn)
+                    .view(jnp.uint8)
+                )
+            ),
+            jnp.float8_e4m3fn,
+        )
+        ip_fin = jnp.array(np.arange(128 * 8, dtype=np.int32).reshape(128, 8))
+        tw_fin = jnp.array(rng.uniform(0.05, 0.25, size=(128, 8)).astype(np.float32)).astype(jnp.bfloat16)
+        sm_fin = jnp.array(rng.standard_normal((128, 8192)).astype(np.float32))
+        with (
+            mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_FP8_UNPOOL, "get", return_value=4096),
+            mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_MXU_COMBINE, "get", return_value=True),
+        ):
+            ns_s, ni_s = kernel_d.pallas_combine_unpool_residual_nextnorm_4slab(
+                fin_only, ip_fin, tw_fin, sm_fin, wu, ws, wv, wv, wv, wv,
+                tok_tile=64, fp8_unpool=True, fp8_unpool_qbs=4096,
+                emit_static_fp8_attn_in=True, scrub_mxu_nan=True,
+            )
+            ns_ns, ni_ns = kernel_d.pallas_combine_unpool_residual_nextnorm_4slab(
+                fin_only, ip_fin, tw_fin, sm_fin, wu, ws, wv, wv, wv, wv,
+                tok_tile=64, fp8_unpool=True, fp8_unpool_qbs=4096,
+                emit_static_fp8_attn_in=True, scrub_mxu_nan=False,
+            )
+            np.testing.assert_array_equal(np.asarray(ns_ns), np.asarray(ns_s))
+            np.testing.assert_array_equal(
+                np.asarray(ni_ns.astype(jnp.float32)), np.asarray(ni_s.astype(jnp.float32))
+            )
+
+    # TPU7x AOT compile checks: 4slab (chunk=128/256) & 4slab_zs (chunk=32) with D_T64_C16 + fp8q512 + bf16 next_in.
     with (
         mock.patch(
             "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
@@ -2320,22 +2595,29 @@ def test_d_mxu_combine_unwritten_nan_padding_and_l61_active_mask():
         tpu_info_for_cpu_export(),
         mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_OPT, "get", return_value=7),
         mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_T128_FAST, "get", return_value=True),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_T64_C16, "get", return_value=True),
         mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_SALU_OVERLAP, "get", return_value=True),
         mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_MXU_COMBINE, "get", return_value=True),
     ):
         topo = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x=2x2x2")
         mesh = Mesh(np.array(topo.devices).reshape(16), ("model",))
-        for tok_loc, qbs in ((128, 4096), (128, 512), (32, 4096)):
+        for tok_loc, qbs, sf8, scrub_f in (
+            (128, 4096, True, True),
+            (256, 512, False, False),
+            (256, 512, True, False),
+            (32, 4096, True, True),
+            (32, 512, False, True),
+        ):
             tok_gl = tok_loc * 16
             jax.clear_caches()
             with mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_FP8_UNPOOL, "get", return_value=qbs):
                 sm_d = jax.jit(
                     jax.shard_map(
-                        lambda ob_, ip_, tw_, sm_, w__, ws__, pf_, al__, be__, ni_: (
+                        lambda ob_, ip_, tw_, sm_, w__, ws__, pf_, al__, be__, ni_, s_f8=sf8, sc_f=scrub_f: (
                             kernel_d.pallas_combine_unpool_residual_nextnorm_4slab(
                                 ob_, ip_, tw_, sm_, w__, ws__, pf_, al__, be__, ni_,
                                 tok_tile=64, fp8_unpool=True, fp8_unpool_qbs=qbs,
-                                emit_static_fp8_attn_in=True,
+                                emit_static_fp8_attn_in=s_f8, scrub_mxu_nan=sc_f,
                             )
                         ),
                         mesh=mesh,
