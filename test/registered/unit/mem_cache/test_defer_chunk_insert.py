@@ -155,11 +155,15 @@ class TestUnifiedDeferChunkCheckpoint(unittest.TestCase):
             cache._components_tuple[0].free_out_of_window_slots.assert_not_called()
             self.assertEqual(req.prefix_len, 0)
 
-    def test_falls_back_when_prefill_chunk_windows_are_kept(self):
-        cache, req = _swa_cache(), _req()
-        with envs.SGLANG_OPT_SWA_KEEP_PREFILL_CHUNK_WINDOWS.override(True):
-            self.assertFalse(UnifiedRadixCache.defer_chunk_checkpoint(cache, req))
-        cache._components_tuple[0].free_out_of_window_slots.assert_not_called()
+    def test_falls_back_when_the_request_cannot_free_its_swa(self):
+        for flag, value in (
+            (envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS, False),
+            (envs.SGLANG_OPT_SWA_KEEP_PREFILL_CHUNK_WINDOWS, True),
+        ):
+            cache, req = _swa_cache(), _req()
+            with self.subTest(flag=flag.name), flag.override(value):
+                self.assertFalse(UnifiedRadixCache.defer_chunk_checkpoint(cache, req))
+            cache._components_tuple[0].free_out_of_window_slots.assert_not_called()
 
 
 def _tokens(seed: int, n: int) -> list[int]:
