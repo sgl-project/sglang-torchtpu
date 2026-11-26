@@ -202,7 +202,9 @@ class TestDsv41FusedMhc(CustomTestCase):
         buffers = dict(decoder.named_buffers())
         for attn, fn in ((True, decoder.hc_attn_fn), (False, decoder.hc_ffn_fn)):
             parts = LiveHcSubLayer(decoder, attn=attn).fused_fn_parts
-            torch.testing.assert_close(parts, fused_mhc.pack_fn(fused_mhc.split_fn(fn.data)))
+            torch.testing.assert_close(
+                parts, fused_mhc.pack_fn(fused_mhc.split_fn(fn.data))
+            )
             name = fused_mhc.FN_PARTS_ATTRS[attn]
             self.assertIs(buffers[name], parts)
             self.assertNotIn(name, decoder.state_dict())

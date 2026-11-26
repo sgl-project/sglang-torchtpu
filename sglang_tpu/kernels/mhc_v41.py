@@ -137,8 +137,7 @@ def _kernel(
         )
         logits = (mixes[:, two:] * s2 + base[:, two:]).T  # tokens on lanes
         c = [
-            [logits[i * hc + j : i * hc + j + 1] for j in range(hc)]
-            for i in range(hc)
+            [logits[i * hc + j : i * hc + j + 1] for j in range(hc)] for i in range(hc)
         ]
         c = _sinkhorn(c, hc, iters, hc_eps)
         comb_out_ref[...] = jnp.concatenate([v for r in c for v in r], axis=0).T
