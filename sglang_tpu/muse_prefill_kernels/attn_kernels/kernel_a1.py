@@ -5414,3 +5414,310 @@ def pallas_a1_chunk_1way_zc(
         compiler_params=cp,
         name=name,
     )(valid_tokens_1d.reshape(1).astype(jnp.int32), *call_args)
+
+
+# -----------------------------------------------------------------------------
+# Wave 9: Static-FP8 Ulysses Sequence-Parallel Attention (`v10_sp`, TP=16)
+# -----------------------------------------------------------------------------
+def pallas_a1_ulysses_qkv_local(
+    x_fp8_shard: jax.Array,
+    w_qkv_3d: jax.Array,
+    w_qkv_sc_3d: jax.Array,
+    cos_own: jax.Array,
+    sin_own: jax.Array,
+    *,
+    h_q_local: int = 8,
+    h_kv_local: int = 1,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    fold_q_scale: bool = False,
+    rope_mode: str = "interleaved_roll",
+    tm: int = 256,
+    sub_n: int | None = None,
+    vmem_limit_mb: int = 48,
+) -> tuple[jax.Array, jax.Array]:
+    """Local Ulysses A1 QKV+Norm+RoPE on token shard (`c_k` rows x all `tp_deg` head groups).
+
+    Multiplies `x_fp8_shard [c_k, H]` once per `t_blk <= 1024` block against per-head-rank
+    weights `w_qkv_3d [tp_deg, H, Q + 2*KV]` (`[Q | K | V]`, `w_qkv_sc_3d` pre-multiplied by
+    `STATIC_A1_ACT_SCALE`), applies dual-head RMSNorm + RoPE using rank-local `cos_own/sin_own`,
+    and returns unpacked `(q_3d: bf16[tp_deg, c_k, Q], kv_3d: fp8[tp_deg, c_k, 128])` ready for
+    compact `27 MB` `lax.all_to_all` exchange before RPA packing.
+    """
+    assert h_kv_local == 1 and h_q_local % 2 == 0
+    c_k, k_dim = x_fp8_shard.shape
+    tp_deg, w_k, qkv_cols = w_qkv_3d.shape
+    assert w_k == k_dim
+    q_size = h_q_local * HEAD_DIM
+    kv_cols = 2 * h_kv_local * HEAD_DIM
+    assert qkv_cols == q_size + kv_cols
+    num_q_slices = q_size // 128
+
+    if c_k <= 1024:
+        t_blk = c_k
+    else:
+        t_blk = next(
+            (t for t in range(1024, 0, -64) if c_k % t == 0),
+            next(t for t in (1024, 512, 256, 128, 64, 32, 16, 8) if c_k % t == 0),
+        )
+    tm_eff = next(
+        t for t in (256, 128, 64, 32, 16, 8) if t <= tm and t_blk % t == 0
+    )
+    num_blk = c_k // t_blk
+    num_m_blk = t_blk // tm_eff
+
+    q_eff_scale = (
+        QUERY_SCALE * SM_SCALE * k_scale * LOG2E if fold_q_scale else QUERY_SCALE
+    )
+    inv_k_scale = 1.0 / k_scale
+    inv_v_scale = 1.0 / v_scale
+
+    from sglang_tpu.envs import envs as _tpu_envs
+
+    if sub_n is None:
+        sub_n_env = getattr(_tpu_envs, "SGLANG_TPU_MUSE_KERNEL_A1_SUB_N", None)
+        eff_sub_n = int(sub_n_env.get() or 0) if sub_n_env is not None else 0
+    else:
+        eff_sub_n = int(sub_n)
+    if eff_sub_n not in (128, 256, 512) or q_size % eff_sub_n != 0:
+        eff_sub_n = 0
+    fn_env = getattr(_tpu_envs, "SGLANG_TPU_MUSE_KERNEL_A1_FAST_NORM", None)
+    use_fast_norm = bool(fn_env is not None and fn_env.get())
+
+    def _ulysses_qkv_kernel(x_ref, w_ref, w_sc_ref, cos_ref, sin_ref, q_out_ref, kv_out_ref):
+        lane = lax.broadcasted_iota(jnp.int32, (tm_eff, 128), 1)
+        is_lo = lane < 64
+        mask_lo = is_lo.astype(jnp.float32)
+        mask_hi = 1.0 - mask_lo
+
+        for m in range(num_m_blk):
+            m0 = m * tm_eff
+            m1 = m0 + tm_eff
+            x_m = x_ref[m0:m1, :]
+            cos_m = cos_ref[m0:m1, :]
+            sin_m = sin_ref[m0:m1, :]
+            cos_kv = jnp.where(is_lo, cos_m, 1.0)
+            sin_kv = jnp.where(is_lo, sin_m, 0.0)
+
+            if eff_sub_n > 0:
+                for c0 in range(0, q_size, eff_sub_n):
+                    c1 = c0 + eff_sub_n
+                    acc_q = (
+                        jnp.dot(
+                            x_m,
+                            w_ref[0, :, c0:c1],
+                            preferred_element_type=jnp.float32,
+                        )
+                        * w_sc_ref[0, :, c0:c1]
+                    )
+                    for s_loc in range(eff_sub_n // 128):
+                        d0 = s_loc * 128
+                        d1 = d0 + 128
+                        q_norm = _dual_head_rmsnorm_128(
+                            acc_q[:, d0:d1],
+                            is_lo,
+                            mask_lo,
+                            mask_hi,
+                            q_eff_scale,
+                            eps=1e-5,
+                            fast_6roll=use_fast_norm,
+                        )
+                        q_out_ref[0, m0:m1, c0 + d0 : c0 + d1] = _rope_128_vreg(
+                            q_norm, cos_m, sin_m, lane, rope_mode=rope_mode
+                        )
+                kv_pair = (
+                    jnp.dot(
+                        x_m,
+                        w_ref[0, :, q_size : q_size + 128],
+                        preferred_element_type=jnp.float32,
+                    )
+                    * w_sc_ref[0, :, q_size : q_size + 128]
+                )
+            else:
+                acc = (
+                    jnp.dot(x_m, w_ref[0, :, :], preferred_element_type=jnp.float32)
+                    * w_sc_ref[0, :, :]
+                )
+                for s in range(num_q_slices):
+                    c0, c1 = s * 128, (s + 1) * 128
+                    q_norm = _dual_head_rmsnorm_128(
+                        acc[:, c0:c1],
+                        is_lo,
+                        mask_lo,
+                        mask_hi,
+                        q_eff_scale,
+                        eps=1e-5,
+                        fast_6roll=use_fast_norm,
+                    )
+                    q_out_ref[0, m0:m1, c0:c1] = _rope_128_vreg(
+                        q_norm, cos_m, sin_m, lane, rope_mode=rope_mode
+                    )
+                kv_pair = acc[:, q_size : q_size + 128]
+
+            sq_lo = jnp.sum(kv_pair * kv_pair * mask_lo, axis=1, keepdims=True) * (
+                1.0 / 64.0
+            )
+            inv_rms_kv = jnp.where(is_lo, lax.rsqrt(sq_lo + 1e-5), 1.0)
+            kv_norm = (
+                (kv_pair * inv_rms_kv).astype(jnp.bfloat16).astype(jnp.float32)
+            )
+            kv_rot = _rope_128_vreg(
+                kv_norm, cos_kv, sin_kv, lane, rope_mode=rope_mode
+            )
+            kv_sc = jnp.where(is_lo, inv_k_scale, inv_v_scale)
+            kv_out_ref[0, m0:m1, :] = jnp.clip(
+                kv_rot.astype(jnp.float32) * kv_sc, -FP8_MAX, FP8_MAX
+            ).astype(jnp.float8_e4m3fn)
+
+    return pl.pallas_call(
+        _ulysses_qkv_kernel,
+        grid=(num_blk, tp_deg),
+        in_specs=[
+            pl.BlockSpec((t_blk, k_dim), lambda blk, r: (blk, 0)),
+            pl.BlockSpec((1, k_dim, qkv_cols), lambda blk, r: (r, 0, 0)),
+            pl.BlockSpec((1, 1, qkv_cols), lambda blk, r: (r, 0, 0)),
+            pl.BlockSpec((t_blk, 128), lambda blk, r: (blk, 0)),
+            pl.BlockSpec((t_blk, 128), lambda blk, r: (blk, 0)),
+        ],
+        out_specs=[
+            pl.BlockSpec((1, t_blk, q_size), lambda blk, r: (r, blk, 0)),
+            pl.BlockSpec((1, t_blk, kv_cols), lambda blk, r: (r, blk, 0)),
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct((tp_deg, c_k, q_size), jnp.bfloat16),
+            jax.ShapeDtypeStruct((tp_deg, c_k, kv_cols), jnp.float8_e4m3fn),
+        ],
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel"),
+            vmem_limit_bytes=vmem_limit_mb * (1 << 20),
+        ),
+        name=f"pallas_a1_ulysses_qkv_c{c_k}_tb{t_blk}_tm{tm_eff}"
+        + (f"_sn{eff_sub_n}" if eff_sub_n > 0 else "")
+        + ("_fn" if use_fast_norm else ""),
+    )(x_fp8_shard, w_qkv_3d, w_qkv_sc_3d, cos_own, sin_own)
+
+
+def pallas_pack_ulysses_qkv_for_rpa(
+    q_2d: jax.Array,
+    kv_2d: jax.Array,
+    *,
+    h_q_local: int = 8,
+    h_kv_local: int = 1,
+    tm: int = 512,
+    vmem_limit_mb: int = 32,
+) -> tuple[jax.Array, jax.Array]:
+    """Packs post-A2A `q_2d [c_tok, Q]` & `kv_2d [c_tok, 128]` into RPA v3 `rpa_layout`."""
+    assert h_kv_local == 1 and h_q_local % 2 == 0
+    c_tok, q_size = q_2d.shape
+    num_q_slices = q_size // 128
+    tm_eff = next(
+        t for t in (512, 256, 128, 64, 32, 16, 8) if t <= tm and c_tok % t == 0
+    )
+
+    def _pack_kernel(q_in_ref, kv_in_ref, q_out_ref, kv_out_ref):
+        lane = lax.broadcasted_iota(jnp.int32, (tm_eff, 128), 1)
+        is_lo = lane < 64
+        mask_lo = is_lo.astype(jnp.float32)
+
+        q_words = (
+            q_out_ref.bitcast(jnp.uint32)
+            .at[0]
+            .reshape(tm_eff * num_q_slices, 128)
+        )
+        for s in range(num_q_slices):
+            q_words[pl.ds(s, tm_eff, stride=num_q_slices)] = _rpa_q_word(
+                q_in_ref[:, s * 128 : (s + 1) * 128], is_lo, mask_lo
+            )
+
+        kv_f32 = kv_in_ref[...].astype(jnp.float32)
+        k8 = jnp.clip(
+            jnp.where(is_lo, kv_f32, 0.0), -FP8_MAX, FP8_MAX
+        ).astype(jnp.float8_e4m3fn)
+        v8 = jnp.clip(
+            jnp.where(is_lo, pltpu.roll(kv_f32, shift=64, axis=1), 0.0),
+            -FP8_MAX,
+            FP8_MAX,
+        ).astype(jnp.float8_e4m3fn)
+        kv_out_ref.bitcast(jnp.uint32).at[0].reshape(tm_eff, 128)[...] = (
+            _f8_code_u32(k8) | (_f8_code_u32(v8) << 8)
+        )
+
+    q_5d, kv_buf = pl.pallas_call(
+        _pack_kernel,
+        grid=(c_tok // tm_eff,),
+        in_specs=[
+            pl.BlockSpec((tm_eff, q_size), lambda i: (i, 0)),
+            pl.BlockSpec((tm_eff, 128), lambda i: (i, 0)),
+        ],
+        out_specs=[
+            pl.BlockSpec((1, tm_eff, num_q_slices, 2, 128), lambda i: (0, i, 0, 0, 0)),
+            pl.BlockSpec((1, tm_eff, 4, 128), lambda i: (0, i, 0, 0)),
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct((1, c_tok, num_q_slices, 2, 128), jnp.bfloat16),
+            jax.ShapeDtypeStruct((1, c_tok, 4, 128), jnp.float8_e4m3fn),
+        ],
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",),
+            vmem_limit_bytes=vmem_limit_mb * (1 << 20),
+        ),
+        name=f"pallas_pack_ulysses_rpa_c{c_tok}_q{q_size}_tm{tm_eff}",
+    )(q_2d, kv_2d)
+    return q_5d, kv_buf.reshape(c_tok, 1, 4, 128)
+
+
+def pallas_ulysses_local_gate(
+    x_fp8_shard: jax.Array,
+    w_gate_fp8: jax.Array,
+    w_gate_sc_2d: jax.Array,
+    *,
+    tm: int = 256,
+    bn: int = 1024,
+    vmem_limit_mb: int = 48,
+) -> jax.Array:
+    """Token-local Gate projection (`[c_k, H] fp8 @ [H, H] fp8 -> bf16[c_k, H]`).
+
+    Keeps each `t_blk <= 1024` input block resident in VMEM across output column tiles `bn`
+    so `x_fp8_shard` and `w_gate_fp8` are each read once from HBM.
+    """
+    c_k, k_dim = x_fp8_shard.shape
+    w_k, n_dim = w_gate_fp8.shape
+    assert w_k == k_dim
+    eff_bn = next(b for b in (bn, 1024, 512, 256, 128) if b <= n_dim and n_dim % b == 0)
+
+    if c_k <= 1024:
+        t_blk = c_k
+    else:
+        t_blk = next(
+            (t for t in range(1024, 0, -64) if c_k % t == 0),
+            next(t for t in (1024, 512, 256, 128, 64, 32, 16, 8) if c_k % t == 0),
+        )
+    tm_eff = next(
+        t for t in (256, 128, 64, 32, 16, 8) if t <= tm and t_blk % t == 0
+    )
+    num_blk = c_k // t_blk
+    num_j = n_dim // eff_bn
+
+    def _gate_kernel(x_ref, w_ref, w_sc_ref, out_ref):
+        sc = w_sc_ref[...]
+        for m0 in range(0, t_blk, tm_eff):
+            m1 = m0 + tm_eff
+            acc = jnp.dot(x_ref[m0:m1, :], w_ref[...], preferred_element_type=jnp.float32)
+            out_ref[m0:m1, :] = (acc * sc).astype(jnp.bfloat16)
+
+    return pl.pallas_call(
+        _gate_kernel,
+        grid=(num_blk, num_j),
+        in_specs=[
+            pl.BlockSpec((t_blk, k_dim), lambda blk, j: (blk, 0)),
+            pl.BlockSpec((k_dim, eff_bn), lambda blk, j: (0, j)),
+            pl.BlockSpec((1, eff_bn), lambda blk, j: (0, j)),
+        ],
+        out_specs=pl.BlockSpec((t_blk, eff_bn), lambda blk, j: (blk, j)),
+        out_shape=jax.ShapeDtypeStruct((c_k, n_dim), jnp.bfloat16),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel"),
+            vmem_limit_bytes=vmem_limit_mb * (1 << 20),
+        ),
+        name=f"pallas_ulysses_gate_c{c_k}_n{n_dim}_tb{t_blk}_bn{eff_bn}",
+    )(x_fp8_shard, w_gate_fp8, w_gate_sc_2d)
