@@ -124,6 +124,7 @@
         "hicache"
       ]
     },
+    "unified-kv": "Unified Full/SWA KV pool",
     "l3-file": "HiCache L3 storage (file backend)",
     "logprob": "Prompt logprobs",
     "compile": "torch.compile",
