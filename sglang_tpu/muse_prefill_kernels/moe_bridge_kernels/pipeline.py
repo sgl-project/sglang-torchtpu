@@ -3140,6 +3140,7 @@ def fused_moe_full_bridge_and_ffn(
                     fp8_unpool=d_fp8_unpool,
                     emit_fp8_attn_in=d_emit_fp8_attn_in,
                     emit_static_fp8_attn_in=eff_emit_static_fp8,
+                    scrub_mxu_nan=(t_local < 256),
                 )
                 if d_layout == "4slab"
                 else functools.partial(
