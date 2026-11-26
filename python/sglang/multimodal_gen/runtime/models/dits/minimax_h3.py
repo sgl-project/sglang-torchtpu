@@ -111,6 +111,7 @@ from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_all_gather,
     _usp_input_all_to_all_packed_qkv,
     _usp_output_all_to_all,
+    allgather_kv_ring_attn,
     ulysses_head_group_pipelined_attention,
     uncached_a2a_staging,
 )
@@ -935,6 +936,18 @@ _COLLECTIVE_PIPELINED_ATTENTION_BACKENDS = (AttentionBackendEnum.AITER,)
 _RING_ATTENTION_BACKENDS = (AttentionBackendEnum.FA, AttentionBackendEnum.AITER)
 
 
+def _minimax_h3_rings_by_allgather(attention: MiniMaxH3Attention) -> bool:
+    """Whether ring attention gathers K/V and resumes the softmax per shard in
+    the kernel (``usp.allgather_kv_ring_attn``) instead of the p2p varlen ring
+    of _RING_ATTENTION_BACKENDS; backends without p2p (TPU) ring this way."""
+    impl = attention._attention_impl
+    return (
+        attention._attention_backend_enum not in _RING_ATTENTION_BACKENDS
+        and impl is not None
+        and impl.supports_ring_resume()
+    )
+
+
 def _minimax_h3_collective_pipelined_attention(
     attention: MiniMaxH3Attention,
     q: torch.Tensor,
@@ -1149,21 +1162,34 @@ def _minimax_h3_attention_core_impl(
 
     if ring_active:
         ring_ws, _ = get_ring_ctx()
-        if attention._attention_backend_enum not in _RING_ATTENTION_BACKENDS:
+        if attention._attention_backend_enum in _RING_ATTENTION_BACKENDS:
+            # max_seqlen is cu_seqlens[1] (`used`) by construction -- the real,
+            # non-padding row count ring needs, already a host int here.
+            out = _ring_attention_varlen(
+                q,
+                k,
+                v,
+                attn_impl=attention._attention_impl,
+                real_seq_len=max_seqlen,
+                ring_ws=ring_ws,
+            )
+        elif _minimax_h3_rings_by_allgather(attention):
+            # One live segment then trailing padding: the live length,
+            # cu_seqlens[1], is read on device, so a compiled block takes no
+            # host bounds.
+            out = allgather_kv_ring_attn(
+                q.unsqueeze(0),
+                k.unsqueeze(0),
+                v.unsqueeze(0),
+                attn_impl=attention._attention_impl,
+                kv_real_len=cu_seqlens[1],
+            )[0]
+        else:
             raise NotImplementedError(
                 "MiniMax H3 ring parallelism requires the FlashAttention or "
-                "aiter backend (their packed kernels return the softmax LSE)."
+                "aiter backend (their packed kernels return the softmax LSE), "
+                "or a backend that rings by K/V all-gather (TPU)."
             )
-        # max_seqlen is cu_seqlens[1] (`used`) by construction -- the real,
-        # non-padding row count ring needs, already a host int here.
-        out = _ring_attention_varlen(
-            q,
-            k,
-            v,
-            attn_impl=attention._attention_impl,
-            real_seq_len=max_seqlen,
-            ring_ws=ring_ws,
-        )
     else:
         if (
             attention._attention_backend_enum
@@ -1349,9 +1375,9 @@ class MiniMaxH3Attention(nn.Module):
             prefix=self.prefix,
             packed_trailing_padding=True,
         )
-        # Ring only supports _RING_ATTENTION_BACKENDS; keep the resolved enum
-        # alongside the impl instance instead of a second get_attn_backend()
-        # call at the ring gate.
+        # Ring picks the p2p ring for _RING_ATTENTION_BACKENDS; keep the
+        # resolved enum alongside the impl instance instead of a second
+        # get_attn_backend() call at the ring gate.
         self._attention_backend_enum = backend.get_enum()
 
     def _install_qkv_weight_loader(self, arch: MiniMaxH3DiTArchConfig) -> None:
@@ -3414,9 +3440,12 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         cu_seqlens = cu_seqlens.to(device)
         block_cu_seqlens_host = cu_seqlens_host
         block_max_seqlen = max_seqlen
-        if ring_ws == 1 and self._attention_reads_live_length():
+        if self._attention_reads_live_length() and (
+            ring_ws == 1 or _minimax_h3_rings_by_allgather(self.blocks[0].attn)
+        ):
             # Host bounds would specialize each compiled block on the live
-            # length, i.e. on the prompt length.
+            # length, i.e. on the prompt length. The all-gather ring reads it
+            # on device too; only the p2p ring takes it from the host.
             block_cu_seqlens_host = None
             block_max_seqlen = seq_len
         spectrum_on = self._h3_spectrum_requested(sp_ws=sp_ws)

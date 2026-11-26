@@ -792,6 +792,39 @@ def test_validate_server_args_accepts_ring_on_lse_backends(backend):
         MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
 
 
+def test_validate_server_args_accepts_ring_on_a_platform_ring_backend():
+    # TPU declares its own backend ring-capable: it rings by K/V all-gather.
+    config = MiniMaxH3PipelineConfig()
+    server_args = SimpleNamespace(
+        component_attention_backends={},
+        attention_backend="oot",
+        ring_degree=2,
+        performance_mode="speed",
+        resolve_component_attention_backend=lambda *_names: (None, None),
+        _normalize_attention_backend_name=lambda name: (
+            "oot" if name == "tpu_splash_attn" else name
+        ),
+    )
+    platform = (
+        "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.current_platform"
+    )
+    with (
+        patch(f"{platform}.get_ring_capable_attention_backends", return_value=None),
+        pytest.raises(ValueError, match="ring parallelism requires"),
+    ):
+        MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+    with (
+        patch(
+            f"{platform}.get_ring_capable_attention_backends",
+            return_value=("tpu_splash_attn",),
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.layers.attention.selector.get_attn_backend"
+        ),
+    ):
+        MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+
+
 def test_validate_server_args_accepts_transformer_backend_override():
     config = MiniMaxH3PipelineConfig()
     server_args = SimpleNamespace(

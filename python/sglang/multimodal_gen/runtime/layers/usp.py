@@ -1140,7 +1140,7 @@ def allgather_kv_ring_attn(
     key: torch.Tensor,
     value: torch.Tensor,
     attn_impl: "AttentionImpl",
-    kv_real_len: int | None = None,
+    kv_real_len: int | torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Ring attention over all-gathered K/V; inputs and output are [B, S, H, D].
 
@@ -1153,6 +1153,9 @@ def allgather_kv_ring_attn(
     zeroed. Which shard is local and how many real keys each shard holds
     depend on the rank, so they reach the kernel as device data: ranks running
     collectives inside one compiled program must compile the same program.
+    ``kv_real_len`` may itself be a device scalar (e.g. a packed sequence's
+    live length read from ``cu_seqlens``): one program then serves every live
+    length of a padded shape.
 
     Nothing rotates: K/V of the whole ring group stay resident on every device
     (about ``2 * S_total * H_kv * D`` elements), and only the local shard's
@@ -1167,9 +1170,14 @@ def allgather_kv_ring_attn(
     world_size = dist.get_world_size(group=ring_pg)
     batch, shard_len, kv_heads = key.shape[:3]
     self_attention = query.shape[1] == shard_len
-    padded = kv_real_len is not None and kv_real_len < world_size * shard_len
-    if kv_real_len is None:
-        kv_real_len = world_size * shard_len
+    if isinstance(kv_real_len, torch.Tensor):
+        # Known only on device: mask as if padded (all-real rows keep theirs).
+        padded = True
+        kv_real_len = kv_real_len.reshape(()).to(torch.int32)
+    else:
+        padded = kv_real_len is not None and kv_real_len < world_size * shard_len
+        if kv_real_len is None:
+            kv_real_len = world_size * shard_len
     # This rank's ring position as data: an all-to-all of [0, .., R-1] hands
     # rank r the value r. Issued before the K/V gathers it gates. A per-process
     # constant tensor would skip the collective, but a compiler may fold it

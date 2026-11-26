@@ -120,6 +120,16 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
         attention_backend = self._server_arg_value(attention_backend)
         return AttentionBackendEnum[str(attention_backend).strip().upper()]
 
+    @staticmethod
+    def _platform_rings_with(server_args, backend) -> bool:
+        """Whether the platform declares ``backend`` ring-capable: its own
+        backend there rings by K/V all-gather (TPU, without p2p) instead of
+        the p2p varlen ring the FlashAttention and aiter kernels serve."""
+        names = current_platform.get_ring_capable_attention_backends() or ()
+        return backend is not None and backend.name.lower() in {
+            server_args._normalize_attention_backend_name(name) for name in names
+        }
+
     def uses_subblock_attention(self, server_args) -> bool:
         """Return whether H3 must build SubBlock-only request metadata."""
         return (
@@ -256,13 +266,16 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                     "pass --enable-torch-compile false"
                 )
         selected_backend = self.resolve_transformer_attention_backend(server_args)
-        if int(server_args.ring_degree or 1) > 1 and selected_backend not in (
-            AttentionBackendEnum.FA,
-            AttentionBackendEnum.AITER,
+        if (
+            int(server_args.ring_degree or 1) > 1
+            and selected_backend
+            not in (AttentionBackendEnum.FA, AttentionBackendEnum.AITER)
+            and not self._platform_rings_with(server_args, selected_backend)
         ):
             raise ValueError(
                 "MiniMax-H3 ring parallelism requires the FlashAttention or "
-                "aiter backend for the transformer"
+                "aiter backend for the transformer, or a backend the platform "
+                "declares ring-capable (TPU: tpu_splash_attn)"
             )
         if selected_backend is None:
             return
