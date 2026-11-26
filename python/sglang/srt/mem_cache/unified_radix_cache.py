@@ -1674,10 +1674,6 @@ class UnifiedRadixCache(BasePrefixCache):
             or self.supports_mamba()
             or req.session_id is not None
             or req.finished()
-            # A deferred chunk must free its own SWA below the window, or it stays
-            # out of eviction's reach; these flags stop that free during prefill.
-            or not envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get()
-            or envs.SGLANG_OPT_SWA_KEEP_PREFILL_CHUNK_WINDOWS.get()
         ):
             return False
         self.advance_unpublished_req(req)

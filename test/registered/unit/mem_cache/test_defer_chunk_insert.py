@@ -107,6 +107,15 @@ class TestDisaggPrefillChunkInsert(unittest.TestCase):
         calls, _ = _run_disagg(16384, 16384, 20000, prompt_len=20000)
         self.assertEqual(calls, [("checkpoint", 20000)])
 
+    def test_chunk_inserts_when_the_request_cannot_free_its_swa(self):
+        for flag, value in (
+            (envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS, False),
+            (envs.SGLANG_OPT_SWA_KEEP_PREFILL_CHUNK_WINDOWS, True),
+        ):
+            with self.subTest(flag=flag.name), flag.override(value):
+                calls, _ = _run_disagg(16384, 4096, 8192, prompt_len=20000)
+                self.assertEqual(calls, [("checkpoint", 8192)])
+
     def test_bootstrap_finalize_publishes_held_chunks(self):
         # Chunks advanced unpublished while bootstrap was pending leave
         # prefix_len == extend_end; the finalize call must insert them.
@@ -154,16 +163,6 @@ class TestUnifiedDeferChunkCheckpoint(unittest.TestCase):
             self.assertFalse(UnifiedRadixCache.defer_chunk_checkpoint(cache, req))
             cache._components_tuple[0].free_out_of_window_slots.assert_not_called()
             self.assertEqual(req.prefix_len, 0)
-
-    def test_falls_back_when_the_request_cannot_free_its_swa(self):
-        for flag, value in (
-            (envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS, False),
-            (envs.SGLANG_OPT_SWA_KEEP_PREFILL_CHUNK_WINDOWS, True),
-        ):
-            cache, req = _swa_cache(), _req()
-            with self.subTest(flag=flag.name), flag.override(value):
-                self.assertFalse(UnifiedRadixCache.defer_chunk_checkpoint(cache, req))
-            cache._components_tuple[0].free_out_of_window_slots.assert_not_called()
 
 
 def _tokens(seed: int, n: int) -> list[int]:

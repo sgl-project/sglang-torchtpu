@@ -725,10 +725,16 @@ class SchedulerDisaggregationPrefillMixin:
         # A newly computed chunk before the prompt end is mid-prefill, so a
         # chunk-insert stride can keep it request-owned; its KV is then sent once a
         # later insert protects it. A call that computed nothing (the bootstrap
-        # finalize) publishes every chunk the request still holds.
+        # finalize) publishes every chunk the request still holds. A deferred chunk
+        # must free its own SWA below the window or it stays out of eviction's
+        # reach; the last two flags stop that free during prefill.
         end = req.extend_end
         mid_prefill = (
-            end is not None and end < len(req.origin_input_ids) and req.prefix_len < end
+            end is not None
+            and end < len(req.origin_input_ids)
+            and req.prefix_len < end
+            and envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get()
+            and not envs.SGLANG_OPT_SWA_KEEP_PREFILL_CHUNK_WINDOWS.get()
         )
         checkpoint_kv_cache(req, cache, mid_prefill=mid_prefill)
 
