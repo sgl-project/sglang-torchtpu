@@ -4,6 +4,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
+import os
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -810,6 +811,7 @@ def test_device_accept_gather_routes_seq_lens_and_reuses_state(with_hidden):
         ),
         patch.object(kernels, "gather_spec_extras_func", side_effect=gather),
         patch.object(overlap_utils, "_DEBUG_ASSERT", True),
+        patch.dict(os.environ, {"SGLANG_ENABLE_ASYNC_ASSERT": "1"}),
         patch.object(
             overlap_utils, "_assert_nonneg_and_invalidate", side_effect=invalidate
         ) as debug,
