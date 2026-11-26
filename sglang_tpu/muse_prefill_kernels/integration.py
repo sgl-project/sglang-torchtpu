@@ -1303,7 +1303,7 @@ def _ops(
             in_shard_map=True,
             b2_deq0_new_buffer=fused_glue,
             next_in_gather_rows=next_in_gather_rows,
-            next_in_gather_static_fp8=(a1_variant == "v6"),
+            next_in_gather_static_fp8=(a1_variant in ("v6", "v10_sp")),
             ep_tp2_mode=ep_tp2_mode,
             causal_chunk_stream=causal_chunk_stream,
             causal_chunk_spec=causal_chunk_spec,
@@ -1478,6 +1478,7 @@ def _ops(
             if tpu_envs.SGLANG_TPU_MUSE_KERNEL_PALLAS_CHIPMATE_ROUTE.get()
             else ""
         )
+        + ("_f8ni" if a1_variant == "v10_sp" and d_opt > 0 else "")
     )
     fp8_tiles_tag = tpu_envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_FP8_GMM_TILES.get().replace(
         ",", "_"
@@ -2344,6 +2345,8 @@ class _LayerWeights(torch.nn.Module):
         tp16_owner_a1: bool = False,
     ) -> None:
         super().__init__()
+        from sglang_tpu.fp8_moe import _own_storage
+
         attn, moe = layer.self_attn, layer.mlp
         q, k, v = attn.qkv_proj.weight.split(
             [attn.q_size, attn.kv_size, attn.kv_size], dim=0
@@ -2394,24 +2397,25 @@ class _LayerWeights(torch.nn.Module):
             # gathered from pre-quantized per-rank FP8 columns for 0-ULP weight identity vs v6.
             wqkv_loc, wqkv_sc_loc = _fp8_k_major(torch.cat([q, k, v], dim=0))
             hidden_w, qkv_cols = wqkv_loc.shape
-            wqkvg = (
+            wqkvg = _own_storage(
                 gather(wqkv_loc.view(torch.uint8))
                 .view(torch.float8_e4m3fn)
                 .reshape(-1, hidden_w, qkv_cols)
-                .contiguous()
             )
-            wqkvg_scale = gather(wqkv_sc_loc[None]).contiguous()
+            wqkvg_scale = _own_storage(gather(wqkv_sc_loc[None]))
             wg_loc, wg_sc_loc = _fp8_k_major(attn.gate_proj.weight)
-            w_gate = (
+            w_gate = _own_storage(
                 gather(wg_loc.t().contiguous().view(torch.uint8))
                 .view(torch.float8_e4m3fn)
                 .t()
                 .contiguous()
             )
-            w_gate_scale = gather(wg_sc_loc).contiguous()
+            w_gate_scale = _own_storage(gather(wg_sc_loc))
             hybrid_buffers = {
+                "wqkvg_scale_3d": _own_storage(wqkvg_scale[:, None, :]),
                 "w_gate": w_gate,
                 "w_gate_scale": w_gate_scale,
+                "w_gate_scale_2d": _own_storage(w_gate_scale[None]),
             }
         else:
             # A1 reads its columns as [q | gate | k | v].
@@ -2421,12 +2425,12 @@ class _LayerWeights(torch.nn.Module):
         if tp16_owner_a1:
             hidden, columns = wqkvg.shape
             # Gather already-quantized columns to preserve the original FP8 values.
-            wqkvg = (
+            wqkvg = _own_storage(
                 gather(wqkvg.view(torch.uint8))
                 .view(torch.float8_e4m3fn)
                 .reshape(-1, hidden, columns)
             )
-            wqkvg_scale = gather(wqkvg_scale[None])
+            wqkvg_scale = _own_storage(gather(wqkvg_scale[None]))
         wo, wo_scale, self.wo_shape = _prepare_wo(
             attn.o_proj.weight,
             a3_variant=a3_variant,
@@ -2449,6 +2453,12 @@ class _LayerWeights(torch.nn.Module):
                 wo, wo_scale, w_shape=self.wo_shape, block=256
             )
             self.wo_shape = tuple(wo.shape)
+        else:
+            wo = _own_storage(wo.reshape(self.wo_shape))
+        if wqkvg_scale.ndim == 1:
+            hybrid_buffers["wqkvg_scale_2d"] = _own_storage(wqkvg_scale[None])
+        if wo_scale.ndim == 1:
+            hybrid_buffers["wo_scale_2d"] = _own_storage(wo_scale[None])
         # Column-parallel shards -> full [out, in] weights, replicated (Option 3A).
         wpool, wpool_scale = _fp8_k_major(gather(moe.pre_expert_proj.weight))
         wunpool, wunpool_scale = _fp8_k_major(gather(moe.post_expert_proj.weight))
@@ -2643,8 +2653,8 @@ class MusePrefillKernels(torch.nn.Module):
         self.causal_chunk_stream = (
             tpu_envs.SGLANG_TPU_MUSE_KERNEL_CAUSAL_CHUNK_STREAM.get()
         )
-        self.causal_chunk_spec = (
-            tpu_envs.SGLANG_TPU_MUSE_KERNEL_CAUSAL_CHUNK_SPEC.get()
+        self.causal_chunk_spec = tpu_envs.SGLANG_TPU_MUSE_KERNEL_CAUSAL_CHUNK_SPEC.get() or (
+            "256,512" if self.a1_variant == "v10_sp" else ""
         )
         emb_mod = getattr(decoder, "embed_tokens", None)
         self.sp_entry = (
@@ -3432,7 +3442,9 @@ class MusePrefillKernels(torch.nn.Module):
 
         attn = layer.self_attn
         be = get_attn_backend()
-        wqkvg_scale = weights.wqkvg_scale[None]
+        wqkvg_scale = getattr(weights, "wqkvg_scale_2d", None)
+        if wqkvg_scale is None:
+            wqkvg_scale = weights.wqkvg_scale[None]
         a1_extra = (valid_tokens,) if self._a1_skip else ()
         q_size = attn.num_heads * 64
         bs = exit_last_index.shape[0]
@@ -3948,8 +3960,13 @@ class MusePrefillKernels(torch.nn.Module):
         attn, moe = layer.self_attn, layer.mlp
         # q is already QK-normed, scaled and rotated; k/v are fp8 (scale 1), as the
         # fp8 KV pool stores them.
-        wqkvg_scale, wo_scale = weights.wqkvg_scale[None], weights.wo_scale[None]
-        wo = weights.wo.view(weights.wo_shape)
+        wqkvg_scale = getattr(weights, "wqkvg_scale_2d", None)
+        if wqkvg_scale is None:
+            wqkvg_scale = weights.wqkvg_scale[None]
+        wo_scale = getattr(weights, "wo_scale_2d", None)
+        if wo_scale is None:
+            wo_scale = weights.wo_scale[None]
+        wo = weights.wo if weights.wo.shape == weights.wo_shape else weights.wo.view(weights.wo_shape)
         a1_extra = (valid_tokens,) if self._a1_skip else ()
         a3_extra = (valid_tokens,) if self._a3_skip else ()
         q_tok_dim = 1 if self.a1_rpa_layout else 0
@@ -4234,14 +4251,20 @@ class MusePrefillKernels(torch.nn.Module):
         for c_k in eff_chunks:
             in_slices.append(attn_in[r_off : r_off + c_k])
             r_off += c_k
+        wqkvg_sc3d = getattr(weights, "wqkvg_scale_3d", None)
+        if wqkvg_sc3d is None:
+            wqkvg_sc3d = weights.wqkvg_scale[:, None, :]
+        w_gate_sc = getattr(weights, "w_gate_scale_2d", None)
+        if w_gate_sc is None:
+            w_gate_sc = weights.w_gate_scale[None]
         return (
             eff_chunks,
             eff_rope_chunks,
             eff_metas,
             in_slices,
-            weights.wqkvg_scale[:, None, :],
+            wqkvg_sc3d,
             weights.w_gate,
-            weights.w_gate_scale[None],
+            w_gate_sc,
         )
 
     def _forward_ulysses_v10(
