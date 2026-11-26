@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage, StaticPoolShape
+from sglang.srt.mem_cache.unified_cache.cache_action import FreeDeviceKV
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.session.streaming_session import SessionSlot
@@ -435,6 +436,19 @@ class TestShardedFullPoolInvariant(CustomTestCase):
         with (
             envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1),
             self.assertRaisesRegex(StateCheckError, "Full Pool Mem Leak Detected"),
+        ):
+            checker.run(CheckPhase.BUSY, MagicMock())
+
+    def test_busy_check_counts_held_checkpoint_frees_as_allocated(self):
+        checker = self._make_checker()
+        self._active_partial_page(checker)
+        held, _ = self._allocate(self.PAGE_SIZE)  # deduped by a checkpoint, free held
+        sink = [FreeDeviceKV(indices=[held])]
+        checker.get_held_frees = lambda: [sink]
+        self.assertEqual(checker._get_total_uncached_sizes(), (2 * self.PAGE_SIZE, {}))
+        with (
+            envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1),
+            envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.override(False),
         ):
             checker.run(CheckPhase.BUSY, MagicMock())
 

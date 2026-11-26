@@ -196,6 +196,13 @@ class BaseKVManager(ABC):
 
 
 class BaseKVSender(ABC):
+    # Opt-in per backend, for a sender whose pages_exposed_before_result is True:
+    # the result publishes its KV at once and holds the checkpoint's device frees
+    # until the transfer ends, instead of publishing at release. An abort before
+    # the result releases the pages at once, so abort() must block until the
+    # transfer concludes, or the sender sets group_failure_requires_drain.
+    holds_checkpoint_frees: bool = False
+
     @abstractmethod
     def __init__(
         self,

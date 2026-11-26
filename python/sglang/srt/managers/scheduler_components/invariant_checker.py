@@ -82,6 +82,9 @@ class SchedulerInvariantChecker:
     get_pp_mbs: Callable = field(default=lambda: ())
     # Whether the idle pool checks skip this idle iteration.
     get_skip_idle_pool_checks: Callable[[], bool] = field(default=lambda: False)
+    # PD prefill: each request's checkpoint device frees held until its
+    # transfer ends (``disagg_prefill_deferred_frees``).
+    get_held_frees: Callable[[], Iterable[list]] = field(default=lambda: ())
     reporter: FailureReporter = field(default_factory=FailureReporter)
     # Requests that have not both exited and sent their final output; an ended
     # one leaves at the next idle check.
@@ -426,6 +429,14 @@ class SchedulerInvariantChecker:
 
             if req.beam_group is not None:
                 full_uncached += req.beam_group.extra_uncached_tokens()
+
+        # A held checkpoint free's rows left the request's private share but
+        # are still allocated until the transfer ends.
+        for sink in self.get_held_frees():
+            tokens, window_tokens = self.tree_cache.deferred_free_units(sink)
+            full_uncached += tokens
+            for sub_pool in windows:
+                window_uncached[sub_pool] += window_tokens.get(sub_pool, 0)
 
         return full_uncached, window_uncached
 

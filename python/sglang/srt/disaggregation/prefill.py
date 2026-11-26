@@ -695,6 +695,11 @@ class SchedulerDisaggregationPrefillMixin:
     Mixin for Scheduler to handle disaggregation prefill
     """
 
+    # Results' checkpoint device frees held until their transfer ends, by request.
+    # Created at the first hold rather than in init_disaggregation, which a
+    # scheduler subclass may override without calling the base.
+    disagg_prefill_deferred_frees: Optional[Dict[Req, list]] = None
+
     def maybe_prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
         """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""
         kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
@@ -716,13 +721,38 @@ class SchedulerDisaggregationPrefillMixin:
             cache.advance_unpublished_req(req)
             req.prefix_len = req.extend_end
             return
-        exposed = getattr(req.disagg_kv_sender, "pages_exposed_before_result", False)
+        sender = req.disagg_kv_sender
+        exposed = getattr(sender, "pages_exposed_before_result", False)
         if exposed is True and req.extend_end >= len(req.origin_input_ids):
             # A transfer may already read these pages, and an insert frees the
-            # ones the tree also holds; release_kv_cache inserts them later.
+            # ones the tree also holds.
+            if (
+                sender.holds_checkpoint_frees
+                and not req.pending_bootstrap
+                and isinstance(cache, UnifiedRadixCache)
+            ):
+                # Publish now; those frees wait for the transfer's end.
+                self._checkpoint_holding_frees(req)
+            # Otherwise release_kv_cache inserts them after the transfer.
             return
 
         checkpoint_kv_cache(req, cache)
+
+    def _checkpoint_holding_frees(self: Scheduler, req: Req) -> None:
+        """Checkpoint a result whose last chunk a transfer may still read. The
+        checkpoint's dedup frees of those pages are held until the transfer ends."""
+        frees = []
+        with self.tree_cache.defer_device_frees(frees):
+            checkpoint_kv_cache(req, self.tree_cache)
+        if frees:
+            if self.disagg_prefill_deferred_frees is None:
+                self.disagg_prefill_deferred_frees = {}
+            self.disagg_prefill_deferred_frees.setdefault(req, []).extend(frees)
+
+    def _apply_deferred_frees(self: Scheduler, req: Req) -> None:
+        frees = (self.disagg_prefill_deferred_frees or {}).pop(req, None)
+        if frees is not None:
+            self.tree_cache.apply_deferred_frees(frees)
 
     def release_prefill_sender(
         self: Scheduler, req: Req, *, abort_sender: bool
@@ -1471,6 +1501,7 @@ class SchedulerDisaggregationPrefillMixin:
                     self.batch_result_processor._maybe_collect_routed_experts(req)
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finish_outside_step(FINISH_LENGTH(length=0))
+                self._apply_deferred_frees(req)
                 self.request_retirer.release(req, checkpoint=True)
                 # FIXME: clean up req's data in transfer engine
                 req.disagg_kv_sender.clear()
@@ -1545,6 +1576,7 @@ class SchedulerDisaggregationPrefillMixin:
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
             )
+        self._apply_deferred_frees(req)
         self.request_retirer.release(req, checkpoint=False)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
@@ -1784,6 +1816,7 @@ class SchedulerDisaggregationPrefillMixin:
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
+        first_output_id: Optional[int] = None,
     ) -> None:
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
         if last_chunk and computer is not None:
@@ -1804,16 +1837,20 @@ class SchedulerDisaggregationPrefillMixin:
                 digest = computer.compute(page_indices_gpu, state_indices)
                 signature = self.disagg_prefill_bootstrap_queue.kv_checksum_signature
             self.disagg_metadata_buffers.set_kv_checksum(req, digest, signature)
-        self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
+        self._send_kv_chunk(
+            req, last_chunk=last_chunk, end_idx=end_idx, first_output_id=first_output_id
+        )
 
     def _send_kv_chunk(
         self: Scheduler,
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
+        first_output_id: Optional[int] = None,
     ) -> None:
         """
-        Send a prefilled chunk to the decode server
+        Send a prefilled chunk to the decode server. A last chunk sent before its
+        result passes the sampled first token as first_output_id.
         """
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
@@ -1874,7 +1911,10 @@ class SchedulerDisaggregationPrefillMixin:
         state_types = ()
         if last_chunk:
             try:
-                self.disagg_metadata_buffers.set_buf(req)
+                if first_output_id is None:
+                    self.disagg_metadata_buffers.set_buf(req)
+                else:
+                    self.disagg_metadata_buffers.set_buf(req, first_output_id)
             except CustomizedInfoError as exc:
                 # customized_info may be unserializable or exceed the transfer buffer.
                 req.customized_info = None

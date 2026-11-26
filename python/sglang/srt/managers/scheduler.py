@@ -3130,6 +3130,7 @@ class Scheduler(
                     and self.disagg_decode_transfer_queue.has_pending_deferred_releases()
                 )
             ),
+            get_held_frees=lambda: (self.disagg_prefill_deferred_frees or {}).values(),
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
 

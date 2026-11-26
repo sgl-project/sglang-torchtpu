@@ -8,7 +8,7 @@ import time
 import zlib
 from array import array
 from collections import deque
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import replace
 from http import HTTPStatus
 from queue import Queue
@@ -94,6 +94,8 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     FreeDeviceKV,
     FreeDeviceKVFullOnly,
+    RecoverSWAWithLockedFull,
+    ReleaseRehomedOwnerRows,
     UpdatePendingBackupOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import tree_slot_ids
@@ -225,6 +227,8 @@ class UnifiedRadixCache(BasePrefixCache):
     # Whether eviction walks every component in one joint LRU order; set from the
     # eviction policy at construction (a cache built piecemeal walks per component).
     evicts_by_joint_lru: bool = False
+    # Set by defer_device_frees: device frees collect here instead.
+    _deferred_free_sink: Optional[list] = None
 
     def __init__(
         self,
@@ -1038,6 +1042,11 @@ class UnifiedRadixCache(BasePrefixCache):
         demand: Optional[dict[ComponentType, int]] = None,
         satisfied: Optional[Callable[[], bool]] = None,
     ) -> EvictResult:
+        if self._deferred_free_sink is not None:
+            # Eviction frees only unlocked nodes, never a transfer's pages: apply
+            # its frees now, or an allocation that evicts to make room fails.
+            with self.defer_device_frees(None):
+                return self._evict(params, demand=demand, satisfied=satisfied)
         if self.disable:
             return EvictResult()
         start_time = time.perf_counter()
@@ -1983,7 +1992,71 @@ class UnifiedRadixCache(BasePrefixCache):
         finally:
             actions.reverse()
 
+    @contextmanager
+    def defer_device_frees(self, sink: Optional[list]):
+        """Collect device KV and state-slot frees into ``sink`` instead of
+        applying them; ``apply_deferred_frees`` applies them once nothing reads
+        those pages (e.g. a PD transfer of the same request has ended). A None
+        sink applies frees at once, as eviction needs inside a deferral."""
+        prev, self._deferred_free_sink = self._deferred_free_sink, sink
+        try:
+            yield sink
+        finally:
+            self._deferred_free_sink = prev
+
+    def apply_deferred_frees(self, sink: list) -> None:
+        self._apply_cache_actions(sink)
+
+    def deferred_free_units(self, sink: list) -> tuple[int, dict[str, int]]:
+        """The owner tokens and each window sub-pool's tokens that ``sink``'s
+        held frees give back once applied; until then no pool count holds them."""
+        _, windows, _ = self._sub_pool_roles()
+        tokens, window_tokens = 0, dict.fromkeys(windows, 0)
+        for action in sink:
+            if isinstance(action, ReleaseRehomedOwnerRows):
+                # The recovery moved the incoming ids' window rows; only the
+                # owner rows remain.
+                tokens += int(action.incoming_full.numel())
+                continue
+            n = sum(int(ids.numel()) for ids in action.indices)
+            if isinstance(action, FreeDeviceKV):
+                # A combined free of segments whose window rows are all bound.
+                tokens += n
+                for name in windows:
+                    window_tokens[name] += n
+            elif isinstance(action, FreeDeviceKVFullOnly):
+                tokens += n
+            elif isinstance(action, FreeComponentDeviceSlot):
+                # State and sidecar slots are not in the token pool checks.
+                if action.component_type == BASE_COMPONENT_TYPE:
+                    tokens += n
+                else:
+                    sub_pool = self._window_sub_pools_by_slot().get(
+                        action.component_type
+                    )
+                    if sub_pool in window_tokens:
+                        window_tokens[sub_pool] += n
+        return tokens, window_tokens
+
     def _apply_cache_action(self, action: CacheAction | ComponentAction) -> None:
+        if self._deferred_free_sink is not None:
+            if isinstance(
+                action, (FreeDeviceKV, FreeDeviceKVFullOnly, FreeComponentDeviceSlot)
+            ):
+                self._deferred_free_sink.append(action)
+                return
+            if isinstance(action, RecoverSWAWithLockedFull):
+                # The recovery publishes now; the incoming full it frees is held.
+                self.components[action.component_type].recover_swa_with_locked_full(
+                    action
+                )
+                self._deferred_free_sink.append(
+                    ReleaseRehomedOwnerRows(
+                        incoming_full=action.incoming_full,
+                        component_type=action.component_type,
+                    )
+                )
+                return
         # Component actions route to their component class; the rest are
         # cache-owned and handled here by type.
         if isinstance(action, ComponentAction):

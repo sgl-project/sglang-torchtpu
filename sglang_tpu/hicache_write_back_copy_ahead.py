@@ -516,7 +516,12 @@ def install(cache_cls: Optional[type] = None) -> None:
     ) -> EvictResult:
         if self._write_back_copy_ahead is None:
             return orig_evict(self, params, demand=demand, satisfied=satisfied)
-        return evict_with_copy_ahead(self, params, demand=demand, satisfied=satisfied)
+        # Eviction frees only unlocked nodes: apply them now, also inside a
+        # checkpoint whose frees are held (UnifiedRadixCache._evict does the same).
+        with self.defer_device_frees(None):
+            return evict_with_copy_ahead(
+                self, params, demand=demand, satisfied=satisfied
+            )
 
     def check_hicache_events(self):
         orig_check_hicache_events(self)
