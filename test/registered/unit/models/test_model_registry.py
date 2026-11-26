@@ -32,11 +32,19 @@ class _ExternalOverride(nn.Module):
     pass
 
 
+class _PlatformModel(nn.Module):
+    pass
+
+
 DEFAULT_PACKAGE = "sglang.srt.models"
+# The registry tells default models apart by the package that defines them.
+_DefaultModel.__module__ = f"{DEFAULT_PACKAGE}.fake"
 FAKE_PACKAGES = {
     DEFAULT_PACKAGE: {"DefaultArch": _DefaultModel, "SharedArch": _DefaultModel},
     "another.models": {"DefaultArch": _ExternalModel},
     "backend.models": {"BackendArch": _ExternalModel},
+    "platform.models": {"DefaultArch": _PlatformModel, "PlatformArch": _PlatformModel},
+    "platform_shared.models": {"SharedArch": _PlatformModel},
 }
 EXTERNAL_MODELS = {"ExternalArch": _ExternalModel, "SharedArch": _ExternalOverride}
 
@@ -113,6 +121,22 @@ class TestLazyDefaultModels(CustomTestCase):
         for _ in range(2):
             with self.assertRaisesRegex(ValueError, "DefaultArch already registered"):
                 self.registry.get_supported_archs()
+
+    def test_override_package_replaces_a_default_model_before_the_fast_path(self):
+        """A platform model beats a same-arch default on the first lookup."""
+        # The registry registry.py builds without SGLANG_EXTERNAL_MODEL_PACKAGE.
+        registry = _ModelRegistry(models=dict(FAKE_PACKAGES[DEFAULT_PACKAGE]))
+        registry.register_lazy("platform.models", override_defaults=True)
+        self.assertIs(registry.resolve_model_cls("DefaultArch")[0], _PlatformModel)
+        self.assertIs(registry.resolve_model_cls("SharedArch")[0], _DefaultModel)
+        self.assertIs(registry.resolve_model_cls("PlatformArch")[0], _PlatformModel)
+        self.assertEqual(self.import_calls, ["platform.models"])
+
+    def test_override_package_still_rejects_a_non_default_duplicate(self):
+        # SharedArch is the external package's model here, not a default one.
+        self.registry.register_lazy("platform_shared.models", override_defaults=True)
+        with self.assertRaisesRegex(ValueError, "SharedArch already registered"):
+            self.registry.get_supported_archs()
 
 
 if __name__ == "__main__":
