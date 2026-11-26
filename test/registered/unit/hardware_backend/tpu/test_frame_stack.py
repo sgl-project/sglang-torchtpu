@@ -4,14 +4,17 @@ import resource
 import sys
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.compilation.frame_stack import (
     call_with_reserved_frame_stack,
 )
 
-# Pure Python, no torch_tpu needed.
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+# Pure Python, no torch_tpu needed. Registered on the TPU unit lane rather than
+# `base-a-test-cpu`: the reservation under test is applied on CPython 3.12 only
+# (see frame_stack.py), the CPU lane pins Python 3.10, and the TPU image runs
+# 3.12, so this is the lane where the two cases actually execute.
+register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit", chips=1)
 
 _CALLS_PER_DEPTH = 2000
 # Sweep enough depths to cross several ordinary stack chunks.
