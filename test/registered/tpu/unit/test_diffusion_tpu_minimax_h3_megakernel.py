@@ -1846,14 +1846,15 @@ class TestKernelLevers(CustomTestCase):
     def test_each_lever_takes_only_its_shapes(self):
         # 9,600 rows on 4 devices take split_items and lean_cut (their cut
         # tile's second 1,280-key sub-block runs 640 keys); their 640-row
-        # phase A tiles already take 64-row epilogue chunks; wide_kv_online
-        # (not wide_kv) puts eight 640-key online sub-blocks in a key step.
+        # phase A tiles already take 64-row epilogue chunks.
         # modulate_pieces: one a chunk of the phase A tile (608 rows: 19 of
         # 32; 640: 8 of 80; 480: 6 of 80).
         import dataclasses
 
         op = op_module()
-        every = frozenset(op.LEVER_SHAPES)
+        # wide_kv and wide_kv_online are exclusive: every lever but the latter,
+        # whose own shapes take it below.
+        every = frozenset(op.LEVER_SHAPES) - {"wide_kv_online"}
         wants = {
             (8, 4992): {},
             (8, 4864): {
@@ -1870,11 +1871,9 @@ class TestKernelLevers(CustomTestCase):
                 "step_tables": True,
                 "slab_modulate": True,
             },
-            # prefetch_down: back on at 4 devices (stack_kwargs' default off);
-            # wide_kv_online groups the online key steps only.
+            # prefetch_down: back on at 4 devices (stack_kwargs' default off).
             (4, 9600): {
                 "split_items": True,
-                "kv_group": (1, 2),
                 "cut_kv_compute": 256,
                 "modulate_pieces": 8,
                 "prefetch_down": True,
@@ -1989,6 +1988,23 @@ class TestKernelLevers(CustomTestCase):
         # wide_kv_online alone groups the online softmax's key tiles only.
         online = op.stack_kwargs(2, 37_633, rows=19200, levers={"wide_kv_online"})
         self.assertEqual(online["kv_group"], (1, 2))
+        online = op.stack_kwargs(4, 37_633, rows=9600, levers={"wide_kv_online"})
+        self.assertEqual(online["kv_group"], (1, 2))
+        # wide_kv and wide_kv_online are exclusive whatever the shape: every
+        # call refuses the pair, and so does the op's registration (server
+        # start), before any call.
+        both = {"wide_kv", "wide_kv_online"}
+        for devices, structure, rows in (
+            (8, 37_633, 4864),
+            (4, 37_633, 9600),
+            (2, 37_633, 19200),
+            (8, 0, 4864),
+            (8, None, 4864),
+        ):
+            with self.assertRaisesRegex(ValueError, "wide_kv and wide_kv_online"):
+                op.stack_kwargs(devices, structure, rows=rows, levers=both)
+        with self.assertRaisesRegex(ValueError, "wide_kv and wide_kv_online"):
+            op.build_stack_op(self.config, 8, structured=True, levers=both)
         self.assertNotIn(
             "kv_group", op.stack_kwargs(8, 37_633, rows=4800, levers=every)
         )
@@ -2202,7 +2218,8 @@ class TestKernelLevers(CustomTestCase):
         from jax.sharding import AbstractMesh
 
         op = op_module()
-        every = frozenset(op.LEVER_SHAPES)
+        # wide_kv_online is exclusive with wide_kv: every lever but it.
+        every = frozenset(op.LEVER_SHAPES) - {"wide_kv_online"}
         for devices, rows in ((8, 4864), (4, 9600), (2, 19456)):
             for margin in (None, 1.1):
                 with self.subTest(devices=devices, rows=rows, margin=margin):
@@ -2219,7 +2236,7 @@ class TestKernelLevers(CustomTestCase):
                             "_epilogue_chunks_lean_cut_mask_scores"
                             "_modulate_pieces_prefetch_down_slab_modulate"
                             "_split_items_step_tables_sum_vouch_uniform_adaln"
-                            "_wide_kv_wide_kv_online_zero_ahead"
+                            "_wide_kv_zero_ahead"
                         )
                     )
                     (kwargs,) = _kernel_calls(
@@ -2443,8 +2460,8 @@ def op_module():
 class TestOpCall(CustomTestCase):
     def test_the_kernel_call_is_pinned(self):
         # Proven-only fixed max (the kernel's own norm bound; nothing vouched,
-        # no flags or calibration), bf16, no sparse/windowed/far attention,
-        # no peaks, the default fixed max; the live length as data.
+        # no flags or calibration), no peaks, the default fixed max; the live
+        # length as data.
         op = op_module()
         config = pack.config_from_arch(_arch(heads=2), 2)
         names = ("x", "onehot", "cos", "sin", "tables", "used", *pack.WEIGHT_ORDER)
@@ -2473,18 +2490,8 @@ class TestOpCall(CustomTestCase):
                 interpret=False,
                 fixed=None,
                 fixed_heads=None,
-                head_perm=None,
                 return_peaks=False,
-                fp8=False,
-                sparse=None,
-                window=None,
-                far=None,
-                far_mode=None,
-                tile_masks=None,
-                listed=None,
                 narrow_tail=False,
-                scaled_v=False,
-                fast_phase_c=False,
                 fixed_max=17.0,
             ),
         )
