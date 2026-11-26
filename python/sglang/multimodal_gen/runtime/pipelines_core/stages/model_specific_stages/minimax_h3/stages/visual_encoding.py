@@ -47,7 +47,8 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
         stage_name = self._component_stage_name(stage_name)
-        return [ComponentUse(stage_name, "video_vae")]
+        # loaded only where a visual condition is encoded (a T2V request has none)
+        return [ComponentUse(stage_name, "video_vae", start_at_stage_entry=False)]
 
     def build_dedup_fingerprint(self, batch: Req, server_args: ServerArgs):
         parent_request_id = batch.extra.get("parent_request_id")

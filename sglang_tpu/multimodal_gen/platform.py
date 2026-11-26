@@ -30,6 +30,9 @@ SPLASH_ATTN_BACKEND_NAME = "tpu_splash_attn"
 _SPLASH_ATTN_BACKEND_CLS = (
     "sglang_tpu.multimodal_gen.tpu_splash_attn.TpuSplashAttentionBackend"
 )
+_HYBRID_WINDOW_ATTN_H3_BACKEND_CLS = (
+    "sglang_tpu.multimodal_gen.minimax_h3_vdn.TpuHybridWindowAttentionH3Backend"
+)
 
 
 class TpuOOTPlatform(TpuPlatform):
@@ -99,6 +102,9 @@ class TpuOOTPlatform(TpuPlatform):
                 "per shape, or entirely off TPU v7x)."
             )
             return _SPLASH_ATTN_BACKEND_CLS
+        if selected_backend is AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3:
+            # VDN-H3: the window softmax on the splash kernels, compiled per block.
+            return _HYBRID_WINDOW_ATTN_H3_BACKEND_CLS
         return super().get_attn_backend_cls_str(selected_backend, head_size, dtype)
 
     @classmethod

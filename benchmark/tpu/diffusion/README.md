@@ -15,6 +15,7 @@ and run Ulysses across the two cores of a chip with a K/V all-gather ring across
 | `wan22_a14b.sh` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers`, `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `ltx2.sh` | `Lightricks/LTX-2` | 8 | CFG 2 x Ulysses 4 |
 | `pika_h3_flex.sh` | `Pika-Labs/Pika-H3-Flex` | 8 | Ulysses 8, LoRA adapters unmerged |
+| `vdn_h3.sh` | `OpenVDN/vdn-minimax-h3` | 8 | Ulysses 8 (`hybrid_window_attn_h3`) |
 
 Override `NUM_GPUS`, `PARALLEL_ARGS`, `MODEL_ARGS`, `HOST` (default `127.0.0.1`) or `PORT` from the environment
 (an empty `PARALLEL_ARGS`/`MODEL_ARGS` drops the recipe's flags). Flags in `LIBTPU_INIT_ARGS` are kept; the clock and
@@ -42,6 +43,8 @@ stage boundaries (otherwise queued denoising work is counted in the decode stage
 | Pika-H3-Flex | T2VA 1344x768, 5 s, 6 steps | 8 | 11.2 s | 1.14 s | 3.2 s | 83.4 GiB |
 | Pika-H3-Flex | FL2VA 1344x768 (first frame), 5 s, 6 steps | 8 | 12.0 s | 1.29 s | 3.2 s | 84.1 GiB |
 | Pika-H3-Flex | Ref2VA 1344x768 (2 images, video with audio), 5 s, 6 steps | 8 | 57.5 s | 5.65 s | 3.2 s | 93.0 GiB |
+| VDN-H3 | T2VA 1344x768, 4 s, 8 NFE | 8 | 24.3 s | 1.20 s | 2.7 s | 82.3 GB |
+| VDN-H3 | T2VA 1344x768, 14 s, 8 NFE | 8 | 54.5 s | 4.01 s | 9.0 s | 89.2 GB |
 
 
 ## Example requests
@@ -76,6 +79,16 @@ curl -s -X POST http://localhost:30000/v1/videos -H "Content-Type: application/j
   "prompt": "A street musician plays an acoustic guitar on a busy sidewalk at dusk, people walking past under warm city lights",
   "task": "t2va", "conditions": [], "target": {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5},
   "num_inference_steps": 6, "seed": 42
+}'
+```
+
+VDN-H3 (`vdn_h3.sh`) takes MiniMax-H3's video request at its eight DiT forwards:
+
+```bash
+curl -s -X POST http://localhost:30000/v1/videos -H "Content-Type: application/json" -d '{
+  "prompt": "A skateboarder does a kickflip down a set of concrete stairs in a sunny city plaza, the camera tracks alongside him",
+  "task": "t2va", "conditions": [], "target": {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 4},
+  "num_inference_steps": 8, "quality": "lossless", "seed": 42
 }'
 ```
 

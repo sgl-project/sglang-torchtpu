@@ -148,7 +148,13 @@ class MiniMaxH3VDNHybridAttention(nn.Module):
             max_seqlen=max_seqlen,
             ulysses_active=ulysses_active,
         )
-        if attention.bcg_breakpoint and is_in_breakable_cuda_graph():
+        # a backend may bring its own core (the TPU plugin's compiles per block)
+        attention_core = getattr(
+            attention._attention_impl, "hybrid_attention_core", None
+        )
+        if attention_core is not None:
+            softmax_out, linear_out = attention_core(*core_args, **core_kwargs)
+        elif attention.bcg_breakpoint and is_in_breakable_cuda_graph():
             softmax_out, linear_out = _hybrid_attention_core_bcg(
                 *core_args, **core_kwargs
             )
@@ -634,12 +640,19 @@ def prepare_hybrid_attention_metadata(
                 _rope_cos_sin_cache(rope_freqs, dtype=torch.bfloat16),
                 torch.arange(layout.seq_len, device=device, dtype=torch.long),
             )
-    metadata = HybridWindowAttentionH3MetadataBuilder().build(
+    builder_cls = getattr(
+        model.blocks[0].attn._attention_impl,
+        "hybrid_metadata_builder_cls",
+        HybridWindowAttentionH3MetadataBuilder,
+    )
+    metadata = builder_cls().build(
         layout=layout,
         hybrid=hybrid,
         device=device,
         rope_cache_full=rope_cache_full,
         max_gather_rows=max_gather_rows,
+        model=model,
+        server_args=server_args,
     )
     logger.info(
         "VDN-H3 hybrid attention: frames=%d tokens/frame=%d text=%d "

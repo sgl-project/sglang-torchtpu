@@ -38,6 +38,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipel
 from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
     ImageEncodingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.audio_encoding import (
+    MiniMaxH3AudioEncodingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.visual_encoding import (
+    MiniMaxH3VisualEncodingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.text_encoding import (
     RealtimeTextEncodingStage,
 )
@@ -995,6 +1001,34 @@ def test_explicit_component_use_is_prepared_only_at_call_site():
 
     strategy.prepare_for_use.assert_called_once_with(module, use, manager.state)
     strategy.wait_for_use.assert_called_once_with(module, use, manager.state)
+
+
+@pytest.mark.parametrize(
+    "stage_cls, component_name",
+    [
+        (MiniMaxH3VisualEncodingStage, "video_vae"),
+        (MiniMaxH3AudioEncodingStage, "audio_vae"),
+    ],
+)
+def test_minimax_h3_condition_vae_waits_for_its_encode(stage_cls, component_name):
+    # A text-to-video request encodes no condition: entering the stage must not
+    # move the VAE (an offloaded VAE made a host round trip per request).
+    h3_stage = stage_cls.__new__(stage_cls)
+    h3_stage._registered_stage_name = None
+    stage = _Stage(*h3_stage.component_uses(None, "stage"))
+    module = torch.nn.Linear(2, 2)
+    manager, server_args = _manager_for_stage(stage, {component_name: module})
+    strategy = Mock()
+    manager.strategy_for = Mock(return_value=strategy)
+
+    manager.before_stage(stage, 0, SimpleNamespace(is_warmup=False), server_args)
+    manager.begin_stage()
+    strategy.prepare_for_use.assert_not_called()
+
+    manager.begin_use(stage.uses[0])
+    strategy.prepare_for_use.assert_called_once_with(
+        module, stage.uses[0], manager.state
+    )
 
 
 def test_realtime_text_encoder_use_starts_at_call_site():
