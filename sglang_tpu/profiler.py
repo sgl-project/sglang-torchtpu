@@ -27,6 +27,13 @@ def start_tpu_profile(*, output_dir: Path, with_cpu: bool = True) -> _TpuTrace:
     """
     # start_trace/stop_trace live in _impl; the package root re-exports only
     # profile, xprof_trace_handler and the remote-capture server.
+    from sglang_tpu.diagon import get_diagon_adapter
+
+    diagon = get_diagon_adapter()
+    if diagon.enabled:
+        session_id = diagon.start_profile()
+        return _TpuTrace(output_dir=output_dir, diagon_session_id=session_id)
+
     from torch_tpu._internal.profiler import _impl as tpu_profiler
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -36,7 +43,12 @@ def start_tpu_profile(*, output_dir: Path, with_cpu: bool = True) -> _TpuTrace:
 
 def stop_tpu_profile(trace: _TpuTrace) -> None:
     """Stop an xprof session started by :func:`start_tpu_profile`."""
-    del trace  # the session is process-global; only one may run at a time
+    if trace is not None and getattr(trace, "diagon_session_id", None) is not None:
+        from sglang_tpu.diagon import get_diagon_adapter
+
+        get_diagon_adapter().stop_profile()
+        return
+
     from torch_tpu._internal.profiler import _impl as tpu_profiler
 
     tpu_profiler.stop_trace()
@@ -46,6 +58,7 @@ class _TpuTrace(msgspec.Struct, frozen=True):
     """Handle for an in-flight capture. torch_tpu keeps the session itself."""
 
     output_dir: Path
+    diagon_session_id: str | None = None
 
 
 def _tpu_profile_options(*, with_cpu: bool):

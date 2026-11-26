@@ -19,6 +19,7 @@ from sglang_tpu.hooks.dflash_mla import (
     dflash_mla_head_dims,
     select_dflash_mla_attention,
 )
+from sglang_tpu.hooks.diagon import hook_specs as diagon_hooks
 from sglang_tpu.hooks.draft_kv_pool import (
     draft_cell_size_per_token,
     draft_mha_pool_class,
@@ -354,6 +355,8 @@ HOOKS.extend(hook_specs())
 HOOKS.extend(padded_logits_sampling_hooks())
 
 HOOKS.extend(logprob_grid_hooks())
+
+HOOKS.extend(diagon_hooks())
 
 _registered = False
 
