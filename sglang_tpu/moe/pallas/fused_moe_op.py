@@ -747,7 +747,7 @@ def _fused_moe_jax(
     if (
         m != 1
         and not no_combine
-        and global_num_experts == num_experts
+        and global_num_experts <= num_experts
         and not w_quant_bits
         and w1_scale is not None
         and w2_scale is not None
