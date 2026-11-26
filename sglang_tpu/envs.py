@@ -714,7 +714,7 @@ class TpuEnvs:
     # Fused-RS W4A16: row buckets of at most this many rows run both GMMs as one dot per
     # 256-K block with the fp4 codes pushed as e4m3 and the block scale applied to the f32
     # partial (half the weight pushes; numerics change). 0 = off; 64 measured best.
-    SGLANG_TPU_FUSED_RS_QBLOCK_SMALL_M = EnvInt(64)
+    SGLANG_TPU_FUSED_RS_QBLOCK_SMALL_M = EnvInt(0)
     # Fused-RS: extra row buckets (comma list, multiples of the sublane tiling) added
     # to the power-of-two buckets; exact.
     SGLANG_TPU_FUSED_RS_EXTRA_M_BUCKETS = EnvStr("160,192")
