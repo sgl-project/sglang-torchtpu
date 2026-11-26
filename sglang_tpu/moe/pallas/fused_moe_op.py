@@ -742,7 +742,19 @@ def _fused_moe_jax(
 
     # Two or more tokens: distinct experts streamed once through a VMEM ring, where
     # that kernel covers the call and its cost model beats gmm_v2; None otherwise.
-    if m != 1:
+    # Guard the import with the cheap eligibility checks so unquantized/EP calls
+    # (including CPU-only unit tests without torch_tpu) do not import moe_ring.
+    if (
+        m != 1
+        and not no_combine
+        and global_num_experts == num_experts
+        and not w_quant_bits
+        and w1_scale is not None
+        and w2_scale is not None
+        and w1_bias is None
+        and w2_bias is None
+        and activation_name.startswith("silu_and_mul_clamp:")
+    ):
         from sglang_tpu.moe.pallas.moe_ring import maybe_moe_ring
 
         out = maybe_moe_ring(
