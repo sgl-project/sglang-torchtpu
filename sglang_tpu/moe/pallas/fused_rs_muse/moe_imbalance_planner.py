@@ -369,18 +369,24 @@ def sort_placement_intra_owner_hot0(
     *,
     num_owners: int = 8,
     replicated_placed_eids: Sequence[int] = (),
+    sub_owners: int | None = None,
 ) -> np.ndarray:
-    """Reorder slots WITHIN each owner `[o*E_loc .. (o+1)*E_loc)` so slot `0` holds
-    that owner's hottest non-replicated decode expert (0 cross-owner perturbation!).
+    """Reorder slots WITHIN each owner (or ``sub_owners``) so slot `0` holds
+    that group's hottest non-replicated decode expert (0 cross-owner perturbation!).
     """
+    eff_groups = num_owners if sub_owners is None else int(sub_owners)
+    if eff_groups <= 0 or eff_groups % num_owners != 0:
+        raise ValueError(
+            f"sub_owners={sub_owners} must be a positive multiple of num_owners={num_owners}"
+        )
     perm = _validate_permutation(placement, int(np.asarray(placement).size))
     num_experts = int(perm.size)
-    e_per_owner = num_experts // num_owners
+    e_per_owner = num_experts // eff_groups
     dec = np.asarray(decode_counts, dtype=np.float64)
     placed_dec = dec[perm]
     rep_set = {int(x) for x in replicated_placed_eids if int(x) >= 0}
     out = perm.copy()
-    for o in range(num_owners):
+    for o in range(eff_groups):
         base = o * e_per_owner
         non_rep = [
             le for le in range(e_per_owner) if (base + le) not in rep_set
@@ -407,6 +413,7 @@ def build_static_placement(
     min_gain: float = 0.02,
     decode_counts: Any | None = None,
     hot_slot0_order: bool = False,
+    sub_owners: int | None = None,
 ) -> np.ndarray:
     """Compute a static expert placement permutation `int32[E]` (Section 4.5a).
 
@@ -416,7 +423,9 @@ def build_static_placement(
     physical chip totals and per-owner totals before 2-opt refinement. When
     `objective="dual"`, passing optional `decode_counts` optimizes the decode axis
     directly against observed decode-step routing counts while balancing prefill rows
-    against `expert_counts`.
+    against `expert_counts`. When `sub_owners` (e.g. `16` for `num_owners=8`) is set,
+    balances at `sub_owners` granularity first and pairs sub-bins into balanced
+    `num_owners` parent groups so both EP scales (`EP=8` and `EP=16`) stay balanced.
     """
     counts = np.asarray(expert_counts, dtype=np.float64)
     if counts.ndim != 1 or counts.size == 0:
@@ -439,6 +448,78 @@ def build_static_placement(
             raise ValueError("decode_counts must be non-negative")
     e_per_owner = num_experts // num_owners
     chip_map = _validate_owner_to_chip(owner_to_chip, num_owners)
+
+    if sub_owners is not None:
+        sub_n = int(sub_owners)
+        if sub_n <= num_owners or sub_n % num_owners != 0 or num_experts % sub_n != 0:
+            raise ValueError(
+                f"sub_owners={sub_n} must strictly exceed and divide cleanly into "
+                f"num_owners={num_owners} and num_experts={num_experts}"
+            )
+        sub_perm = build_static_placement(
+            counts,
+            num_owners=sub_n,
+            owner_to_chip=None,
+            tile_m=tile_m,
+            max_2opt_iters=max_2opt_iters,
+            objective=objective,
+            calib_batch=calib_batch,
+            topk=topk,
+            min_gain=0.0,
+            decode_counts=decode_counts,
+            hot_slot0_order=False,
+        )
+        e_per_sub = num_experts // sub_n
+        subs_per_owner = sub_n // num_owners
+        sub_bins = [sub_perm[s * e_per_sub : (s + 1) * e_per_sub] for s in range(sub_n)]
+        obj_key_s = (objective or "decode_active").strip().lower()
+        if obj_key_s in ("dual", "dual_tiles", "colocated", "colocated_hybrid"):
+            pre_o = "prefill_tiles" if obj_key_s == "dual_tiles" else "prefill_rows"
+            w_pre_s = _decode_objective_weights(
+                counts, objective=pre_o, calib_batch=calib_batch, topk=topk, tile_m=max(128, tile_m) if obj_key_s == "dual_tiles" else tile_m
+            )
+            w_dec_s = _decode_objective_weights(
+                dec_src if dec_src.sum() > 0.0 else counts, objective="decode_active", calib_batch=calib_batch, topk=topk, tile_m=32
+            )
+            w_sub = (
+                w_pre_s / max(1e-12, float(w_pre_s.mean()))
+                + w_dec_s / max(1e-12, float(w_dec_s.mean()))
+            ) * 0.5
+        else:
+            w_sub = _decode_objective_weights(
+                counts, objective=objective, calib_batch=calib_batch, topk=topk, tile_m=tile_m
+            )
+        sub_loads = [float(w_sub[b].sum()) for b in sub_bins]
+        sub_order = sorted(range(sub_n), key=lambda s: (-sub_loads[s], s))
+        p_bins: list[list[int]] = [[] for _ in range(num_owners)]
+        p_loads = np.zeros(num_owners, dtype=np.float64)
+        n_ch_s = int(chip_map.max()) + 1 if chip_map is not None else num_owners
+        ch_loads = np.zeros(n_ch_s, dtype=np.float64)
+        for s_idx in sub_order:
+            cands = [o for o in range(num_owners) if len(p_bins[o]) < subs_per_owner]
+            if chip_map is not None:
+                best_o = min(cands, key=lambda o: (float(ch_loads[int(chip_map[o])]), float(p_loads[o]), len(p_bins[o]), o))
+            else:
+                best_o = min(cands, key=lambda o: (float(p_loads[o]), len(p_bins[o]), o))
+            p_bins[best_o].append(s_idx)
+            p_loads[best_o] += sub_loads[s_idx]
+            if chip_map is not None:
+                ch_loads[int(chip_map[best_o])] += sub_loads[s_idx]
+        grouped = np.concatenate([sub_bins[s_idx] for o in range(num_owners) for s_idx in p_bins[o]]).astype(np.int32)
+        grouped = _validate_permutation(grouped, num_experts)
+        if min_gain > 0.0 and w_sub.sum() > 0.0:
+            id_l = w_sub.reshape(sub_n, e_per_sub).sum(axis=1)
+            pl_l = w_sub[grouped].reshape(sub_n, e_per_sub).sum(axis=1)
+            if (float(id_l.max()) - float(pl_l.max())) / max(1e-12, float(id_l.mean())) < min_gain:
+                grouped = np.arange(num_experts, dtype=np.int32)
+        if hot_slot0_order:
+            grouped = sort_placement_intra_owner_hot0(
+                grouped,
+                dec_src if dec_src.sum() > 0.0 else counts,
+                num_owners=num_owners,
+                sub_owners=sub_n,
+            )
+        return grouped
 
     obj_key = (objective or "decode_active").strip().lower()
     if obj_key in ("dual", "dual_tiles", "colocated", "colocated_hybrid") and (
