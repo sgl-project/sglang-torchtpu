@@ -1,5 +1,6 @@
 """TPU CI entry for the all-gather ring attention tests: the dispatch and
-reference logic, and the ring with the Pallas kernel on device."""
+reference logic (MiniMax-H3's packed core included), and the ring with the
+Pallas kernel on device."""
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
@@ -18,6 +19,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPAImpl
 from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
+from sglang.multimodal_gen.test.unit.test_minimax_h3_ring_allgather import (  # noqa: F401
+    TestMiniMaxH3AllGatherRing,
+)
 from sglang.multimodal_gen.test.unit.test_usp_allgather_ring import (  # noqa: F401
     TestAllGatherRingAttention,
 )
@@ -186,7 +190,7 @@ class TestAllGatherRingOnDevice(unittest.TestCase):
             outputs.append(out.to("cpu"))
         return outputs
 
-    def _check(self, world_size, shard_len, kv_real_len=None):
+    def _check(self, world_size, shard_len, kv_real_len=None, on_device=False):
         gen = torch.Generator().manual_seed(world_size * shard_len)
         shape = (1, world_size * shard_len, 2, 128)
         q, k, v = (torch.randn(shape, generator=gen).bfloat16() for _ in range(3))
@@ -194,6 +198,9 @@ class TestAllGatherRingOnDevice(unittest.TestCase):
         # Keys past the real count are padding and may hold anything.
         k[:, real:], v[:, real:] = float("nan"), float("nan")
 
+        if on_device:
+            # A device scalar, as MiniMax H3 passes its packed live length.
+            kv_real_len = torch.tensor(real, dtype=torch.int32, device="tpu")
         out = torch.cat(self._ring(world_size, q, k, v, kv_real_len), dim=1)
         self.assertEqual(out.shape, q.shape)
         self.assertEqual(out.dtype, torch.bfloat16)
@@ -227,6 +234,16 @@ class TestAllGatherRingOnDevice(unittest.TestCase):
                     world_size,
                     shard_len=1024,
                     kv_real_len=(world_size - 1) * 1024 + 100,
+                )
+
+    def test_live_length_read_on_device(self):
+        for world_size in (2, 4):
+            with self.subTest(world_size=world_size):
+                self._check(
+                    world_size,
+                    shard_len=1024,
+                    kv_real_len=(world_size - 1) * 1024 + 100,
+                    on_device=True,
                 )
 
 

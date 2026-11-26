@@ -124,23 +124,29 @@ class TestAllGatherRingAttention(unittest.TestCase):
                     )
 
     def test_tail_padding_is_skipped_and_pad_rows_are_zero(self):
-        world_size, shard, real = 3, 6, 14  # last shard: 2 real keys, 4 pad
-        q, k, v = _inputs(world_size, shard)
-        k[:, real:], v[:, real:] = float("nan"), float("nan")
-        expected = _reference(q, k, v, real)
-        outputs, _ = _run_ring(
-            world_size,
-            q.chunk(world_size, dim=1),
-            k.chunk(world_size, dim=1),
-            v.chunk(world_size, dim=1),
-            _ResumeAttention(),
-            kv_real_len=real,
-        )
-        out = torch.cat(outputs, dim=1)
-        torch.testing.assert_close(
-            out[:, :real], expected[:, :real], rtol=1e-5, atol=1e-6
-        )
-        self.assertTrue(torch.all(out[:, real:] == 0))
+        world_size, shard = 3, 6
+        # 14: the last shard has 2 real keys; 10: it has none. A device scalar
+        # (MiniMax H3's cu_seqlens[1]) works like a Python int; 18 = no padding.
+        for real, on_device in ((14, False), (10, False), (14, True), (18, True)):
+            with self.subTest(real=real, on_device=on_device):
+                q, k, v = _inputs(world_size, shard)
+                k[:, real:], v[:, real:] = float("nan"), float("nan")
+                expected = _reference(q, k, v, real)
+                outputs, _ = _run_ring(
+                    world_size,
+                    q.chunk(world_size, dim=1),
+                    k.chunk(world_size, dim=1),
+                    v.chunk(world_size, dim=1),
+                    _ResumeAttention(),
+                    kv_real_len=(
+                        torch.tensor(real, dtype=torch.int32) if on_device else real
+                    ),
+                )
+                out = torch.cat(outputs, dim=1)
+                torch.testing.assert_close(
+                    out[:, :real], expected[:, :real], rtol=1e-5, atol=1e-6
+                )
+                self.assertTrue(torch.all(out[:, real:] == 0))
 
     def test_cross_attention_between_two_sharded_streams(self):
         # LTX-2 audio-to-video: query and key streams differ in length.
@@ -165,7 +171,7 @@ class TestAllGatherRingAttention(unittest.TestCase):
         # Ranks running collectives inside one compiled program must compile
         # the same program: the shard choice travels as data, never as Python
         # values that differ per rank.
-        for kv_real_len in (None, 9):
+        for kv_real_len in (None, 9, torch.tensor(9, dtype=torch.int32)):
             with self.subTest(kv_real_len=kv_real_len):
                 world_size, shard = 2, 6
                 calls = [[] for _ in range(world_size)]
