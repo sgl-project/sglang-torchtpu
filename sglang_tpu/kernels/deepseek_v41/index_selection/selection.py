@@ -229,8 +229,8 @@ def _sparsecore_top_k(
     """V4's SparseCore top-k (`sglang_tpu/dsv4/sparsecore_topk.py`).
 
     Same set as ``jax.lax.top_k`` over the finite scores (ties at the k-th
-    value by lowest index), unordered, ``-1`` suffix-padded; ``-inf`` and
-    columns ``>= lengths`` are never selected.
+    value by lowest index), ascending (score order for ``k > 4096``), ``-1``
+    suffix-padded; ``-inf`` and columns ``>= lengths`` are never selected.
     """
     from sglang_tpu.dsv4.sparsecore_topk import LANES, sparsecore_topk
 
@@ -308,16 +308,27 @@ def _publish_candidate_blocks(
     block_scores=None,
     scheduling_group_id=None,
 ):
-    """Match vLLM candidate_blocks.py: per-query block maxima and newest block."""
+    """Match vLLM candidate_blocks.py: per-query block maxima and newest block.
+
+    Rows ascend with -1 suffix padding, so FP8 candidate metadata skips its sort.
+    """
     rows, width = scores.shape
     lengths = jnp.clip(lengths, 0, width)
     if block_scores is None:
         block_scores = publication.candidate_block_scores(
             scores, lengths, block_size=block_size
         )
+    from sglang_tpu.dsv4.sparsecore_topk import supports_topk_width
+
     blocks = block_scores.shape[1]
     cand_k = min(count, blocks)
-    if unordered and blocks >= 2048 and blocks % 16 == 0 and cand_k % 16 == 0:
+    # Wider k falls back to an unsorted `lax.top_k` inside `_sparsecore_top_k`.
+    if (
+        unordered
+        and blocks >= 2048
+        and blocks % 16 == 0
+        and supports_topk_width(cand_k)
+    ):
         block_lengths = (lengths + block_size - 1) // block_size
         published = _sparsecore_top_k(
             block_scores,
@@ -327,7 +338,7 @@ def _publish_candidate_blocks(
         ).astype(jnp.int32)
     else:
         values, ids = jax.lax.top_k(block_scores, cand_k)
-        published = jnp.where(values > -jnp.inf, ids, -1).astype(jnp.int32)
+        published = _compact_selected(jnp.where(values > -jnp.inf, ids, -1))
     return jnp.pad(published, ((0, 0), (0, count - cand_k)), constant_values=-1)
 
 
@@ -601,8 +612,16 @@ def _select_fp8_indexer_jax(
                 return jnp.full(
                     (q.shape[0], min(topk, width)), -1, jnp.int32
                 ), candidates
+            # `_publish_candidate_blocks` and `block_topk` emit ascending rows.
             gathered_candidates = prepare_candidates(
-                banks, page_table, candidates, requests, layout, block_size, width
+                banks,
+                page_table,
+                candidates,
+                requests,
+                layout,
+                block_size,
+                width,
+                ascending=True,
             )
             return _score_and_select_candidates(
                 q,
@@ -955,6 +974,7 @@ def prepare_fp8_candidates(
     width: int,
 ) -> tuple[jax.Array, ...]:
     return tuple(
+        # `_publish_candidate_blocks` and `block_topk` emit ascending rows.
         prepare_candidates(
             banks,
             page_table,
@@ -963,6 +983,7 @@ def prepare_fp8_candidates(
             PackedFP8Layout(*layout),
             block,
             width,
+            ascending=True,
         )
     )
 
