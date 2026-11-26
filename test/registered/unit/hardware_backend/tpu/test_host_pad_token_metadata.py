@@ -14,7 +14,7 @@ from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu import patches
+from sglang_tpu import host_upload, patches
 from sglang_tpu.compilation import compiled_forward_shim as shim
 from sglang_tpu.compilation.bucketer import Bucketer
 from sglang_tpu.compilation.compiled_forward_shim import (
@@ -151,6 +151,35 @@ class TestPositionOnHost(CustomTestCase):
                     self.assertEqual(uploads[1].dtype, dtype)
                     self.assertEqual(uploads[0].tolist(), expected_positions)
                     self.assertEqual(uploads[1].tolist(), expected_starts)
+
+    def test_compute_position_torch_cpu_staged_uses_host_lens(self):
+        """Given the host copies, the staged path reads no length tensor back
+        and uploads its results without blocking."""
+        prefixes = torch.tensor([2, 10, 5], dtype=torch.int32)
+        lengths = torch.tensor([2, 0, 3], dtype=torch.int32)
+
+        def no_readback(tensor):
+            raise AssertionError("a length tensor was read back")
+
+        with (
+            patch.object(patches, "_compute_position_torch_patched", False),
+            patch.object(
+                forward_batch_info,
+                "compute_position_torch",
+                forward_batch_info.compute_position_torch,
+            ),
+            patch.object(torch.Tensor, "tolist", no_readback),
+            patch.object(host_upload, "upload", wraps=host_upload.upload) as upload,
+        ):
+            patches._patch_compute_position_torch()
+            positions, starts = forward_batch_info.compute_position_torch(
+                prefixes, lengths, host_lens=([2, 10, 5], [2, 0, 3])
+            )
+
+        self.assertEqual(positions.dtype, torch.int64)
+        self.assertTrue(torch.equal(positions, torch.tensor([2, 3, 5, 6, 7])))
+        self.assertTrue(torch.equal(starts, torch.tensor([0, 2, 2], dtype=torch.int32)))
+        self.assertEqual(upload.call_count, 2)
 
 
 class TestPadTensor(CustomTestCase):

@@ -458,13 +458,23 @@ def _patch_compute_position_torch() -> None:
     import torch
 
     from sglang.srt.model_executor import forward_batch_info
+    from sglang_tpu.host_upload import upload
 
     def compute_position_torch_cpu_staged(
-        extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor
+        extend_prefix_lens: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        host_lens=None,
     ):
         device = extend_prefix_lens.device
-        prefix_lens = extend_prefix_lens.tolist()
-        seq_lens = extend_seq_lens.tolist()
+        # The host copies, when the caller has them: reading device tensors
+        # back waits for every forward already queued, which serializes the
+        # next batch's launch behind the running one when the inputs are not
+        # host-padded.
+        if host_lens is None:
+            prefix_lens = extend_prefix_lens.tolist()
+            seq_lens = extend_seq_lens.tolist()
+        else:
+            prefix_lens, seq_lens = host_lens
         positions_cpu = torch.cat(
             [
                 torch.arange(p, p + s, device="cpu")
@@ -472,7 +482,7 @@ def _patch_compute_position_torch() -> None:
             ],
             axis=0,
         ).to(torch.int64)
-        # Reuse the host lists from the readbacks above. Computing this on the
+        # Reuse the host lists from above. Computing this on the
         # input tensors would compile zeros/cumsum/view updates on TPU.
         extend_start_loc_cpu = torch.zeros_like(extend_seq_lens, device="cpu")
         if len(seq_lens) > 1:
@@ -481,7 +491,9 @@ def _patch_compute_position_torch() -> None:
                 dim=0,
                 dtype=torch.int32,
             )
-        return positions_cpu.to(device), extend_start_loc_cpu.to(device)
+        # Non-blocking for the same reason: a blocking upload would wait for
+        # the queued forwards too.
+        return upload(positions_cpu, device), upload(extend_start_loc_cpu, device)
 
     forward_batch_info.compute_position_torch = compute_position_torch_cpu_staged
 
