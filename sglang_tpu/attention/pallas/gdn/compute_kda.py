@@ -362,69 +362,6 @@ def chunked_kda(
     return out, state
 
 
-def recurrent_kda_per_seq(
-    q: jax.Array,  # (num_kq_heads, chunk, kq_head_dim)
-    k: jax.Array,  # (num_kq_heads, chunk, kq_head_dim)
-    v: jax.Array,  # (num_v_heads, chunk, v_head_dim)
-    gating_decay: jax.Array,  # (num_v_heads, chunk, kq_head_dim)
-    beta: jax.Array,  # (num_v_heads, chunk, 1)
-    state: jax.Array,  # (num_v_heads, kq_head_dim, v_head_dim)
-    cfgs: config.GDNConfig,
-) -> tuple[jax.Array, jax.Array]:
-    """Run the token recurrence and retain one state per verify position.
-
-    BATCHED speculative decode sets ``chunk_size == window_size`` so every
-    post-token state is retained.  The ordinary decode case is the degenerate
-    one-token window.  Invalid ragged tail rows have q/k/v/beta zeroed and a
-    unit decay, therefore their output is zero and their state is unchanged;
-    memory_ref only writes checkpoints belonging to real rows.
-    """
-    out_list = []
-    state_list = []
-    contract_dk = (((2,), (1,)), ((0,), (0,)))
-
-    for c_idx in range(cfgs.chunk_size):
-        # Repeat Q and K for GQA.  K3 currently has one V head per QK head,
-        # but keeping this here preserves the generic KDA ABI.
-        q_heads = jnp.repeat(q[:, c_idx], cfgs.v_per_kq_head, axis=0)[
-            :, None, :
-        ]  # (num_v_heads, 1, kq_head_dim)
-        k_heads = jnp.repeat(k[:, c_idx], cfgs.v_per_kq_head, axis=0)[
-            :, None, :
-        ]  # (num_v_heads, 1, kq_head_dim)
-        k_heads_t = compute_gdn.fused_transpose_broadcast(
-            k_heads, src_dim=2, dst_dim=1
-        )  # (num_v_heads, kq_head_dim, 1)
-
-        v_heads = v[:, c_idx : c_idx + 1]
-        beta_heads = beta[:, c_idx : c_idx + 1]
-        decay = gating_decay[:, c_idx, :, None]
-
-        state_updated = state * decay
-        v_updated = jax.lax.dot(
-            k_heads,
-            state_updated,
-            dimension_numbers=contract_dk,
-            preferred_element_type=jnp.float32,
-        ).astype(cfgs.dtypes.compute)
-
-        v_new = beta_heads * (v_heads - v_updated)
-        state = state_updated + k_heads_t * v_new
-
-        out = jax.lax.dot(
-            q_heads,
-            state,
-            dimension_numbers=contract_dk,
-            preferred_element_type=jnp.float32,
-        ).astype(cfgs.dtypes.compute)
-        out_list.append(out[:, 0, :])
-
-        if c_idx >= cfgs.chunk_size - cfgs.window_size:
-            state_list.append(state)
-
-    return jnp.stack(out_list, axis=0), jnp.stack(state_list, axis=0)
-
-
 def recurrent_kda(
     real_sizes: jax.Array,
     q_compact: jax.Array,
@@ -437,6 +374,7 @@ def recurrent_kda(
     dt_bias: jax.Array,
     cfg: config.GDNConfig,
 ) -> tuple[jax.Array, jax.Array]:
+    """Token-recurrent KDA scan over a tile of sequences."""
     mask_dtype = compute_gdn.get_mask_dtype(cfg.dtypes.compute)
     iota = jax.lax.broadcasted_iota(
         mask_dtype, (cfg.seq_tile_size, 1, cfg.chunk_size, 1, 1), 2
@@ -459,7 +397,7 @@ def recurrent_kda(
         # its existing compute dtype and layout.
         beta = beta.astype(cfg.dtypes.act_out).astype(jnp.float32)
     beta = compute_gdn.fused_transpose_broadcast(beta, src_dim=4, dst_dim=1)
-    beta = beta[:, : cfg.num_v_heads, :, 0, :]
+    beta = beta[:, : cfg.num_v_heads]
 
     a_log_kda = a_log.reshape(1, cfg.num_v_heads, 1, 1, 1).astype(jnp.float32)
     dt_bias_kda = dt_bias.reshape(1, cfg.num_v_heads, 1, 1, cfg.kq_head_dim).astype(
@@ -470,26 +408,50 @@ def recurrent_kda(
     gating_log = jnp.where(mask, gating_log, 0.0)
     gating_decay = jnp.exp(gating_log)[:, :, :, 0, :]
 
-    # Drop the compact layout's singleton dimension before the token scan.
-    q = q[:, :, :, 0, :]
-    k = k[:, :, :, 0, :]
-    v = v[:, :, :, 0, :]
-
+    # Contract over kq_head_dim with (seq_tile_size, num_v_heads) flattened into
+    # one batch axis and [k_heads, q_heads] fused along the length-2 axis.
+    batch_dot_dims = (((2,), (1,)), ((0,), (0,)))
     out_list = []
-    new_state_list = []
-    for idx in range(cfg.seq_tile_size):
-        out, state = recurrent_kda_per_seq(
-            q[idx],
-            k[idx],
-            v[idx],
-            gating_decay[idx],
-            beta[idx],
-            state_prev[idx],
-            cfg,
-        )
-        out_list.append(out)
-        new_state_list.append(state)
+    state_list = []
+    state = state_prev
+    for c_idx in range(cfg.chunk_size):
+        q_c = q[:, :, c_idx]
+        k_c = k[:, :, c_idx]
+        q_heads = jnp.repeat(q_c, cfg.v_per_kq_head, axis=1)
+        k_heads = jnp.repeat(k_c, cfg.v_per_kq_head, axis=1)
+        v_heads = v[:, :, c_idx]
+        beta_heads = beta[:, :, c_idx]
+        decay = gating_decay[:, :, c_idx, :, None]
 
-    out = jnp.stack(out_list, axis=0)
-    new_recurrent_state = jnp.stack(new_state_list, axis=0)
-    return out, new_recurrent_state
+        state_updated = state * decay
+        kq_merged = jnp.concat([k_heads, q_heads], axis=2)
+        kq_proj = (
+            jax.lax.dot_general(
+                kq_merged.reshape(-1, 2, cfg.kq_head_dim),
+                state_updated.reshape(-1, cfg.kq_head_dim, cfg.v_head_dim),
+                dimension_numbers=batch_dot_dims,
+                preferred_element_type=jnp.float32,
+            )
+            .astype(cfg.dtypes.compute)
+            .reshape(cfg.seq_tile_size, cfg.num_v_heads, 2, cfg.v_head_dim)
+        )
+        v_updated = kq_proj[:, :, :1, :]
+        out_decayed = kq_proj[:, :, 1:, :]
+
+        v_new = beta_heads * (v_heads - v_updated)
+        qk_dot = jnp.repeat(
+            jnp.sum(q_c * k_c, axis=-1, keepdims=True), cfg.v_per_kq_head, axis=1
+        )
+        out = (out_decayed + qk_dot * v_new).astype(cfg.dtypes.compute)
+        k_heads_t = jnp.repeat(
+            compute_gdn.fused_transpose_broadcast(k_c, src_dim=3, dst_dim=2),
+            cfg.v_per_kq_head,
+            axis=1,
+        )
+        state = state_updated + k_heads_t * v_new
+
+        out_list.append(out[:, :, 0, :])
+        if c_idx >= cfg.chunk_size - cfg.window_size:
+            state_list.append(state)
+
+    return jnp.stack(out_list, axis=1), jnp.stack(state_list, axis=1)
