@@ -53,6 +53,7 @@ from sglang_tpu.moe.pallas.fused_moe_v2.host import (
 from sglang_tpu.moe.pallas.fused_moe_v2.kernel import (
     build_combine_kernel,
     combine_step_tokens,
+    combine_tables_fit,
     rowquant_fp8,
 )
 from sglang_tpu.moe.pallas.fused_moe_v2.layer import (
@@ -119,11 +120,15 @@ def _combine_arrivals_fs(
 ):
     """v2's `_combine_arrivals`, with the arrival-scale lookup done inside the
     combine kernel (see kernel._build_combine_kernel) where that kernel
-    applies; v2's XLA epilogue everywhere else."""
+    applies; v2's `_combine_arrivals` everywhere else, including where this
+    build's four prefetched tables would overflow SMEM."""
     t_local, topk = pos.shape
     recv_rows, lane_blocks, lanes = arrivals.shape
     mirror_sublanes, tile_m = arrival_scales.shape
-    if not combine_step_tokens(t_local):
+    if not (
+        combine_step_tokens(t_local)
+        and combine_tables_fit(t_local, topk, scale_words=arrival_scales.size)
+    ):
         return _combine_arrivals(
             arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
         )

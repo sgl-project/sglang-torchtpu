@@ -37,11 +37,14 @@ import pytest
 jax = pytest.importorskip("jax")
 jnp = jax.numpy
 
-from sglang_tpu.moe.pallas.fused_moe_v2 import host, layer  # noqa: E402
+from sglang_tpu.moe.pallas.fused_moe_v2 import host, kernel, layer  # noqa: E402
 from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe import fusion  # noqa: E402
 from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe import routing  # noqa: E402
 from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe import (  # noqa: E402
     host as push_host,
+)
+from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe import (  # noqa: E402
+    layer as push_layer,
 )
 
 
@@ -702,6 +705,113 @@ def test_ep16_fused_metadata_matches_native_tables(monkeypatch, interpret, scena
             _assert_arrays_equal(
                 jax.tree.leaves(actual), jax.tree.leaves(expected), shard=rank
             )
+
+
+_V7X = SimpleNamespace(smem_capacity_bytes=1 << 20)  # one TPU v7x core
+
+
+@pytest.mark.parametrize(
+    "t_local,topk,scale_words,fits",
+    [
+        (8192, 10, None, True),  # 640 KiB <= 992 KiB
+        (12288, 10, None, True),  # 960 KiB
+        (16384, 8, None, False),  # 1,024 KiB
+        (16384, 10, None, False),  # 1,280 KiB, vllm-project/vllm-torchtpu#3694
+        (4096, 10, 128, True),  # fused scales: 480 KiB + 0.5 KiB
+        (8192, 10, 128, True),  # 960 KiB + 0.5 KiB
+        (12288, 10, 128, False),  # 1,440 KiB + 0.5 KiB
+    ],
+)
+def test_combine_tables_fit_the_chips_smem_less_headroom(
+    t_local, topk, scale_words, fits
+):
+    assert (
+        kernel.combine_tables_fit(t_local, topk, scale_words=scale_words, info=_V7X)
+        is fits
+    )
+
+
+def _combine_args(t_local, topk, recv_rows=64, lane_blocks=1, tile_m=128):
+    rng = np.random.default_rng(0)
+    arrivals = rng.standard_normal((recv_rows, lane_blocks, 128)).astype(np.float32)
+    arrival_scales = rng.uniform(0.5, 1.5, (4, tile_m)).astype(np.float32)
+    pos = rng.integers(0, recv_rows, (t_local, topk)).astype(np.int32)
+    mirror_pos = rng.integers(0, 4 * tile_m, (t_local, topk)).astype(np.int32)
+    weights = rng.uniform(0, 1, (t_local, topk)).astype(np.float32)
+    expected = np.einsum(
+        "tk,tkh->th",
+        weights * arrival_scales.reshape(-1)[mirror_pos],
+        arrivals.reshape(recv_rows, -1)[pos],
+    )
+    args = tuple(
+        jnp.asarray(a) for a in (arrivals, arrival_scales, pos, mirror_pos, weights)
+    )
+    return args, expected
+
+
+def _smem(monkeypatch, capacity):
+    info = SimpleNamespace(smem_capacity_bytes=capacity)
+    monkeypatch.setattr(kernel.pltpu, "get_tpu_info", lambda: info)
+
+
+def _no_kernel(**kwargs):
+    raise AssertionError(f"the combine kernel was built over SMEM: {kwargs}")
+
+
+def test_combine_arrivals_uses_xla_when_tables_overflow_smem(monkeypatch):
+    t_local, topk = 256, 10  # 20 KiB of tables
+    assert kernel.combine_step_tokens(t_local)
+    _smem(monkeypatch, host.SMEM_HEADROOM_BYTES + 16 * 1024)
+    monkeypatch.setattr(layer, "build_combine_kernel", _no_kernel)
+    args, expected = _combine_args(t_local, topk)
+    got = layer._combine_arrivals(*args, jnp.float32)
+    np.testing.assert_allclose(np.asarray(got), expected, rtol=1e-5, atol=1e-5)
+
+
+def test_combine_arrivals_uses_kernel_when_tables_fit(monkeypatch):
+    t_local, topk = 256, 10
+    _smem(monkeypatch, 1 << 20)
+    sentinel = jnp.zeros((t_local, 128), jnp.float32)
+    built = {}
+
+    def fake_builder(**kwargs):
+        built.update(kwargs)
+        return lambda arrivals, coef, rows: sentinel
+
+    monkeypatch.setattr(layer, "build_combine_kernel", fake_builder)
+    args, _ = _combine_args(t_local, topk)
+    assert layer._combine_arrivals(*args, jnp.float32) is sentinel
+    assert (built["t_local"], built["topk"]) == (t_local, topk)
+
+
+def test_push_combine_falls_back_to_plain_kernel_when_fused_tables_overflow(
+    monkeypatch,
+):
+    """Fused scales need 30 KiB of tables here and the plain build 20 KiB; a
+    24 KiB budget keeps the plain kernel and skips the fused one."""
+    t_local, topk = 256, 10
+    _smem(monkeypatch, host.SMEM_HEADROOM_BYTES + 24 * 1024)
+    monkeypatch.setattr(push_layer, "build_combine_kernel", _no_kernel)
+    sentinel = jnp.zeros((t_local, 128), jnp.float32)
+    monkeypatch.setattr(
+        layer,
+        "build_combine_kernel",
+        lambda **kwargs: lambda arrivals, coef, rows: sentinel,
+    )
+    args, _ = _combine_args(t_local, topk)
+    assert push_layer._combine_arrivals_fs(*args, jnp.float32) is sentinel
+
+
+def test_build_combine_kernel_rejects_an_unaligned_token_count():
+    with pytest.raises(ValueError, match="t_local=8"):
+        kernel._build_combine_kernel(
+            t_local=8,
+            topk=10,
+            hidden=128,
+            lane_blocks=1,
+            wire_dtype=jnp.float32,
+            out_dtype=jnp.float32,
+        )
 
 
 if __name__ == "__main__":

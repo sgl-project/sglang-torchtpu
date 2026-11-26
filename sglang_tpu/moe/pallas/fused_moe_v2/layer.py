@@ -19,6 +19,7 @@ fused_ep_moe_v2 wraps the kernel builder in a shard_map over the
 expert-parallel mesh axis: quantize, dispatch, kernel, combine.
 """
 
+import functools
 import threading
 from typing import cast
 
@@ -26,6 +27,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from sglang_tpu._logging import get_logger
 from sglang_tpu.moe.pallas.fused_moe_v2.host import (
     HIDDEN_LANE_BLOCK,
     MAX_ROUTING_BLOCK,
@@ -59,7 +61,10 @@ from sglang_tpu.moe.pallas.fused_moe_v2.host import (
 from sglang_tpu.moe.pallas.fused_moe_v2.kernel import (
     build_combine_kernel,
     build_fused_ep_moe_kernel,
+    combine_prefetch_bytes,
+    combine_smem_budget,
     combine_step_tokens,
+    combine_tables_fit,
     rowquant_fp8,
 )
 from sglang_tpu.moe.pallas.fused_moe_v2.preprocessing import PreprocessTopology
@@ -73,6 +78,8 @@ from sglang_tpu.moe.pallas.fused_moe_v2.token_parallel import (
     TokenReplicaLayout,
     replica_wire_rows,
 )
+
+logger = get_logger(__name__)
 
 # The scoring functions the router can apply to the gate logits. These
 # mirror the `scoring_func` branches in python/sglang/srt/layers/moe/topk.py.
@@ -151,6 +158,19 @@ def _lookup_row_scales(arrival_scales, scl, shift):
     return lax.bitcast_convert_type(word, jnp.float32).reshape(shape)
 
 
+# The standard logging.Logger has no info_once; log each shape once.
+@functools.lru_cache(maxsize=None)
+def _log_combine_over_smem(t_local, topk):
+    logger.info(
+        "fused EP MoE v2: the combine tables for t_local=%d, topk=%d take %d "
+        "bytes, over the %d-byte SMEM budget; using the XLA combine",
+        t_local,
+        topk,
+        combine_prefetch_bytes(t_local, topk),
+        combine_smem_budget(),
+    )
+
+
 def _combine_arrivals(
     arrivals,
     arrival_scales,
@@ -169,12 +189,14 @@ def _combine_arrivals(
     written in it -- so a whole source TILE's scales are one sublane and the
     mirror position is NOT the arrival row.
 
-    Where the kernel path applies (kernel.combine_step_tokens) the row gather
-    and the weighted sum are one Mosaic call: XLA answers `arrivals[rows]`
-    with a SparseCore gather whose output is in HBM at any size, so the rows
-    are written out and read straight back before the sum sees them.
-    Everywhere else the gather is not offloaded and there is no round trip to
-    remove, so the fused XLA epilogue below stays.
+    Where the kernel path applies (kernel.combine_step_tokens, and the pos
+    and coef tables fit SMEM: kernel.combine_tables_fit) the row gather and
+    the weighted sum are one Mosaic call: XLA answers `arrivals[rows]` with a
+    SparseCore gather whose output is in HBM at any size, so the rows are
+    written out and read straight back before the sum sees them. Below the
+    token threshold the gather is not offloaded and there is no round trip to
+    remove, so the fused XLA epilogue below stays; it also stays where the
+    tables would overflow SMEM.
 
     Both paths fold the arrival row's scale and the router weight into one
     coefficient over K * t_local values, so each of the K * t_local * hidden
@@ -192,7 +214,8 @@ def _combine_arrivals(
     scl = jnp.minimum(mirror_pos, mirror_sublanes * tile_m - 1)
     row_scales = _lookup_row_scales(arrival_scales, scl, shift)
     coef = row_scales * topk_weights.astype(jnp.float32)
-    if combine_step_tokens(t_local):
+    step_tokens = combine_step_tokens(t_local)
+    if step_tokens and combine_tables_fit(t_local, topk):
         combine = build_combine_kernel(
             t_local=t_local,
             topk=topk,
@@ -202,6 +225,8 @@ def _combine_arrivals(
             out_dtype=out_dtype,
         )
         return combine(arrivals, coef, rows)
+    if step_tokens:
+        _log_combine_over_smem(t_local, topk)
     rows_fp8 = arrivals[pos.T.reshape(-1)]  # f8 [K*t, lane blocks, 128]
     coef_k = coef.T.reshape(-1)  # k-major [K*t_local]
     terms = []
