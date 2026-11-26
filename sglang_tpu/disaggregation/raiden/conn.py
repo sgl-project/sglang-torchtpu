@@ -1353,8 +1353,8 @@ class RaidenKVManager(
             if msg is not None:
                 try:
                     self._dispatch(msg)
-                except Exception as e:
-                    logger.error("RaidenKVManager message handling error: %s", e)
+                except Exception:
+                    logger.exception("RaidenKVManager message handling error")
             if sweeps and time.monotonic() >= next_sweep:
                 now = time.monotonic()
                 interval = self._listener_sweep_interval_s
