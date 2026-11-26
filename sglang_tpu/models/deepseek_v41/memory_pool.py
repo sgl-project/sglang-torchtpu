@@ -50,7 +50,7 @@ from sglang_tpu.models.deepseek_v41.request_window import (
 )
 
 try:
-    from sglang_tpu.kernels.deepseek_v41.index_selection.fp8.cache import (
+    from sglang_tpu.kernels.index_selection.fp8.cache import (
         PAGE_RECORDS,
         PAGE_ROWS,
         PackedFP8Layout,
