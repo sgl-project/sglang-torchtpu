@@ -66,6 +66,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils.common import ceil_align, ceil_div
 from sglang.srt.utils.device import is_float4_e2m1fn_x2, is_hip, is_npu
+from sglang.srt.utils.log_utils import print_warning_once
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -202,7 +203,7 @@ def _charges_dflash_draft_kv_per_token(kvc: KVCacheConfigurator) -> bool:
     )
 
 
-def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
+def _dflash_draft_cell_size(kvc: KVCacheConfigurator, *, is_swa: bool = False) -> int:
     """Bytes/token the DFLASH draft KV pool adds per target row, 0 if none."""
     if not _charges_dflash_draft_kv_per_token(kvc):
         return 0
@@ -221,8 +222,44 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
             kvc,
             draft_model_config.get_num_kv_heads(kvc.draft_attn_tp_size),
             draft_model_config.head_dim,
+            is_swa=is_swa,
         )
     return int(cell_size) * kvc.dflash_draft_loc_space_scale
+
+
+def _dflash_draft_is_window_only(kvc: KVCacheConfigurator) -> bool:
+    """Whether the DFLASH draft config declares every layer sliding-window, so
+    its runner builds only an SWA sub-pool on the target's SWA ids."""
+    # The unified-memory solve prices the draft per full token only.
+    if (
+        not _charges_dflash_draft_kv_per_token(kvc)
+        or get_memory().enable_unified_memory
+    ):
+        return False
+    draft = kvc.spec_aux_config.draft_model_config
+    if (
+        draft is None
+        or not draft.is_hybrid_swa
+        or not draft.swa_attention_layer_ids
+        or draft.full_attention_layer_ids
+    ):
+        return False
+    from sglang.srt.speculative.dflash_utils import (
+        get_dflash_attention_sliding_window_size,
+    )
+
+    # The target's SWA eviction keeps only the target's window, so a wider draft
+    # window is an unsupported layout; it keeps the per-full-token charge.
+    draft_window = get_dflash_attention_sliding_window_size(draft.hf_config)
+    target_window = kvc.sliding_window_size
+    if draft_window is None or target_window is None or draft_window > target_window:
+        print_warning_once(
+            f"The DFLASH draft declares every layer sliding-window, but its window "
+            f"({draft_window}) is not within the target's ({target_window}); "
+            "reserving its KV per full token."
+        )
+        return False
+    return True
 
 
 def dflash_draft_kv_follows_target_swa(kvc: KVCacheConfigurator) -> bool:
@@ -1112,7 +1149,8 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                     - self._draft_swa_full_layers_num
                 )
 
-        self._draft_cell_size = _dflash_draft_cell_size(kvc)
+        draft_window_only = _dflash_draft_is_window_only(kvc)
+        self._draft_cell_size = _dflash_draft_cell_size(kvc, is_swa=draft_window_only)
         self._fused_full_entry = kvc.fused_entry_bytes("full")
         window = kvc.target_window_sub_pool()
         self._fused_swa_entry = (
@@ -1129,7 +1167,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             self._draft_cell_size > 0 and dflash_draft_kv_follows_target_swa(kvc)
         )
         self._draft_swa_cell_size = 0
-        if self._draft_follows_swa:
+        if self._draft_follows_swa or draft_window_only:
             self._draft_swa_cell_size = self._draft_cell_size
             self._draft_cell_size = 0
 
@@ -1164,6 +1202,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 + self._draft_swa_per_token * self._draft_swa_layers_num
                 + self._draft_swa_per_token * self._draft_swa_full_layers_num
                 + self._draft_cell_size
+                + self._draft_swa_cell_size
             )
         else:
             self._cell_size = (
@@ -1183,6 +1222,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             + self._draft_swa_per_token
             * (self._draft_swa_layers_num + self._draft_swa_full_layers_num)
             + self._draft_cell_size
+            + self._draft_swa_cell_size
         )
 
     def _draft_pool_bytes_per_token(self) -> int:
@@ -1302,6 +1342,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         return ceil_align(self._pipeline_swa_tokens, page_size) * (
             self._swa_per_token * self._swa_layers_num
             + self._draft_swa_per_token * self._draft_swa_layers_num
+            + self._draft_swa_cell_size
         )
 
     def calculate_pool_sizes(

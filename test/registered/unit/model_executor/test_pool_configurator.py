@@ -205,6 +205,7 @@ def _make_model_runner(
         eagle_draft_num_layers=None,
         eagle_draft_swa_num_layers=None,
         dflash_draft_num_layers=None,
+        draft_model_config=None,
     )
     # Fused draft KV is off unless a test opts in (a bare MagicMock return
     # would read as a truthy entry size and take the fused pricing branch).
@@ -1831,34 +1832,155 @@ class TestDflashDraftKvBudget(CustomTestCase):
             8,
         )
 
-    def test_hybrid_swa_budget_shrinks_by_draft_pool(self):
-        """The HybridSWA budget must charge the DFLASH draft pool."""
-        available = 10_000_000
+    # Target: 32 layers of 1 KiB/token, 16 full + 16 SWA unless a case says
+    # otherwise, window 256.
+    _TARGET_CELL = 16 * 1024
+    _SWA_RATIO = 0.25
+    # Five draft layers of 1 KiB/token.
+    _DRAFT_CELL = 5 * 1024
+    _WINDOW_ONLY = ("sliding_attention",) * 5
 
-        def _tokens(draft_kv_per_token):
-            mr = _make_model_runner(
-                self,
-                is_hybrid_swa=True,
-                full_attention_layer_ids=list(range(16)),
-                swa_attention_layer_ids=list(range(16, 32)),
-                swa_num_kv_heads=4,
+    def _draft_kv_budget(
+        self,
+        *,
+        layer_types=_WINDOW_ONLY,
+        declares_swa=True,
+        sliding_window=256,
+        target_full_layers=16,
+        **publish,
+    ):
+        """The target's per-full-token charge, the budget, and the bytes the
+        target's pools plus the draft runner's own pool allocate out of it."""
+        import torch
+
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
+            SpecAuxHiddenStateConfig,
+        )
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        available, page_size = 200_000_000, 16
+        publish.update(swa_full_tokens_ratio=self._SWA_RATIO, page_size=page_size)
+        layer_ids = {
+            kind: [i for i, t in enumerate(layer_types) if t == kind]
+            for kind in ("full_attention", "sliding_attention")
+        }
+        draft = _make_model_runner(
+            self,
+            num_layers=len(layer_types),
+            is_hybrid_swa=declares_swa,
+            full_attention_layer_ids=layer_ids["full_attention"],
+            swa_attention_layer_ids=layer_ids["sliding_attention"],
+            **publish,
+        )
+        draft.model_config.hf_config.layer_types = layer_types
+        draft.model_config.hf_config.sliding_window = sliding_window
+        target = _make_model_runner(
+            self,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=list(range(target_full_layers)),
+            swa_attention_layer_ids=list(range(target_full_layers, 32)),
+            sliding_window_size=255,
+            **publish,
+        )
+        target.spec_algorithm.is_dflash_family.return_value = True
+        target.spec_aux_config = SpecAuxHiddenStateConfig(
+            draft_model_config=draft.model_config,
+            dflash_draft_num_layers=len(layer_types),
+        )
+        target.dflash_draft_cell_size_per_token = self._DRAFT_CELL
+        with mock_cpu_env():
+            cfg = create_memory_pool_configurator(target)
+            config = cfg.calculate_pool_sizes(available, page_size)
+            draft_kvc = KVCacheConfigurator(
+                device="cpu",
+                gpu_id=0,
+                attn_dp_size=1,
+                pp_size=1,
+                pp_group=draft.pp_group,
+                model=None,
+                model_config=draft.model_config,
+                server_args=get_server_args(),
+                kv_cache_dtype=torch.bfloat16,
+                model_dtype=torch.bfloat16,
+                page_size=page_size,
+                sliding_window_size=sliding_window - 1,
+                spec_algorithm=SpeculativeAlgorithm.DFLASH,
+                is_draft_worker=True,
+                post_capture_kv_active=False,
+                spec_aux_config=SpecAuxHiddenStateConfig(),
+                is_hybrid_swa=declares_swa,
+                is_hybrid_swa_compress=False,
+                use_mla_backend=False,
+                layer_info=draft.layer_info,
+                forward_stream=None,
+                req_to_token_pool=None,
+                token_to_kv_pool_allocator=None,
+                memory_pool_config=config,
             )
-            mr.spec_algorithm.is_dflash_family.return_value = True
-            mr.dflash_draft_cell_size_per_token = draft_kv_per_token
-            mr.spec_aux_config = SimpleNamespace(
-                eagle_draft_num_layers=None,
-                dflash_draft_num_layers=5,
+            draft_pool = draft_kvc._build_token_to_kv_pool(
+                sizes=draft_kvc._derive_pool_sizes(config=config),
+                is_dsa_model=False,
+                is_compressed_kv_model=False,
+                req_to_token_pool=None,
             )
-            with mock_cpu_env():
-                from sglang.srt.model_executor.pool_configurator import (
-                    create_memory_pool_configurator,
-                )
+        # Each sub-pool's own rows, without the padding page it allocates on top.
+        sub_pools = (
+            (draft_pool.full_kv_pool, draft_pool.swa_kv_pool)
+            if declares_swa
+            else (draft_pool,)
+        )
+        draft_bytes = sum(
+            sum(pool.get_kv_size_bytes()) * pool.size // (pool.size + page_size)
+            for pool in sub_pools
+        )
+        allocated = _actual_memory_used(target, config) + draft_bytes
+        return cfg._cell_size, available, allocated
 
-                cfg = create_memory_pool_configurator(mr)
-                config = cfg.calculate_pool_sizes(available, get_schedule().page_size)
-            return config.full_max_total_num_tokens
+    def test_window_only_draft_reserves_what_its_pool_allocates(self):
+        """A draft whose config declares every layer sliding-window gets a pool of
+        SWA-token rows; charging it per full token left that HBM unused."""
+        for name, layout in (
+            ("hybrid_target", {}),
+            ("all_swa_target", dict(target_full_layers=0)),
+            # Each of the 9 pipeline slots pins a 512-token chunk in the SWA pool.
+            (
+                "pipeline_chunks",
+                dict(
+                    pp_size=8,
+                    pp_async_batch_depth=1,
+                    chunked_prefill_size=512,
+                    disable_overlap_schedule=True,
+                ),
+            ),
+        ):
+            with self.subTest(name):
+                _, available, allocated = self._draft_kv_budget(**layout)
+                self.assertLessEqual(allocated, available)
+                self.assertGreater(allocated / available, 0.99)
 
-        self.assertLess(_tokens(10240), _tokens(None))
+    def test_other_drafts_keep_the_per_full_token_charge(self):
+        per_full_token = (
+            self._TARGET_CELL + self._SWA_RATIO * self._TARGET_CELL + self._DRAFT_CELL
+        )
+        for name, case in (
+            # Undeclared, its runner allocates one row per full token.
+            ("undeclared", dict(declares_swa=False)),
+            (
+                "one_full_layer",
+                dict(layer_types=self._WINDOW_ONLY[:4] + ("full_attention",)),
+            ),
+            ("window_wider_than_target", dict(sliding_window=512)),
+            # The unified solve prices the draft from its per-full-token term.
+            ("unified_memory", dict(enable_unified_memory=True)),
+        ):
+            with self.subTest(name):
+                cell_size, available, allocated = self._draft_kv_budget(**case)
+                self.assertEqual(cell_size, per_full_token)
+                self.assertLessEqual(allocated, available)
 
 
 class TestMixedKVFormats(CustomTestCase):
