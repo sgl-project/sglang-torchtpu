@@ -185,6 +185,22 @@ def _read_fast_gs_knob() -> bool:
     return val
 
 
+def _read_b16_sparse_knob() -> bool:
+    import os
+
+    val = _env_bool_fallback("SGLANG_TPU_MUSE_KERNEL_DECODE_B16_SPARSE", False)
+    if os.environ.get("SGLANG_TPU_MUSE_KERNEL_DECODE_B16_SPARSE") is None:
+        try:
+            from sglang_tpu.envs import envs
+
+            ev = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_DECODE_B16_SPARSE", None)
+            if ev is not None:
+                val = bool(ev.get())
+        except Exception:
+            pass
+    return val
+
+
 def _read_spec_prime_fast_knobs() -> tuple[bool, int]:
     import os
 
@@ -409,9 +425,10 @@ def default_sparse_decode_config(
             **route_kw,
         )
 
-    # Compact K256/K512: dense fast-path at B=16 (or B<=64 when fast_b64==3), 2/3-bucket sparse at B in (32, 64),
-    # 3-bucket (16, 32, 64) unlooped sparse + BF16 RS wire at B >= 128 (~38 MiB VMEM).
-    if batch_size <= 16 or (fast_b64 == 3 and batch_size <= 64):
+    # Compact K256/K512: dense fast-path at B=16 (unless DECODE_B16_SPARSE=1, or B<=64 when fast_b64==3),
+    # 2/3-bucket sparse at B in (16/32, 64), 3-bucket (16, 32, 64) at B >= 128 (~38 MiB VMEM).
+    b16_sparse = _read_b16_sparse_knob()
+    if (batch_size <= 16 and not b16_sparse) or (fast_b64 == 3 and batch_size <= 64):
         return SparseDecodeConfig(
             row_mode="dense",
             weight_mode="stream3_k2" if (contig_parts and scale_block <= 256) else "stream3",
@@ -432,30 +449,35 @@ def default_sparse_decode_config(
             **route_kw,
         )
     if batch_size <= 64:
+        is_b16 = batch_size <= 16
         w_m = (
             "w1_2x_w2_1x"
-            if fast_b64 == 2
+            if (fast_b64 == 2 and not is_b16)
             else ("stream3_k2" if (contig_parts and scale_block <= 256) else "stream3")
         )
         m_bkts = (
-            (8, 16, 32)
-            if fast_b64 in (1, 2)
-            else ((8, 32) if decode_m8 else (16, 32))
+            ((8,) if batch_size <= 8 else (8, 16))
+            if is_b16
+            else (
+                (8, 16, 32)
+                if fast_b64 in (1, 2)
+                else ((8, 32) if decode_m8 else (16, 32))
+            )
         )
         return SparseDecodeConfig(
             row_mode="sparse",
             weight_mode=w_m,
-            tile_m=32,
+            tile_m=16 if is_b16 else 32,
             m_buckets=m_bkts,
             loop32_in_tile=False,
             k16_blockdiag_rows=(),
             k256_strip_mode=eff_strip,
             k256_dual_mode="dual" if fast_b64 == 2 else "hybrid",
-            rs_wire_bf16=use_br64,
+            rs_wire_bf16=False if is_b16 else use_br64,
             pair_rs=use_pair_rs,
-            bridge_ag=use_ep16_bridge_ag or use_br64,
+            bridge_ag=use_ep16_bridge_ag or (False if is_b16 else use_br64),
             norm_f32_stage=True,
-            route_chunk_rows=batch_size if fast_b64 >= 1 else 32,
+            route_chunk_rows=min(batch_size, 16) if is_b16 else (batch_size if fast_b64 >= 1 else 32),
             static_holder_mask=static_mask,
             spec_prime_parts=spec_eff,
             fast_b64_epi_pro=(fast_b64 >= 1),
@@ -1749,6 +1771,7 @@ def plan_and_prime_muse_sparse_from_vmem(
     zero_and_pack: bool = True,
     x_in_ref=None,
     x_3d_buf=None,
+    free_params_ref=None,
 ) -> MuseSparsePlanResult | None:
     """Phase 1 of VMEM-resident Muse sparse decode: route, plan, prime Expert-0, & optional zero/pack.
 
@@ -1895,6 +1918,7 @@ def plan_and_prime_muse_sparse_from_vmem(
             free_min_slot=cfg.free_min_slot,
             route_rb16_mode=getattr(cfg, "route_rb16_mode", None),
             route_fast=getattr(cfg, "route_fast", None),
+            free_params_ref=free_params_ref,
         )
         counts_smem = r_scratch.counts_smem
 
@@ -1930,6 +1954,7 @@ def plan_and_prime_muse_sparse_from_vmem(
                 holder_slot_expert_smem,
                 d_scratch,
                 spec_slot=spec_slot,
+                fast_plan=bool(getattr(cfg, "fast_plan", False)),
             )
         else:
             num_exec = build_exec_plan_from_masks_smem(
@@ -1945,7 +1970,14 @@ def plan_and_prime_muse_sparse_from_vmem(
     else:
         if is_dense:
             num_exec = build_dense_exec_plan_smem(
-                me, e_local, 0, None, None, d_scratch, spec_slot=spec_slot
+                me,
+                e_local,
+                0,
+                None,
+                None,
+                d_scratch,
+                spec_slot=spec_slot,
+                fast_plan=bool(getattr(cfg, "fast_plan", False)),
             )
         else:
             num_exec = build_default_exec_plan_smem(
@@ -4254,6 +4286,7 @@ def _run_muse_sparse_from_vmem_core(
     holder_slot_expert_smem=None,
     holder_cand_smem=None,
     spec_slot_ref=None,
+    free_params_ref=None,
     x_is_3d: bool = False,
     wait_entry_barrier: bool = True,
     write_output_ref: bool = True,
@@ -4306,6 +4339,7 @@ def _run_muse_sparse_from_vmem_core(
         zero_and_pack=True,
         x_in_ref=None if x_is_3d else x_in_ref,
         x_3d_buf=None if x_is_3d else x_3d_buf,
+        free_params_ref=free_params_ref,
     )
     if plan_res is None:
         return
@@ -4377,6 +4411,7 @@ def _sparse_decode_kernel(
     ep_axis_name: str,
     cfg: SparseDecodeConfig,
     has_spec_slot_arg: bool = False,
+    has_free_params_arg: bool = False,
 ):
     has_replicas = num_replicas > 0
     is_k256 = scale_block >= 256
@@ -4394,6 +4429,7 @@ def _sparse_decode_kernel(
     rank_ref = next(it)
     replica_meta_ref = next(it) if has_replicas else None
     spec_slot_ref = next(it) if has_spec_slot_arg else None
+    free_params_ref = next(it) if has_free_params_arg else None
     logits_ref = next(it)
     bias_ref = next(it)
     x_in_ref = next(it)
@@ -4587,6 +4623,7 @@ def _sparse_decode_kernel(
         holder_slot_expert_smem=holder_slot_expert_smem,
         holder_cand_smem=holder_cand_smem,
         spec_slot_ref=spec_slot_ref,
+        free_params_ref=free_params_ref,
         x_is_3d=False,
         wait_entry_barrier=True,
         write_output_ref=True,
@@ -4827,6 +4864,7 @@ def fused_decode_sparse_from_logits(
     rep_s2: jax.Array | None = None,
     replica_meta: jax.Array | None = None,
     spec_home_slot: jax.Array | None = None,
+    free_params: jax.Array | None = None,
     *,
     ep: int = 8,
     return_sharded: bool = False,
@@ -4944,11 +4982,23 @@ def fused_decode_sparse_from_logits(
     else:
         spec_slot_arg = None
 
+    has_free_params_arg = free_params is not None
+    if has_free_params_arg:
+        free_params_arg = free_params.reshape(-1).astype(jnp.float32)
+        if free_params_arg.shape != (4,):
+            raise ValueError(
+                f"Expected free_params shape (4,), got {free_params.shape}"
+            )
+    else:
+        free_params_arg = None
+
     scalar_args = [rank]
     if has_replicas:
         scalar_args.append(replica_meta)
     if has_spec_slot_arg:
         scalar_args.append(spec_slot_arg)
+    if has_free_params_arg:
+        scalar_args.append(free_params_arg)
     num_scalar_prefetch = len(scalar_args)
 
     if has_replicas:
@@ -4986,6 +5036,7 @@ def fused_decode_sparse_from_logits(
         ep_axis_name=ep_axis_name,
         cfg=config,
         has_spec_slot_arg=has_spec_slot_arg,
+        has_free_params_arg=has_free_params_arg,
     )
     rep_tag = f"_r{num_replicas}" if has_replicas else ""
     out_tag = "_sh" if return_sharded else "_rep"
@@ -4996,6 +5047,7 @@ def fused_decode_sparse_from_logits(
         f"{f'_fp{config.fast_plan}' if config.fast_plan else ''}"
         f"{'_us1' if config.unroll_strips else ''}"
         f"{'_fgs1' if config.fast_gs else ''}"
+        f"{'_dfp' if has_free_params_arg else ''}"
     )
     return pl.pallas_call(
         kernel_fn,

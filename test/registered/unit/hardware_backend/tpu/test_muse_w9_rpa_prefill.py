@@ -2088,13 +2088,15 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
                 )
             return captured
 
-        self.assertIn("sw_unalign_fuse", _capture_swa("", qh=8, sw=2048)["_prefill_opts"])
-        self.assertIn("sw_unalign_fuse", _capture_swa("", qh=8, sw=2049)["_prefill_opts"])
-        self.assertNotIn("sw_unalign_fuse", _capture_swa("nosw_unalign_fuse", qh=8, sw=2048)["_prefill_opts"])
-        self.assertNotIn("sw_unalign_fuse", _capture_swa("nosw2048_fuse", qh=8, sw=2048)["_prefill_opts"])
-        self.assertNotIn("sw_unalign_fuse", _capture_swa("nosw_mk128", qh=8, sw=2048)["_prefill_opts"])
-        self.assertNotIn("sw_unalign_fuse", _capture_swa("", qh=4, sw=2048)["_prefill_opts"])
-        self.assertNotIn("sw_unalign_fuse", _capture_swa("", qh=8, sw=None)["_prefill_opts"])
+        self.assertNotIn("sw_unalign_fuse", _capture_swa("", qh=8, sw=2048)["_prefill_opts"])
+        self.assertNotIn("sw_unalign_fuse", _capture_swa("", qh=8, sw=2049)["_prefill_opts"])
+        self.assertIn("sw_unalign_fuse", _capture_swa("sw_unalign_fuse", qh=8, sw=2048)["_prefill_opts"])
+        self.assertIn("sw_unalign_fuse", _capture_swa("sw_unalign_fuse", qh=8, sw=2049)["_prefill_opts"])
+        self.assertNotIn("sw_unalign_fuse", _capture_swa("sw_unalign_fuse,nosw_unalign_fuse", qh=8, sw=2048)["_prefill_opts"])
+        self.assertNotIn("sw_unalign_fuse", _capture_swa("sw_unalign_fuse,nosw2048_fuse", qh=8, sw=2048)["_prefill_opts"])
+        self.assertNotIn("sw_unalign_fuse", _capture_swa("sw_unalign_fuse,nosw_mk128", qh=8, sw=2048)["_prefill_opts"])
+        self.assertNotIn("sw_unalign_fuse", _capture_swa("sw_unalign_fuse", qh=4, sw=2048)["_prefill_opts"])
+        self.assertNotIn("sw_unalign_fuse", _capture_swa("sw_unalign_fuse", qh=8, sw=None)["_prefill_opts"])
 
         rng = np.random.default_rng(1414)
         page_size = 512
@@ -2201,6 +2203,181 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
                 jax.ShapeDtypeStruct((3,), jnp.int32),
             )
             self.assertIn("sw_unalign_fuse", exp.mlir_module())
+
+    def test_cand15_sw_tail_clamp_parity_and_routing(self):
+        """Verify sw_tail_clamp routing, InterpretParams nan-free parity, and TPU v7 export."""
+        from jax import export as jax_export
+        from jax.experimental.pallas import tpu as pltpu
+        from sglang_tpu.attention.pallas import ragged_paged_attention_v3 as rpa_v3_mod
+        from sglang_tpu import attention_pallas_rpa_v3 as rpa_wrap_mod
+
+        class _FakeRng:
+            def __init__(self, shape, dtype="bfloat16"):
+                self.shape = shape
+                self.ndim = len(shape)
+                self.dtype = dtype
+
+        def _capture_swa(w7_opts: str, *, qh: int = 8, sw: int | None = 2048):
+            captured = {}
+
+            def _stub(*args, **kwargs):
+                captured.update(kwargs)
+                return ("out", "kvc")
+
+            env = {
+                "SGLANG_TPU_RPA_V3_PREFILL_KERNEL_MODE": "m0_ring_fuse",
+                "SGLANG_TPU_RPA_V3_PREFILL_W9": "1",
+                "SGLANG_TPU_RPA_V3_PREFILL_W7_OPTS": w7_opts,
+                "SGLANG_TPU_RPA_V3_PREFILL_A3_LAYOUT": "1",
+                "SGLANG_TPU_RPA_V3_SKIP_EMPTY_DECODE": "1",
+                "SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT": "1",
+                "SGLANG_TPU_KV_PACK_HEADS": "2",
+            }
+            with patch.dict(os.environ, env, clear=False):
+                rpa_wrap_mod._invoke_v3_kernel(
+                    _stub,
+                    queries=_FakeRng((1, 8192, qh, 2, 128), "bfloat16"),
+                    keys=_FakeRng((8192, 1, 4, 128), "float8_e4m3fn"),
+                    values=None,
+                    kv_cache_fused=_FakeRng((2048, 512, 1, 4, 128), "float8_e4m3fn"),
+                    kv_lens=_FakeRng((64,)),
+                    page_indices=_FakeRng((64 * 32,)),
+                    cu_q_lens=_FakeRng((65,)),
+                    cu_kv_lens=_FakeRng((65,)),
+                    distribution=_FakeRng((3,)),
+                    attention_sink=None,
+                    sm_scale=0.125,
+                    sliding_window=sw,
+                    soft_cap=None,
+                    k_scale=1.0,
+                    v_scale=1.0,
+                    prepared_inputs=True,
+                    skip_decode=True,
+                    a3_out_layout=-2,
+                )
+            return captured
+
+        self.assertNotIn("sw_tail_clamp", _capture_swa("", qh=8, sw=2048)["_prefill_opts"])
+        self.assertNotIn("sw_tail_clamp", _capture_swa("", qh=8, sw=2049)["_prefill_opts"])
+        self.assertIn("sw_tail_clamp", _capture_swa("sw_tail_clamp", qh=8, sw=2048)["_prefill_opts"])
+        self.assertIn("sw_tail_clamp", _capture_swa("sw_tail_clamp", qh=8, sw=2049)["_prefill_opts"])
+        self.assertNotIn("sw_tail_clamp", _capture_swa("sw_tail_clamp,nosw_tail_clamp", qh=8, sw=2048)["_prefill_opts"])
+        self.assertNotIn("sw_tail_clamp", _capture_swa("sw_tail_clamp,nosw_unalign_fuse", qh=8, sw=2048)["_prefill_opts"])
+        self.assertNotIn("sw_tail_clamp", _capture_swa("sw_tail_clamp,nosw2048_fuse", qh=8, sw=2048)["_prefill_opts"])
+        self.assertNotIn("sw_tail_clamp", _capture_swa("sw_tail_clamp,nosw_mk128", qh=8, sw=2048)["_prefill_opts"])
+        self.assertNotIn("sw_tail_clamp", _capture_swa("sw_tail_clamp", qh=4, sw=2048)["_prefill_opts"])
+        self.assertNotIn("sw_tail_clamp", _capture_swa("sw_tail_clamp", qh=8, sw=None)["_prefill_opts"])
+
+        rng = np.random.default_rng(1515)
+        page_size = 512
+        # Covers valid_bq_rows in {1, 17, 128, 255, 3(after 256)} across aligned & unaligned sw_left,
+        # w_off=0 (sw=2049, q_first=2304), unaligned w_off (q_first=4097), and kv_len > q_first + valid_bq_rows.
+        seq_q = [1, 17, 128, 255, 259]
+        seq_kv = [2305, 4114, 3000, 4351, 5600]
+        tot_q = sum(seq_q)
+        t_buf = 768
+        pps = 12
+        q_jax = jnp.asarray(rng.normal(0.0, 0.35, (1, t_buf, 8, 2, 128)), dtype=jnp.bfloat16)
+        kv_jax = jnp.asarray(rng.normal(0.0, 0.35, (t_buf, 1, 4, 128)), dtype=jnp.float8_e4m3fn)
+        kl_arr = np.array([*seq_kv, 0], dtype=np.int32)
+        cq_arr = np.zeros((7,), dtype=np.int32)
+        ckv_arr = np.zeros((7,), dtype=np.int32)
+        pi_arr = np.zeros((6 * pps,), dtype=np.int32)
+        cur_p = 0
+        for si, (ql, kvl) in enumerate(zip(seq_q, seq_kv)):
+            cq_arr[si + 1] = cq_arr[si] + ql
+            ckv_arr[si + 1] = ckv_arr[si] + kvl
+            for lp in range((kvl + page_size - 1) // page_size):
+                pi_arr[si * pps + lp] = cur_p
+                cur_p += 1
+        cq_arr[6] = cq_arr[5]
+        ckv_arr[6] = ckv_arr[5]
+        kl = jnp.asarray(kl_arr)
+        cq = jnp.asarray(cq_arr)
+        ckv = jnp.asarray(ckv_arr)
+        pi = jnp.asarray(pi_arr)
+        dist = jnp.array([0, 0, len(seq_q)], dtype=jnp.int32)
+
+        interp = pltpu.InterpretParams(detect_races=True, uninitialized_memory="nan")
+        base_swa = frozenset({
+            "stationary_q_m0_ring_fuse", "skip_empty_cdma", "mixed_s3",
+            "sw2048_fuse", "sw_short_v2", "sw_unalign_fuse", "fp8_qk", "mk128",
+            "la2", "sub8_l", "bf16_pop", "unroll_up", "mrb3",
+        })
+        for sw, a3_out, use_d2 in (
+            (2048, True, False),
+            (2048, True, True),
+            (2049, False, False),
+            (2048, False, True),
+        ):
+            phys_pg = page_size // 2 if use_d2 else page_size
+            cache_u8 = np.full((cur_p + 2, phys_pg, 1, 4, 128), 0x7F, dtype=np.uint8)
+            for pg_i in range(cur_p):
+                cache_u8[pg_i, :, 0, :4, :] = rng.integers(
+                    0x28, 0x3A, size=(phys_pg, 4, 128), dtype=np.uint8
+                )
+            kv_cache = _u8_to_fp8(cache_u8)
+            with self.subTest(sw=sw, a3_out=a3_out, use_d2=use_d2):
+                with patch.object(rpa_v3_mod, "get_tpu_version", return_value=7):
+                    out_base, _ = rpa_v3_mod.ragged_paged_attention(
+                        jnp.array(q_jax), jnp.array(kv_jax), None, jnp.array(kv_cache),
+                        kl, pi, cq, ckv, dist, None, None,
+                        sm_scale=0.125, sliding_window=sw, k_scale=1.0, v_scale=1.0,
+                        m_block_sizes=(256, 2048, 256, 512), _prefill_opts=base_swa,
+                        _fused_out_pack=2, _prepared_inputs=True,
+                        _skip_decode=True, _a3_out_layout=a3_out,
+                        _kv_pack_dense2=use_d2, _interpret=interp,
+                    )
+                    out_clamp, _ = rpa_v3_mod.ragged_paged_attention(
+                        jnp.array(q_jax), jnp.array(kv_jax), None, jnp.array(kv_cache),
+                        kl, pi, cq, ckv, dist, None, None,
+                        sm_scale=0.125, sliding_window=sw, k_scale=1.0, v_scale=1.0,
+                        m_block_sizes=(256, 2048, 256, 512),
+                        _prefill_opts=base_swa | {"sw_tail_clamp", "poison_vmem_nan"},
+                        _fused_out_pack=2, _prepared_inputs=True,
+                        _skip_decode=True, _a3_out_layout=a3_out,
+                        _kv_pack_dense2=use_d2, _interpret=interp,
+                    )
+                a = np.asarray(out_base[:, :tot_q] if not a3_out else out_base[:tot_q], dtype=np.float32)
+                b = np.asarray(out_clamp[:, :tot_q] if not a3_out else out_clamp[:tot_q], dtype=np.float32)
+                self.assertTrue(np.all(np.isfinite(b)), f"Non-finite output for sw={sw}, a3={a3_out}, d2={use_d2}")
+                cos = float(np.dot(a.ravel(), b.ravel()) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
+                self.assertGreaterEqual(cos, 0.99999)
+                self.assertLessEqual(float(np.max(np.abs(a - b))), 1e-2)
+
+        try:
+            from jax._src import tpu_info as _tpu_info  # noqa: F401
+        except ImportError:
+            self.skipTest("jax._src.tpu_info not available in lightweight CPU venv")
+        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+        with (
+            patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+            tpu_info_for_cpu_export(),
+        ):
+            exp = jax_export.export(
+                jax.jit(
+                    lambda q, kv, c, kl_i, pi_i, cq_i, ckv_i, d: rpa_v3_mod.ragged_paged_attention(
+                        q, kv, None, c, kl_i, pi_i, cq_i, ckv_i, d, None, None,
+                        sm_scale=0.125, sliding_window=2048, k_scale=1.0, v_scale=1.0,
+                        m_block_sizes=(256, 2048, 256, 512),
+                        _prefill_opts=base_swa | {"sw_tail_clamp"},
+                        _fused_out_pack=2, _prepared_inputs=True,
+                        _skip_decode=True, _a3_out_layout=True,
+                    )
+                ),
+                platforms=["tpu"],
+            )(
+                jax.ShapeDtypeStruct((1, 8192, 8, 2, 128), jnp.bfloat16),
+                jax.ShapeDtypeStruct((8192, 1, 4, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((512, 512, 1, 4, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((64,), jnp.int32),
+                jax.ShapeDtypeStruct((64 * 32,), jnp.int32),
+                jax.ShapeDtypeStruct((65,), jnp.int32),
+                jax.ShapeDtypeStruct((65,), jnp.int32),
+                jax.ShapeDtypeStruct((3,), jnp.int32),
+            )
+            self.assertIn("sw_tail_clamp", exp.mlir_module())
 
 
 if __name__ == "__main__":

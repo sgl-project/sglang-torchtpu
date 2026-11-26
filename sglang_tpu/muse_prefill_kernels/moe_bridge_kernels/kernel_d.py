@@ -66,6 +66,7 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
     num_rows: int | None = None,
     stream_out: jax.Array | None = None,
     salu_overlap: bool = False,
+    scrub_mxu_nan: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
     """Design D1 (4-Slab Pipelined VMEM Cache): Single-kernel fused combine + unpool + norms.
 
@@ -138,7 +139,15 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
         zero_spill
         or envs.SGLANG_TPU_MUSE_KERNEL_D_ZERO_SPILL.get()
         or tok_tile_eff > 64
+        or (tok_tile_eff >= 32 and chunk_size <= 32)
     ) and not (emit_fp8_attn_in or use_blk_fp8_unpool)
+    if not use_zero_spill:
+        # _d_4slab_kernel with t128+fp8q512+c16h+bf16 next_in exceeds 63 MiB (63.51M>63.00M),
+        # while emit_static_fp8_attn_in=True fits cleanly at t128.
+        if chunk_size <= 32 and chunk_size % 16 == 0:
+            tok_tile_eff = min(tok_tile_eff, 16)
+        elif not emit_static_fp8_attn_in:
+            tok_tile_eff = min(tok_tile_eff, 64)
 
     num_rows = chunk_size - row_start if num_rows is None else num_rows
     assert row_start % tok_tile_eff == 0 and num_rows % tok_tile_eff == 0, (
@@ -219,6 +228,20 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                 u_scratch_ref[r0 : r0 + r_step, c0 * lanes : (c0 + c_step) * lanes] = (
                     jnp.concatenate(parts, axis=0)
                 )
+
+    def _load_mxu_tile_128x1024(buf_2x_ref, slot, m0, m1, c0, c1, c_grp):
+        vals_raw = buf_2x_ref[slot, m0:m1, c0:c1, :]
+        if in_buf_is_fp8:
+            vals_raw = vals_raw.astype(jnp.bfloat16)
+            if scrub_mxu_nan:
+                # float8_e4m3fn has no Inf (only 0x7F/0xFF NaN); bf16 self-compare avoids the f32 cast tax.
+                vals_raw = jnp.where(vals_raw == vals_raw, vals_raw, jnp.bfloat16(0.0))
+        elif scrub_mxu_nan:
+            # Scrub NaN/Inf on bfloat16 inputs so 0.0 * NaN/Inf cannot propagate within a 16-row block.
+            vals_raw = jnp.where(
+                jnp.isfinite(vals_raw.astype(jnp.float32)), vals_raw, jnp.bfloat16(0.0)
+            )
+        return vals_raw.reshape(16 * topk, c_grp * lanes)
 
     if use_zero_spill:
         t_sub = min(32, tok_tile_eff)
@@ -337,7 +360,7 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
 
             # Phase 1: Low-VREG top-8 combine into u_scratch_ref [tok_tile_eff, 4096]
             amax_u_128 = jnp.zeros((tok_tile_eff, LANE), dtype=jnp.float32)
-            if in_buf_is_fp8 and not kmajor_buf:
+            if in_buf_is_fp8 and not kmajor_buf and not eff_mxu_combine:
                 _combine_fp8_phase1(buf_2x_ref, slot, w_vmem_ref, u_scratch_ref)
             elif eff_mxu_combine:
                 c_grp_zs = 8
@@ -350,8 +373,8 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                     for c_blk in range(n2_cols // c_grp_zs):
                         c0, c1 = c_blk * c_grp_zs, (c_blk + 1) * c_grp_zs
                         u0, u1 = c0 * lanes, c1 * lanes
-                        vals_128x1024 = buf_2x_ref[slot, m0:m1, c0:c1, :].reshape(
-                            16 * topk, c_grp_zs * lanes
+                        vals_128x1024 = _load_mxu_tile_128x1024(
+                            buf_2x_ref, slot, m0, m1, c0, c1, c_grp_zs
                         )
                         u_sub_bf16 = jnp.dot(
                             w_16x128,
@@ -416,7 +439,7 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                         u_scratch_ref[t0:t1, c0 * lanes : c1 * lanes] = u_sub
 
             if fp8_unpool:
-                if (in_buf_is_fp8 and not kmajor_buf) or not eff_mxu_combine:
+                if not eff_mxu_combine:
                     for c_blk in range(4):
                         u0, u1 = c_blk * 1024, (c_blk + 1) * 1024
                         amax_u_128 = jnp.maximum(
@@ -633,7 +656,7 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
         fp8_tag = "_fp8u" if fp8_unpool else ""
         fast_tag = "_c16so" if use_d_t128_fast else ""
         do_tag = f"_do{eff_d_opt}" if eff_d_opt else ""
-        mxu_tag = "_mxuc" if eff_mxu_combine else ""
+        mxu_tag = (("_mxuc" if scrub_mxu_nan else "_mxuc_ns") if eff_mxu_combine else "")
         sfp8_tag = "_sfp8" if emit_static_fp8_attn_in else ""
         zs_in_specs = [
             pl.BlockSpec(memory_space=pltpu.HBM),
@@ -777,7 +800,7 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
             envs.SGLANG_TPU_MUSE_KERNEL_D_T64_C16.get()
             and tok_tile_eff % 32 == 0
         )
-        if in_buf_is_fp8:
+        if in_buf_is_fp8 and not eff_mxu_combine:
             _combine_fp8_phase1(buf_2x_ref, slot, w_vmem_ref, u_scratch_ref)
             if fp8_unpool and not use_blk_fp8_unpool:
                 for c_blk in range(4):
@@ -799,8 +822,8 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                 for c_blk in range(n2_cols // c_grp):
                     c0, c1 = c_blk * c_grp, (c_blk + 1) * c_grp
                     u0, u1 = c0 * lanes, c1 * lanes
-                    vals_128x1024 = buf_2x_ref[slot, m0:m1, c0:c1, :].reshape(
-                        16 * topk, c_grp * lanes
+                    vals_128x1024 = _load_mxu_tile_128x1024(
+                        buf_2x_ref, slot, m0, m1, c0, c1, c_grp
                     )
                     u_sub_bf16 = jnp.dot(
                         w_16x128,
@@ -1150,7 +1173,7 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
         ),
         compiler_params=pltpu.CompilerParams(
             disable_bounds_checks=True,
-            vmem_limit_bytes=62 * 1024 * 1024,
+            vmem_limit_bytes=63 * 1024 * 1024,
         ),
         name=(
             f"pallas_d_combine_unpool_4slab_t{tok_tile_eff}"
@@ -1167,7 +1190,7 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
             + (f"_sn{t64_sub_n}" if t64_sub_n != 512 else "")
             + (f"_fp8q{eff_fp8_qbs}" if eff_fp8_qbs > 0 else "")
             + (f"_do{eff_d_opt}" if eff_d_opt else "")
-            + ("_mxuc" if eff_mxu_combine else "")
+            + (("_mxuc" if scrub_mxu_nan else "_mxuc_ns") if eff_mxu_combine else "")
         ),
         input_output_aliases=aliases,
     )(

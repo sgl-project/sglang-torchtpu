@@ -51,6 +51,66 @@ def parse_free_expert_rows_spec(spec: str) -> tuple[int, float, int]:
     return max_rows, max_w, min_slot
 
 
+def _filter_topk_keep_flags(
+    slot_ws: list[jax.Array],
+    *,
+    route_eps: float,
+    min_p_topk: float | jax.Array,
+    topk: int,
+) -> list[jax.Array]:
+    w_sum8 = sum(slot_ws) + route_eps
+    if isinstance(min_p_topk, jax.Array):
+        is_off = min_p_topk <= 0.0
+        is_floor = (min_p_topk > 0.0) & (min_p_topk < 0.5)
+        is_cap = min_p_topk >= 1.0
+        # Express all 4 modes as scalar float32 thresholds (no scalar->vector i1 select_n in Mosaic).
+        floor_eff = jnp.where(is_floor, min_p_topk, jnp.float32(-1.0))
+        mass_eff = jnp.where(
+            (~is_off) & (~is_floor) & (~is_cap), min_p_topk, jnp.float32(2.0)
+        )
+        cap_i32 = jnp.where(is_cap, min_p_topk.astype(jnp.int32), jnp.int32(topk + 1))
+        keep_flags: list[jax.Array] = []
+        cum_p = jnp.zeros_like(w_sum8)
+        for s, w_s in enumerate(slot_ws):
+            pos = w_s > 0.0
+            if s == 0:
+                keep_flags.append(pos)
+            else:
+                # Encode scalar cap via float32 threshold (< -1.0 impossible for positive weights).
+                s_mass = jnp.where(jnp.int32(s) < cap_i32, mass_eff, jnp.float32(-1.0))
+                s_floor = jnp.where(jnp.int32(s) < cap_i32, floor_eff, jnp.float32(2.0))
+                ratio = w_s / w_sum8
+                keep_flags.append(pos & (ratio >= s_floor) & (cum_p < s_mass))
+            cum_p = cum_p + (w_s / w_sum8)
+        return keep_flags
+    if min_p_topk <= 0.0:
+        return [w_s > 0.0 for w_s in slot_ws]
+    if min_p_topk < 0.5:
+        return [
+            (w_s > 0.0)
+            if s == 0
+            else jnp.logical_and(w_s > 0.0, (w_s / w_sum8) >= min_p_topk)
+            for s, w_s in enumerate(slot_ws)
+        ]
+    if min_p_topk >= 1.0:
+        k_cap = max(1, min(topk, int(min_p_topk)))
+        return [
+            (w_s > 0.0) if s < k_cap else jnp.zeros_like(w_s, dtype=jnp.bool_)
+            for s, w_s in enumerate(slot_ws)
+        ]
+    keep_flags = []
+    cum_p = jnp.zeros_like(w_sum8)
+    for s, w_s in enumerate(slot_ws):
+        keep_s = (
+            (w_s > 0.0)
+            if s == 0
+            else jnp.logical_and(w_s > 0.0, cum_p < min_p_topk)
+        )
+        keep_flags.append(keep_s)
+        cum_p = cum_p + (w_s / w_sum8)
+    return keep_flags
+
+
 def _select_and_filter_chunk_vpu(
     lg_raw: jax.Array,
     bias_row: jax.Array,
@@ -59,7 +119,7 @@ def _select_and_filter_chunk_vpu(
     *,
     topk: int,
     route_eps: float,
-    min_p_topk: float,
+    min_p_topk: float | jax.Array,
 ) -> tuple[list[jax.Array], list[jax.Array], list[jax.Array]]:
     """Select ``topk`` experts per row on VPU and apply per-token ``min_p_topk`` filter."""
     neg_inf = jnp.float32(-jnp.inf)
@@ -81,33 +141,9 @@ def _select_and_filter_chunk_vpu(
         slot_ws.append(w_slot)
         choice = jnp.where(pick, neg_inf, choice)
 
-    w_sum8 = sum(slot_ws) + route_eps
-    if min_p_topk <= 0.0:
-        keep_flags = [w_s > 0.0 for w_s in slot_ws]
-    elif min_p_topk < 0.5:
-        keep_flags = [
-            (w_s > 0.0)
-            if s == 0
-            else jnp.logical_and(w_s > 0.0, (w_s / w_sum8) >= min_p_topk)
-            for s, w_s in enumerate(slot_ws)
-        ]
-    elif min_p_topk >= 1.0:
-        k_cap = max(1, min(topk, int(min_p_topk)))
-        keep_flags = [
-            (w_s > 0.0) if s < k_cap else jnp.zeros_like(w_s, dtype=jnp.bool_)
-            for s, w_s in enumerate(slot_ws)
-        ]
-    else:
-        keep_flags = []
-        cum_p = jnp.zeros_like(w_sum8)
-        for s, w_s in enumerate(slot_ws):
-            keep_s = (
-                (w_s > 0.0)
-                if s == 0
-                else jnp.logical_and(w_s > 0.0, cum_p < min_p_topk)
-            )
-            keep_flags.append(keep_s)
-            cum_p = cum_p + (w_s / w_sum8)
+    keep_flags = _filter_topk_keep_flags(
+        slot_ws, route_eps=route_eps, min_p_topk=min_p_topk, topk=topk
+    )
     return slot_bests, slot_ws, keep_flags
 
 
@@ -116,14 +152,26 @@ def _droppable_flags_for_chunk(
     keep_flags: list[jax.Array],
     *,
     route_eps: float,
-    free_max_w: float,
-    free_min_slot: int,
+    free_max_w: float | jax.Array,
+    free_min_slot: int | jax.Array,
 ) -> list[jax.Array]:
-    eff_min_slot = max(1, int(free_min_slot))
     w_sum_kept = (
         sum(jnp.where(k_s, w_s, 0.0) for w_s, k_s in zip(slot_ws, keep_flags))
         + route_eps
     )
+    if isinstance(free_min_slot, jax.Array):
+        eff_min_s = jnp.maximum(jnp.int32(1), free_min_slot.astype(jnp.int32))
+        return [
+            jnp.zeros_like(k_s)
+            if s < 1
+            else jnp.logical_and(
+                k_s,
+                (w_s / w_sum_kept)
+                < jnp.where(jnp.int32(s) >= eff_min_s, free_max_w, jnp.float32(-1.0)),
+            )
+            for s, (w_s, k_s) in enumerate(zip(slot_ws, keep_flags))
+        ]
+    eff_min_slot = max(1, int(free_min_slot))
     return [
         jnp.zeros_like(k_s)
         if s < eff_min_slot
@@ -290,9 +338,9 @@ def dense_routing_scratch_shapes(
         counts_vmem=pltpu.VMEM((8, num_experts), jnp.int32),
         counts_smem=pltpu.SMEM((8, num_experts), jnp.int32),
         dense_w_vmem=pltpu.VMEM((batch_size, num_experts), jnp.float32),
-        exec_expert_id=pltpu.SMEM((max_exec_experts,), jnp.int32),
-        exec_weight_src=pltpu.SMEM((max_exec_experts,), jnp.int32),
-        exec_weight_slot=pltpu.SMEM((max_exec_experts,), jnp.int32),
+        exec_expert_id=pltpu.SMEM((max_exec_experts + 1,), jnp.int32),
+        exec_weight_src=pltpu.SMEM((max_exec_experts + 1,), jnp.int32),
+        exec_weight_slot=pltpu.SMEM((max_exec_experts + 1,), jnp.int32),
     )
 
 
@@ -656,6 +704,7 @@ def _route_vertical_lane_parallel(
     free_max_rows: int = 0,
     free_max_w: float = 0.06,
     free_min_slot: int = 5,
+    free_params_ref=None,
 ) -> None:
     """Zero-cross-lane-butterfly, 0.0-ULP bit-exact VPU router for E == 256.
 
@@ -665,6 +714,18 @@ def _route_vertical_lane_parallel(
     square ``128x128`` XLU hardware ``vxpose`` so tokens sit in independent lanes
     with zero cross-lane swizzles and zero ``fori_loop`` ``sbr`` drains.
     """
+    if free_params_ref is not None:
+        eff_min_p = free_params_ref[0].astype(jnp.float32)
+        eff_free_rows = jnp.maximum(jnp.int32(0), free_params_ref[1].astype(jnp.int32))
+        eff_free_w = free_params_ref[2].astype(jnp.float32)
+        eff_free_ms = jnp.maximum(jnp.int32(1), free_params_ref[3].astype(jnp.int32))
+        has_free = True
+    else:
+        eff_min_p = min_p_topk
+        eff_free_rows = free_max_rows
+        eff_free_w = free_max_w
+        eff_free_ms = free_min_slot
+        has_free = free_max_rows > 0
     batch_size, num_experts = logits_ref.shape
     first = my_owner * e_per_owner
     last_excl = first + e_per_owner
@@ -779,45 +840,21 @@ def _route_vertical_lane_parallel(
         ]
         del st_hi, s2, s3
 
-        w_sum8 = sum(slot_ws) + route_eps
-        if min_p_topk <= 0.0:
-            keep_flags = [w_s > 0.0 for w_s in slot_ws]
-        elif min_p_topk < 0.5:
-            keep_flags = [
-                (w_s > 0.0)
-                if s == 0
-                else jnp.logical_and(w_s > 0.0, (w_s / w_sum8) >= min_p_topk)
-                for s, w_s in enumerate(slot_ws)
-            ]
-        elif min_p_topk >= 1.0:
-            k_cap = max(1, min(topk, int(min_p_topk)))
-            keep_flags = [
-                (w_s > 0.0) if s < k_cap else jnp.zeros_like(w_s, dtype=jnp.bool_)
-                for s, w_s in enumerate(slot_ws)
-            ]
-        else:
-            keep_flags = []
-            cum_p = jnp.zeros_like(w_sum8)
-            for s, w_s in enumerate(slot_ws):
-                keep_s = (
-                    (w_s > 0.0)
-                    if s == 0
-                    else jnp.logical_and(w_s > 0.0, cum_p < min_p_topk)
-                )
-                keep_flags.append(keep_s)
-                cum_p = cum_p + (w_s / w_sum8)
+        keep_flags = _filter_topk_keep_flags(
+            slot_ws, route_eps=route_eps, min_p_topk=eff_min_p, topk=topk
+        )
 
         ht0 = jnp.zeros((64, 128), dtype=jnp.bool_)
         ht1 = jnp.zeros((64, 128), dtype=jnp.bool_)
         ht2 = jnp.zeros((64, 128), dtype=jnp.bool_)
         ht3 = jnp.zeros((64, 128), dtype=jnp.bool_)
-        if free_max_rows > 0:
+        if has_free:
             drop_flags = _droppable_flags_for_chunk(
                 slot_ws,
                 keep_flags,
                 route_eps=route_eps,
-                free_max_w=free_max_w,
-                free_min_slot=free_min_slot,
+                free_max_w=eff_free_w,
+                free_min_slot=eff_free_ms,
             )
             dt0 = jnp.zeros((64, 128), dtype=jnp.bool_)
             dt1 = jnp.zeros((64, 128), dtype=jnp.bool_)
@@ -850,7 +887,7 @@ def _route_vertical_lane_parallel(
         return slot_bests, slot_ws, keep_flags, None, tot_chunk, None
 
     def _apply_fmask_to_chunk(slot_bests, keep_flags, drop_flags, fm_lo, fm_hi):
-        eff_min_s = max(1, int(free_min_slot))
+        eff_min_s = 1 if isinstance(eff_free_ms, jax.Array) else max(1, int(eff_free_ms))
         for s in range(eff_min_s, topk):
             b_T = slot_bests[s]
             freed_T = jnp.any(
@@ -903,7 +940,7 @@ def _route_vertical_lane_parallel(
         ]
 
     def _compute_free_masks(tot_all, drp_all):
-        fmask = (tot_all > 0) & (tot_all <= free_max_rows) & (drp_all == tot_all)
+        fmask = (tot_all > 0) & (tot_all <= eff_free_rows) & (drp_all == tot_all)
         counts_acc = jnp.where(fmask, jnp.int32(0), tot_all)
         fm_lo = jnp.transpose(
             jnp.broadcast_to(fmask[:, :128].astype(jnp.int32), (128, 128))
@@ -917,7 +954,7 @@ def _route_vertical_lane_parallel(
         s_bests, s_ws, k_flags, d_flags, tot_all, drp_all = _score_vertical_chunk(
             0, batch_size
         )
-        if free_max_rows > 0:
+        if has_free:
             counts_acc, fm_lo, fm_hi = _compute_free_masks(tot_all, drp_all)
             _apply_fmask_to_chunk(s_bests, k_flags, d_flags, fm_lo, fm_hi)
         else:
@@ -930,11 +967,11 @@ def _route_vertical_lane_parallel(
         tot_all = jnp.zeros((1, num_experts), dtype=jnp.int32)
         drp_all = (
             jnp.zeros((1, num_experts), dtype=jnp.int32)
-            if free_max_rows > 0
+            if has_free
             else None
         )
         can_cache_vmem = (
-            free_max_rows > 0
+            has_free
             and ((2 * topk) % 8 == 0)
             and all(c_rows >= 2 * topk for _, c_rows in chunks)
         )
@@ -1004,13 +1041,13 @@ def _route_vertical_lane_parallel(
                     t0, c_rows
                 )
                 tot_all = tot_all + tot_c
-                if free_max_rows > 0:
+                if has_free:
                     drp_all = drp_all + drp_c
                     if can_cache_vmem:
                         _stash_chunk_to_vmem(t0, s_bests, s_ws, k_flags, d_flags)
                 else:
                     _pack_vertical_chunk(t0, c_rows, s_bests, s_ws, k_flags)
-            if free_max_rows > 0:
+            if has_free:
                 counts_acc, fm_lo, fm_hi = _compute_free_masks(tot_all, drp_all)
                 for t0, c_rows in chunks:
                     if can_cache_vmem:
@@ -1074,6 +1111,7 @@ def route_topk_and_counts_in_kernel(
     free_min_slot: int = 5,
     route_rb16_mode: int | None = None,
     route_fast: bool | None = None,
+    free_params_ref=None,
 ) -> None:
     """VPU-filtered top-k routing compacting local-candidate hits per token in VREGs.
 
@@ -1125,10 +1163,24 @@ def route_topk_and_counts_in_kernel(
             free_max_rows=free_max_rows,
             free_max_w=free_max_w,
             free_min_slot=free_min_slot,
+            free_params_ref=free_params_ref,
         )
         return
+    if free_params_ref is not None:
+        eff_min_p_fb = free_params_ref[0].astype(jnp.float32)
+        eff_free_rows_fb = jnp.maximum(jnp.int32(0), free_params_ref[1].astype(jnp.int32))
+        eff_free_w_fb = free_params_ref[2].astype(jnp.float32)
+        eff_free_ms_fb = jnp.maximum(jnp.int32(1), free_params_ref[3].astype(jnp.int32))
+        has_free_fb = True
+        has_dyn_prune = True
+    else:
+        eff_min_p_fb = min_p_topk
+        eff_free_rows_fb = free_max_rows
+        eff_free_w_fb = free_max_w
+        eff_free_ms_fb = free_min_slot
+        has_free_fb = free_max_rows > 0
+        has_dyn_prune = (min_p_topk > 0.0) or (free_max_rows > 0)
     rb16_mode = _read_route_rb16_mode() if route_rb16_mode is None else int(route_rb16_mode)
-    has_dyn_prune = (min_p_topk > 0.0) or (free_max_rows > 0)
     if rb16_mode > 0:
         eff_chunk = (
             min(route_chunk_rows, 16) if has_dyn_prune else route_chunk_rows
@@ -1136,7 +1188,7 @@ def route_topk_and_counts_in_kernel(
     else:
         eff_chunk = (
             max(route_chunk_rows, min(batch_size, 64))
-            if (free_max_rows > 0 and batch_size <= 64)
+            if (has_free_fb and batch_size <= 64)
             else route_chunk_rows
         )
     rb = min(batch_size, eff_chunk)
@@ -1153,7 +1205,7 @@ def route_topk_and_counts_in_kernel(
     counts_init = jnp.zeros((1, num_experts), jnp.int32)
     neg_inf = jnp.float32(-jnp.inf)
 
-    if rb16_mode > 0 and free_max_rows > 0:
+    if rb16_mode > 0 and has_free_fb:
         # Opt-in 2-pass VMEM-staged routing over spill-free <=16-row chunks:
         # Pass 1 evaluates sigmoid + Top-8 ONCE per chunk into scratch.route_pack_vmem;
         # Pass 2 masks freed experts and normalizes weights without re-reading logits!
@@ -1175,14 +1227,14 @@ def route_topk_and_counts_in_kernel(
                 num_experts,
                 topk=topk,
                 route_eps=route_eps,
-                min_p_topk=min_p_topk,
+                min_p_topk=eff_min_p_fb,
             )
             df = _droppable_flags_for_chunk(
                 sw,
                 kf,
                 route_eps=route_eps,
-                free_max_w=free_max_w,
-                free_min_slot=free_min_slot,
+                free_max_w=eff_free_w_fb,
+                free_min_slot=eff_free_ms_fb,
             )
             stage_meta = jnp.zeros((rb, 128), dtype=jnp.int32)
             stage_w = jnp.zeros((rb, 128), dtype=jnp.float32)
@@ -1229,7 +1281,7 @@ def route_topk_and_counts_in_kernel(
             )
 
         fmask = (
-            (tot_all > 0) & (tot_all <= free_max_rows) & (drp_all == tot_all)
+            (tot_all > 0) & (tot_all <= eff_free_rows_fb) & (drp_all == tot_all)
         )
         counts_acc = jnp.where(fmask, jnp.int32(0), tot_all)
         fmask_bcast = jnp.broadcast_to(fmask, (rb, num_experts))
@@ -1323,7 +1375,7 @@ def route_topk_and_counts_in_kernel(
     elif has_dyn_prune:
         # Exact cand_w9_base (349b604d63) default routing path (rb=64 at B<=64 when free_max_rows>0).
         n_chunks = batch_size // rb
-        eff_min_s = max(1, int(free_min_slot))
+        eff_min_s = 1 if isinstance(eff_free_ms_fb, jax.Array) else max(1, int(eff_free_ms_fb))
         first_v = jnp.broadcast_to(first, (rb, 1))
         last_excl_v = jnp.broadcast_to(last_excl, (rb, 1))
         rep_vecs = tuple(
@@ -1331,7 +1383,7 @@ def route_topk_and_counts_in_kernel(
             for eid in holder_cand_eids
         )
         free_mask_global = None
-        if free_max_rows > 0 and n_chunks > 1:
+        if has_free_fb and n_chunks > 1:
 
             def _scan_free_sparse(ci, carry):
                 tot_c, drp_c = carry
@@ -1343,14 +1395,14 @@ def route_topk_and_counts_in_kernel(
                     num_experts,
                     topk=topk,
                     route_eps=route_eps,
-                    min_p_topk=min_p_topk,
+                    min_p_topk=eff_min_p_fb,
                 )
                 df = _droppable_flags_for_chunk(
                     sw,
                     kf,
                     route_eps=route_eps,
-                    free_max_w=free_max_w,
-                    free_min_slot=free_min_slot,
+                    free_max_w=eff_free_w_fb,
+                    free_min_slot=eff_free_ms_fb,
                 )
                 for b_s, k_s, d_s in zip(sb, kf, df):
                     pk = e_iota == b_s
@@ -1370,7 +1422,7 @@ def route_topk_and_counts_in_kernel(
                 0, n_chunks, _scan_free_sparse, (counts_init, counts_init)
             )
             free_mask_global = (
-                (tot_all > 0) & (tot_all <= free_max_rows) & (drp_all == tot_all)
+                (tot_all > 0) & (tot_all <= eff_free_rows_fb) & (drp_all == tot_all)
             )
 
         def _route_chunk_sparse_dyn(r0, counts_acc):
@@ -1382,15 +1434,15 @@ def route_topk_and_counts_in_kernel(
                 num_experts,
                 topk=topk,
                 route_eps=route_eps,
-                min_p_topk=min_p_topk,
+                min_p_topk=eff_min_p_fb,
             )
-            if free_max_rows > 0:
+            if has_free_fb:
                 drop_flags = _droppable_flags_for_chunk(
                     slot_ws,
                     keep_flags,
                     route_eps=route_eps,
-                    free_max_w=free_max_w,
-                    free_min_slot=free_min_slot,
+                    free_max_w=eff_free_w_fb,
+                    free_min_slot=eff_free_ms_fb,
                 )
                 if free_mask_global is None:
                     tot_c = counts_init
@@ -1409,7 +1461,7 @@ def route_topk_and_counts_in_kernel(
                         )
                     fmask = (
                         (tot_c > 0)
-                        & (tot_c <= free_max_rows)
+                        & (tot_c <= eff_free_rows_fb)
                         & (drp_c == tot_c)
                     )
                 else:
@@ -1712,9 +1764,54 @@ def build_dense_exec_plan_smem(
     d_scratch: DenseRoutingScratch,
     *,
     spec_slot: jax.Array | None = None,
+    fast_plan: bool = False,
 ) -> jax.Array:
     """Build compact active-expert list in SMEM for dense-rows mode."""
     first = my_owner * e_per_owner
+    if fast_plan and e_per_owner <= 64 and num_replicas <= 8:
+        if spec_slot is not None:
+            use_sp = (spec_slot >= 0) & (spec_slot < e_per_owner)
+            safe_sp = jnp.where(use_sp, spec_slot, jnp.int32(0))
+            g_sp = first + safe_sp
+            cnt_sp = d_scratch.counts_smem[0, g_sp]
+            keep_sp = use_sp & (
+                jnp.logical_and(cnt_sp > 0, local_suppress_smem[safe_sp] == 0)
+                if local_suppress_smem is not None
+                else (cnt_sp > 0)
+            )
+            d_scratch.exec_expert_id[0] = g_sp
+            d_scratch.exec_weight_src[0] = jnp.int32(0)
+            d_scratch.exec_weight_slot[0] = safe_sp
+            k = keep_sp.astype(jnp.int32)
+        else:
+            use_sp = jnp.bool_(False)
+            safe_sp = jnp.int32(-1)
+            k = jnp.int32(0)
+        for le in range(e_per_owner):
+            is_sp = use_sp & (jnp.int32(le) == safe_sp)
+            g_e = first + jnp.int32(le)
+            cnt = d_scratch.counts_smem[0, g_e]
+            keep = (~is_sp) & (
+                jnp.logical_and(cnt > 0, local_suppress_smem[le] == 0)
+                if local_suppress_smem is not None
+                else (cnt > 0)
+            )
+            d_scratch.exec_expert_id[k] = g_e
+            d_scratch.exec_weight_src[k] = jnp.int32(0)
+            d_scratch.exec_weight_slot[k] = jnp.int32(le)
+            k = k + keep.astype(jnp.int32)
+        if num_replicas > 0 and active_rep_eid_smem is not None:
+            for slot in range(num_replicas):
+                g_e = active_rep_eid_smem[slot]
+                has_rep = g_e >= 0
+                safe_e = jnp.where(has_rep, g_e, jnp.int32(0))
+                cnt = jnp.where(has_rep, d_scratch.counts_smem[0, safe_e], jnp.int32(0))
+                active = has_rep & (cnt > 0)
+                d_scratch.exec_expert_id[k] = safe_e
+                d_scratch.exec_weight_src[k] = jnp.int32(1)
+                d_scratch.exec_weight_slot[k] = jnp.int32(slot)
+                k = k + active.astype(jnp.int32)
+        return k
     k_init = jnp.int32(0)
     if spec_slot is not None:
         use_sp = (spec_slot >= 0) & (spec_slot < e_per_owner)

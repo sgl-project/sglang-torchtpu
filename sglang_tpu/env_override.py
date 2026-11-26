@@ -34,6 +34,17 @@ _SPARSE_CORE_OFFLOAD_OVERRIDES = (
     # SparseCore offload for the all-reduce after embed lookup can return
     # wrong values inside compiled regions on TP=8 dense Qwen.
     "--xla_tpu_enable_sparse_core_collective_offload_all_reduce=false",
+    # SparseCore compute/elementwise offloads halt SC3 on TP=8 Muse when
+    # num_local_experts is divisible by 8 (e.g. EPLB R=0 / off) and serialize
+    # CCS layout copies on SparseCore against collective all-gather offloads.
+    "--xla_tpu_enable_sparse_core_compute_offload=false",
+    "--xla_tpu_enable_offloading_gather_to_sparsecore=false",
+    "--xla_tpu_enable_offloading_scatter_to_sparsecore=false",
+    "--xla_tpu_enable_offloading_copy_to_sparsecore=false",
+    "--xla_tpu_enable_offloading_reshape_to_sparsecore=false",
+    "--xla_tpu_enable_offloading_reduce_to_sparsecore=false",
+    "--xla_tpu_enable_offloading_sort_to_sparsecore=false",
+    "--xla_tpu_enable_offloading_dynamic_padding_to_sparsecore=false",
 )
 
 _ASSOCIATIVE_SCAN_OVERRIDES = (

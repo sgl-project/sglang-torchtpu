@@ -586,6 +586,10 @@ class TpuEnvs:
     SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_PLAN = EnvInt(0)
     SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_GS = EnvBool(False)
     SGLANG_TPU_MUSE_KERNEL_DECODE_EP_TP2_PAIR_RS = EnvBool(False)
+    # Opt-in B=16 (LC 8K/1K) sparse execution (m_buckets=(8, 16) vs dense) unlocking FREE/MIN_P.
+    SGLANG_TPU_MUSE_KERNEL_DECODE_B16_SPARSE = EnvBool(False)
+    # Opt-in non-uniform per-layer FREE/MIN_P preset or spec ("" = uniform off).
+    SGLANG_TPU_MUSE_DECODE_NONUNIFORM_FREE = EnvStr("")
     # Opt-in (#3035): allow SPEC_PRIME (>0) alongside ROUTE_FAST + FAST_PLAN=2 and optional home slot hint (-1=auto).
     SGLANG_TPU_MUSE_KERNEL_DECODE_SPEC_PRIME_FAST = EnvBool(False)
     SGLANG_TPU_MUSE_KERNEL_DECODE_SPEC_HOME_SLOT = EnvInt(-1)
@@ -754,6 +758,10 @@ class TpuEnvs:
     # ([K_even, V_even, K_odd, V_odd]), halving KV pool HBM (512 -> 256 B/tok/layer/TC)
     # and halving KV page DMA bytes in RPAd_fast, RPAm, and write_kv_only_rpa_v3.
     SGLANG_TPU_KV_PACK_DENSE2 = EnvBool(False)
+    # On TP=16 (1 KV head x head_dim 64 FP8, zero-padded to 128 lanes), pack 4 consecutive
+    # tokens into each 32-bit (1, 4, 128) word ([K0|K1, V0|V1, K2|K3, V2|V3] across lanes
+    # [0..63 | 64..127]), cutting KV pool HBM & page DMA by 4x (512 -> 128 B/tok/layer).
+    SGLANG_TPU_KV_PACK_BD4 = EnvBool(False)
     # Route uniform-width speculative TARGET_VERIFY (decode_query_size in 2..8, e.g.
     # DFlash dq=5/6) through RPAd_fast batched [16*dq, 128] single-MXU-pass verify.
     SGLANG_TPU_RPA_V3_DECODE_FAST_VERIFY = EnvBool(False)
@@ -1499,6 +1507,10 @@ class TpuEnvs:
     # and Entry on BOTH TP=8 (B=32..384) and TP=16 (B=64..384), eliminating intra-chip stream
     # split/re-gather D2D barriers and concat loops.
     SGLANG_TPU_MUSE_DECODE_CHIP_SHARDED_BRIDGES = EnvBool(False)
+    # Opt-in parallel orthogonal 3-slab XYZ reduce-scatter in TP=16 B=64 chip-sharded Bridge 1b.
+    SGLANG_TPU_MUSE_DECODE_TP16_PARALLEL_RS = EnvBool(False)
+    # Opt-in Bug C (4 KiB sq_pair swap, -50% VPU) + half-col 1-shot ag_exp + d2d2 at r_pair=8.
+    SGLANG_TPU_MUSE_DECODE_BUG_C_ONESHOT = EnvBool(False)
     # Wave-9 opt-in TP_chip=2 W_post [4096, 4096] in chip-sharded Bridge 2b & L61 Final Norm on TP=8,
     # eliminating both tok_s2 and post_ici inter-chip ICI collectives (+0.97 GiB/rank HBM).
     SGLANG_TPU_MUSE_DECODE_CHIP_B2_TP2_WPOST = EnvBool(False)
@@ -1506,6 +1518,10 @@ class TpuEnvs:
     # + Step (a) [chip_b1 + muse_sparse] on L61 across TP=8/16 (eliminates inter-op XLA
     # barriers and keeps residual stream live in VMEM across MoE).
     SGLANG_TPU_MUSE_DECODE_B1_MOE_B2_SUPERKERNEL = EnvBool(False)
+    # Wave-9 opt-in Step (c) [chip_b1 + muse_sparse(3d) + chip_b2 + RPAd] decode superkernel
+    # on SWA / bounded-context layers (<= 20 ring slots*pages, B <= 64, EP=8/16): fuses next
+    # layer RPAd directly behind Bridge 2b QKV/RoPE/KV epilogue and skips next self_attn.
+    SGLANG_TPU_MUSE_DECODE_STEP_C_SUPERKERNEL = EnvBool(False)
     # Wave-8 fuse decode QKV RMSNorm + RoPE + KV FP8 quant epilogue directly into Bridge 2b & L0.
     SGLANG_TPU_MUSE_DECODE_BRIDGE_QKV_EPI = EnvBool(False)
     # Wave-9 unlock fused in-VMEM QKV/RoPE/FP8-KV epilogue on TP=16 (qkv_cols=640, 8Q/1KV) across
@@ -1532,6 +1548,13 @@ class TpuEnvs:
     # page-aligned chunk cuts; 2 = exact token compute charge + exact unaligned cuts;
     # >=64 = exact token compute charge + chunk cuts aligned to the token multiple (e.g. 4096).
     SGLANG_TPU_EXACT_CHUNK_FILL = EnvInt(0)
+    # Wave-16 opt-in asymmetric power-of-2 B1+B2 chunk split (e.g. 512+1024 on TP=16,
+    # 1024+2048 on TP=8 for 24K buckets) under GMM_PREQUANT_LHS_FP8=5 so every B2
+    # all_gather is a power-of-2 size without non-pow2 SparseCore AG cliffs.
+    SGLANG_TPU_MUSE_KERNEL_B2_POW2_CHUNKS = EnvBool(False)
+    # Wave-16 opt-in double-buffered stream HBM->VMEM prefetch + direct (bm, 32, 128) FP8 store
+    # inside pallas_fused_b1_b2_wpool_quant (-0.73..-0.96 ms/61L on 4c Ghostfish, 0-ULP bit-exact).
+    SGLANG_TPU_MUSE_KERNEL_B2_DBL_STREAM = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:

@@ -3535,3 +3535,212 @@ def a3_v17_option3d_single_kernel_fused_gate_a2a_wo_3d_sp(
         bn=bn,
         d_order=d_order,
     )
+
+
+# -----------------------------------------------------------------------------
+# Wave 9: Static-FP8 Ulysses Sequence-Parallel Attention (`v10_sp`, TP=16)
+# -----------------------------------------------------------------------------
+def pallas_ulysses_norm_fp8_for_rev_a2a(
+    raw_attn_out: jax.Array,
+    *,
+    head_norm_eps: float = 1e-5,
+    tm: int = 512,
+    vmem_limit_mb: int = 32,
+) -> jax.Array:
+    """Per-head RMSNorm + `* 32.0` static FP8 quant before reverse A2A (`12 MB` total)."""
+    c_tok, q_local = raw_attn_out.shape
+    assert q_local % 128 == 0
+    tm_eff = next(
+        t for t in (512, 256, 128, 64, 32, 16, 8) if t <= tm and c_tok % t == 0
+    )
+    sub_r = min(128, tm_eff)
+
+    def _norm_quant_tile(attn_ref, out_ref):
+        lane = lax.broadcasted_iota(jnp.int32, (sub_r, 128), 1)
+        is_lo = lane < 64
+        mask_lo = is_lo.astype(jnp.float32)
+        mask_hi = 1.0 - mask_lo
+        for r0 in range(0, tm_eff, sub_r):
+            r1 = r0 + sub_r
+            for c0 in range(0, q_local, 128):
+                c1 = c0 + 128
+                a_norm = _dual_head_rmsnorm_128(
+                    attn_ref[r0:r1, c0:c1].astype(jnp.float32),
+                    is_lo,
+                    mask_lo,
+                    mask_hi,
+                    1.0,
+                    eps=head_norm_eps,
+                )
+                out_ref[r0:r1, c0:c1] = jnp.clip(
+                    a_norm * STATIC_A3_ACT_MULT, -FP8_MAX, FP8_MAX
+                ).astype(jnp.float8_e4m3fn)
+
+    return pl.pallas_call(
+        _norm_quant_tile,
+        grid=(c_tok // tm_eff,),
+        in_specs=[pl.BlockSpec((tm_eff, q_local), lambda i: (i, 0))],
+        out_specs=pl.BlockSpec((tm_eff, q_local), lambda i: (i, 0)),
+        out_shape=jax.ShapeDtypeStruct((c_tok, q_local), jnp.float8_e4m3fn),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",),
+            vmem_limit_bytes=vmem_limit_mb * (1 << 20),
+        ),
+        name=f"pallas_ulysses_norm_fp8_c{c_tok}_q{q_local}_tm{tm_eff}",
+    )(raw_attn_out)
+
+
+def pallas_ulysses_gate_fuse(
+    attn_fp8_3d: jax.Array,
+    gate_2d: jax.Array,
+    *,
+    tm: int = 256,
+    vmem_limit_mb: int = 32,
+) -> jax.Array:
+    """Applies local `sigmoid(gate)` to static-FP8 reverse-A2A attention in VMEM.
+
+    `attn_fp8_3d [tp_deg, c_k, q_local]` already carries scale `STATIC_A3_ACT_MULT (32.0)`,
+    so `sigmoid(gate) * attn_fp8` directly produces static-FP8 `[c_k, tp_deg * q_local]`
+    without an intermediate HBM transpose or rescaling multiply.
+    """
+    tp_deg, c_k, q_local = attn_fp8_3d.shape
+    g_rows, n_full = gate_2d.shape
+    assert g_rows == c_k and n_full == tp_deg * q_local and q_local % 128 == 0
+    tm_eff = next(
+        t for t in (256, 128, 64, 32, 16, 8) if t <= tm and c_k % t == 0
+    )
+    sub_r = min(128, tm_eff)
+
+    def _fuse_tile(a_ref, g_ref, out_ref):
+        for r0 in range(0, tm_eff, sub_r):
+            r1 = r0 + sub_r
+            for h in range(tp_deg):
+                col0, col1 = h * q_local, (h + 1) * q_local
+                g_sig = jax.nn.sigmoid(
+                    g_ref[r0:r1, col0:col1].astype(jnp.float32)
+                ).astype(jnp.bfloat16)
+                prod = (
+                    g_sig * a_ref[h, r0:r1, :].astype(jnp.bfloat16)
+                ).astype(jnp.float32)
+                out_ref[r0:r1, col0:col1] = jnp.clip(
+                    prod, -FP8_MAX, FP8_MAX
+                ).astype(jnp.float8_e4m3fn)
+
+    return pl.pallas_call(
+        _fuse_tile,
+        grid=(c_k // tm_eff,),
+        in_specs=[
+            pl.BlockSpec((tp_deg, tm_eff, q_local), lambda i: (0, i, 0)),
+            pl.BlockSpec((tm_eff, n_full), lambda i: (i, 0)),
+        ],
+        out_specs=pl.BlockSpec((tm_eff, n_full), lambda i: (i, 0)),
+        out_shape=jax.ShapeDtypeStruct((c_k, n_full), jnp.float8_e4m3fn),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",),
+            vmem_limit_bytes=vmem_limit_mb * (1 << 20),
+        ),
+        name=f"pallas_ulysses_gate_fuse_tp{tp_deg}_c{c_k}_q{q_local}_tm{tm_eff}",
+    )(attn_fp8_3d, gate_2d)
+
+
+def pallas_ulysses_wo_local(
+    q_parts: jax.Array | tuple[jax.Array, ...],
+    wo_fp8: jax.Array,
+    wo_scale_2d: jax.Array,
+    *,
+    bm: int = 256,
+    bn: int = 1024,
+    vmem_limit_mb: int = 48,
+) -> jax.Array:
+    """Zero-ICI token-local FP8 `o_proj` (`[T_shard, H] @ Wo_fp8[H, H] -> bf16[T_shard, H]`).
+
+    Accepts 1 tensor or 2 chunk tensors `(q0, q1)` to avoid HBM concatenation on 2-chunk CCS.
+    For `sum(c_k) <= 1536` (`<= 12 MiB` activation), pins `q_parts` in VMEM across output tiles
+    `bn` so both activations and `Wo` (`64 MiB`) are read once from HBM; larger shards tile
+    rows into `t_blk <= 1024` blocks so VMEM stays bounded.
+    """
+    parts = q_parts if isinstance(q_parts, (tuple, list)) else (q_parts,)
+    k_dim, n_dim = wo_fp8.shape
+    eff_bn = next(b for b in (bn, 1024, 512, 256, 128) if b <= n_dim and n_dim % b == 0)
+    t_total = sum(p.shape[0] for p in parts)
+    for p in parts:
+        assert p.shape[1] == k_dim
+
+    if len(parts) <= 2 and t_total <= 1536:
+        n_parts = len(parts)
+
+        def _wo_pinned_kernel(*refs):
+            q_refs = refs[:n_parts]
+            w_ref, w_sc_ref, out_ref = refs[n_parts], refs[n_parts + 1], refs[n_parts + 2]
+            sc_vec = w_sc_ref[...] * STATIC_A3_ACT_SCALE
+            w_tile = w_ref[...]
+            row_off = 0
+            for q_r in q_refs:
+                c_p = q_r.shape[0]
+                bm_p = next(
+                    t for t in (bm, 256, 128, 64, 32, 16, 8) if t <= c_p and c_p % t == 0
+                )
+                for m0 in range(0, c_p, bm_p):
+                    acc = jnp.dot(
+                        q_r[m0 : m0 + bm_p, :],
+                        w_tile,
+                        preferred_element_type=jnp.float32,
+                    )
+                    out_ref[row_off + m0 : row_off + m0 + bm_p, :] = (
+                        acc * sc_vec
+                    ).astype(jnp.bfloat16)
+                row_off += c_p
+
+        return pl.pallas_call(
+            _wo_pinned_kernel,
+            grid=(n_dim // eff_bn,),
+            in_specs=[
+                *(pl.BlockSpec((p.shape[0], k_dim), lambda j: (0, 0)) for p in parts),
+                pl.BlockSpec((k_dim, eff_bn), lambda j: (0, j)),
+                pl.BlockSpec((1, eff_bn), lambda j: (0, j)),
+            ],
+            out_specs=pl.BlockSpec((t_total, eff_bn), lambda j: (0, j)),
+            out_shape=jax.ShapeDtypeStruct((t_total, n_dim), jnp.bfloat16),
+            compiler_params=pltpu.CompilerParams(
+                dimension_semantics=("parallel",),
+                vmem_limit_bytes=vmem_limit_mb * (1 << 20),
+            ),
+            name=f"pallas_ulysses_wo_p{'_'.join(str(p.shape[0]) for p in parts)}_k{k_dim}_bn{eff_bn}",
+        )(*parts, wo_fp8, wo_scale_2d)
+
+    q_cat = parts[0] if len(parts) == 1 else jnp.concatenate(parts, axis=0)
+    t_blk = next(
+        (t for t in range(1024, 0, -64) if t_total % t == 0),
+        next(t for t in (1024, 512, 256, 128, 64, 32, 16, 8) if t_total % t == 0),
+    )
+    bm_eff = next(
+        t for t in (bm, 256, 128, 64, 32, 16, 8) if t <= t_blk and t_blk % t == 0
+    )
+
+    def _wo_tiled_kernel(q_ref, w_ref, w_sc_ref, out_ref):
+        sc_vec = w_sc_ref[...] * STATIC_A3_ACT_SCALE
+        w_tile = w_ref[...]
+        for m0 in range(0, t_blk, bm_eff):
+            acc = jnp.dot(
+                q_ref[m0 : m0 + bm_eff, :],
+                w_tile,
+                preferred_element_type=jnp.float32,
+            )
+            out_ref[m0 : m0 + bm_eff, :] = (acc * sc_vec).astype(jnp.bfloat16)
+
+    return pl.pallas_call(
+        _wo_tiled_kernel,
+        grid=(t_total // t_blk, n_dim // eff_bn),
+        in_specs=[
+            pl.BlockSpec((t_blk, k_dim), lambda blk, j: (blk, 0)),
+            pl.BlockSpec((k_dim, eff_bn), lambda blk, j: (0, j)),
+            pl.BlockSpec((1, eff_bn), lambda blk, j: (0, j)),
+        ],
+        out_specs=pl.BlockSpec((t_blk, eff_bn), lambda blk, j: (blk, j)),
+        out_shape=jax.ShapeDtypeStruct((t_total, n_dim), jnp.bfloat16),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel"),
+            vmem_limit_bytes=vmem_limit_mb * (1 << 20),
+        ),
+        name=f"pallas_ulysses_wo_tiled_t{t_total}_tb{t_blk}_k{k_dim}_bn{eff_bn}",
+    )(q_cat, wo_fp8, wo_scale_2d)

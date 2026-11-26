@@ -128,6 +128,30 @@ def kv_pack_dense2_enabled(
     )
 
 
+def kv_pack_bd4_enabled(
+    *,
+    packs_bd4_cls: bool,
+    num_kv_heads: int,
+    head_dim: int,
+    align: int,
+    store_dtype: torch.dtype,
+    page_size: int = 128,
+) -> bool:
+    """True when 4 consecutive TP=16 d=64 FP8 tokens pack into one (1, 4, 128) lane row."""
+    bd4_env = getattr(tpu_envs, "SGLANG_TPU_KV_PACK_BD4", None)
+    return bool(
+        packs_bd4_cls
+        and bd4_env is not None
+        and bd4_env.get()
+        and num_kv_heads == 1
+        and head_dim == 64
+        and align == 128
+        and _torch_dtype_packing(store_dtype) == 4
+        and page_size >= 16
+        and page_size % 16 == 0
+    )
+
+
 def register_hicache_io_backend_pools(io_backend: str, *pool_classes: type) -> None:
     """Declare that ``io_backend`` can offload each of ``pool_classes`` to host,
     by adding it to their ``kv_offload_io_backends``."""
@@ -174,6 +198,8 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     PACKS_HEADS = True
     # Whether this layout can pack two consecutive FP8 tokens into one lane row (kv_pack_dense2).
     PACKS_DENSE2 = True
+    # Whether this layout can pack four consecutive TP=16 d=64 FP8 tokens into one row (kv_pack_bd4).
+    PACKS_BD4 = True
     # Name of the page's interior arrangement. The torch_tpu host pool folds it
     # into its HiCache storage key; a subclass that changes the arrangement
     # must restate it, or pages it writes would be read back by this layout.
@@ -195,6 +221,8 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         and elements sharing a 32-bit lane (``kv_packing``).
         """
         tag = f"{self.KV_LAYOUT_NAME}-hp{self.kv_pack_heads}-p{self.kv_packing}"
+        if getattr(self, "kv_pack_bd4", False):
+            return f"{tag}-bd4"
         return f"{tag}-d2" if getattr(self, "kv_pack_dense2", False) else tag
 
     @classmethod
@@ -223,6 +251,14 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         per_tok = (
             num_kv_heads_x2 * padded_head_dim * torch._utils._element_size(store_dtype)
         )
+        if kv_pack_bd4_enabled(
+            packs_bd4_cls=cls.PACKS_BD4,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            align=cls.HEAD_DIM_ALIGNMENT,
+            store_dtype=store_dtype,
+        ):
+            return per_tok // 4
         if kv_pack_dense2_enabled(
             packs_heads_cls=cls.PACKS_HEADS and cls.PACKS_DENSE2,
             num_kv_heads=num_kv_heads,
@@ -328,7 +364,15 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         self.num_kv_heads_x2 = (
             _cdiv(self.head_num * 2, self.kv_packing) * self.kv_packing
         )
-        self.kv_pack_dense2 = kv_pack_dense2_enabled(
+        self.kv_pack_bd4 = kv_pack_bd4_enabled(
+            packs_bd4_cls=self.PACKS_BD4,
+            num_kv_heads=self.head_num,
+            head_dim=self.head_dim,
+            align=self.HEAD_DIM_ALIGNMENT,
+            store_dtype=self.store_dtype,
+            page_size=self.page_size,
+        )
+        self.kv_pack_dense2 = (not self.kv_pack_bd4) and kv_pack_dense2_enabled(
             packs_heads_cls=self.PACKS_HEADS and self.PACKS_DENSE2,
             num_kv_heads=self.head_num,
             head_dim=self.head_dim,
@@ -419,11 +463,12 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     # ------------------------------------------------------------------ #
 
     def _buffer_shape(self) -> tuple[int, ...]:
-        phys_page_rows = (
-            self.page_size // 2
-            if getattr(self, "kv_pack_dense2", False)
-            else self.page_size
-        )
+        if getattr(self, "kv_pack_bd4", False):
+            phys_page_rows = self.page_size // 4
+        elif getattr(self, "kv_pack_dense2", False):
+            phys_page_rows = self.page_size // 2
+        else:
+            phys_page_rows = self.page_size
         return (
             self.num_blocks,
             phys_page_rows,
@@ -647,6 +692,14 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         """
         buf = self.kv_buffer[layer_id - self.start_layer]
         n_blocks, phys_rows, packed, packing, hd = buf.shape
+        if getattr(self, "kv_pack_bd4", False):
+            # Each (1, 4, 128) row packs 2 pairs along sublanes and 2 tokens along lanes (64 each):
+            # [K0|K1, V0|V1, K2|K3, V2|V3] -> [4, 2, 64].
+            return (
+                buf.reshape(n_blocks * phys_rows, 2, 2, 2, 64)
+                .permute(0, 1, 3, 2, 4)
+                .reshape(n_blocks * phys_rows * 4, 2, 64)
+            )
         if getattr(self, "kv_pack_dense2", False):
             # Each (1, 4, hd) row packs [K_even, V_even, K_odd, V_odd] -> [2, 2, hd].
             return buf.reshape(n_blocks * phys_rows * 2, 2, hd)
@@ -956,6 +1009,8 @@ class TpuBlockMajorMHATokenToKVPool(TpuFusedMHATokenToKVPool):
     # raiden moves a bundle row by its dim-0 block id; torch_tpu's host pool
     # reads the pool layer by layer, which the bundle does not offer.
     kv_offload_io_backends: frozenset[str] = frozenset({"raiden"})
+    PACKS_DENSE2 = False
+    PACKS_BD4 = False
 
     def _create_buffers(self):
         kv_heads_packed = self.num_kv_heads_x2 // self.kv_packing
@@ -1780,6 +1835,7 @@ class TpuDraftFusedMHATokenToKVPool(TpuFusedMHATokenToKVPool):
     """
 
     PACKS_DENSE2 = False
+    PACKS_BD4 = False
 
 
 # raiden copies whole pages by their dim-0 block id, so it serves any

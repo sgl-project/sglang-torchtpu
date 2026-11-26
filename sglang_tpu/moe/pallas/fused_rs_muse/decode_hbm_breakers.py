@@ -293,6 +293,179 @@ def resolve_free_and_min_p_for_batch(
     return eff_min_p, scaled_rows, eff_max_w, scaled_min_slot
 
 
+_NONUNIFORM_FREE_PRESETS: dict[
+    str, tuple[tuple[int, float, int, float], tuple[int, float, int, float], int]
+] = {
+    # (boundary: rows, max_w, min_slot, min_p), (middle: rows, max_w, min_slot, min_p), boundary_n
+    "mid_f10p82": ((6, 0.18, 2, 0.88), (10, 0.22, 1, 0.82), 5),
+    "mid_f10p84": ((6, 0.18, 2, 0.88), (10, 0.22, 1, 0.84), 5),
+    "mid_f9p84": ((6, 0.18, 2, 0.88), (9, 0.20, 1, 0.84), 5),
+    # Pareto-optimal profiles: low row-cap (3..6) targets wasteful few-row experts
+    # while higher free_max_w + min_p preserve router weight mass & top-2 slots.
+    "pareto_f4w22p88": ((6, 0.18, 2, 0.88), (4, 0.22, 2, 0.88), 5),
+    "pareto_f6w24p84": ((6, 0.18, 2, 0.88), (6, 0.24, 1, 0.84), 5),
+    "pareto_f4w24p86": ((4, 0.22, 2, 0.88), (4, 0.24, 2, 0.86), 5),
+    "pareto_f3w28p88": ((4, 0.22, 2, 0.88), (3, 0.28, 2, 0.88), 5),
+}
+
+_NONUNIFORM_FREE_LAYER_PRESETS: dict[str, str] = {
+    # 3-tier profiles aligned to 62L Muse Spark entropy:
+    # boundary (0..5,56..61) | skewed middle (6..20,26,51..55) | broad flat middle (21..25,27..50)
+    "pareto_3tier_safe": (
+        "default=6:0.18:2:0.88;6-20,26,51-55=4:0.22:2:0.88;21-25,27-50=4:0.24:2:0.86"
+    ),
+    "pareto_3tier_fast": (
+        "default=6:0.18:2:0.88;6-20,26,51-55=4:0.22:2:0.88;21-25,27-50=3:0.28:2:0.88"
+    ),
+}
+
+
+def _parse_free4(tok: str) -> tuple[int, float, int, float]:
+    parts = [p.strip() for p in tok.split(":")]
+    if len(parts) != 4:
+        raise ValueError(f"Expected 4 colon-separated fields in {tok!r}")
+    return int(parts[0]), float(parts[1]), int(parts[2]), float(parts[3])
+
+
+def _parse_layer_selector(sel: str) -> frozenset[int]:
+    layers: set[int] = set()
+    for part in sel.split(","):
+        item = part.strip().lstrip("Ll")
+        if not item:
+            continue
+        if "-" in item:
+            lo_s, sep, hi_s = item.partition("-")
+            if not sep or not lo_s.isdigit() or not hi_s.isdigit():
+                raise ValueError(f"Invalid layer range {part!r}")
+            lo, hi = int(lo_s), int(hi_s)
+            if hi < lo:
+                raise ValueError(f"Invalid descending layer range {part!r}")
+            layers.update(range(lo, hi + 1))
+        else:
+            if not item.isdigit():
+                raise ValueError(f"Invalid layer index {part!r}")
+            layers.add(int(item))
+    if not layers:
+        raise ValueError(f"Empty layer selector {sel!r}")
+    return frozenset(layers)
+
+
+def parse_nonuniform_free_spec(
+    spec: str,
+) -> (
+    tuple[tuple[int, float, int, float], tuple[int, float, int, float], int]
+    | dict[str, object]
+    | None
+):
+    """Parse ``SGLANG_TPU_MUSE_DECODE_NONUNIFORM_FREE`` preset, ``b|m[@bn]``, or per-layer rules.
+
+    Format:
+      - ``""`` / ``"off"`` / ``"0"`` -> ``None`` (uniform fallback)
+      - 2-tier preset name (``"mid_f10p82"``, ``"pareto_f4w22p88"``, etc.)
+      - 3-tier preset name (``"pareto_3tier_safe"``, ``"pareto_3tier_fast"``)
+      - Explicit 2-tier ``"b_rows:b_w:b_ms:b_mp|m_rows:m_w:m_ms:m_mp[@bn]"``
+      - Explicit multi-rule ``"default=r:w:ms:mp;6-20,26=r:w:ms:mp;21-50=r:w:ms:mp"``
+    """
+    raw = str(spec or "").strip()
+    if not raw or raw.lower() in ("0", "false", "no", "off", "none"):
+        return None
+    key = raw.lower()
+    preset = _NONUNIFORM_FREE_PRESETS.get(key)
+    if preset is not None:
+        return preset
+    scale_62 = key in _NONUNIFORM_FREE_LAYER_PRESETS
+    rule_str = _NONUNIFORM_FREE_LAYER_PRESETS[key] if scale_62 else raw
+    if "=" in rule_str:
+        default_cfg: tuple[int, float, int, float] | None = None
+        rules: list[tuple[frozenset[int], tuple[int, float, int, float]]] = []
+        for clause in rule_str.split(";"):
+            clause = clause.strip()
+            if not clause:
+                continue
+            sel_s, _, cfg_s = clause.partition("=")
+            sel_k = sel_s.strip().lower()
+            cfg4 = _parse_free4(cfg_s.strip())
+            if sel_k in ("default", "*"):
+                default_cfg = cfg4
+            else:
+                rules.append((_parse_layer_selector(sel_k), cfg4))
+        if default_cfg is None:
+            raise ValueError(
+                f"Multi-rule SGLANG_TPU_MUSE_DECODE_NONUNIFORM_FREE={raw!r} "
+                "must include a 'default=rows:max_w:min_slot:min_p' clause"
+            )
+        return {"default": default_cfg, "rules": rules, "scale_62": scale_62}
+
+    body, _, bn_str = raw.partition("@")
+    boundary_n = max(1, int(bn_str)) if bn_str.strip() else 5
+    b_raw, sep, m_raw = body.partition("|")
+    if not sep:
+        raise ValueError(
+            f"Invalid SGLANG_TPU_MUSE_DECODE_NONUNIFORM_FREE={raw!r}; "
+            "expected preset, 'b|m[@bn]', or 'default=...;layers=...'"
+        )
+    return _parse_free4(b_raw), _parse_free4(m_raw), boundary_n
+
+
+def resolve_nonuniform_free_for_layer(
+    layer_idx: int,
+    num_layers: int,
+    batch_size: int,
+    *,
+    min_p_topk: float,
+    free_rows: int,
+    free_max_w: float,
+    free_min_slot: int,
+    parse_free_spec_fn,
+    ep: int = 8,
+    scale_mode: str | None = None,
+    spec: str | None = None,
+) -> tuple[float, int, float, int]:
+    """Resolve ``(min_p_topk, free_rows, free_max_w, free_min_slot)`` for one MoE layer.
+
+    When ``SGLANG_TPU_MUSE_DECODE_NONUNIFORM_FREE`` is unset/empty, delegates
+    identically to ``resolve_free_and_min_p_for_batch``. Otherwise applies
+    2-tier boundary/middle presets, 3-tier entropy presets, or explicit
+    per-layer range rules, with ``ep``-aware clamping at ``B <= 16``
+    (``<= 1`` row on ``EP=16``, ``<= 2`` on ``EP=8``).
+    """
+    eff_spec = (
+        str(_env_raw("SGLANG_TPU_MUSE_DECODE_NONUNIFORM_FREE", "")).strip()
+        if spec is None
+        else str(spec).strip()
+    )
+    parsed = parse_nonuniform_free_spec(eff_spec)
+    if parsed is None or batch_size >= 128:
+        return resolve_free_and_min_p_for_batch(
+            batch_size,
+            min_p_topk=min_p_topk,
+            free_rows=free_rows,
+            free_max_w=free_max_w,
+            free_min_slot=free_min_slot,
+            parse_free_spec_fn=parse_free_spec_fn,
+            scale_mode=scale_mode,
+        )
+    if isinstance(parsed, dict):
+        eff_idx = (
+            int(round(layer_idx * 61.0 / max(1, num_layers - 1)))
+            if parsed.get("scale_62") and num_layers != 62
+            else int(layer_idx)
+        )
+        chosen = parsed["default"]
+        for lset, cfg4 in parsed["rules"]:  # type: ignore[union-attr]
+            if eff_idx in lset:
+                chosen = cfg4
+        t_rows, t_w, t_ms, t_mp = chosen  # type: ignore[misc]
+    else:
+        b_cfg, m_cfg, bn = parsed
+        is_boundary = (layer_idx <= bn) or (layer_idx >= max(bn + 1, num_layers - 1 - bn))
+        t_rows, t_w, t_ms, t_mp = b_cfg if is_boundary else m_cfg
+    s_rows, s_ms = scale_free_expert_for_batch(t_rows, t_ms, batch_size, mode=scale_mode)
+    if batch_size <= 16 and s_rows > 0:
+        s_rows = min(s_rows, 1 if ep >= 16 else 2)
+    return t_mp, s_rows, t_w, s_ms
+
+
 def read_sparse_v2_env_overrides() -> SparseV2EnvOverrides:
     """Read granular ``SparseDecodeV2Config`` overrides from environment."""
     m_bkt_str = str(_env_raw("SGLANG_TPU_MUSE_KERNEL_DECODE_M_BUCKETS", ""))
