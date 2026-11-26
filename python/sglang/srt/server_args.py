@@ -899,6 +899,18 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
 
 ZMQ_TCP_PORT_DELTA = 233
 DP_ATTENTION_HANDSHAKE_PORT_DELTA = 13
+# Default nccl_port = --port + this. Servers sharing a host have distinct --port
+# by construction, so they get distinct rendezvous ports; above the ZMQ TCP block
+# (--port + 233 .. + 239 + dp ranks) so the two never meet.
+NCCL_PORT_DELTA = 2 * ZMQ_TCP_PORT_DELTA
+
+
+def default_nccl_port(port: int) -> int:
+    """The nccl_port a server at `port` uses when --nccl-port is not given."""
+    nccl_port = port + NCCL_PORT_DELTA
+    if nccl_port > 65535:
+        nccl_port = port - NCCL_PORT_DELTA
+    return nccl_port
 
 
 @dataclasses.dataclass
@@ -941,8 +953,12 @@ class PortArgs:
     ) -> PortArgs:
         cfg = resolving_view(server_args)
         if server_args.nccl_port is None:
-            # The scheduler child binds this later; keep it out of the ephemeral range.
-            nccl_port = get_free_port_below_ephemeral()
+            # Derived from --port, so servers started together on one host never
+            # draw the same port; a random port below the ephemeral range when
+            # that one is taken. The scheduler child binds it later.
+            nccl_port = get_free_port_below_ephemeral(
+                preferred=default_nccl_port(server_args.port)
+            )
         else:
             nccl_port = server_args.nccl_port
 
