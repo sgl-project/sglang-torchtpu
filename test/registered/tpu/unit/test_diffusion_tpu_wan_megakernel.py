@@ -435,6 +435,54 @@ class TestKernelInterpret(CustomTestCase):
                     got = _interpret(case, dataclasses.replace(base, **opts))
                     np.testing.assert_array_equal(got, want)
 
+    def test_more_layout_options(self):
+        """Tiling.mask_scores, zero_ahead and semaphore_checks lay the same
+        arithmetic out differently: on every softmax path the output is the
+        default layout's bit for bit, alone, together and beside
+        pipelined_epilogues. 512 rows: a full key tile before the masked one; 256
+        rows: the masked key tile alone."""
+        options = (
+            {"mask_scores": True},
+            {"zero_ahead": True},
+            # (interpret mode keeps its checks: semaphore_checks rides along)
+            {"semaphore_checks": False},
+            {
+                "mask_scores": True,
+                "zero_ahead": True,
+                "pipelined_epilogues": True,
+            },
+        )
+        cases = {
+            "fixed": _case(qk_scale=0.25),
+            "fixed, two key tiles": _case(qk_scale=0.25, rows=512),
+            "rowfix": _case(qk_scale=3.0),
+            "online rerun": _case(
+                rows=512, craft=_all_rows_far, rope=False, e_rows={ref.GATE: 50.0}
+            ),
+        }
+        base = dataclasses.replace(_tiling(), cols=128)
+        for name, case in cases.items():
+            want = _interpret(case, base)
+            self.assertTrue(np.isfinite(want).all())
+            for opts in options:
+                with self.subTest(name, **opts):
+                    got = _interpret(case, dataclasses.replace(base, **opts))
+                    np.testing.assert_array_equal(got, want)
+
+    def test_masked_scores_each_variant(self):
+        """mask_scores with every softmax variant forced: the fixed path's masked
+        tile subtracts its column, rowfix and online keep the select; each gives
+        the default layout's output bit for bit (rowfix and online subtract an
+        offset after the scale, where a column would change the rounding)."""
+        case = _case(qk_scale=3.0)
+        base = dataclasses.replace(_tiling(), cols=128)
+        ms = dataclasses.replace(base, mask_scores=True)
+        for variant in ("fixed", "rowfix", "online"):
+            with self.subTest(variant=variant):
+                np.testing.assert_array_equal(
+                    _interpret(case, ms, variant), _interpret(case, base, variant)
+                )
+
     def test_pipelined_epilogues_dma_orders(self):
         """The pipelined streams with one and with several tiles a stream (cols 512:
         one phase C projection tile, two MLP up tiles; cols 128: four and eight), in
@@ -779,6 +827,32 @@ class TestCrossKeys(CustomTestCase):
         self.assertEqual(int(keys[0]), 512)
         self.assertEqual(w.unique().tolist(), [1.0])
 
+    def test_nonblocking_upload(self):
+        """nonblocking: the same keys and weights, and no blocking upload
+        (``torch.tensor(..., device=...)``): the counts go up by a non-blocking
+        copy of a host tensor."""
+        import torch
+
+        from sglang_tpu.multimodal_gen.wan_megakernel import pack
+
+        real = torch.tensor
+        for n in (40, 98, 300):
+            k, v = self.kv(n)
+            want = pack.cross_keys(k, v, (64, 128, 256))
+            calls = []
+
+            def counted(*args, **kwargs):
+                calls.append("device" in kwargs)
+                return real(*args, **kwargs)
+
+            with unittest.mock.patch.object(torch, "tensor", counted):
+                got = pack.cross_keys(k, v, (64, 128, 256), nonblocking=True)
+            with self.subTest(n=n):
+                self.assertEqual(calls, [False])
+                for a, b in zip(got, want):
+                    self.assertEqual((a.dtype, a.shape), (b.dtype, b.shape))
+                    self.assertTrue(torch.equal(a, b))
+
 
 @unittest.skipUnless(_HAS_JAX, _SKIP)
 class TestTiling(CustomTestCase):
@@ -793,6 +867,16 @@ class TestTiling(CustomTestCase):
             Tiling(pipelined_epilogues=True, dma_bounds_checks=False).opt_suffix(),
             "_pe_nb",
         )
+        more = Tiling(
+            pipelined_epilogues=True,
+            dma_bounds_checks=False,
+            semaphore_checks=False,
+            mask_scores=True,
+            zero_ahead=True,
+        )
+        self.assertEqual(more.opt_suffix(), "_pe_nb_ns_ms_za")
+        for devices in (4, 2, 1):
+            more.check(32768 // devices, devices, 5120, 13824, 40)
 
     def test_for_tokens(self):
         """Rows a device and attention tiles a token count runs with."""

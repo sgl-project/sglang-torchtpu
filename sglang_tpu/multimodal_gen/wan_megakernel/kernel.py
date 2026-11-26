@@ -779,7 +779,16 @@ def _kernel(
                     )
                     * scale_l2
                 )
-                if masked is not None:
+                if masked is not None and tiling.mask_scores and variant == "fixed":
+                    # A per-key column: s - 0 is s, s - inf is -inf (scores are
+                    # finite), whose exp2 is the select's 0. The fixed path only:
+                    # there exp2 takes s as is, so a fused multiply-add of the
+                    # scale and the column rounds once, as the product alone does;
+                    # rowfix and online subtract an offset next, which the select
+                    # keeps a separate rounding of the scaled score.
+                    kcol = lax.broadcasted_iota(jnp.int32, (SUB, 1), 0) + masked
+                    s = s - jnp.where(kcol < valid, 0.0, jnp.inf)
+                elif masked is not None:
                     kidx = lax.broadcasted_iota(jnp.int32, s.shape, 0) + masked
                     s = jnp.where(kidx < valid, s, _MASK)
                 vs = v[slot, pl.ds(start, SUB), :]
@@ -802,14 +811,16 @@ def _kernel(
                     vs, p_.astype(BF16), FIRST, preferred_element_type=F32
                 )
 
-            def attend(lh, variant, q, m0):
+            def attend(lh, variant, q, m0, zero=True):
                 """The key tiles of real rows only against the query tile in ``q``, one
                 softmax variant, from a fresh state whose running max is ``m0`` (the
                 fixed or per-row offset: the state is then exactly an online one).
-                Starts the edge tile's copy; ``edge`` finishes it."""
+                Starts the edge tile's copy; ``edge`` finishes it. ``zero`` False: the
+                sum and output are already zero (zero_ahead)."""
                 m_run[0:1, :] = m0
-                l_run[...] = jnp.zeros(l_run.shape, F32)
-                o_run[...] = jnp.zeros(o_run.shape, F32)
+                if zero:
+                    l_run[...] = jnp.zeros(l_run.shape, F32)
+                    o_run[...] = jnp.zeros(o_run.shape, F32)
                 for c in kv_fetch(lh, 0, 0):
                     c.start()
 
@@ -918,7 +929,13 @@ def _kernel(
 
                     @pl.when(fixed_ok)
                     def _fixed():
-                        attend(lh, "fixed", q, jnp.zeros(bound_row.shape, F32))
+                        attend(
+                            lh,
+                            "fixed",
+                            q,
+                            jnp.zeros(bound_row.shape, F32),
+                            zero=not tiling.zero_ahead,
+                        )
                         edge(lh, q, "fixed")
                         # Real rows only: padding rows' fixed sums are >= 2^-109 a
                         # key, their outputs finite.
@@ -967,6 +984,11 @@ def _kernel(
                     out_send(it - 2, slot, wait_only=True)
 
                 stage[slot] = (o_run[...] / (l_run[0:1, :] * V_SCALE)).T.astype(BF16)
+                if tiling.zero_ahead and softmax == "auto":
+                    # The next item's sum and output, zeroed beside the output's
+                    # transposes (ahead of the send, which orders the stores).
+                    l_run[...] = jnp.zeros(l_run.shape, F32)
+                    o_run[...] = jnp.zeros(o_run.shape, F32)
                 out_send(it, slot, wait_only=False)
                 return carry
 
@@ -993,6 +1015,9 @@ def _kernel(
                     pl.when(owner != me)(remote.start)
 
             items = LH * q_tiles
+            if tiling.zero_ahead and softmax == "auto":  # the first item's state
+                l_run[...] = jnp.zeros(l_run.shape, F32)
+                o_run[...] = jnp.zeros(o_run.shape, F32)
             lax.fori_loop(0, items, item, None)
             for back in range(min(2, items), 0, -1):
                 out_send(items - back, (items - back) % 2, wait_only=True)
@@ -1685,6 +1710,7 @@ def stack(
             collective_id=_COLLECTIVE_ID if P > 1 else None,
             vmem_limit_bytes=tiling.vmem_limit_bytes,
             **({} if tiling.dma_bounds_checks else {"disable_bounds_checks": True}),
+            **({} if tiling.semaphore_checks else {"disable_semaphore_checks": True}),
         ),
         interpret=interpret,
         name="wan_stack",

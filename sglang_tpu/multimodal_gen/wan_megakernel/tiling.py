@@ -60,12 +60,32 @@ class Tiling:
     # Mosaic's DMA bounds checks (a trap on an out-of-bounds copy, scalar work at
     # every copy the kernel starts or waits). Off: the same copies without them.
     dma_bounds_checks: bool = True
+    # Mosaic's semaphore checks. Off: the same waits and signals without them.
+    semaphore_checks: bool = True
+    # A masked attention sub-block (the key tile holding the last real row) on
+    # the fixed path (the path ~98% of items take) subtracts a per-key column
+    # from its scores, 0 at a real key and +inf at a padding key, instead of
+    # selecting its scores: a real score is unchanged (s - 0 is s, signed zeros
+    # included, also fused with the scale's multiply), a padding one -inf, whose
+    # exp2 is the select's 0. The same probabilities, so the same bits. The
+    # rowfix and online paths keep the select.
+    mask_scores: bool = False
+    # Each attention item's running sum and output are zeroed in the item
+    # before's epilogue, after its output is read and ahead of its send, where
+    # the stores issue beside the output's transposes, instead of at the item's
+    # start ahead of its first key tile (the first item's before the item loop).
+    # The fixed path then starts from the same zero state: the same bits.
+    zero_ahead: bool = False
     vmem_limit_bytes: int = 64 * 1024 * 1024
 
     def opt_suffix(self) -> str:
         """The op name's mark of the exact layout options in effect."""
-        return ("_pe" if self.pipelined_epilogues else "") + (
-            "" if self.dma_bounds_checks else "_nb"
+        return (
+            ("_pe" if self.pipelined_epilogues else "")
+            + ("" if self.dma_bounds_checks else "_nb")
+            + ("" if self.semaphore_checks else "_ns")
+            + ("_ms" if self.mask_scores else "")
+            + ("_za" if self.zero_ahead else "")
         )
 
     def row_unit(self) -> int:

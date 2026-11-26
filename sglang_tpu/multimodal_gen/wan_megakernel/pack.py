@@ -240,7 +240,10 @@ def cross_kv(
 
 @torch.no_grad()
 def cross_keys(
-    k2: torch.Tensor, v2: torch.Tensor, counts: tuple[int, ...]
+    k2: torch.Tensor,
+    v2: torch.Tensor,
+    counts: tuple[int, ...],
+    nonblocking: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``kernel.stack``'s ``keys`` (``[1]`` int32) and ``key_weights`` (``[T, 1]``
     f32) for ``k2, v2 [L, heads, T, D]``.
@@ -256,7 +259,9 @@ def cross_keys(
     ``p`` does, so the result differs from the all-rows one only by the f32
     rounding of the sums. Otherwise they share it equally. With ``keys = T``
     every weight is 1. Rows are compared exactly, so this holds for any K/V; it
-    runs on the device (no host sync).
+    runs on the device (no host sync). ``nonblocking``: the key counts go up
+    without waiting for queued device work (on torch_tpu a blocking upload
+    returns only once the queue has drained); the same values either way.
     """
     T = k2.shape[2]
     dev = k2.device
@@ -264,7 +269,12 @@ def cross_keys(
     differs = (k2 != k2[:, :, -1:]).any(dim=-1) | (v2 != v2[:, :, -1:]).any(dim=-1)
     differs = differs.reshape(-1, T).any(dim=0)
     n = torch.where(differs, idx, -1).max() + 1  # the repeated last row's first row
-    sizes = torch.tensor([c for c in counts if c < T] + [T], device=dev)
+    if nonblocking:
+        sizes = torch.tensor([c for c in counts if c < T] + [T]).to(
+            dev, non_blocking=True
+        )
+    else:
+        sizes = torch.tensor([c for c in counts if c < T] + [T], device=dev)
     keys = torch.where(sizes > n, sizes, T).min()
     m = T - n  # rows the copies stand for
     bit = torch.arange(T.bit_length(), device=dev)
