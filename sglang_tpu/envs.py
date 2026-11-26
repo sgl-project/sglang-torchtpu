@@ -474,6 +474,9 @@ class TpuEnvs:
     # DeepSeek-V4.1 SWA publish: sort and pair a forward's write records once,
     # in its first layer, instead of in every layer.
     SGLANG_TPU_DSV41_SWA_PUBLISH_PLAN = EnvBool(False)
+    # Use native scatter for staged request-window writes in place of the
+    # legacy SWA writer. Opt in per deployment after checking model outputs.
+    SGLANG_TPU_DSV41_SWA_WINDOW_SCATTER = EnvBool(False)
     # DeepSeek-V4.1 request window: size an extend's SWA row moves to the rank's
     # request slots instead of the fixed extend batch (torch_compile_max_bs).
     SGLANG_TPU_DSV41_SWA_PLAN_TRIM = EnvBool(False)

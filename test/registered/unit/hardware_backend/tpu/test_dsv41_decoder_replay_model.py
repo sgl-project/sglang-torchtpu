@@ -932,6 +932,29 @@ class TestDecoderReplayModelRequestWindow(TestDecoderReplayModel):
 
     window = True
 
+    def test_window_writer_dispatch(self):
+        from sglang_tpu.envs import envs as tpu_envs
+
+        flag = tpu_envs.SGLANG_TPU_DSV41_SWA_WINDOW_SCATTER
+        self.assertIs(flag.default, False)
+        for window, enabled in ((True, False), (True, True), (False, True)):
+            with (
+                self.subTest(window=window, scatter=enabled),
+                flag.override(enabled),
+                patch.object(
+                    RefCsa2,
+                    "publish_window_scatter",
+                    wraps=RefCsa2.publish_window_scatter,
+                ) as scatter,
+                patch.object(
+                    RefCsa2, "publish_swa", wraps=RefCsa2.publish_swa
+                ) as legacy,
+            ):
+                run = _Run(self, mode="full", window=window)
+                run.forward([_chunk(1, 0, 128)])
+                self.assertEqual(scatter.called, window and enabled)
+                self.assertEqual(legacy.called, not (window and enabled))
+
 
 class TestDecoderReplayModelPromptRule(TestDecoderReplayModel):
     """The prompt-tail rule (each prompt's last window; vLLM-TorchTPU CED)."""

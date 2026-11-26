@@ -2278,6 +2278,8 @@ class DSV41TPUAttnBackend(AttentionBackend):
 
         Core passes save_kv_cache=False with k = kv because prepare_mqa_qkv
         returned kv; this backend always owns the SWA write."""
+        from sglang_tpu.envs import envs as tpu_envs
+
         if not q.shape[0]:
             return q.new_empty(q.shape[0], q.shape[1], layer.v_head_dim)
         metadata = self.get_or_create_metadata(forward_batch)
@@ -2295,6 +2297,7 @@ class DSV41TPUAttnBackend(AttentionBackend):
             history = swa.reshape(-1, kv.shape[1])[plan.history_src]
             kv = torch.cat((kv, history, kv[plan.commit_token]))
             records = torch.cat((records, plan.history_dst, plan.commit_dst))
+        if plan is not None and tpu_envs.SGLANG_TPU_DSV41_SWA_WINDOW_SCATTER.get():
             updated = self.csa2_ops.publish_window_scatter(swa, records, kv)
         else:
             updated = self._publish_swa(metadata, swa, records, kv)
