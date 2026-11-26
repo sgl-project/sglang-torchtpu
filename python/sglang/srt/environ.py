@@ -709,6 +709,18 @@ class Envs:
     SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION = EnvInt(4096)
     SGLANG_MAX_NEW_TOKENS_LIMIT = EnvInt(None)
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
+    # Prefill chunk size for a pass whose head request (the continuing chunked
+    # request, else the first waiting one) has at most this many tokens left to
+    # prefill (a cached prefix counts once matched: always for the continuing
+    # request, for a waiting one only where the policy pre-matches prefixes);
+    # 0 keeps --chunked-prefill-size for every pass. Lets a large chunk
+    # serve long prompts while short prompts finish in smaller forwards.
+    SGLANG_SHORT_HEAD_PREFILL_CHUNK_SIZE = EnvInt(0)
+    # A lone head request (nothing else waiting) with at most this many tokens
+    # left gets the short chunk; values below the short chunk size (0 included)
+    # mean the short chunk size itself. A larger value sends a request just over
+    # one short chunk through short chunks instead of one padded full chunk.
+    SGLANG_SHORT_HEAD_PREFILL_MAX_TOKENS = EnvInt(0)
     # Window for the token-weighted recent cache-hit rate used to estimate
     # waiting-queue prefill load.
     SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS = EnvFloat(15.0)

@@ -4917,6 +4917,28 @@ class Scheduler(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             ).release_state_slot(req)
 
+    def _short_head_chunk_size(self, chunked_prefill_size: Optional[int]):
+        """Shrink this pass's chunk when its head request is short (see the
+        SGLANG_SHORT_HEAD_PREFILL_* envs)."""
+        short = envs.SGLANG_SHORT_HEAD_PREFILL_CHUNK_SIZE.get()
+        if chunked_prefill_size is None or not 0 < short < chunked_prefill_size:
+            return chunked_prefill_size
+        head = self.chunked_req
+        others = len(self.waiting_queue)
+        if head is None:
+            if not self.waiting_queue:
+                return chunked_prefill_size
+            head = self.waiting_queue[0]
+            others -= 1
+        left = len(head.origin_input_ids) + len(head.output_ids)
+        left -= head.prefix_len
+        # The larger limit only for a lone request: with others waiting, the
+        # full chunk fills with them instead of padding.
+        limit = short
+        if not others:
+            limit = max(short, envs.SGLANG_SHORT_HEAD_PREFILL_MAX_TOKENS.get())
+        return short if left <= limit else chunked_prefill_size
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -5005,6 +5027,7 @@ class Scheduler(
             dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
+        chunked_prefill_size = self._short_head_chunk_size(chunked_prefill_size)
 
         # Prefill policy
         # Get BLOCK_M from the backend for tile-budget admission logic
