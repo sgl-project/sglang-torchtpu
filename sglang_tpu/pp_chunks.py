@@ -104,6 +104,8 @@ class StepCostModel:
     granularity: int
     # (pairs, bq, bkv) the attention kernel schedules per step, or None.
     schedule: tuple[int, int, int] | None = None
+    # Whether the quarter-step floor counts the tokens already in the step.
+    floor_counts_step: bool = False
 
     @classmethod
     def fit(
@@ -119,7 +121,9 @@ class StepCostModel:
         slowest ladder entry per bucket and the largest slope. The target is
         a prefix-free top-bucket step plus ``slack``; with
         ``target_ref_tokens``, the step's linear part runs at that bucket's
-        per-token cost, which also counts its fixed cost ``top / ref`` times."""
+        per-token cost, which also counts its fixed cost ``top / ref`` times.
+        A reference below the top bucket also makes the quarter-step floor
+        count the step's tokens (see ``chunk``)."""
         if slack < 0:
             raise ValueError(f"the chunk slack must not be negative: {slack}")
         if not stage_samples:
@@ -159,6 +163,7 @@ class StepCostModel:
         linear = {b: max(ladder[b] for ladder in ladders) for b in buckets}
         attn = max(slopes)
         top = buckets[-1]
+        floor_counts_step = target_ref_tokens is not None and target_ref_tokens < top
         if target_ref_tokens is None:
             target_ref_tokens = top
         elif not is_target_ref(target_ref_tokens, buckets):
@@ -170,7 +175,13 @@ class StepCostModel:
             linear[target_ref_tokens] * (top / target_ref_tokens) + attn * top * top / 2
         )
         return cls(
-            buckets, linear, attn, full_step * (1.0 + slack), int(granularity), schedule
+            buckets,
+            linear,
+            attn,
+            full_step * (1.0 + slack),
+            int(granularity),
+            schedule=schedule,
+            floor_counts_step=floor_counts_step,
         )
 
     def pairs(self, chunk: int, prefix: int) -> int:
@@ -201,17 +212,20 @@ class StepCostModel:
         ``step_tokens`` tokens (``step_pairs`` chunk*prefix products and
         ``step_squares`` squared chunk lengths) within the target. A chunk
         that does not finish the request leaves the step total on a granule
-        multiple and, when the step has the room, brings the step to at least
-        a quarter of a step, since a run of tiny steps costs more than the
-        balance it buys; in a step that already holds a quarter step it takes
-        only what the target leaves;
+        multiple and is at least a quarter of a step when the step has the
+        room, since a run of tiny steps costs more than the balance it buys;
+        with ``floor_counts_step`` the floor applies to the step total
+        instead, so in a step that already holds a quarter step the chunk
+        takes only what the target leaves;
         ``step_limit`` keeps the step within a smaller bucket, and with a
         schedule capacity the chunk's attention pairs must fit beside the
         ``step_schedule`` pairs already in the step. 0 when nothing
         fits."""
         best = 0
         attn = self.attn_ms_per_token_pair
-        quarter = self.buckets[-1] // 4
+        floor = self.buckets[-1] // 4
+        if self.floor_counts_step:
+            floor -= step_tokens
         for bucket in self.buckets:
             if step_limit is not None and bucket > step_limit:
                 continue
@@ -228,7 +242,7 @@ class StepCostModel:
                     fit, int(-prefix + math.sqrt(prefix * prefix + 2 * spare / attn))
                 )
             if fit < remaining:
-                fit = min(max(fit, quarter - step_tokens), remaining, room)
+                fit = min(max(fit, floor), remaining, room)
             if fit < remaining:
                 total = step_tokens + fit
                 fit = total - total % self.granularity - step_tokens
@@ -252,6 +266,8 @@ class StepCostModel:
         if self.schedule is not None:
             pairs, bq, bkv = self.schedule
             text += f", at most {pairs} attention pairs ({bq}x{bkv}) per step"
+        if self.floor_counts_step:
+            text += ", quarter-step floor counts the step's tokens"
         return text
 
 

@@ -252,6 +252,9 @@ instead of the top bucket's, so a kernel speedup confined to the larger buckets 
 the chunks behind long prefixes while it leaves the attention slope alone. It
 counts the bucket's fixed per-step cost `top / ref` times, so it is paired with
 a smaller slack. Startup fails on every rank if the ranks disagree on it.
+Below the top bucket it also makes the quarter-step chunk floor count the tokens
+already in the step, so a first chunk behind another request's last chunk takes
+only what the target leaves.
 
 ## Notes
 

@@ -2,6 +2,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+from dataclasses import replace
+
 import pytest
 
 from sglang.srt.runtime_context import get_context
@@ -165,8 +167,34 @@ def test_chunk_behind_a_prefix_shrinks_to_a_bucket_that_fits():
     assert model.chunk(16384, 5000, 0, 0.0, 0.0) == 5000
 
 
-def test_a_clipped_chunk_brings_the_step_to_a_quarter_step():
+def test_a_clipped_chunk_is_at_least_a_quarter_step():
     model = _model(granularity=2048)
+    # Very deep in a prompt the time budget would allow under 2K tokens.
+    assert model.chunk(200 * 1024, 16384, 0, 0.0, 0.0) == 4096
+    # The floor never exceeds the room left in the step.
+    assert model.chunk(200 * 1024, 16384, 14336, 0.0, 0.0) == 2048
+    assert model.chunk(200 * 1024, 16384, 16384, 0.0, 0.0) == 0
+    # Under the top-bucket target the floor ignores the step's tokens.
+    assert not model.floor_counts_step
+    deep = 600 * 1024
+    assert model.chunk(deep, 16384, 2048, 0.0, 2048.0**2) == 4096
+
+
+def test_only_a_reference_target_makes_the_floor_count_the_step():
+    def counts(ref):
+        return StepCostModel.fit([_stage()], 0.1, 4096, target_ref_tokens=ref)
+
+    assert not counts(None).floor_counts_step
+    assert not counts(16384).floor_counts_step
+    assert counts(4096).floor_counts_step
+    assert counts(8192).floor_counts_step
+    note = "quarter-step floor counts the step's tokens"
+    assert note in counts(4096).describe()
+    assert note not in counts(None).describe()
+
+
+def test_a_clipped_chunk_brings_the_step_to_a_quarter_step():
+    model = replace(_model(granularity=2048), floor_counts_step=True)
     deep = 600 * 1024  # the time budget alone allows under a granule here
     assert model.chunk(deep, 16384, 0, 0.0, 0.0) == 4096
     # The floor counts the tokens already in the step.
@@ -190,6 +218,10 @@ def test_a_chunk_behind_another_requests_last_chunk_keeps_the_step_on_target():
     ladder = [15.6, 19.4, 28.8, 38.5, 48.6, 59.4, 69.0, 82.0, 91.8]
     model = StepCostModel(buckets, dict(zip(buckets, ladder)), 8.755e-8, 104.2, 1024)
     step = (3072, 3072 * 128000.0, 3072.0**2)
+    # A floor that ignores the step's tokens raises the chunk to a quarter
+    # step and takes the step past the target.
+    assert model.chunk(117760, 13312, *step) == 2048
+    model = replace(model, floor_counts_step=True)
     chunk = model.chunk(117760, 13312, *step)
     assert chunk == 1024
     pairs, squares = step[1] + chunk * 117760.0, step[2] + chunk**2

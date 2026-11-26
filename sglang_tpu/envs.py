@@ -425,7 +425,8 @@ class TpuEnvs:
     SGLANG_TPU_PP_DYNAMIC_CHUNKS = EnvBool(True)
     SGLANG_TPU_PP_CHUNK_SLACK = EnvFloat(0.1)
     # A profiled bucket whose per-token cost sizes the step target; unset sizes it
-    # from the top bucket.
+    # from the top bucket. A bucket below the top one also makes the quarter-step
+    # chunk floor count the tokens already in the step.
     SGLANG_TPU_PP_CHUNK_TARGET_REF_TOKENS = EnvInt(None)
 
     # PD disaggregation tracing
