@@ -2650,3 +2650,231 @@ def test_d_mxu_combine_unwritten_nan_padding_and_l61_active_mask():
     assert "torch.nn.functional.pad(active, (0, 128 - bs))" in integ_src
     assert "valid_mask_128 = (" in integ_src
     assert "torch.where(valid_mask_128, attn_proj, 0)" in ms_src
+
+
+def test_a3_wo_3chunk_zero_concat_parity_and_aot():
+    """Verify 3-chunk zero-concat A3 wo 0-ULP parity, DMA race freedom, fallback, and TPU7x AOT."""
+    import jax
+    import jax.numpy as jnp
+    from jax._src.pallas.mosaic.interpret import interpret_pallas_call as _interp_mod
+    from jax.experimental import pallas as pl
+    from jax.experimental import topologies
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    from sglang_tpu.muse_prefill_kernels import integration
+    from sglang_tpu.muse_prefill_kernels.attn_kernels import kernel_a3
+
+    assert tpu_envs.SGLANG_TPU_MUSE_KERNEL_A3_CCS_2CHUNK.get() is False
+
+    cpus = jax.devices("cpu")
+    tp = 8
+    if len(cpus) < tp:
+        pytest.skip(f"Requires {tp} CPU devices for TP={tp} shard_map (have {len(cpus)})")
+    mesh = Mesh(np.array(cpus[:tp]), ("model",))
+
+    real_pc = pl.pallas_call
+
+    def _race_nan_interp(*args, **kwargs):
+        kwargs["interpret"] = pltpu.InterpretParams(
+            detect_races=True, uninitialized_memory="nan"
+        )
+        return real_pc(*args, **kwargs)
+
+    # 1. Bit-exact 0-ULP parity & zero DMA races across straddling/multi-tile 3-chunk splits.
+    k_loc = 256
+    n_dim = 2048
+    rng = np.random.default_rng(4679)
+    with (
+        mock.patch(
+            "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+        ),
+        tpu_info_for_cpu_export(),
+        mock.patch.object(pl, "pallas_call", _race_nan_interp),
+        jax.default_device(cpus[0]),
+    ):
+        for chunks_3, stage_mode, bn_2k in (
+            ((128, 192, 192), 0, False),
+            ((128, 192, 192), 1, True),
+            ((128, 192, 192), 2, False),
+            ((192, 128, 320), 1, True),
+            ((128, 128, 128), 1, False),
+        ):
+            c0, c1, c2 = chunks_3
+            _interp_mod.reset_global_state() if hasattr(_interp_mod, "reset_global_state") else None
+            q0_j = jnp.array(rng.uniform(-4.0, 4.0, (tp, tp, c0, k_loc)).astype(np.float32)).astype(
+                jnp.float8_e4m3fn
+            )
+            q1_j = jnp.array(rng.uniform(-4.0, 4.0, (tp, tp, c1, k_loc)).astype(np.float32)).astype(
+                jnp.float8_e4m3fn
+            )
+            q2_j = jnp.array(rng.uniform(-4.0, 4.0, (tp, tp, c2, k_loc)).astype(np.float32)).astype(
+                jnp.float8_e4m3fn
+            )
+            wo_j = jnp.array(rng.uniform(-0.5, 0.5, (tp, tp, k_loc, n_dim)).astype(np.float32)).astype(
+                jnp.float8_e4m3fn
+            )
+            wsc_j = jnp.array(rng.uniform(0.01, 0.05, (tp, 1, n_dim)).astype(np.float32))
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "SGLANG_TPU_MUSE_KERNEL_A3_STAGE_SENDS": str(stage_mode),
+                    "SGLANG_TPU_MUSE_KERNEL_A3_BN2048": "1" if bn_2k else "0",
+                },
+            ):
+                use_ps = stage_mode in (1, 2)
+                q_cat_f8 = np.asarray(
+                    jnp.concatenate([q0_j, q1_j, q2_j], axis=2).astype(jnp.float32)
+                )
+                wo_f8 = np.asarray(wo_j.astype(jnp.float32))
+                wsc_np = np.asarray(wsc_j)
+                t_shard = c0 + c1 + c2
+                ref_shards = []
+                for me in range(tp):
+                    acc = np.zeros((t_shard, n_dim), dtype=np.float32)
+                    for step in range(tp):
+                        peer = (
+                            me
+                            if step == 0
+                            else int(
+                                kernel_a3._a3_v16_step_peer_jax(
+                                    jnp.int32(me),
+                                    step,
+                                    tp,
+                                    step_xors=tuple(range(tp)),
+                                    parity_stagger=use_ps,
+                                )
+                            )
+                        )
+                        acc = acc + (q_cat_f8[peer, me] @ wo_f8[me, step]).astype(np.float32)
+                    scaled = acc * (wsc_np[me] * kernel_a3.STATIC_A3_ACT_SCALE)
+                    ref_shards.append(
+                        np.asarray(jnp.asarray(scaled).astype(jnp.bfloat16).astype(jnp.float32))
+                    )
+                out_ref = np.concatenate(ref_shards, axis=0)
+
+                got_fn = jax.shard_map(
+                    lambda a, b, c, w, s: kernel_a3.pallas_option3d_3chunk_async_a2a_wo_3d_static_fp8(
+                        a.squeeze(0),
+                        b.squeeze(0),
+                        c.squeeze(0),
+                        w.squeeze(0),
+                        s.squeeze(0),
+                        tp_axis="model",
+                        bn=512,
+                        stage_sends_mode=stage_mode,
+                    ),
+                    mesh=mesh,
+                    in_specs=(P("model"),) * 5,
+                    out_specs=P("model", None),
+                    check_vma=False,
+                )
+                out_got = np.asarray(got_fn(q0_j, q1_j, q2_j, wo_j, wsc_j).astype(jnp.float32))
+                races = getattr(_interp_mod, "races", None)
+                if races is not None and hasattr(races, "races_found"):
+                    assert not races.races_found, (
+                        f"DMA/VMEM data race detected for chunks={chunks_3}, ss={stage_mode}"
+                    )
+                np.testing.assert_array_equal(out_got, out_ref)
+
+    # 2. Unaligned (<64 or %64!=0) falls back cleanly to concatenated _opt_wo_kernel,
+    #    and real tpu7x=2x2x1 AOT .compile() succeeds for 16K and 24K 3-chunk CCS shapes.
+    with (
+        mock.patch(
+            "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+        ),
+        tpu_info_for_cpu_export(),
+    ):
+        topo = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x=2x2x1")
+        mesh_221 = Mesh(np.array(topo.devices).reshape(8), ("model",))
+
+        unaligned_sm = jax.shard_map(
+            lambda a, b, c, w, s: kernel_a3.pallas_option3d_3chunk_async_a2a_wo_3d_static_fp8(
+                a.squeeze(0),
+                b.squeeze(0),
+                c.squeeze(0),
+                w.squeeze(0),
+                s.squeeze(0),
+                tp_axis="model",
+            ),
+            mesh=mesh_221,
+            in_specs=(P("model"),) * 5,
+            out_specs=P("model", None),
+            check_vma=False,
+        )
+        mlir_fb = (
+            jax.jit(unaligned_sm)
+            .trace(
+                jax.ShapeDtypeStruct((8, 8, 64, 1024), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((8, 8, 32, 1024), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((8, 8, 416, 1024), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((8, 8, 1024, 8192), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((8, 1, 8192), jnp.float32),
+            )
+            .lower(lowering_platforms=("tpu",))
+            .as_text("stablehlo")
+        )
+        assert "pallas_a3_wo_v16_opt" in mlir_fb
+
+        for chunks_3, bn_2k, stage_mode in (
+            ((512, 768, 768), False, 1),
+            ((512, 768, 768), True, 1),
+            ((512, 768, 768), True, 2),
+            ((512, 1280, 1280), False, 1),
+            ((512, 1280, 1280), True, 1),
+            ((768, 1024, 1280), False, 1),
+            ((768, 1024, 1280), True, 1),
+        ):
+            c0, c1, c2 = chunks_3
+            jax.clear_caches()
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "SGLANG_TPU_MUSE_KERNEL_A3_STAGE_SENDS": str(stage_mode),
+                    "SGLANG_TPU_MUSE_KERNEL_A3_BN2048": "1" if bn_2k else "0",
+                },
+            ):
+                sm_3c = jax.shard_map(
+                    lambda a, b, c, w, s, sm=stage_mode: (
+                        kernel_a3.pallas_option3d_3chunk_async_a2a_wo_3d_static_fp8(
+                            a.squeeze(0),
+                            b.squeeze(0),
+                            c.squeeze(0),
+                            w.squeeze(0),
+                            s.squeeze(0),
+                            tp_axis="model",
+                            stage_sends_mode=sm,
+                        )
+                    ),
+                    mesh=mesh_221,
+                    in_specs=(P("model"),) * 5,
+                    out_specs=P("model", None),
+                    check_vma=False,
+                )
+                compiled = (
+                    jax.jit(sm_3c)
+                    .trace(
+                        jax.ShapeDtypeStruct((8, 8, c0, 1024), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((8, 8, c1, 1024), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((8, 8, c2, 1024), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((8, 8, 1024, 8192), jnp.float8_e4m3fn),
+                        jax.ShapeDtypeStruct((8, 1, 8192), jnp.float32),
+                    )
+                    .lower(lowering_platforms=("tpu",))
+                    .compile()
+                )
+                hlo_txt = compiled.as_text()
+                assert "pad_maximum_fusion" not in hlo_txt
+                assert f"pallas_a3_wo_3chunk_c{c0}_{c1}_{c2}" in hlo_txt
+
+    # 3. Verify integration._ops gates a3_wo_3chunk behind SGLANG_TPU_MUSE_KERNEL_A3_CCS_2CHUNK.
+    integ_src = (
+        pathlib.Path(__file__).resolve().parents[5]
+        / "sglang_tpu/muse_prefill_kernels/integration.py"
+    ).read_text()
+    assert 'export(\n                "a3_v16_wo_3chunk"' in integ_src or '"a3_v16_wo_3chunk"' in integ_src
+    assert "self.ops.a3_wo_3chunk is not None" in integ_src
+    assert "len(q_parts) == 3" in integ_src
+    assert hasattr(integration._Ops, "_fields")
+    assert "a3_wo_3chunk" in integration._Ops._fields

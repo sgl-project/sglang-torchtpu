@@ -2901,33 +2901,30 @@ def pallas_option3d_zero_copy9_persrc_async_a2a_wo_3d_static_fp8(
 
 
 
-def pallas_option3d_2chunk_async_a2a_wo_3d_static_fp8(
-    q_part0_3d: jax.Array,
-    q_part1_3d: jax.Array,
+def pallas_option3d_nchunk_async_a2a_wo_3d_static_fp8(
+    q_parts_3d: tuple[jax.Array, ...] | list[jax.Array],
     wo_fp8_xor_3d: jax.Array,
     wo_scale_2d: jax.Array,
     *,
     tp_axis: str = "model",
     bn: int = 1024,
-    vmem_limit_mb: int = 62,
+    vmem_limit_mb: int = 63,
     d_order: tuple[int, ...] | None = None,
     stage_sends_mode: int | None = None,
 ) -> jax.Array:
-    """Zero-concat 2-chunk CCS variant of ``_opt_wo_kernel`` reading ``(q_part0_3d, q_part1_3d)`` directly.
+    """Zero-concat N-chunk CCS variant of ``_opt_wo_kernel`` reading ``q_parts_3d`` directly.
 
-    Eliminates the external ``torch.cat(q_parts, dim=1)`` (``%pad_maximum_fusion``: ``+5.14 ms/fwd``
-    and ``+2.94 GB/fwd`` at ``c24k``) by issuing 64-row-aligned local/remote DMAs directly from
-    ``q_part0_3d [tp, c0, k_local]`` and ``q_part1_3d [tp, c1, k_local]`` into ``recv_vmem``.
+    Eliminates external ``torch.cat(q_parts, dim=1)`` (``%pad_maximum_fusion``) for 2-, 3-,
+    or N-chunk CCS by issuing 64-row-aligned local/remote DMAs directly from each
+    ``q_part_3d [tp, c_k, k_local]`` into ``recv_vmem``.
     """
     from sglang_tpu.envs import envs as _tpu_envs
 
-    tp_deg, c0, k_local = q_part0_3d.shape
-    tp_deg_1, c1, k_local_1 = q_part1_3d.shape
-    assert tp_deg == tp_deg_1 and k_local == k_local_1
-    t_shard = c0 + c1
-    if c0 < 64 or c1 < 64 or c0 % 64 != 0 or c1 % 64 != 0:
+    q_parts = tuple(q_parts_3d)
+    assert len(q_parts) >= 1
+    if len(q_parts) == 1:
         return pallas_option3d_zero_copy9_persrc_async_a2a_wo_3d_static_fp8(
-            jnp.concatenate([q_part0_3d, q_part1_3d], axis=1),
+            q_parts[0],
             wo_fp8_xor_3d,
             wo_scale_2d,
             tp_axis=tp_axis,
@@ -2938,6 +2935,26 @@ def pallas_option3d_2chunk_async_a2a_wo_3d_static_fp8(
             stage_sends_mode=stage_sends_mode,
         )
 
+    tp_deg, _, k_local = q_parts[0].shape
+    chunk_sizes: list[int] = []
+    for qp in q_parts:
+        assert qp.shape[0] == tp_deg and qp.shape[2] == k_local
+        chunk_sizes.append(int(qp.shape[1]))
+    t_shard = sum(chunk_sizes)
+    if any(c < 64 or c % 64 != 0 for c in chunk_sizes):
+        return pallas_option3d_zero_copy9_persrc_async_a2a_wo_3d_static_fp8(
+            jnp.concatenate(q_parts, axis=1),
+            wo_fp8_xor_3d,
+            wo_scale_2d,
+            tp_axis=tp_axis,
+            bn=bn,
+            vmem_limit_mb=vmem_limit_mb,
+            opt_wo=True,
+            d_order=d_order,
+            stage_sends_mode=stage_sends_mode,
+        )
+
+    num_parts = len(q_parts)
     _, _, n_dim = wo_fp8_xor_3d.shape
     ss_env = getattr(_tpu_envs, "SGLANG_TPU_MUSE_KERNEL_A3_STAGE_SENDS", None)
     eff_stage_mode = (
@@ -2978,6 +2995,11 @@ def pallas_option3d_2chunk_async_a2a_wo_3d_static_fp8(
     step_xors = tuple(range(tp_deg)) if d_order is None else tuple(d_order)
 
     # Static DMA segment table: each entry is (seg_id, th_i, part_idx, src_r0, dst_r0, nrows).
+    part_bounds: list[tuple[int, int, int]] = []
+    cur_r = 0
+    for p_idx, ck in enumerate(chunk_sizes):
+        part_bounds.append((p_idx, cur_r, cur_r + ck))
+        cur_r += ck
     segs: list[tuple[int, int, int, int, int, int]] = []
     th_segs: list[list[tuple[int, int, int, int, int, int]]] = [
         [] for _ in range(num_t_half)
@@ -2985,46 +3007,35 @@ def pallas_option3d_2chunk_async_a2a_wo_3d_static_fp8(
     for th_i in range(num_t_half):
         r0 = th_i * tm_half
         r1 = r0 + tm_half
-        if r1 <= c0:
-            item = (len(segs), th_i, 0, r0, 0, tm_half)
-            segs.append(item)
-            th_segs[th_i].append(item)
-        elif r0 >= c0:
-            item = (len(segs), th_i, 1, r0 - c0, 0, tm_half)
-            segs.append(item)
-            th_segs[th_i].append(item)
-        else:
-            len0 = c0 - r0
-            len1 = r1 - c0
-            item0 = (len(segs), th_i, 0, r0, 0, len0)
-            segs.append(item0)
-            th_segs[th_i].append(item0)
-            item1 = (len(segs), th_i, 1, 0, len0, len1)
-            segs.append(item1)
-            th_segs[th_i].append(item1)
+        for p_idx, p0, p1 in part_bounds:
+            ov0 = max(r0, p0)
+            ov1 = min(r1, p1)
+            if ov1 > ov0:
+                item = (len(segs), th_i, p_idx, ov0 - p0, ov0 - r0, ov1 - ov0)
+                segs.append(item)
+                th_segs[th_i].append(item)
     num_segs = len(segs)
 
-    def _opt_wo_2chunk_kernel(
-        src0_hbm_ref,
-        src1_hbm_ref,
-        w_xor_ref,
-        w_sc_ref,
-        out_hbm_ref,
-        recv_vmem,
-        acc_vmem,
-        out_vmem,
-        rsems,
-        ssems,
-        out_sems,
-    ):
+    def _opt_wo_nchunk_kernel(*all_refs):
+        src_refs = all_refs[:num_parts]
+        (
+            w_xor_ref,
+            w_sc_ref,
+            out_hbm_ref,
+            recv_vmem,
+            acc_vmem,
+            out_vmem,
+            rsems,
+            ssems,
+            out_sems,
+        ) = all_refs[num_parts:]
         t_half = pl.program_id(0)
         step = pl.program_id(1)
         j = pl.program_id(2)
         me = lax.axis_index(tp_axis)
 
         def _src_slice(p_idx: int, r_idx, s_r0: int, nr: int):
-            ref = src0_hbm_ref if p_idx == 0 else src1_hbm_ref
-            return ref.at[pl.ds(r_idx, 1), pl.ds(s_r0, nr), :]
+            return src_refs[p_idx].at[pl.ds(r_idx, 1), pl.ds(s_r0, nr), :]
 
         def _dst_slice(th_i: int, d_idx, d_r0: int, nr: int):
             return recv_vmem.at[pl.ds(th_i * tp_deg + d_idx, 1), pl.ds(d_r0, nr), :]
@@ -3213,12 +3224,12 @@ def pallas_option3d_2chunk_async_a2a_wo_3d_static_fp8(
         vmem_limit_bytes=vmem_limit_mb * (1 << 20),
     )
     ss_tag = f"_ss{eff_stage_mode}" if eff_stage_mode > 0 else ""
+    chunk_tag = "_".join(str(c) for c in chunk_sizes)
     return pl.pallas_call(
-        _opt_wo_2chunk_kernel,
+        _opt_wo_nchunk_kernel,
         grid=(num_t_half, tp_deg, num_j),
         in_specs=[
-            any_spec,
-            any_spec,
+            *(any_spec for _ in range(num_parts)),
             pl.BlockSpec(
                 (1, k_local, bn_eff), lambda t_half, step, j: (step, 0, j)
             ),
@@ -3228,8 +3239,59 @@ def pallas_option3d_2chunk_async_a2a_wo_3d_static_fp8(
         out_shape=jax.ShapeDtypeStruct((t_shard, n_dim), jnp.bfloat16),
         scratch_shapes=scratches,
         compiler_params=cp,
-        name=f"pallas_a3_wo_2chunk_c{c0}_{c1}_bn{bn_eff}{ss_tag}",
-    )(q_part0_3d, q_part1_3d, wo_fp8_xor_3d, wo_scale_2d)
+        name=f"pallas_a3_wo_{num_parts}chunk_c{chunk_tag}_bn{bn_eff}{ss_tag}",
+    )(*q_parts, wo_fp8_xor_3d, wo_scale_2d)
+
+
+def pallas_option3d_2chunk_async_a2a_wo_3d_static_fp8(
+    q_part0_3d: jax.Array,
+    q_part1_3d: jax.Array,
+    wo_fp8_xor_3d: jax.Array,
+    wo_scale_2d: jax.Array,
+    *,
+    tp_axis: str = "model",
+    bn: int = 1024,
+    vmem_limit_mb: int = 63,
+    d_order: tuple[int, ...] | None = None,
+    stage_sends_mode: int | None = None,
+) -> jax.Array:
+    """Zero-concat 2-chunk CCS variant of ``_opt_wo_kernel``."""
+    return pallas_option3d_nchunk_async_a2a_wo_3d_static_fp8(
+        (q_part0_3d, q_part1_3d),
+        wo_fp8_xor_3d,
+        wo_scale_2d,
+        tp_axis=tp_axis,
+        bn=bn,
+        vmem_limit_mb=vmem_limit_mb,
+        d_order=d_order,
+        stage_sends_mode=stage_sends_mode,
+    )
+
+
+def pallas_option3d_3chunk_async_a2a_wo_3d_static_fp8(
+    q_part0_3d: jax.Array,
+    q_part1_3d: jax.Array,
+    q_part2_3d: jax.Array,
+    wo_fp8_xor_3d: jax.Array,
+    wo_scale_2d: jax.Array,
+    *,
+    tp_axis: str = "model",
+    bn: int = 1024,
+    vmem_limit_mb: int = 63,
+    d_order: tuple[int, ...] | None = None,
+    stage_sends_mode: int | None = None,
+) -> jax.Array:
+    """Zero-concat 3-chunk CCS variant of ``_opt_wo_kernel``."""
+    return pallas_option3d_nchunk_async_a2a_wo_3d_static_fp8(
+        (q_part0_3d, q_part1_3d, q_part2_3d),
+        wo_fp8_xor_3d,
+        wo_scale_2d,
+        tp_axis=tp_axis,
+        bn=bn,
+        vmem_limit_mb=vmem_limit_mb,
+        d_order=d_order,
+        stage_sends_mode=stage_sends_mode,
+    )
 
 def a3_v16_option3d_zero_copy9_persrc_sem_async_a2a_wo_3d_sp(
     normed_attn_out: jax.Array,

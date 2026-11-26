@@ -69,6 +69,7 @@ class _Ops(NamedTuple):
     a3_prologue_chunk: object = None
     a3_wo: object = None
     a3_wo_2chunk: object = None
+    a3_wo_3chunk: object = None
     gather_fp8_stream: object = None
     # Wave-8 CCS Mode-2 K-deep A3 ops (per-chunk prologue+A2A + fused last-chunk K-deep Wo).
     a3_pro_a2a_chunk: object = None
@@ -1878,6 +1879,7 @@ def _ops(
     a3_pro_chunk_op = None
     a3_wo_op = None
     a3_wo_2chunk_op = None
+    a3_wo_3chunk_op = None
     if (
         causal_chunk_stream
         and a3_variant == "v16"
@@ -2013,6 +2015,36 @@ def _ops(
                 + ("_bn2k" if a3_bn2k_ccs else ""),
                 a3_wo_2chunk,
                 4,
+                1,
+            )
+
+            def a3_wo_3chunk_body(q0_3d, q1_3d, q2_3d, wo_in, wo_sc_in):
+                return kernel_a3.pallas_option3d_3chunk_async_a2a_wo_3d_static_fp8(
+                    q0_3d,
+                    q1_3d,
+                    q2_3d,
+                    wo_in,
+                    wo_sc_in,
+                    tp_axis=_AXIS,
+                )
+
+            a3_wo_3c_sm = shard(a3_wo_3chunk_body, 5, 1)
+
+            def a3_wo_3chunk(
+                q0_3d: jax.Array,
+                q1_3d: jax.Array,
+                q2_3d: jax.Array,
+                wo_in: jax.Array,
+                wo_sc_in: jax.Array,
+            ) -> jax.Array:
+                return a3_wo_3c_sm(q0_3d, q1_3d, q2_3d, wo_in, wo_sc_in)
+
+            a3_wo_3chunk_op = export(
+                "a3_v16_wo_3chunk"
+                + (f"_ss{a3_stage_sends}" if a3_stage_sends else "")
+                + ("_bn2k" if a3_bn2k_ccs else ""),
+                a3_wo_3chunk,
+                5,
                 1,
             )
     a3_pro_a2a_chunk_op = None
@@ -2209,6 +2241,7 @@ def _ops(
         a3_prologue_chunk=a3_pro_chunk_op,
         a3_wo=a3_wo_op,
         a3_wo_2chunk=a3_wo_2chunk_op,
+        a3_wo_3chunk=a3_wo_3chunk_op,
         gather_fp8_stream=gather_fp8_op,
         a3_pro_a2a_chunk=a3_pro_a2a_chunk_op,
         a3_pro_last_chunk=a3_pro_last_chunk_op,
@@ -4101,6 +4134,14 @@ class MusePrefillKernels(torch.nn.Module):
                 ):
                     attn_out_shard = self.ops.a3_wo_2chunk(
                         q_parts[0], q_parts[1], wo, wo_scale
+                    )
+                elif (
+                    self.ops.a3_wo_3chunk is not None
+                    and len(q_parts) == 3
+                    and not a3_extra
+                ):
+                    attn_out_shard = self.ops.a3_wo_3chunk(
+                        q_parts[0], q_parts[1], q_parts[2], wo, wo_scale
                     )
                 else:
                     q_3d = torch.cat(q_parts, dim=1)
