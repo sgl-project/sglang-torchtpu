@@ -18,6 +18,8 @@ from jax import numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sglang_tpu.envs import envs as tpu_envs
+
 # Tokens per grid step: 32 overflowed scoped VMEM at a 4096-wide hidden.
 _TOKENS_PER_BLOCK = 16
 
@@ -158,9 +160,6 @@ def pair_post_combine(
 
 def _pair_combine_scatter_kernel(
     tok_ref,
-    x_hbm_ref,
-    gain_ref,
-    w_ref,
     *refs,
     num_steps: int,
     rb: int,
@@ -169,11 +168,18 @@ def _pair_combine_scatter_kernel(
     blocks: int,
     eps: float,
     q8_blocks: int = 0,
+    w_scatter: bool = False,
 ):
     """Pallas kernel: block sum + RMSNorm + top-k weight + VMEM scatter-add.
 
     q8_blocks > 0: that many more blocks arrive as e4m3 rows with f32 row scales.
+    w_scatter: the weights are SMEM scalars applied per row in the scatter loop.
     """
+    if w_scatter:
+        ws_ref, x_hbm_ref, gain_ref, *refs = refs
+        w_ref = None
+    else:
+        x_hbm_ref, gain_ref, w_ref, *refs = refs
     if q8_blocks:
         (
             q8_hbm_ref,
@@ -244,10 +250,13 @@ def _pair_combine_scatter_kernel(
         z = (y * jax.lax.rsqrt(sum_sq / hidden + eps)[:, :, None]).astype(
             x_buf_ref.dtype
         )
-        w = w_ref[pl.ds(step * rb, rb), :1]
-        row_buf_ref[...] = (z.astype(jnp.float32) * w[:, :, None]).astype(
-            row_buf_ref.dtype
-        )
+        if w_scatter:
+            row_buf_ref[...] = z.astype(row_buf_ref.dtype)
+        else:
+            w = w_ref[pl.ds(step * rb, rb), :1]
+            row_buf_ref[...] = (z.astype(jnp.float32) * w[:, :, None]).astype(
+                row_buf_ref.dtype
+            )
 
         base = step * rb
 
@@ -255,7 +264,12 @@ def _pair_combine_scatter_kernel(
             for u in range(8):
                 r = k * 8 + u
                 t = tok_ref[base + r]
-                acc_ref[t] = acc_ref[t] + row_buf_ref[r].astype(jnp.float32)
+                if w_scatter:
+                    row = row_buf_ref[r].astype(jnp.float32) * ws_ref[base + r]
+                    row = row.astype(row_buf_ref.dtype).astype(jnp.float32)
+                    acc_ref[t] = acc_ref[t] + row
+                else:
+                    acc_ref[t] = acc_ref[t] + row_buf_ref[r].astype(jnp.float32)
             return c
 
         jax.lax.fori_loop(0, rb // 8, _scatter8, 0)
@@ -316,8 +330,13 @@ def pair_post_combine_scatter(
     tok = rank_token.astype(jnp.int32)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
-    in_specs = [hbm, vmem, vmem]
-    args = [tok, x, gain, w]
+    w_scatter = tpu_envs.SGLANG_TPU_FUSED_RS_COMBINE_W_SCATTER.get()
+    if w_scatter:
+        in_specs = [hbm, vmem]
+        args = [tok, rank_weight.astype(jnp.float32), x, gain]
+    else:
+        in_specs = [hbm, vmem, vmem]
+        args = [tok, x, gain, w]
     q8_scratch = []
     if q8_blocks:
         in_specs += [hbm, hbm]
@@ -339,10 +358,11 @@ def pair_post_combine_scatter(
             blocks=blocks,
             eps=eps,
             q8_blocks=q8_blocks,
+            w_scatter=w_scatter,
         ),
         out_shape=jax.ShapeDtypeStruct((chunk_size, h1, h2), out_dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
+            num_scalar_prefetch=2 if w_scatter else 1,
             in_specs=in_specs,
             out_specs=hbm,
             scratch_shapes=[

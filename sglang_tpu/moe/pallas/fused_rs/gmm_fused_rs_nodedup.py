@@ -2179,6 +2179,14 @@ def kernel_main_fused_rs(
                 # Copy gmm1_out (f32) to intermediate_ref (bf16, scatter layout).
                 # Activation was already applied inside inner_kernel via fuse_act.
                 def _interlude(m_rows):
+                    # detail trace: the tile's row bucket (bucket histogram per call)
+                    if int(os.environ.get("MUSE_MK_TRACE", "0")) >= 1:
+                        with jax.named_scope(f"frs_bucket_{m_rows}"):
+                            _interlude_body(m_rows)
+                    else:
+                        _interlude_body(m_rows)
+
+                def _interlude_body(m_rows):
                     gmm1_result = gmm1_out_ref[pl.ds(0, m_rows)]
                     k2_pad = dims.size_k2 - gmm1_result.shape[1]
                     if k2_pad > 0:

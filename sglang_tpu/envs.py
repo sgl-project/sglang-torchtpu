@@ -754,6 +754,10 @@ class TpuEnvs:
     # With Q8_IN_GMM1: each (tile, owner) run's first row in the tile comes from a table built
     # with the routing metadata instead of an in-kernel sum over the lower owners' runs.
     SGLANG_TPU_FUSED_RS_PAIR_SRC_TABLE = EnvBool(True)
+    # Expert-TP fused-RS scatter combine: top-k weights as SMEM scalars applied in the
+    # scatter-add loop (load-bound, VALU slack) instead of a [rows, 128] f32 broadcast
+    # multiplied in the VALU-bound norm pass; same ops in the same order (bit-identical).
+    SGLANG_TPU_FUSED_RS_COMBINE_W_SCATTER = EnvBool(False)
     # Batched RPA: run target-verify rows (speculative_num_draft_tokens per request) as MIXED
     # with a q block of that width; the prefill block search otherwise pads each request's
     # rows to a ~2048-row block (16 x 8 rows at 150K context: 42 -> 2.2 ms per layer).
