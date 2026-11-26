@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.page_interleave import PageInterleaveHostPool
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.observability.trace import (
     TraceNullContext,
     TraceReqContext,
@@ -55,13 +56,12 @@ from sglang.srt.observability.trace import (
     get_thread_caller_info,
     trace_set_thread_info,
 )
+from sglang.srt.utils import broadcast_pyobj
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.kv.storage import KVStorage
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.kv.storage import KVStorage
 
-from sglang.srt.mem_cache.utils import get_storage_hash_str
-from sglang.srt.utils import broadcast_pyobj
 
 logger = logging.getLogger(__name__)
 
@@ -1238,6 +1238,12 @@ class HybridCacheController(BaseHiCacheController):
             num_bytes += num_slots * entry.host_pool.size_per_token
         return num_bytes
 
+    def _alloc_load_kv_indices(self, allocator, need_size, extra_pools):
+        """Allocate reload destinations in the backend's metadata representation."""
+        if need_size == 0:
+            return torch.empty((0,), dtype=torch.int64, device=self.device)
+        return allocator.alloc(need_size)
+
     def load(
         self,
         host_indices: torch.Tensor,
@@ -1263,7 +1269,7 @@ class HybridCacheController(BaseHiCacheController):
         if caller_owned:
             assert len(device_indices) == len(host_indices)
         elif not need_load_kv:
-            device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
+            device_indices = self._alloc_load_kv_indices(full_allocator, 0, extra_pools)
         elif self.kv_storage is not None:
             take_owner_rows, _ = self.kv_storage.owner_load_alloc()
             device_indices = take_owner_rows(len(host_indices))
@@ -1278,7 +1284,9 @@ class HybridCacheController(BaseHiCacheController):
                     need_size=len(host_indices),
                 )
             else:
-                device_indices = full_allocator.alloc(len(host_indices))
+                device_indices = self._alloc_load_kv_indices(
+                    full_allocator, len(host_indices), extra_pools
+                )
             if device_indices is None:
                 return None
 

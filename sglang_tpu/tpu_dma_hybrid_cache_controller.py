@@ -19,6 +19,7 @@ thread and returns poll-only future-events, which serve as the acks and feed a
 
 from __future__ import annotations
 
+import functools
 import logging
 from typing import Any, Callable, List, Optional
 
@@ -31,12 +32,14 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
+from sglang_tpu.allocator_tpu import TpuPagedTokenToKVPoolAllocator
 from sglang_tpu.kv_free_fence import (
     KVFreeFence,
     assert_not_forward_write_target,
     deferred_dma_read,
 )
 from sglang_tpu.tpu_dma_hicache import NOOP_EVENT, CombinedFutureEvent, TransferEvent
+from sglang_tpu.unified_kv_pool import _SharedPagesAllocator
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +88,21 @@ class TpuDMAHybridCacheController(HybridCacheController):
         super().__init__(*args, **kwargs)
         for entry in self.mem_pool_host.entries:
             _check_kv_page_pool(entry.name)
+            swa_allocator = getattr(
+                self.mem_pool_device_allocator, "swa_attn_allocator", None
+            )
+            # Both split and unified SWA stacks supply these callbacks. They
+            # only allocate reload destinations, whose DMA metadata stays on CPU.
+            if (
+                entry.name == PoolName.SWA
+                and type(swa_allocator)
+                in (TpuPagedTokenToKVPoolAllocator, _SharedPagesAllocator)
+                and entry.device_alloc_fn == swa_allocator.alloc
+                and entry.device_free_fn == swa_allocator.free
+            ):
+                entry.device_alloc_fn = functools.partial(
+                    swa_allocator.alloc, return_host=True
+                )
         # The engine gates the whole forward at once (no per-layer device streams).
         # Swap the per-layer LayerDoneCounter for a BatchDoneCounter and
         # re-register it on the device pool wrapper (SWAKVPool holds the
@@ -140,6 +158,23 @@ class TpuDMAHybridCacheController(HybridCacheController):
 
     # ----- index handling -----------------------------------------------------
 
+    def _alloc_load_kv_indices(self, allocator, need_size, extra_pools):
+        # Full/SWA wrappers allocate the anchor through their full sub-allocator.
+        # Derived sidecars reuse those indices; none require an upload for DMA.
+        full_allocator = getattr(
+            self.mem_pool_device_allocator,
+            "full_attn_allocator",
+            self.mem_pool_device_allocator,
+        )
+        if allocator is full_allocator and type(allocator) in (
+            TpuPagedTokenToKVPoolAllocator,
+            _SharedPagesAllocator,
+        ):
+            if need_size == 0:
+                return torch.empty((0,), dtype=torch.int64, device="cpu")
+            return allocator.alloc(need_size, return_host=True)
+        return super()._alloc_load_kv_indices(allocator, need_size, extra_pools)
+
     def move_indices(self, host_indices, device_indices):
         # Engines address whole pages; the token->page conversion happens in
         # each host pool. Keep index tensors as-is: no stream moves, no
@@ -152,6 +187,9 @@ class TpuDMAHybridCacheController(HybridCacheController):
         priority: Optional[int] = None,
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        *,
+        device_indices: Optional[torch.Tensor] = None,
+        anchor_indices: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         assert_not_forward_write_target(self.mem_pool_device_allocator)
         device_indices = super().load(
@@ -159,6 +197,8 @@ class TpuDMAHybridCacheController(HybridCacheController):
             priority=priority,
             node_id=node_id,
             extra_pools=extra_pools,
+            device_indices=device_indices,
+            anchor_indices=anchor_indices,
         )
         if device_indices is None:
             return None
