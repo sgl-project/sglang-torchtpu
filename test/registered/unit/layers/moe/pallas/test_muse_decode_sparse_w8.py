@@ -3246,6 +3246,11 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
             self.assertEqual(cfg_b16.tile_m, 16)
             self.assertEqual(cfg_b16.m_buckets, (8, 16))
             self.assertEqual(cfg_b16.route_chunk_rows, 16)
+            cfg_b8 = v1_mod.default_sparse_decode_config(8, 8, 512)
+            self.assertEqual(cfg_b8.row_mode, "sparse")
+            self.assertEqual(cfg_b8.tile_m, 16)
+            self.assertEqual(cfg_b8.m_buckets, (8,))
+            self.assertEqual(cfg_b8.route_chunk_rows, 8)
         finally:
             if prev_b16 is None:
                 os.environ.pop("SGLANG_TPU_MUSE_KERNEL_DECODE_B16_SPARSE", None)
