@@ -740,6 +740,41 @@ def _fused_moe_jax(
         rhs_quant_dtype = jnp.int4
         maybe_quantize_lhs = use_vmem_fp8
 
+    # Two or more tokens: distinct experts streamed once through a VMEM ring, where
+    # that kernel covers the call and its cost model beats gmm_v2; None otherwise.
+    # Guard the import with the cheap eligibility checks so unquantized/EP calls
+    # (including CPU-only unit tests without torch_tpu) do not import moe_ring.
+    if (
+        m != 1
+        and not no_combine
+        and global_num_experts <= num_experts
+        and not w_quant_bits
+        and w1_scale is not None
+        and w2_scale is not None
+        and w1_bias is None
+        and w2_bias is None
+        and activation_name.startswith("silu_and_mul_clamp:")
+    ):
+        from sglang_tpu.moe.pallas.moe_ring import maybe_moe_ring
+
+        out = maybe_moe_ring(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            w1_scale,
+            w2_scale,
+            w1_bias,
+            w2_bias,
+            activation_name=activation_name,
+            no_combine=no_combine,
+            use_group_offset=global_num_experts > num_experts,
+            w_quant_bits=w_quant_bits,
+        )
+        if out is not None:
+            return out
+
     if tpu_envs.SGLANG_TPU_ENABLE_STREAMING_MOE_KERNEL.get():
         from sglang_tpu.moe.pallas.moe_stream import maybe_moe_stream
 
