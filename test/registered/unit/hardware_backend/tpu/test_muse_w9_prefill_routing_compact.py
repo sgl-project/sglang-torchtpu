@@ -625,6 +625,8 @@ def test_macro_vec_qblock_coarse48_parity_and_tpu7x_aot():
         (16, 16, 8192, 128, 2, 11, True),
         (16, 16, 24576, 256, 2, 0, False),
         (16, 16, 24576, 256, 4, 15, True),
+        (16, 16, 24576, 256, 12, 15, True),
+        (16, 16, 24576, 256, 16, 0, False),
     )
     with _tpu7x_cpu_context(interpret=False):
         for ep_size, base_loc, t_tot, q_m, n_rep, rk, add_pad in cases:
@@ -685,6 +687,8 @@ def test_macro_vec_qblock_coarse48_parity_and_tpu7x_aot():
         for topo_name, ep_size, base_loc, e_loc in (
             ("tpu7x=2x2x1", 8, 32, 36),
             ("tpu7x=2x2x2", 16, 16, 18),
+            ("tpu7x=2x2x2", 16, 16, 28),
+            ("tpu7x=2x2x2", 16, 16, 32),
         ):
             topo = topologies.get_topology_desc(platform="tpu", topology_name=topo_name)
             shd = jax.sharding.SingleDeviceSharding(topo.devices[0])

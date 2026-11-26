@@ -11,9 +11,9 @@ Design invariants:
    forms a complete bijection of all 256 original experts.
 3. Three lossless routing modes:
    - `"perm"` (`R = 0`, `+0 GiB` HBM): tile-aware LPT + 2-opt bin-packing (`0.0 us` runtime glue).
-   - `"home"` (`1 <= R <= 8`): routes `id < R` to each token's home chip `chip * (32+R) + 32 + id`
+   - `"home"` (`1 <= R <= 16`): routes `id < R` to each token's home chip `chip * (32+R) + 32 + id`
      (`2` vector ops, `0` ICI bytes for replicated experts).
-   - `"q_block"` (`1 <= R <= 8`): partitions `[T, topk]` into 64 static blocks (`<= 1` tile/block)
+   - `"q_block"` (`1 <= R <= 16`): partitions `[T, topk]` into 64 static blocks (`<= 1` tile/block)
      and assigns full `quantum`-row (`tile_m`-row) tiles across the lightest ranks via a 64-element
      prefix count (`< 5 us` XLA glue, zero partial-tile explosion on uniform/short batches, and
      uniformly spreads padded tail rows).
@@ -58,7 +58,7 @@ VALID_EPLB_MODES = (
     "dyn_holder",
     "dyn_split",
 )
-MAX_EPLB_REPLICAS = 8
+MAX_EPLB_REPLICAS = 16
 
 
 def resolve_prefill_eplb_config(mode_raw: str, replicas_raw: int) -> tuple[str, int]:
@@ -129,7 +129,7 @@ def compute_zeroglue_eplb_perm(
         raise ValueError(
             f"expected expert_counts shape ({num_experts},), got {counts.shape}"
         )
-    if not (0 <= num_replicas <= min(MAX_EPLB_REPLICAS, num_local_base - 1)):
+    if not (0 <= num_replicas <= min(MAX_EPLB_REPLICAS, num_local_base)):
         raise ValueError(
             f"invalid num_replicas={num_replicas} for num_local_base={num_local_base}"
         )
@@ -508,11 +508,13 @@ def remap_zeroglue_virtual_ids(
         resolve_qblock_params,
     )
 
+    n_blocks, q_eff = resolve_qblock_params(total_elems, ep_size, quantum)
     if (
         int(_tpu_envs.SGLANG_TPU_MUSE_KERNEL_PALLAS_SORTFREE_ROUTING.get() or 0) >= 1
         and ep_size in (8, 16)
         and num_base_local in (16, 32)
-        and 1 <= num_replicas <= 8
+        and 1 <= num_replicas <= MAX_EPLB_REPLICAS
+        and (n_blocks <= 128 or num_replicas <= 12)
         and quantum > 0
         and total_elems >= 32768
         and total_elems % (64 * 512) == 0
@@ -528,7 +530,6 @@ def remap_zeroglue_virtual_ids(
             quantum=quantum,
         )
 
-    n_blocks, q_eff = resolve_qblock_params(total_elems, ep_size, quantum)
     blk_elems = total_elems // n_blocks
     ids_blk = ids_by_chip.reshape(n_blocks, blk_elems)
     base_owner_blk = base_owner.reshape(n_blocks, blk_elems)

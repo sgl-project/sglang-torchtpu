@@ -395,7 +395,7 @@ class TpuEnvs:
     SGLANG_TPU_MUSE_KERNEL_EXPERT_PLACEMENT = EnvStr("")
     # Prefill EPLB modes: "", "perm", "stripe", "home", "q_block", "dyn_holder", "dyn_split".
     SGLANG_TPU_MUSE_KERNEL_PREFILL_EPLB_MODE = EnvStr("")
-    # Replicated hot experts per EP rank for PREFILL_EPLB_MODE in {"stripe", "home", "q_block", "dyn_holder", "dyn_split"} (0..8).
+    # Replicated hot experts per EP rank for PREFILL_EPLB_MODE in {"stripe", "home", "q_block", "dyn_holder", "dyn_split"} (0..16).
     SGLANG_TPU_MUSE_KERNEL_PREFILL_EPLB_REPLICAS = EnvInt(0)
     # Muse prefill §4.5b cross-chip preloaded hot-expert replica slots per rank (0 = off; 1, 2, or 4).
     SGLANG_TPU_MUSE_KERNEL_PREFILL_REPLICA_SLOTS = EnvInt(0)

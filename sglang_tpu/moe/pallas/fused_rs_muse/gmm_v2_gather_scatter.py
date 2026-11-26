@@ -1652,6 +1652,8 @@ def inner_kernel(
                         and fp4_acc_mode in (2, 3)
                         and not use_eo_strip_fp8
                     ):
+                        _fuse_g2_amax_dual = _can_fuse_g2_amax and _direct_silu != 2
+                        _g1_m128_bf16_dual = None
                         for s_n in range(0, half_tile_n, strip_step):
                             e_n = min(half_tile_n, s_n + strip_step)
                             col_w = e_n - s_n
@@ -1702,9 +1704,26 @@ def inner_kernel(
                                         )
                                         * up_acc
                                     )
-                                tiled_out_ref[:, s_n:e_n] = prod.astype(
-                                    tiled_out_ref.dtype
-                                )
+                                prod_out = prod.astype(tiled_out_ref.dtype)
+                                tiled_out_ref[:, s_n:e_n] = prod_out
+                                if _fuse_g2_amax_dual:
+                                    _g1_m128_bf16_dual = _accum_g2_amax_m128(
+                                        _g1_m128_bf16_dual,
+                                        prod_out,
+                                        cfgs.tiles.tile_m,
+                                        prequant_lhs_scale_ref.shape[-1],
+                                    )
+                        if _fuse_g2_amax_dual and _g1_m128_bf16_dual is not None:
+                            _flush_g2_amax_m128(
+                                prequant_lhs_scale_ref,
+                                fused_g2_amax_slot,
+                                _g1_m128_bf16_dual,
+                                _n_id,
+                                _num_n,
+                                cfgs.tiles.tile_m,
+                                prequant_lhs_scale_ref.shape[-1],
+                                merge_prev=True,
+                            )
                     elif _direct_silu >= 1:
                         _fuse_g2_amax_ds = _can_fuse_g2_amax and _direct_silu == 1
                         _g1_m128_bf16_ds = None
