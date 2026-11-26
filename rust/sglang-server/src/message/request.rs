@@ -15,7 +15,7 @@ use super::sampling::SamplingParams;
 use super::types::{OneOrMany, OneOrManyItem, TokenIds};
 use super::wire;
 use crate::message::config::ServerArgs;
-use crate::message::ids::Rid;
+use crate::message::ids::{HEALTH_CHECK_RID_PREFIX, Rid};
 use crate::utils::fsm::RequestState;
 use crate::utils::{environ::env_i64, error::Error};
 use sglang_api_types::api::v1 as api_v1;
@@ -130,6 +130,18 @@ pub fn into_requests(
         ..
     } = req;
     let rid = rid.and_then(wire::string_or_list);
+
+    // Client IDs must not select the scheduler's internal probe behavior.
+    let reserved_rid = match &rid {
+        Some(OneOrMany::One(r)) => r.starts_with(HEALTH_CHECK_RID_PREFIX),
+        Some(OneOrMany::Many(v)) => v.iter().any(|r| r.starts_with(HEALTH_CHECK_RID_PREFIX)),
+        None => false,
+    };
+    if reserved_rid {
+        return Err(Error::Validation(format!(
+            "Request IDs starting with '{HEALTH_CHECK_RID_PREFIX}' are reserved for internal health probes"
+        )));
+    }
     let text = text.and_then(wire::string_or_list);
     let input_ids = input_ids.and_then(wire::token_ids_or_list);
     let stream = stream.unwrap_or(false);
@@ -1328,6 +1340,26 @@ mod tests {
                 err,
                 format!("{field} is not supported by the Rust server"),
                 "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn client_health_probe_rids_are_rejected() {
+        for body in [
+            r#"{"text":"a","rid":"HEALTH_CHECK"}"#,
+            r#"{"text":"a","rid":"HEALTH_CHECK_client","sampling_params":{"max_new_tokens":1000}}"#,
+            r#"{"text":["a","b"],"rid":"HEALTH_CHECK_client"}"#,
+            r#"{"text":["a","b"],"rid":["user","HEALTH_CHECK_client"]}"#,
+            r#"{"text":"a","rid":"HEALTH_CHECK_client","is_health_check":true}"#,
+        ] {
+            let error = requests(body).expect_err("client probe ID must be rejected");
+            assert!(matches!(error, Error::Validation(_)), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("reserved for internal health probes"),
+                "{error}"
             );
         }
     }

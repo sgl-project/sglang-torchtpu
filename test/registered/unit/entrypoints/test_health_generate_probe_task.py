@@ -16,11 +16,12 @@ import gc
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.entrypoints import http_server
-from sglang.srt.managers.io_struct import HealthCheckOutput
+from sglang.srt.managers.io_struct import GenerateReqInput, HealthCheckOutput
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
@@ -40,7 +41,8 @@ def _ack(rid, seq=1, incarnation=INCARNATION, dp_rank=0):
 def _probe_that_acks(make_ack, *, lose_cancel=False, bump_tstamp=False):
     """generate_request stand-in: delivers make_ack(rid) like handle_loop would."""
 
-    async def generate_request(obj, request=None):
+    async def generate_request(obj, request=None, *, is_health_check=False):
+        assert is_health_check
         tokenizer_manager = http_server.get_global_state().tokenizer_manager
         await asyncio.sleep(0)
         if bump_tstamp:
@@ -176,7 +178,8 @@ class TestHealthGenerateCompletionAck(CustomTestCase):
     def test_decode_probe_forces_a_real_decode_step(self):
         seen = []
 
-        async def generate_request(obj, request=None):
+        async def generate_request(obj, request=None, *, is_health_check=False):
+            self.assertTrue(is_health_check)
             seen.append(obj)
             http_server.get_global_state().tokenizer_manager._handle_health_check_output(
                 _ack(obj.rid)
@@ -194,12 +197,14 @@ class TestHealthGenerateCompletionAck(CustomTestCase):
             response, _, _ = self.call_health_generate(generate_request)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(seen[0].sampling_params["max_new_tokens"], 2)
+        self.assertTrue(seen[0].sampling_params["ignore_eos"])
         self.assertEqual(seen[0].bootstrap_room, 0)
 
     def test_non_disagg_probe_generates_one_token(self):
         seen = []
 
-        async def generate_request(obj, request=None):
+        async def generate_request(obj, request=None, *, is_health_check=False):
+            self.assertTrue(is_health_check)
             seen.append(obj)
             http_server.get_global_state().tokenizer_manager._handle_health_check_output(
                 _ack(obj.rid)
@@ -248,6 +253,50 @@ class TestHealthGenerateCompletionAck(CustomTestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(unretrieved, [])
+
+    def test_generate_reports_reserved_client_rid_as_invalid_request(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                tm = TokenizerManager.__new__(TokenizerManager)
+                tm.auto_create_handle_loop = Mock()
+                tm._init_req_state = Mock()
+                tm.create_abort_task = Mock()
+                obj = GenerateReqInput(
+                    rid=f"{HEALTH_CHECK_RID_PREFIX}_client",
+                    input_ids=[0],
+                    stream=stream,
+                )
+                request = SimpleNamespace(
+                    headers={},
+                    json=AsyncMock(
+                        return_value={
+                            "rid": obj.rid,
+                            "input_ids": [0],
+                            "stream": stream,
+                        }
+                    ),
+                    is_disconnected=AsyncMock(return_value=False),
+                )
+
+                async def drive():
+                    response = await http_server.generate_request(obj, request)
+                    if stream:
+                        output = b"".join(
+                            [chunk async for chunk in response.body_iterator]
+                        )
+                        self.assertIn(b"reserved for internal health probes", output)
+                        self.assertIn(b"invalid_request_error", output)
+                    else:
+                        self.assertEqual(response.status_code, 400)
+                        self.assertIn(
+                            b"reserved for internal health probes", response.body
+                        )
+
+                with patch.object(
+                    http_server, "_global_state", SimpleNamespace(tokenizer_manager=tm)
+                ):
+                    asyncio.run(drive())
+                tm._init_req_state.assert_not_called()
 
 
 if __name__ == "__main__":

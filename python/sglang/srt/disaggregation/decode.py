@@ -98,6 +98,12 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import dsa_index_k_page_tokens
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import NextBatchPlan, ScheduleBatch
+from sglang.srt.managers.scheduler_components.health_probe import (
+    ProbeAction,
+    finished_probe_count,
+    probe_action,
+    retire_decode_probe,
+)
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     kv_private_tokens,
     kv_private_window_tokens,
@@ -4342,28 +4348,41 @@ class SchedulerDisaggregationDecodeMixin:
         self: Scheduler, running_batch: ScheduleBatch
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
-        # Process pending prebuilt batch: output processing + filter + merge
-        new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
-        if new_prebuilt_batch:
-            assert self.chunked_req is None
-            self.batch_result_processor.process_batch_result_prebuilt(
-                new_prebuilt_batch
-            )
-            new_prebuilt_batch.filter_batch()
-            if not new_prebuilt_batch.is_empty():
-                if running_batch.is_empty():
-                    running_batch = new_prebuilt_batch
-                    if self.enable_hisparse:
-                        running_batch.hisparse_coordinator = self.hisparse_coordinator
-                else:
-                    running_batch.merge_batch(new_prebuilt_batch)
+        for health_check_only in (False, True):
+            # One-token or aborted users can all finish at prebuilt, without
+            # proving inference progress. Give a queued probe its own forward
+            # before admitting more such users, even when the queue stays busy.
+            if health_check_only:
+                if not running_batch.is_empty() or not any(
+                    is_health_check_req(req) for req in self.waiting_queue
+                ):
+                    break
+                new_prebuilt_batch = self.get_new_prebuilt_batch(
+                    running_batch, health_check_only=True
+                )
+            else:
+                new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
 
-        # Schedule decode batch
-        if running_batch.is_empty():
-            ret = None
-        else:
-            running_batch = self.update_running_batch(running_batch)
-            ret = running_batch if not running_batch.is_empty() else None
+            if new_prebuilt_batch:
+                assert self.chunked_req is None
+                self.batch_result_processor.process_batch_result_prebuilt(
+                    new_prebuilt_batch
+                )
+                new_prebuilt_batch.filter_batch()
+                if not new_prebuilt_batch.is_empty():
+                    if running_batch.is_empty():
+                        running_batch = new_prebuilt_batch
+                        if self.enable_hisparse:
+                            running_batch.hisparse_coordinator = (
+                                self.hisparse_coordinator
+                            )
+                    else:
+                        running_batch.merge_batch(new_prebuilt_batch)
+
+            if not running_batch.is_empty():
+                running_batch = self.update_running_batch(running_batch)
+
+        ret = running_batch if not running_batch.is_empty() else None
 
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
         if ret:
@@ -4371,9 +4390,11 @@ class SchedulerDisaggregationDecodeMixin:
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
     def get_new_prebuilt_batch(
-        self, running_batch: ScheduleBatch
+        self, running_batch: ScheduleBatch, *, health_check_only: bool = False
     ) -> Optional[ScheduleBatch]:
-        batch = self._get_new_prebuilt_batch(running_batch)
+        batch = self._get_new_prebuilt_batch(
+            running_batch, health_check_only=health_check_only
+        )
         if batch is None:
             return None
         nonblocking = self._nonblocking_admit_in_scope(batch)
@@ -4513,7 +4534,10 @@ class SchedulerDisaggregationDecodeMixin:
             self.metrics_collector.increment_transfer_failed_reqs()
 
     def _get_new_prebuilt_batch(
-        self: Scheduler, running_batch: ScheduleBatch
+        self: Scheduler,
+        running_batch: ScheduleBatch,
+        *,
+        health_check_only: bool = False,
     ) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
         if self.grammar_manager.has_waiting_grammars():
@@ -4522,6 +4546,13 @@ class SchedulerDisaggregationDecodeMixin:
                 self._add_request_to_queue(req)
 
         if len(self.waiting_queue) == 0:
+            return None
+
+        # An idle probe can still be decoding when a user's KV transfer
+        # finishes. Let its tiny forward finish alone: merging the user into
+        # it would change the user's decode batch shape solely for liveness.
+        finished_probes = finished_probe_count(running_batch.reqs)
+        if finished_probes is None:
             return None
 
         if self.enable_priority_scheduling:
@@ -4535,7 +4566,9 @@ class SchedulerDisaggregationDecodeMixin:
             self._start_host_restores()
             restores_ready = self._host_restores_ready()
 
-        curr_batch_size = running_batch.batch_size()
+        # Finished probes are filtered after prebuilt admission; they must not
+        # keep waiting users out for another scheduler iteration.
+        curr_batch_size = running_batch.batch_size() - finished_probes
 
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
 
@@ -4543,10 +4576,30 @@ class SchedulerDisaggregationDecodeMixin:
 
         # pop req from waiting queue
         can_run_list: List[Req] = []
+        has_traffic = not health_check_only and (
+            curr_batch_size > 0
+            or any(not is_health_check_req(req) for req in self.waiting_queue)
+        )
 
         for req in self.waiting_queue:
-            # we can only add at least `num_not_used_batch` new batch to the running queue;
-            # a request restored from host memory waits until its copy has finished
+            if is_health_check_req(req):
+                action = probe_action(
+                    req, self.health_monitor.completion_seq, has_traffic=has_traffic
+                )
+                if action is ProbeAction.RETIRE:
+                    # A previously deferred probe may have a host restore in
+                    # flight. Keep its row until every rank's writer is done.
+                    if req.kv.restore_done_event is not None:
+                        if host_restore and id(req) not in restores_ready:
+                            continue
+                        finish_restore_kv_cache(req, self.tree_cache)
+                    retire_decode_probe(self, req)
+                    continue
+                if action is ProbeAction.DEFER:
+                    continue
+            elif health_check_only:
+                continue
+            # A host-restored request joins only after the copy is ready.
             if len(can_run_list) < num_not_used_batch and (
                 not host_restore
                 or req.kv.restore_done_event is None

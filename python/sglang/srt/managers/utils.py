@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, List, Optional, Union
 import msgspec
 import torch
 
-from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.constants import is_health_check_request
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
 from sglang.srt.layers.logits_processor import (
@@ -457,7 +457,7 @@ class EmbeddingBatchResult:
 
 def is_health_check_generate_req(recv_req):
     rid = getattr(recv_req, "rid", None)
-    return rid is not None and rid.startswith(HEALTH_CHECK_RID_PREFIX)
+    return is_health_check_request(rid)
 
 
 class MsgpackDecodeError(ValueError):
