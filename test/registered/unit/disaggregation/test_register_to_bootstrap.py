@@ -68,6 +68,18 @@ class TestRegisterToBootstrap(CustomTestCase):
         # An empty layout never goes on the wire as a new field.
         self.assertIsNone(payload["spec_kv_layout"])
 
+    @patch("sglang.srt.disaggregation.common.conn.time")
+    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    def test_payload_carries_kv_layout(self, mock_put, mock_time):
+        mock_time.monotonic.return_value = 0.0
+        mock_put.return_value = MagicMock(status_code=200)
+
+        for layout in (None, "seq_along_lane"):
+            mgr = self._make_manager()
+            mgr.kv_layout = layout
+            mgr.register_to_bootstrap()
+            self.assertEqual(mock_put.call_args[1]["json"]["kv_layout"], layout)
+
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
     def test_rust_attention_dp_replicates_complete_topology_across_hosts(
         self, mock_put
@@ -213,6 +225,7 @@ class TestRegisterToBootstrap(CustomTestCase):
         mgr.rank_port = 12345
         # Target-only prefill: knows it injects no draft KV.
         mgr.spec_kv_layout = {}
+        mgr.kv_layout = None
 
         mgr.kv_args = MagicMock()
         mgr.kv_args.page_size = 16
@@ -221,6 +234,126 @@ class TestRegisterToBootstrap(CustomTestCase):
         mgr.kv_cache_dtype_str = "auto"
 
         return mgr
+
+
+class TestDecodeKVLayoutCheck(CustomTestCase):
+    """try_ensure_parallel_info raises on a kv_layout mismatch unless the
+    backend fails the room itself."""
+
+    def _manager(self, fails_room):
+        from sglang.srt.disaggregation.common.conn import CommonKVManager
+
+        mgr = MagicMock(spec=CommonKVManager)
+        mgr.try_ensure_parallel_info = CommonKVManager.try_ensure_parallel_info.__get__(
+            mgr, CommonKVManager
+        )
+        mgr.fails_room_on_kv_layout_mismatch = fails_room
+        mgr.prefill_info_table = {}
+        mgr.kv_args = MagicMock(page_size=16, state_types=())
+        mgr.kv_cache_dtype_str = "auto"
+        # Raiden's frame tag, as RaidenKVManager.set_kv_caches leaves it.
+        mgr.kv_layout = "per_layer"
+        mgr.dsv41_spec_layout = None
+        mgr.spec_kv_layout = None
+        mgr.attn_tp_size = 4
+        mgr.is_mla_backend = False
+        mgr.is_hybrid_mla_backend = False
+        mgr.dcp_size = 1
+        return mgr
+
+    def _fetch(self, mgr):
+        info = dict(
+            attn_tp_size=4,
+            attn_cp_size=1,
+            dp_size=1,
+            pp_size=1,
+            page_size=16,
+            kv_cache_dtype="auto",
+            follow_bootstrap_room=True,
+            kv_layout="seq_along_lane",
+        )
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = info
+        with patch(
+            "sglang.srt.disaggregation.common.conn.requests.get", return_value=resp
+        ):
+            return mgr.try_ensure_parallel_info("10.0.0.1:8998")
+
+    def test_mismatch_raises_by_default(self):
+        with self.assertRaisesRegex(RuntimeError, "KV layout mismatch"):
+            self._fetch(self._manager(fails_room=False))
+
+    def test_backend_that_fails_the_room_is_left_to_it(self):
+        mgr = self._manager(fails_room=True)
+        self.assertTrue(self._fetch(mgr))
+        self.assertEqual(
+            mgr.prefill_info_table["10.0.0.1:8998"].kv_layout, "seq_along_lane"
+        )
+
+    def test_raiden_fails_the_room(self):
+        try:
+            from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
+        except ImportError as e:
+            self.skipTest(f"raiden unavailable: {e}")
+        self.assertTrue(RaidenKVManager.fails_room_on_kv_layout_mismatch)
+
+
+class TestGetPdKVLayout(CustomTestCase):
+    def test_pool_resolution(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.disaggregation.utils import get_pd_kv_layout
+
+        seq = SimpleNamespace(disagg_kv_layout="seq_along_lane")
+        self.assertIsNone(get_pd_kv_layout(SimpleNamespace()))
+        self.assertEqual(get_pd_kv_layout(seq), "seq_along_lane")
+        self.assertEqual(
+            get_pd_kv_layout(SimpleNamespace(full_kv_pool=seq)), "seq_along_lane"
+        )
+
+    def test_dsv4_layout_unchanged(self):
+        from sglang.srt.disaggregation.utils import get_pd_kv_layout
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+        )
+
+        pool = object.__new__(DeepSeekV4TokenToKVPool)
+        with patch.object(
+            DeepSeekV4TokenToKVPool, "pd_kv_layout", return_value="dsv4_layout"
+        ):
+            self.assertEqual(get_pd_kv_layout(pool), "dsv4_layout")
+            pool.disagg_kv_layout = "ignored"
+            self.assertEqual(get_pd_kv_layout(pool), "dsv4_layout")
+
+    def test_tpu_pool_classes(self):
+        try:
+            from sglang_tpu.kv_pool import (
+                TpuFusedMHATokenToKVPool,
+                TpuSeqAlongLaneKVPool,
+            )
+        except ImportError as e:
+            self.skipTest(f"TPU pool module unavailable: {e}")
+        self.assertEqual(TpuSeqAlongLaneKVPool.disagg_kv_layout, "seq_along_lane")
+        self.assertFalse(hasattr(TpuFusedMHATokenToKVPool, "disagg_kv_layout"))
+
+    def test_raiden_reads_the_same_layout(self):
+        """Raiden's SEQ_ALONG_LANE flag comes from the advertised layout."""
+        from types import SimpleNamespace
+
+        try:
+            from sglang_tpu.disaggregation.raiden.common import _is_seq_along_lane
+            from sglang_tpu.kv_pool import (
+                TpuFusedMHATokenToKVPool,
+                TpuSeqAlongLaneKVPool,
+            )
+        except ImportError as e:
+            self.skipTest(f"TPU pool module unavailable: {e}")
+        seq = object.__new__(TpuSeqAlongLaneKVPool)
+        fused = object.__new__(TpuFusedMHATokenToKVPool)
+        self.assertTrue(_is_seq_along_lane(seq))
+        self.assertTrue(_is_seq_along_lane(SimpleNamespace(full_kv_pool=seq)))
+        self.assertFalse(_is_seq_along_lane(fused))
+        self.assertFalse(_is_seq_along_lane(None))
 
 
 if __name__ == "__main__":
