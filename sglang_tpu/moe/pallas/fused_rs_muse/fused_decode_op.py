@@ -27,14 +27,20 @@ SUPPORTED_REPLICA_SLOTS = (0, 1, 2, 4, 6, 8)
 SUPPORTED_REPLICA_COST_MODES = ("active", "tiles", "weighted")
 
 
-def supported_fuse_all_batches() -> tuple[int, ...]:
-    """Return active Muse fuse-all decode batch buckets (adds 384 under DECODE_B384=1)."""
+def supported_fuse_all_batches(ep: int | None = None) -> tuple[int, ...]:
+    """Return active Muse fuse-all decode batch buckets (adds 8 under DECODE_B8, 384 under DECODE_B384)."""
     from sglang_tpu.envs import envs as tpu_envs
 
     b384_env = getattr(tpu_envs, "SGLANG_TPU_MUSE_DECODE_B384", None)
-    if b384_env is not None and b384_env.get():
-        return SUPPORTED_FUSE_ALL_BATCHES_B384
-    return SUPPORTED_FUSE_ALL_BATCHES
+    batches = (
+        SUPPORTED_FUSE_ALL_BATCHES_B384
+        if (b384_env is not None and b384_env.get())
+        else SUPPORTED_FUSE_ALL_BATCHES
+    )
+    b8_env = getattr(tpu_envs, "SGLANG_TPU_MUSE_KERNEL_DECODE_B8", None)
+    if b8_env is not None and b8_env.get() and ep in (None, 8):
+        return (8, *batches)
+    return batches
 
 
 def get_fused_decode_op(ep=16):

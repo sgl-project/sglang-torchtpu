@@ -588,6 +588,8 @@ class TpuEnvs:
     SGLANG_TPU_MUSE_KERNEL_DECODE_EP_TP2_PAIR_RS = EnvBool(False)
     # Opt-in B=16 (LC 8K/1K) sparse execution (m_buckets=(8, 16) vs dense) unlocking FREE/MIN_P.
     SGLANG_TPU_MUSE_KERNEL_DECODE_B16_SPARSE = EnvBool(False)
+    # Opt-in native B=8 decode MoE compile bucket on TP=8 (ep=8).
+    SGLANG_TPU_MUSE_KERNEL_DECODE_B8 = EnvBool(False)
     # Opt-in non-uniform per-layer FREE/MIN_P preset or spec ("" = uniform off).
     SGLANG_TPU_MUSE_DECODE_NONUNIFORM_FREE = EnvStr("")
     # Opt-in (#3035): allow SPEC_PRIME (>0) alongside ROUTE_FAST + FAST_PLAN=2 and optional home slot hint (-1=auto).
@@ -596,6 +598,8 @@ class TpuEnvs:
     # Opt-in DFlash verify (B >= 128) routing-pruning & W4A8/tile overrides ("" / -1 / False = inherit decode):
     SGLANG_TPU_MUSE_DECODE_VERIFY_FREE_EXPERT_ROWS = EnvStr("")
     SGLANG_TPU_MUSE_DECODE_VERIFY_MIN_P_TOPK = EnvFloat(-1.0)
+    # Opt-in d=1 scaled FREE/MIN_P at B >= 128 (e.g. c256 concurrency when speculative_algorithm is None).
+    SGLANG_TPU_MUSE_DECODE_D1_LARGE_BATCH_FREE = EnvBool(False)
     SGLANG_TPU_MUSE_KERNEL_DECODE_TILE_M128 = EnvBool(False)
     # Muse Wave-7B: allow DECODE_REPLICA_SLOTS > 0 alongside PREFILL_EPLB_STATS_PATH when
     # PrefillEplbManager._refresh_decode_replicas keeps _fused_decode_rep_* synchronized.

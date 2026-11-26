@@ -2150,11 +2150,12 @@ class MuseSparkMoE(nn.Module):
                 return
 
         from sglang_tpu.fp8_moe import _own_storage
-        from sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_op import (
-            SUPPORTED_FUSE_ALL_BATCHES,
-            get_muse_ep_tp2_fallback_op,
-            get_muse_fuse_all_decode_op,
-        )
+        import sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_op as _fdo_mod
+
+        SUPPORTED_FUSE_ALL_BATCHES = _fdo_mod.SUPPORTED_FUSE_ALL_BATCHES
+        get_muse_ep_tp2_fallback_op = _fdo_mod.get_muse_ep_tp2_fallback_op
+        get_muse_fuse_all_decode_op = _fdo_mod.get_muse_fuse_all_decode_op
+        _batches_fn = getattr(_fdo_mod, "supported_fuse_all_batches", None)
 
         self._register_fused_decode_vecs(norm)
         self.register_buffer("_fused_decode_rank", rank_t, persistent=False)
@@ -2164,10 +2165,15 @@ class MuseSparkMoE(nn.Module):
                 _own_storage(pre_gain.detach().reshape(1, -1).contiguous()),
                 persistent=False,
             )
-        ext_batches = (
-            (*SUPPORTED_FUSE_ALL_BATCHES, 384)
-            if (_decode_max_tokens() >= 384 and 384 not in SUPPORTED_FUSE_ALL_BATCHES)
+        base_batches = (
+            _batches_fn(ep=ep_owners)
+            if (mode == "sparse" and _batches_fn is not None)
             else SUPPORTED_FUSE_ALL_BATCHES
+        )
+        ext_batches = (
+            (*base_batches, 384)
+            if (_decode_max_tokens() >= 384 and 384 not in base_batches)
+            else base_batches
         )
         self._fused_decode_batches = (
             ext_batches
@@ -2679,6 +2685,7 @@ class MuseSparkMoE(nn.Module):
         from sglang_tpu.fp8_moe import _own_storage
         from sglang_tpu.moe.pallas.fused_rs_muse.decode_hbm_breakers import (
             parse_nonuniform_free_spec,
+            read_d1_large_batch_free,
             resolve_nonuniform_free_for_layer,
         )
         from sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_routing import (
@@ -2694,6 +2701,7 @@ class MuseSparkMoE(nn.Module):
         if parse_nonuniform_free_spec(raw_spec) is None:
             return False
 
+        d1_large_batch = read_d1_large_batch_free()
         (
             _,
             _,
@@ -2722,6 +2730,7 @@ class MuseSparkMoE(nn.Module):
                 parse_free_spec_fn=parse_free_expert_rows_spec,
                 ep=ep_owners,
                 spec=raw_spec,
+                d1_large_batch=d1_large_batch,
             )
             vec = torch.tensor(
                 [float(mp), float(f_rows), float(f_max_w), float(f_min_slot)],
