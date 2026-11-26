@@ -4591,6 +4591,224 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
                     comp.memory_analysis().generated_code_size_in_bytes, 0
                 )
 
+    def test_w11_opt_in_w4a8_nc_split512_and_min_batch(self):
+        """Verify LHS_FP8_MIN_BATCH gating, B=128 m32 VMEM fit, W4A8+nc_split512 Interpret parity, and AOT."""
+        import dataclasses
+        import numpy as np
+        from sglang_tpu.envs import envs as tpu_envs
+
+        self.assertEqual(
+            tpu_envs.SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8_MIN_BATCH.get(), 256
+        )
+        v1_mod = _load_pkg_module(
+            "fused_decode_sparse", _MUSE_DIR / "fused_decode_sparse.py"
+        )
+        clean_env = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith("SGLANG_TPU_MUSE_")
+        }
+
+        # 1. Opt-in threshold gating: default MIN_BATCH=256 preserves B<=128 BF16 when LHS_FP8=1.
+        with mock.patch.dict(
+            os.environ,
+            {
+                **clean_env,
+                "SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_B64": "4",
+                "SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8": "1",
+            },
+            clear=True,
+        ):
+            self.assertFalse(v1_mod.default_sparse_decode_config(64, 8, 512).lhs_fp8)
+            self.assertFalse(v1_mod.default_sparse_decode_config(128, 8, 512).lhs_fp8)
+            self.assertTrue(v1_mod.default_sparse_decode_config(256, 8, 512).lhs_fp8)
+
+        # Lowering MIN_BATCH=64 enables W4A8 across B=64..256 (K16 & B<=16 stay BF16).
+        with mock.patch.dict(
+            os.environ,
+            {
+                **clean_env,
+                "SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_B64": "4",
+                "SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8": "1",
+                "SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8_MIN_BATCH": "64",
+            },
+            clear=True,
+        ):
+            c16 = v1_mod.default_sparse_decode_config(16, 8, 512)
+            c64 = v1_mod.default_sparse_decode_config(64, 8, 512)
+            c128 = v1_mod.default_sparse_decode_config(128, 8, 512)
+            c256 = v1_mod.default_sparse_decode_config(256, 8, 512)
+            c64_k16 = v1_mod.default_sparse_decode_config(64, 8, 16)
+            self.assertFalse(c16.lhs_fp8)
+            self.assertFalse(c64_k16.lhs_fp8)
+            self.assertTrue(c64.lhs_fp8 and c64.nc_split512)
+            self.assertTrue(c128.lhs_fp8)
+            self.assertFalse(c128.nc_split512)
+            self.assertEqual(c128.tile_m, 32)
+            self.assertEqual(c128.m_buckets, (16, 32))
+            self.assertTrue(c256.lhs_fp8 and c256.nc_split512)
+
+        # Explicit NC_SPLIT512=1 overrides the B=128 default-off heuristic.
+        with mock.patch.dict(
+            os.environ,
+            {
+                **clean_env,
+                "SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_B64": "4",
+                "SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8": "1",
+                "SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8_MIN_BATCH": "128",
+                "SGLANG_TPU_MUSE_KERNEL_DECODE_NC_SPLIT512": "1",
+            },
+            clear=True,
+        ):
+            c128_ov = v1_mod.default_sparse_decode_config(128, 8, 512)
+            self.assertTrue(c128_ov.lhs_fp8 and c128_ov.nc_split512)
+
+        try:
+            import jax
+            import jax.numpy as jnp
+            from jax.experimental import pallas as pl
+            from jax.experimental.pallas import tpu as pltpu
+            from jax.experimental.topologies import get_topology_desc
+            from jax.sharding import Mesh, PartitionSpec as P
+        except Exception as exc:
+            self.skipTest(f"JAX/Pallas TPU unavailable: {exc}")
+
+        # 2. Eager race/nan-detect Interpret parity for W4A8 + nc_split512/k512_chain & k_offset>0.
+        interp_p = {
+            "dma_execution_mode": "eager",
+            "detect_races": True,
+            **(
+                {"uninitialized_memory": "nan"}
+                if "uninitialized_memory" in pltpu.InterpretParams.__annotations__
+                else {}
+            ),
+        }
+        rng = np.random.default_rng(20261131)
+        sb = 512
+        total_k, n_col = 4096, 1024
+        x_fp8_all = jnp.asarray(
+            rng.normal(0.0, 0.5, size=(32, total_k)), jnp.float8_e4m3fn
+        )
+        sc_lhs_all = jnp.asarray(
+            np.repeat(
+                rng.uniform(0.01, 0.08, size=(32, total_k // 256, 1)), 128, axis=2
+            ).reshape(32, -1),
+            jnp.float32,
+        )
+        for m_rows, k_off, k_dim, k_chain in (
+            (8, 0, 4096, False),
+            (32, 2048, 2048, True),
+        ):
+            read_m = 16 if m_rows == 8 else m_rows
+            w_u32 = jnp.asarray(
+                rng.integers(0, 0xFFFFFFFF, size=(k_dim // 8, n_col), dtype=np.uint32)
+            )
+            sc_w = jnp.asarray(
+                rng.uniform(0.01, 0.05, size=(k_dim // sb, n_col)), jnp.bfloat16
+            )
+
+            def _run_w4a8(nc_split: bool):
+                def _kern(x_r, sc_x_r, w_r, s_r, o_r):
+                    o_r[...] = v1_mod._fp4_gmm_chunked(
+                        x_r,
+                        w_r,
+                        s_r,
+                        m_rows,
+                        k_dim,
+                        0,
+                        n_col,
+                        True,
+                        sb,
+                        lhs_sc_ref=sc_x_r,
+                        hoist_scales=False,
+                        k_offset=k_off,
+                        nc_split512=nc_split,
+                        k512_chain=k_chain,
+                    )
+
+                vm = pltpu.VMEM
+                return pl.pallas_call(
+                    _kern,
+                    out_shape=jax.ShapeDtypeStruct((m_rows, n_col), jnp.float32),
+                    grid_spec=pltpu.PrefetchScalarGridSpec(
+                        num_scalar_prefetch=0,
+                        grid=(1,),
+                        in_specs=(pl.BlockSpec(memory_space=vm),) * 4,
+                        out_specs=pl.BlockSpec(memory_space=vm),
+                    ),
+                    interpret=pltpu.InterpretParams(**interp_p),
+                )(x_fp8_all, sc_lhs_all[:read_m, :], w_u32, sc_w)
+
+            out_ref = np.asarray(_run_w4a8(False))
+            out_nc = np.asarray(_run_w4a8(True))
+            self.assertTrue(np.all(np.isfinite(out_nc)))
+            np.testing.assert_allclose(out_nc, out_ref, atol=1e-3, rtol=1e-3)
+
+        # 3. tpu7x:2x2x1 AOT compilation for W4A8 across B=64 (nc_split512=True) & B=128 (tile_m=32).
+        ep, h, n1, i_dim = 8, 4096, 8192, 4096
+        e_local = 256 // ep
+        tpu_devs = get_topology_desc("tpu7x:2x2x1", platform="tpu").devices
+        if len(tpu_devs) >= 8:
+            tpu_mesh = Mesh(
+                np.array(
+                    sorted(tpu_devs, key=lambda d: (d.coords[1], d.coords[0], d.core_on_chip))
+                ),
+                ("model",),
+            )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    **clean_env,
+                    "SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_B64": "4",
+                    "SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8_MIN_BATCH": "64",
+                },
+                clear=True,
+            ):
+                cfgs = [
+                    dataclasses.replace(
+                        v1_mod.default_sparse_decode_config(cur_b, ep, sb),
+                        pair_rs=True,
+                    )
+                    for cur_b in (64, 128)
+                ]
+            for cur_b, cur_cfg in zip((64, 128), cfgs):
+                shapes = (
+                    jax.ShapeDtypeStruct((1,), jnp.int32),
+                    jax.ShapeDtypeStruct((cur_b, 256), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((1, 256), jnp.float32),
+                    jax.ShapeDtypeStruct((cur_b, h), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((e_local, h, n1), jnp.float4_e2m1fn),
+                    jax.ShapeDtypeStruct((e_local, h // sb, n1), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((e_local, i_dim, h), jnp.float4_e2m1fn),
+                    jax.ShapeDtypeStruct((e_local, i_dim // sb, h), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((1, h), jnp.bfloat16),
+                )
+
+                def _aot_w11(*args, _cfg=cur_cfg):
+                    return v1_mod.fused_decode_sparse_from_logits(
+                        *args, ep=ep, return_sharded=True, config=_cfg
+                    )
+
+                comp = (
+                    jax.jit(
+                        jax.shard_map(
+                            _aot_w11,
+                            mesh=tpu_mesh,
+                            in_specs=(P(),) * len(shapes),
+                            out_specs=P(),
+                            check_vma=False,
+                        )
+                    )
+                    .trace(*shapes)
+                    .lower(lowering_platforms=("tpu",))
+                    .compile()
+                )
+                self.assertIn("tpu_custom_call", comp.as_text())
+                self.assertGreater(
+                    comp.memory_analysis().generated_code_size_in_bytes, 0
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

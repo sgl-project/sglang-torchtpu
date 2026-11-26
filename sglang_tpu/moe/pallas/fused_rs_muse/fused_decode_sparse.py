@@ -255,6 +255,23 @@ def _read_verify_w4a8_knobs() -> tuple[bool, bool]:
     return lhs_fp8, tm128
 
 
+def _read_lhs_fp8_min_batch() -> int:
+    import os
+
+    raw = os.environ.get("SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8_MIN_BATCH")
+    if raw is not None and raw.strip() != "":
+        return int(raw)
+    try:
+        from sglang_tpu.envs import envs
+
+        ev = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8_MIN_BATCH", None)
+        if ev is not None:
+            return int(ev.get())
+    except Exception:
+        pass
+    return 256
+
+
 def _read_sparse_env_overrides() -> (
     tuple[bool, bool, int, int, str, bool, bool, bool, float, int, float, int, int, str]
 ):
@@ -405,6 +422,12 @@ def default_sparse_decode_config(
     tw_eff = raw_tw if (rc_eff > 0 and tr_eff > 0) else 0.0
     fast_gs = _read_fast_gs_knob()
     use_verify_lhs_fp8, use_verify_tm128 = _read_verify_w4a8_knobs()
+    lhs_fp8_min_b = _read_lhs_fp8_min_batch()
+    w4a8_eligible = (
+        (scale_block >= 256)
+        and use_verify_lhs_fp8
+        and (batch_size >= max(32, lhs_fp8_min_b))
+    )
     route_kw = dict(
         hoist_k256_scales=hoist_sc,
         nc_split512=nc_split512,
@@ -502,6 +525,7 @@ def default_sparse_decode_config(
             pair_rs=use_pair_rs,
             bridge_ag=use_ep16_bridge_ag or (False if is_b16 else use_br64),
             norm_f32_stage=True,
+            lhs_fp8=w4a8_eligible and not is_b16,
             route_chunk_rows=min(batch_size, 16) if is_b16 else (batch_size if fast_b64 >= 1 else 32),
             static_holder_mask=static_mask,
             spec_prime_parts=spec_eff,
@@ -509,16 +533,30 @@ def default_sparse_decode_config(
             **route_kw,
         )
     use_v_tm128 = use_verify_tm128 and batch_size >= 256
+    b128_w4a8 = w4a8_eligible and (batch_size == 128)
+    if b128_w4a8:
+        import os
+
+        # Shrink tile_m to 32 (fits <63.94 MiB VMEM on Step-B superkernel) and prefer
+        # wide N-strips unless NC_SPLIT512 is explicitly overridden by env.
+        if os.environ.get("SGLANG_TPU_MUSE_KERNEL_DECODE_NC_SPLIT512") is None:
+            route_kw["nc_split512"] = False
+    tile_m_large = 128 if use_v_tm128 else (32 if b128_w4a8 else 64)
+    m_bkts_large = (
+        (16, 32, 64, 128)
+        if use_v_tm128
+        else ((16, 32) if b128_w4a8 else (16, 32, 64))
+    )
     return SparseDecodeConfig(
         row_mode="sparse",
         weight_mode="half_n",
-        tile_m=128 if use_v_tm128 else 64,
-        m_buckets=(16, 32, 64, 128) if use_v_tm128 else (16, 32, 64),
+        tile_m=tile_m_large,
+        m_buckets=m_bkts_large,
         loop32_in_tile=False,
         k16_blockdiag_rows=(),
         k256_strip_mode=eff_strip,
         k256_dual_mode="hybrid",
-        lhs_fp8=use_verify_lhs_fp8 and batch_size >= 256,
+        lhs_fp8=w4a8_eligible,
         rs_wire_bf16=True,
         pair_rs=use_pair_rs,
         bridge_ag=(ep == 8) or use_ep16_bridge_ag,
@@ -625,7 +663,7 @@ def _fp4_gmm_chunked(
     gpc = _KC // _FP4_GROUP
     read_m = 16 if m_rows == 8 else m_rows
     use_w4a8 = block256 and (lhs_sc_ref is not None)
-    if block256 and not use_w4a8 and (nc_split512 or k512_chain):
+    if block256 and (nc_split512 or k512_chain):
         eff_sb = scale_block if k512_chain else _KC
         n_sb = k_dim // eff_sb
         n_real_sb = k_dim // scale_block
@@ -638,6 +676,8 @@ def _fp4_gmm_chunked(
             and ((m_rows * sub_nc) // 1024 <= 16 or sub_nc <= 1024 or (k_dim // _KC) <= 8)
         )
         chunks_per_sb = eff_sb // _KC
+        x_read_m_s = max(32, read_m) if use_w4a8 else read_m
+        b_off_s = k_offset // _KC
         accs: list[jax.Array] = []
         for si in range(n_sub):
             col0 = n0 + si * sub_nc
@@ -656,8 +696,8 @@ def _fp4_gmm_chunked(
                 blk_acc = None
                 for ci in range(chunks_per_sb):
                     c0 = c_base + ci * _KC
-                    x = x_2d_ref[pl.ds(0, read_m), pl.ds(k_offset + c0, _KC)]
-                    if read_m != m_rows:
+                    x = x_2d_ref[pl.ds(0, x_read_m_s), pl.ds(k_offset + c0, _KC)]
+                    if x_read_m_s != m_rows:
                         x = x[:m_rows, :]
                     w_fp8 = pltpu.bitcast(
                         w_ref[
@@ -669,6 +709,14 @@ def _fp4_gmm_chunked(
                     part = jnp.dot(
                         x, w_fp8, preferred_element_type=jnp.float32
                     )
+                    if use_w4a8:
+                        x_sc = lhs_sc_ref[
+                            pl.ds(0, read_m),
+                            pl.ds((b_off_s + (c0 // _KC)) * 128, 128),
+                        ]
+                        if m_rows == 8:
+                            x_sc = x_sc[:8, :]
+                        part = part * x_sc[:, 0:1]
                     blk_acc = part if blk_acc is None else blk_acc + part
                 real_sb = c_base // scale_block
                 if s_sub is not None:

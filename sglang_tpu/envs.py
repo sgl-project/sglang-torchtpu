@@ -606,6 +606,9 @@ class TpuEnvs:
     # Opt-in load-aware rank-capped FREE tail shedding ("<cap>:<tail_rows>:<tail_w>", e.g. "11:2:0.32").
     SGLANG_TPU_MUSE_DECODE_FREE_RANK_CAP = EnvStr("")
     SGLANG_TPU_MUSE_KERNEL_DECODE_TILE_M128 = EnvBool(False)
+    # Minimum batch size where SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8 activates W4A8
+    # (default 256 preserves decode B<=128 BF16; set 64 or 128 to opt into W4A8 decode).
+    SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8_MIN_BATCH = EnvInt(256)
     # Muse Wave-7B: allow DECODE_REPLICA_SLOTS > 0 alongside PREFILL_EPLB_STATS_PATH when
     # PrefillEplbManager._refresh_decode_replicas keeps _fused_decode_rep_* synchronized.
     SGLANG_TPU_MUSE_KERNEL_DECODE_SYNC_PREFILL_EPLB = EnvBool(False)
