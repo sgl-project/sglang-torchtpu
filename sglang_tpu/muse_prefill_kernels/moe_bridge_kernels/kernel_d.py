@@ -137,8 +137,10 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
     use_zero_spill = (
         zero_spill
         or envs.SGLANG_TPU_MUSE_KERNEL_D_ZERO_SPILL.get()
-        or tok_tile_eff > 64
+        or tok_tile_eff >= 32
     ) and not (emit_fp8_attn_in or use_blk_fp8_unpool)
+    if chunk_size <= 32 and not use_zero_spill and chunk_size % 16 == 0:
+        tok_tile_eff = min(tok_tile_eff, 16)
 
     num_rows = chunk_size - row_start if num_rows is None else num_rows
     assert row_start % tok_tile_eff == 0 and num_rows % tok_tile_eff == 0, (
@@ -1156,7 +1158,7 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
         ),
         compiler_params=pltpu.CompilerParams(
             disable_bounds_checks=True,
-            vmem_limit_bytes=62 * 1024 * 1024,
+            vmem_limit_bytes=63 * 1024 * 1024,
         ),
         name=(
             f"pallas_d_combine_unpool_4slab_t{tok_tile_eff}"

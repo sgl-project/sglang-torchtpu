@@ -1484,11 +1484,14 @@ def pallas_fused_b1_b2_wpool_quant(
     )
 
     num_steps = out_rows // bm
+    b2_dbl_env = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_B2_DBL_STREAM", None)
+    use_dbl_stream = bool(b2_dbl_env is not None and b2_dbl_env.get()) and num_steps >= 2
     strip_w = 256 if use_b12_fast else 2048
     num_strips = h_dim // strip_w
     sub_n = 256
     ep_sub_n = 256 if use_b12_fast else 1024
     f256_sfx = "_f256" if use_b12_fast else ""
+    dbl_sfx = "_dbl" if use_dbl_stream else ""
     inv_h = 1.0 / float(h_dim)
     inv_he = 1.0 / float(he_dim)
     out_cols = he_dim + LANE
@@ -1534,19 +1537,51 @@ def pallas_fused_b1_b2_wpool_quant(
         in_row0 = (step + m_offset) * bm
         smid_out_row0 = in_row0 if (full_stream_mid or stream_mid_prev is not None) else step * bm
 
-        @pl.when(step > 0)
-        def _wait_prev_smid():
-            pltpu.make_async_copy(
-                src_ref=stream_buf_ref,
-                dst_ref=stream_mid_hbm_ref.at[pl.ds(smid_out_row0 - bm, bm), :],
-                sem=dma_sems.at[1],
-            ).wait()
+        if use_dbl_stream:
+            slot = step % 2
+            next_slot = 1 - slot
+            s_ref = stream_buf_ref.at[slot]
 
-        pltpu.make_async_copy(
-            src_ref=stream_hbm_ref.at[pl.ds(in_row0, bm), :],
-            dst_ref=stream_buf_ref,
-            sem=dma_sems.at[0],
-        ).start()
+            @pl.when(step == 0)
+            def _pf_stream0():
+                pltpu.make_async_copy(
+                    src_ref=stream_hbm_ref.at[pl.ds(m_offset * bm, bm), :],
+                    dst_ref=stream_buf_ref.at[0],
+                    sem=dma_sems.at[0],
+                ).start()
+
+            @pl.when(step + 1 < num_steps)
+            def _pf_next_stream():
+                @pl.when(step >= 1)
+                def _wait_wr_next_slot():
+                    pltpu.make_async_copy(
+                        src_ref=stream_buf_ref.at[next_slot],
+                        dst_ref=stream_mid_hbm_ref.at[pl.ds(smid_out_row0 - bm, bm), :],
+                        sem=dma_sems.at[2 + next_slot],
+                    ).wait()
+
+                pltpu.make_async_copy(
+                    src_ref=stream_hbm_ref.at[pl.ds(in_row0 + bm, bm), :],
+                    dst_ref=stream_buf_ref.at[next_slot],
+                    sem=dma_sems.at[next_slot],
+                ).start()
+        else:
+            slot = 0
+            s_ref = stream_buf_ref
+
+            @pl.when(step > 0)
+            def _wait_prev_smid():
+                pltpu.make_async_copy(
+                    src_ref=stream_buf_ref,
+                    dst_ref=stream_mid_hbm_ref.at[pl.ds(smid_out_row0 - bm, bm), :],
+                    sem=dma_sems.at[1],
+                ).wait()
+
+            pltpu.make_async_copy(
+                src_ref=stream_hbm_ref.at[pl.ds(in_row0, bm), :],
+                dst_ref=stream_buf_ref,
+                sem=dma_sems.at[0],
+            ).start()
 
         # Pass 1 (overlaps with stream_in HBM->VMEM DMA): post-attention norm variance
         sq_a_128 = jnp.zeros((bm, LANE), dtype=jnp.float32)
@@ -1562,8 +1597,8 @@ def pallas_fused_b1_b2_wpool_quant(
 
         pltpu.make_async_copy(
             src_ref=stream_hbm_ref.at[pl.ds(in_row0, bm), :],
-            dst_ref=stream_buf_ref,
-            sem=dma_sems.at[0],
+            dst_ref=s_ref,
+            sem=dma_sems.at[slot if use_dbl_stream else 0],
         ).wait()
 
         # Pass 2: Gated residual + Pre-FFN RMSNorm variance (+ algebraic gain*smid amax for fp8_wpool)
@@ -1575,8 +1610,16 @@ def pallas_fused_b1_b2_wpool_quant(
             branch_s = (a_s * inv_rms_a).astype(jnp.bfloat16).astype(jnp.float32)
             alpha_s = b1_vecs_ref[0:1, c0:c1]
             beta_s = b1_vecs_ref[1:2, c0:c1]
-            smid_s = alpha_s * stream_buf_ref[:, c0:c1] + beta_s * branch_s
-            stream_buf_ref[:, c0:c1] = smid_s
+            cur_stream_s = (
+                stream_buf_ref[slot, :, c0:c1]
+                if use_dbl_stream
+                else stream_buf_ref[:, c0:c1]
+            )
+            smid_s = alpha_s * cur_stream_s + beta_s * branch_s
+            if use_dbl_stream:
+                stream_buf_ref[slot, :, c0:c1] = smid_s
+            else:
+                stream_buf_ref[:, c0:c1] = smid_s
             sq_m_128 = sq_m_128 + vpu_tree_sum_128(smid_s * smid_s)
             if fp8_wpool:
                 gain_s = b1_vecs_ref[2:3, c0:c1]
@@ -1608,7 +1651,11 @@ def pallas_fused_b1_b2_wpool_quant(
         logits = jnp.zeros((bm, num_experts), dtype=jnp.float32)
         for s in range(num_strips):
             c0, c1 = s * strip_w, (s + 1) * strip_w
-            smid_s = stream_buf_ref[:, c0:c1]
+            smid_s = (
+                stream_buf_ref[slot, :, c0:c1]
+                if use_dbl_stream
+                else stream_buf_ref[:, c0:c1]
+            )
             gain_s = b1_vecs_ref[2:3, c0:c1]
             r_f32 = smid_s * inv_rms_m * gain_s
             r_bf16 = r_f32.astype(jnp.bfloat16)
@@ -1652,9 +1699,9 @@ def pallas_fused_b1_b2_wpool_quant(
 
         # Async write stream_mid [128, 8192] to HBM overlapped under router top-8 + wpool MXU!
         pltpu.make_async_copy(
-            src_ref=stream_buf_ref,
+            src_ref=s_ref,
             dst_ref=stream_mid_hbm_ref.at[pl.ds(smid_out_row0, bm), :],
-            sem=dma_sems.at[1],
+            sem=dma_sems.at[(2 + slot) if use_dbl_stream else 1],
         ).start()
 
         # In-VMEM router sigmoid + top-8
@@ -1741,22 +1788,32 @@ def pallas_fused_b1_b2_wpool_quant(
                 jnp.float32(448.0) / jnp.maximum(row_amax, jnp.float32(1e-30)),
             ).astype(jnp.bfloat16)
             x_moe_sc_out_ref[:, :] = jnp.broadcast_to(row_sc_f32, (bm, LANE))
-            for m0 in range(0, bm, 32):
-                inv_m = inv_fp8[m0 : m0 + 32, :]
-                q_parts = [
-                    jnp.clip(
-                        u_scratch_ref[m0 : m0 + 32, kh * 2048 : (kh + 1) * 2048]
-                        * inv_m,
+            if use_dbl_stream:
+                for k_c in range(he_dim // LANE):
+                    x_moe_fp8_out_ref[:, k_c, :] = jnp.clip(
+                        u_scratch_ref[:, k_c * LANE : (k_c + 1) * LANE] * inv_fp8,
                         -448.0,
                         448.0,
+                    ).astype(jnp.float8_e4m3fn)
+            else:
+                for m0 in range(0, bm, 32):
+                    inv_m = inv_fp8[m0 : m0 + 32, :]
+                    q_parts = [
+                        jnp.clip(
+                            u_scratch_ref[m0 : m0 + 32, kh * 2048 : (kh + 1) * 2048]
+                            * inv_m,
+                            -448.0,
+                            448.0,
+                        )
+                        .astype(jnp.float8_e4m3fn)
+                        .reshape(32, 16, LANE)
+                        for kh in range(he_dim // 2048)
+                    ]
+                    x_moe_fp8_out_ref[pl.ds(m0, 32), :, :] = (
+                        q_parts[0]
+                        if len(q_parts) == 1
+                        else jnp.concatenate(q_parts, axis=1)
                     )
-                    .astype(jnp.float8_e4m3fn)
-                    .reshape(32, 16, LANE)
-                    for kh in range(he_dim // 2048)
-                ]
-                x_moe_fp8_out_ref[pl.ds(m0, 32), :, :] = (
-                    q_parts[0] if len(q_parts) == 1 else jnp.concatenate(q_parts, axis=1)
-                )
         else:
             row_sc = (row_amax * jnp.float32(1.0 / 127.0)).astype(jnp.bfloat16)
             row_sc = jnp.where(row_amax == 0, jnp.zeros_like(row_sc), row_sc)
@@ -1783,11 +1840,23 @@ def pallas_fused_b1_b2_wpool_quant(
 
         @pl.when(step == num_steps - 1)
         def _wait_last_smid():
-            pltpu.make_async_copy(
-                src_ref=stream_buf_ref,
-                dst_ref=stream_mid_hbm_ref.at[pl.ds(smid_out_row0, bm), :],
-                sem=dma_sems.at[1],
-            ).wait()
+            if use_dbl_stream:
+                pltpu.make_async_copy(
+                    src_ref=stream_buf_ref.at[slot],
+                    dst_ref=stream_mid_hbm_ref.at[pl.ds(smid_out_row0, bm), :],
+                    sem=dma_sems.at[2 + slot],
+                ).wait()
+                pltpu.make_async_copy(
+                    src_ref=stream_buf_ref.at[next_slot],
+                    dst_ref=stream_mid_hbm_ref.at[pl.ds(smid_out_row0 - bm, bm), :],
+                    sem=dma_sems.at[2 + next_slot],
+                ).wait()
+            else:
+                pltpu.make_async_copy(
+                    src_ref=stream_buf_ref,
+                    dst_ref=stream_mid_hbm_ref.at[pl.ds(smid_out_row0, bm), :],
+                    sem=dma_sems.at[1],
+                ).wait()
 
     w_lo_block_shape = (
         (h_dim, num_experts)
@@ -1859,10 +1928,12 @@ def pallas_fused_b1_b2_wpool_quant(
             ],
             out_specs=out_specs_b12,
             scratch_shapes=[
-                pltpu.VMEM((bm, h_dim), jnp.float32),
+                pltpu.VMEM(
+                    (2, bm, h_dim) if use_dbl_stream else (bm, h_dim), jnp.float32
+                ),
                 pltpu.VMEM((bm, h_dim), r_dtype),
                 pltpu.VMEM((bm, he_dim), jnp.bfloat16),
-                pltpu.SemaphoreType.DMA((2,)),
+                pltpu.SemaphoreType.DMA((4 if use_dbl_stream else 2,)),
             ],
         ),
         compiler_params=pltpu.CompilerParams(
@@ -1871,7 +1942,7 @@ def pallas_fused_b1_b2_wpool_quant(
             vmem_limit_bytes=62 * 1024 * 1024,
         ),
         input_output_aliases=aliases,
-        name=f"pallas_fused_b1_b2_{router_mode}_{tag_fp8}{tag_half}_bm{bm}{f256_sfx}{tag_out}",
+        name=f"pallas_fused_b1_b2_{router_mode}_{tag_fp8}{tag_half}_bm{bm}{f256_sfx}{dbl_sfx}{tag_out}",
     )(
         attn_out_shard,
         stream_shard,

@@ -1531,6 +1531,9 @@ class TpuEnvs:
     # 1024+2048 on TP=8 for 24K buckets) under GMM_PREQUANT_LHS_FP8=5 so every B2
     # all_gather is a power-of-2 size without non-pow2 SparseCore AG cliffs.
     SGLANG_TPU_MUSE_KERNEL_B2_POW2_CHUNKS = EnvBool(False)
+    # Wave-16 opt-in double-buffered stream HBM->VMEM prefetch + direct (bm, 32, 128) FP8 store
+    # inside pallas_fused_b1_b2_wpool_quant (-0.73..-0.96 ms/61L on 4c Ghostfish, 0-ULP bit-exact).
+    SGLANG_TPU_MUSE_KERNEL_B2_DBL_STREAM = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:

@@ -2312,12 +2312,9 @@ def fused_moe_full_bridge_and_ffn(
                 else:
                     hs_4d = dequant_single_gmm_layout(ag_i8)
                     hidden_states = hs_4d.reshape(ep_size * t_local, he_dim // 128, 128)
-            elif fused_b1_b2_mode in (3, 4) and (
-                (t_local % 256 == 0)
-                or (_use_b2_pow2 and t_local >= 256 and (t_local % 128 == 0))
-            ):
+            elif fused_b1_b2_mode in (3, 4) and (t_local % 256 == 0):
                 if _use_b2_pow2 and (t_local & (t_local - 1)) != 0 and t_local >= 384:
-                    if t_local % 384 == 0:
+                    if t_local % 384 == 0 and ((t_local // 3) & (t_local // 3 - 1)) == 0:
                         c0_tok = t_local // 3
                     else:
                         pow2_c0 = 1 << ((t_local // 2).bit_length() - 1)
@@ -2440,17 +2437,12 @@ def fused_moe_full_bridge_and_ffn(
                         ag_sc_1 = jax.lax.all_gather(
                             sc_1, axis_name=expert_axis, axis=0, tiled=True
                         ).reshape(ep_size, c1_tok)
-                        if _use_b2_pow2:
-                            sc_buf = jnp.empty((ep_size, t_local), dtype=ag_sc_0.dtype)
-                            sc_buf = jax.lax.dynamic_update_slice(sc_buf, ag_sc_0, (0, 0))
-                            sc_buf = jax.lax.dynamic_update_slice(
-                                sc_buf, ag_sc_1, (0, c0_tok)
-                            )
-                            hidden_states_scale = sc_buf.reshape(-1)
-                        else:
-                            hidden_states_scale = jnp.concatenate(
-                                [ag_sc_0, ag_sc_1], axis=1
-                            ).reshape(-1)
+                        sc_buf = jnp.empty((ep_size, t_local), dtype=ag_sc_0.dtype)
+                        sc_buf = jax.lax.dynamic_update_slice(sc_buf, ag_sc_0, (0, 0))
+                        sc_buf = jax.lax.dynamic_update_slice(
+                            sc_buf, ag_sc_1, (0, c0_tok)
+                        )
+                        hidden_states_scale = sc_buf.reshape(-1)
                     else:
                         sc_01_local = jnp.concatenate([sc_0, sc_1], axis=0)
                         hidden_states_scale = jax.lax.all_gather(
