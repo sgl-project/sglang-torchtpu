@@ -714,7 +714,7 @@ class TpuEnvs:
     # Fused-RS W4A16: row buckets of at most this many rows run both GMMs as one dot per
     # 256-K block with the fp4 codes pushed as e4m3 and the block scale applied to the f32
     # partial (half the weight pushes; numerics change). 0 = off; 64 measured best.
-    SGLANG_TPU_FUSED_RS_QBLOCK_SMALL_M = EnvInt(0)
+    SGLANG_TPU_FUSED_RS_QBLOCK_SMALL_M = EnvInt(64)
     # Fused-RS: extra row buckets (comma list, multiples of the sublane tiling) added
     # to the power-of-two buckets; exact.
     SGLANG_TPU_FUSED_RS_EXTRA_M_BUCKETS = EnvStr("160,192")
@@ -757,7 +757,7 @@ class TpuEnvs:
     # Expert-TP fused-RS scatter combine: top-k weights as SMEM scalars applied in the
     # scatter-add loop (load-bound, VALU slack) instead of a [rows, 128] f32 broadcast
     # multiplied in the VALU-bound norm pass; same ops in the same order (bit-identical).
-    SGLANG_TPU_FUSED_RS_COMBINE_W_SCATTER = EnvBool(False)
+    SGLANG_TPU_FUSED_RS_COMBINE_W_SCATTER = EnvBool(True)
     # Batched RPA: run target-verify rows (speculative_num_draft_tokens per request) as MIXED
     # with a q block of that width; the prefill block search otherwise pads each request's
     # rows to a ~2048-row block (16 x 8 rows at 150K context: 42 -> 2.2 ms per layer).
