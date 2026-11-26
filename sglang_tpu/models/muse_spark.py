@@ -4079,7 +4079,7 @@ class MuseSparkDecoderLayer(nn.Module):
                 step_c_flag is not None
                 and bool(step_c_flag.get())
                 and use_qkv_epi
-                and n_tok <= 64
+                and 32 <= n_tok <= 64
                 and getattr(next_layer_attn, "decode_attn_gate_fuse", False)
                 and (capture_mode is None or not capture_mode.is_full())
             ):
@@ -4151,10 +4151,11 @@ class MuseSparkDecoderLayer(nn.Module):
                         pages_per_seq=pages_per_seq,
                         phys_page_rows=phys_rows,
                         kv_pack_dense2=dense2,
+                        kv_pack_bd4=bd4,
                         b_tokens=n_tok,
                         max_num_seqs=int(kv_lens.shape[0]),
                     )
-                    if not bd4 and step_c_rpa_ok and (tp != 16 or cfg_rpa.num_slots <= 4):
+                    if step_c_rpa_ok and (tp != 16 or cfg_rpa.num_slots <= 4):
                         op_c = get_b1_moe_b2_rpad_chip_sharded_op(
                             tp,
                             bf16_router=bf16_router,
@@ -4165,6 +4166,7 @@ class MuseSparkDecoderLayer(nn.Module):
                             has_free_params=(fp_buf is not None),
                             has_layer_idx=(kv_layer_idx is not None),
                             kv_pack_dense2=dense2,
+                            kv_pack_bd4=bd4,
                             rpa_mode_str=rpa_mode_str,
                         )
                         lidx_tail = (kv_layer_idx,) if kv_layer_idx is not None else ()
@@ -4225,7 +4227,7 @@ class MuseSparkDecoderLayer(nn.Module):
                             float(getattr(next_layer_attn.attn, "v_scale_float", None) or 1.0),
                             float(next_layer_attn.norm_eps),
                         )
-                        get_step_c_kv_write_op(kv_pack_dense2=dense2)(
+                        get_step_c_kv_write_op(kv_pack_dense2=dense2, kv_pack_bd4=bd4)(
                             kv_merged_c,
                             kv_cache,
                             kv_lens,
@@ -7008,12 +7010,22 @@ class MuseSparkForConditionalGeneration(nn.Module):
                         tpu_envs, "SGLANG_TPU_MUSE_DECODE_STEP_C_SUPERKERNEL", None
                     )
                     rpa_m = str(tpu_envs.SGLANG_TPU_RPA_V3_DECODE_FAST.get()).strip()
+                    bd4_flag = getattr(tpu_envs, "SGLANG_TPU_KV_PACK_BD4", None)
+                    step_c_bd4 = bool(warm_tp == 16 and bd4_flag is not None and bd4_flag.get())
                     step_c_cfgs = (
                         (
                             (False, False, rpa_m),
                             (False, True, rpa_m),
                             (True, False, rpa_m),
                             (True, True, rpa_m),
+                            *(
+                                (
+                                    (False, False, rpa_m, True),
+                                    (True, False, rpa_m, True),
+                                )
+                                if step_c_bd4
+                                else ()
+                            ),
                         )
                         if (
                             eff_b1_moe_b2_super

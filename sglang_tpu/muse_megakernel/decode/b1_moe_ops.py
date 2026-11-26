@@ -29,7 +29,7 @@ _B1_MOE_LOCK = Lock()
 _B1_MOE_B2_OPS: dict[tuple, Callable] = {}
 _B1_MOE_B2_B16_OPS: dict[tuple, Callable] = {}
 _B1_MOE_B2_RPAD_OPS: dict[tuple, Callable] = {}
-_STEP_C_KV_WRITE_OPS: dict[bool, Callable] = {}
+_STEP_C_KV_WRITE_OPS: dict[tuple[bool, bool], Callable] = {}
 _B1_MOE_OPS: dict[tuple, Callable] = {}
 
 _B1_BASE_TENSOR_NAMES = (
@@ -426,6 +426,7 @@ def get_b1_moe_b2_rpad_chip_sharded_op(
     has_free_params: bool = False,
     has_layer_idx: bool = False,
     kv_pack_dense2: bool = False,
+    kv_pack_bd4: bool = False,
     rpa_mode_str: str = "",
 ) -> Callable:
     """Return cached TorchTPU custom op for Step (c) ``[chip_b1 + muse_sparse(3d) + chip_b2 + RPAd]``."""
@@ -433,6 +434,8 @@ def get_b1_moe_b2_rpad_chip_sharded_op(
         raise ValueError(
             f"Step (c) superkernel requires world_size in {SUPPORTED_WORLD_SIZES}, got {world_size}"
         )
+    if kv_pack_bd4:
+        kv_pack_dense2 = False
     key = (
         int(world_size),
         bool(bf16_router),
@@ -443,6 +446,7 @@ def get_b1_moe_b2_rpad_chip_sharded_op(
         bool(has_free_params),
         bool(has_layer_idx),
         bool(kv_pack_dense2),
+        bool(kv_pack_bd4),
         str(rpa_mode_str),
     )
     op = _B1_MOE_B2_RPAD_OPS.get(key)
@@ -569,6 +573,7 @@ def get_b1_moe_b2_rpad_chip_sharded_op(
                     rpa_out_norm_eps=float(rpa_norm_eps),
                     rpa_mode_str=(str(rpa_mode_str) if rpa_mode_str else None),
                     kv_pack_dense2=bool(kv_pack_dense2),
+                    kv_pack_bd4=bool(kv_pack_bd4),
                     replica_cost_mode=str(replica_cost_mode),
                     skip_kv_write=True,
                 )
@@ -578,7 +583,7 @@ def get_b1_moe_b2_rpad_chip_sharded_op(
             stag = "_sp" if has_spec_slot else ""
             ftag = "_dfp" if has_free_params else ""
             ltag = "_li" if has_layer_idx else ""
-            d2tag = "_d2" if kv_pack_dense2 else ""
+            d2tag = "_bd4" if kv_pack_bd4 else ("_d2" if kv_pack_dense2 else "")
             mtag = (
                 f"_{re.sub(r'[^a-zA-Z0-9_]+', '_', rpa_mode_str).strip('_')}"
                 if rpa_mode_str
@@ -600,9 +605,14 @@ def get_b1_moe_b2_rpad_chip_sharded_op(
     return op
 
 
-def get_step_c_kv_write_op(kv_pack_dense2: bool = False) -> Callable:
+def get_step_c_kv_write_op(
+    kv_pack_dense2: bool = False,
+    kv_pack_bd4: bool = False,
+) -> Callable:
     """Return cached per-device in-place KV writer op (0 copies) for Step (c)."""
-    key = bool(kv_pack_dense2)
+    bd4_key = bool(kv_pack_bd4)
+    d2_key = bool(kv_pack_dense2) and not bd4_key
+    key = (d2_key, bd4_key)
     op = _STEP_C_KV_WRITE_OPS.get(key)
     if op is not None:
         return op
@@ -619,9 +629,13 @@ def get_step_c_kv_write_op(kv_pack_dense2: bool = False) -> Callable:
             from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
             op_name = (
-                "sglang_tpu_pallas::muse_w9_step_c_write_kv_d2"
-                if key
-                else "sglang_tpu_pallas::muse_w9_step_c_write_kv"
+                "sglang_tpu_pallas::muse_w9_step_c_write_kv_bd4"
+                if bd4_key
+                else (
+                    "sglang_tpu_pallas::muse_w9_step_c_write_kv_d2"
+                    if d2_key
+                    else "sglang_tpu_pallas::muse_w9_step_c_write_kv"
+                )
             )
 
             def _wrapped(
@@ -649,7 +663,8 @@ def get_step_c_kv_write_op(kv_pack_dense2: bool = False) -> Callable:
                     cu_q_lens,
                     cu_kv_lens,
                     distribution,
-                    kv_pack_dense2=key,
+                    kv_pack_dense2=d2_key,
+                    kv_pack_bd4=bd4_key,
                 )
                 return updated.reshape(kv_cache_fused.shape)
 
@@ -810,7 +825,7 @@ def prewarm_b1_moe_superkernel_ops(
     has_rope_variants: tuple[bool, ...] = (True,),
     has_free_params: bool = False,
     include_rep_b16: bool = False,
-    step_c_configs: Iterable[tuple[bool, bool, str]] = (),
+    step_c_configs: Iterable[tuple] = (),
 ) -> None:
     """Eagerly register Step (a), Step (b), B=16, and Step (c) custom ops outside ``torch.compile``."""
     if world_size not in SUPPORTED_WORLD_SIZES:
@@ -872,13 +887,21 @@ def prewarm_b1_moe_superkernel_ops(
                         has_free_params=has_free_params,
                     )
         if step_c_list and bridge_qkv_epi:
-            for has_lidx, dense2, rpa_m in step_c_list:
+            for sc_item in step_c_list:
+                if len(sc_item) == 4:
+                    has_lidx, dense2, rpa_m, bd4 = sc_item
+                else:
+                    has_lidx, dense2, rpa_m = sc_item
+                    bd4 = False
+                eff_d2 = bool(dense2) and not bool(bd4)
+                eff_bd4 = bool(bd4)
                 for r_flag in has_rope_variants:
                     sc_key = (
                         *b1_key,
                         bool(r_flag),
                         bool(has_lidx),
-                        bool(dense2),
+                        eff_d2,
+                        eff_bd4,
                         str(rpa_m),
                     )
                     if sc_key in seen_stepc:
@@ -893,7 +916,8 @@ def prewarm_b1_moe_superkernel_ops(
                         has_rope=r_flag,
                         has_free_params=has_free_params,
                         has_layer_idx=has_lidx,
-                        kv_pack_dense2=dense2,
+                        kv_pack_dense2=eff_d2,
+                        kv_pack_bd4=eff_bd4,
                         rpa_mode_str=rpa_m,
                     )
-                    get_step_c_kv_write_op(kv_pack_dense2=bool(dense2))
+                    get_step_c_kv_write_op(kv_pack_dense2=eff_d2, kv_pack_bd4=eff_bd4)
