@@ -4,6 +4,7 @@
 # PEP 563 must stay off so TorchTPU jax_op / cpu_export_jax_op sees real jax.Array annotations.
 
 from functools import cache, partial
+import inspect
 
 import jax
 import torch
@@ -94,6 +95,7 @@ def muse_fuse_all_decode_op_name(
     return_sharded: bool = False,
     has_w3_mask: bool = False,
     has_spec_slot: bool = False,
+    has_free_params: bool = False,
 ) -> str:
     """Validate fuse-all decode op parameters and return the canonical TorchTPU op name."""
     if mode not in SUPPORTED_FUSE_ALL_MODES:
@@ -109,8 +111,12 @@ def muse_fuse_all_decode_op_name(
         raise ValueError(
             f"has_spec_slot=True requires mode='sparse', got {mode!r}"
         )
-    if has_w3_mask and has_spec_slot:
-        raise ValueError("has_w3_mask and has_spec_slot cannot both be True")
+    if has_free_params and mode != "sparse":
+        raise ValueError(
+            f"has_free_params=True requires mode='sparse', got {mode!r}"
+        )
+    if has_w3_mask and (has_spec_slot or has_free_params):
+        raise ValueError("has_w3_mask cannot be combined with has_spec_slot or has_free_params")
     if return_sharded and mode not in SUPPORTED_SHARDED_FUSE_ALL_MODES:
         raise ValueError(
             f"return_sharded=True requires mode in {SUPPORTED_SHARDED_FUSE_ALL_MODES}, "
@@ -166,6 +172,8 @@ def muse_fuse_all_decode_op_name(
         stem = f"{stem}_w3"
     if has_spec_slot:
         stem = f"{stem}_ss"
+    if has_free_params:
+        stem = f"{stem}_dfp"
     if return_sharded:
         stem = f"{stem}_sh"
     return f"sglang_tpu_pallas::{stem}"
@@ -290,6 +298,7 @@ def get_muse_fuse_all_decode_op(
     return_sharded: bool = False,
     has_w3_mask: bool = False,
     has_spec_slot: bool = False,
+    has_free_params: bool = False,
 ):
     """Return a cached TorchTPU jax_op for Muse Spark fuse-all decode."""
     op_name = muse_fuse_all_decode_op_name(
@@ -303,6 +312,7 @@ def get_muse_fuse_all_decode_op(
         return_sharded=return_sharded,
         has_w3_mask=has_w3_mask,
         has_spec_slot=has_spec_slot,
+        has_free_params=has_free_params,
     )
     return _get_muse_fuse_all_decode_op(
         op_name,
@@ -316,6 +326,7 @@ def get_muse_fuse_all_decode_op(
         return_sharded,
         has_w3_mask,
         has_spec_slot,
+        has_free_params,
     )
 
 
@@ -332,6 +343,7 @@ def _get_muse_fuse_all_decode_op(
     return_sharded: bool = False,
     has_w3_mask: bool = False,
     has_spec_slot: bool = False,
+    has_free_params: bool = False,
 ):
     mesh = _get_mesh()
     kernel_fn = _resolve_fuse_all_kernel(
@@ -343,275 +355,73 @@ def _get_muse_fuse_all_decode_op(
         chipmate_xor=chipmate_xor,
         return_sharded=return_sharded,
     )
-    has_extra = has_w3_mask or has_spec_slot
-    extra_kw = "w3_mask" if has_w3_mask else "spec_home_slot"
+    extra_keys: list[str] = []
+    if has_w3_mask:
+        extra_keys.append("w3_mask")
+    if has_spec_slot:
+        extra_keys.append("spec_home_slot")
+    if has_free_params:
+        extra_keys.append("free_params")
 
-    if num_replicas == 0 and not has_extra:
-        specs = (P(),) * 9
-        mapped = jax.shard_map(
-            kernel_fn,
-            mesh=mesh,
-            in_specs=specs,
-            out_specs=P(),
-            check_vma=False,
-        )
+    base_names = ("rank", "logits", "bias", "x", "w1", "s1", "w2", "s2", "norm")
+    rep_names = ("rep_w1", "rep_s1", "rep_w2", "rep_s2", "replica_meta")
+    arg_names = list(base_names) + (list(rep_names) if num_replicas > 0 else []) + extra_keys
+    specs = (P(),) * len(arg_names)
 
-        def wrapped(
-            rank: jax.Array,
-            logits: jax.Array,
-            bias: jax.Array,
-            x: jax.Array,
-            w1: jax.Array,
-            s1: jax.Array,
-            w2: jax.Array,
-            s2: jax.Array,
-            norm: jax.Array,
-        ) -> jax.Array:
-            _validate_fuse_all_shapes(
-                op_name, mode, block, x, w1, s1, ep=ep, tp=tp, return_sharded=return_sharded
-            )
-            return mapped(rank, logits, bias, x, w1, s1, w2, s2, norm)
+    def _call_local(*t_args):
+        n_core = len(base_names) + (len(rep_names) if num_replicas > 0 else 0)
+        ex_kw = {
+            k: v for k, v in zip(extra_keys, t_args[n_core:])
+        }
+        return kernel_fn(*t_args[:n_core], **ex_kw)
 
-        op = jax_op(
-            op_name,
-            wrapped,
-            mesh=mesh,
-            input_partition_specs=specs,
-            output_partition_specs=(P(),),
-        )
-
-        @op.register_fake
-        def abstract(rank, logits, bias, x, w1, s1, w2, s2, norm):
-            if return_sharded:
-                return x.new_empty((x.shape[0] // (ep * tp), x.shape[1]))
-            return torch.empty_like(x)
-
-        return op
-
-    if num_replicas == 0 and has_extra:
-        specs = (P(),) * 10
-        mapped_extra = jax.shard_map(
-            lambda rk, lg, bi, xv, w1v, s1v, w2v, s2v, nm, ex_arg: kernel_fn(
-                rk, lg, bi, xv, w1v, s1v, w2v, s2v, nm, **{extra_kw: ex_arg}
-            ),
-            mesh=mesh,
-            in_specs=specs,
-            out_specs=P(),
-            check_vma=False,
-        )
-
-        def wrapped_extra(
-            rank: jax.Array,
-            logits: jax.Array,
-            bias: jax.Array,
-            x: jax.Array,
-            w1: jax.Array,
-            s1: jax.Array,
-            w2: jax.Array,
-            s2: jax.Array,
-            norm: jax.Array,
-            extra_arg: jax.Array,
-        ) -> jax.Array:
-            _validate_fuse_all_shapes(
-                op_name, mode, block, x, w1, s1, ep=ep, tp=tp, return_sharded=return_sharded
-            )
-            return mapped_extra(rank, logits, bias, x, w1, s1, w2, s2, norm, extra_arg)
-
-        op = jax_op(
-            op_name,
-            wrapped_extra,
-            mesh=mesh,
-            input_partition_specs=specs,
-            output_partition_specs=(P(),),
-        )
-
-        @op.register_fake
-        def abstract_extra(rank, logits, bias, x, w1, s1, w2, s2, norm, extra_arg):
-            if return_sharded:
-                return x.new_empty((x.shape[0] // (ep * tp), x.shape[1]))
-            return torch.empty_like(x)
-
-        return op
-
-    if not has_extra:
-        specs = (P(),) * 14
-        mapped = jax.shard_map(
-            kernel_fn,
-            mesh=mesh,
-            in_specs=specs,
-            out_specs=P(),
-            check_vma=False,
-        )
-
-        def wrapped_with_replicas(
-            rank: jax.Array,
-            logits: jax.Array,
-            bias: jax.Array,
-            x: jax.Array,
-            w1: jax.Array,
-            s1: jax.Array,
-            w2: jax.Array,
-            s2: jax.Array,
-            norm: jax.Array,
-            rep_w1: jax.Array,
-            rep_s1: jax.Array,
-            rep_w2: jax.Array,
-            rep_s2: jax.Array,
-            replica_meta: jax.Array,
-        ) -> jax.Array:
-            _validate_fuse_all_shapes(
-                op_name, mode, block, x, w1, s1, ep=ep, tp=tp, return_sharded=return_sharded
-            )
-            if rep_w2.shape[0] != num_replicas:
-                raise ValueError(
-                    f"{op_name} expected {num_replicas} replica slots, "
-                    f"got {rep_w2.shape[0]}"
-                )
-            return mapped(
-                rank,
-                logits,
-                bias,
-                x,
-                w1,
-                s1,
-                w2,
-                s2,
-                norm,
-                rep_w1,
-                rep_s1,
-                rep_w2,
-                rep_s2,
-                replica_meta,
-            )
-
-        op = jax_op(
-            op_name,
-            wrapped_with_replicas,
-            mesh=mesh,
-            input_partition_specs=specs,
-            output_partition_specs=(P(),),
-        )
-
-        @op.register_fake
-        def abstract_with_replicas(
-            rank,
-            logits,
-            bias,
-            x,
-            w1,
-            s1,
-            w2,
-            s2,
-            norm,
-            rep_w1,
-            rep_s1,
-            rep_w2,
-            rep_s2,
-            replica_meta,
-        ):
-            if return_sharded:
-                return x.new_empty((x.shape[0] // (ep * tp), x.shape[1]))
-            return torch.empty_like(x)
-
-        return op
-
-    specs = (P(),) * 15
-    mapped_rep_extra = jax.shard_map(
-        lambda rk, lg, bi, xv, w1v, s1v, w2v, s2v, nm, rw1, rs1, rw2, rs2, rmeta, ex_arg: kernel_fn(
-            rk,
-            lg,
-            bi,
-            xv,
-            w1v,
-            s1v,
-            w2v,
-            s2v,
-            nm,
-            rw1,
-            rs1,
-            rw2,
-            rs2,
-            rmeta,
-            **{extra_kw: ex_arg},
-        ),
+    mapped = jax.shard_map(
+        _call_local,
         mesh=mesh,
         in_specs=specs,
         out_specs=P(),
         check_vma=False,
     )
 
-    def wrapped_with_replicas_extra(
-        rank: jax.Array,
-        logits: jax.Array,
-        bias: jax.Array,
-        x: jax.Array,
-        w1: jax.Array,
-        s1: jax.Array,
-        w2: jax.Array,
-        s2: jax.Array,
-        norm: jax.Array,
-        rep_w1: jax.Array,
-        rep_s1: jax.Array,
-        rep_w2: jax.Array,
-        rep_s2: jax.Array,
-        replica_meta: jax.Array,
-        extra_arg: jax.Array,
-    ) -> jax.Array:
+    def wrapped(*args) -> jax.Array:
+        x_val = args[3]
+        w1_val = args[4]
+        s1_val = args[5]
         _validate_fuse_all_shapes(
-            op_name, mode, block, x, w1, s1, ep=ep, tp=tp, return_sharded=return_sharded
+            op_name, mode, block, x_val, w1_val, s1_val, ep=ep, tp=tp, return_sharded=return_sharded
         )
-        if rep_w2.shape[0] != num_replicas:
-            raise ValueError(
-                f"{op_name} expected {num_replicas} replica slots, "
-                f"got {rep_w2.shape[0]}"
-            )
-        return mapped_rep_extra(
-            rank,
-            logits,
-            bias,
-            x,
-            w1,
-            s1,
-            w2,
-            s2,
-            norm,
-            rep_w1,
-            rep_s1,
-            rep_w2,
-            rep_s2,
-            replica_meta,
-            extra_arg,
-        )
+        if num_replicas > 0:
+            rep_w2_val = args[11]
+            if rep_w2_val.shape[0] != num_replicas:
+                raise ValueError(
+                    f"{op_name} expected {num_replicas} replica slots, "
+                    f"got {rep_w2_val.shape[0]}"
+                )
+        return mapped(*args)
+
+    wrapped.__name__ = op_name.split("::")[-1]
+    wrapped.__signature__ = inspect.Signature(
+        parameters=[
+            inspect.Parameter(n, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=jax.Array)
+            for n in arg_names
+        ],
+        return_annotation=jax.Array,
+    )
 
     op = jax_op(
         op_name,
-        wrapped_with_replicas_extra,
+        wrapped,
         mesh=mesh,
         input_partition_specs=specs,
         output_partition_specs=(P(),),
     )
 
     @op.register_fake
-    def abstract_with_replicas_extra(
-        rank,
-        logits,
-        bias,
-        x,
-        w1,
-        s1,
-        w2,
-        s2,
-        norm,
-        rep_w1,
-        rep_s1,
-        rep_w2,
-        rep_s2,
-        replica_meta,
-        extra_arg,
-    ):
+    def abstract(*args, **kwargs):
+        x_val = args[3]
         if return_sharded:
-            return x.new_empty((x.shape[0] // (ep * tp), x.shape[1]))
-        return torch.empty_like(x)
+            return x_val.new_empty((x_val.shape[0] // (ep * tp), x_val.shape[1]))
+        return torch.empty_like(x_val)
 
     return op
 

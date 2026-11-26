@@ -37,6 +37,7 @@ from sglang_tpu.kernels.decode_collective_bridges_w8 import (
     _W8_CID_BASE,
     _as_2d_f32,
     _as_dot_scale_f32,
+    _dma_wait,
     _run_chip_b1_vmem_core,
     _run_chip_b2_vmem_core,
 )
@@ -77,8 +78,9 @@ def _alias_b2_weights(
     return w_post_buf, w_qkv_buf, w_gate_buf
 
 
-def _b1_moe_b2_chip_sharded_kernel(
-    *all_refs,
+def _b1_moe_b2_chip_sharded_impl(
+    all_refs,
+    *,
     world_size: int,
     scale_block: int,
     num_replicas: int,
@@ -103,10 +105,21 @@ def _b1_moe_b2_chip_sharded_kernel(
     has_rope: bool,
     cfg: SparseDecodeConfig,
     has_spec_slot_arg: bool,
+    has_free_params_arg: bool,
     interpret_mode: bool,
     alias_mate_recv: bool,
+    has_rpad: bool,
+    # RPAd options (used only when has_rpad=True).
+    rpa_sm_scale: float = 1.0,
+    rpa_sliding_window: int | None = None,
+    rpa_k_scale: float | None = None,
+    rpa_v_scale: float | None = None,
+    rpa_out_norm_eps: float = 1e-5,
+    rpa_cfg=None,
+    rpa_one_block_per_seq: bool = True,
+    rpa_kv_pack_dense2: bool = False,
 ) -> None:
-    """Fused Step (b) ``[chip_b1 + muse_sparse(fb0) + chip_b2]`` Pallas kernel body."""
+    """Shared Pallas kernel body for Step (b) and Step (c) (``+ RPAd``)."""
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
 
@@ -115,6 +128,16 @@ def _b1_moe_b2_chip_sharded_kernel(
     rank_ref = next(it)
     replica_meta_ref = next(it) if num_replicas > 0 else None
     spec_slot_ref = next(it) if has_spec_slot_arg else None
+    free_params_ref = next(it) if has_free_params_arg else None
+    if has_rpad:
+        kv_lens_ref = next(it)
+        page_indices_ref = next(it)
+        cu_q_lens_ref = next(it)
+        cu_kv_lens_ref = next(it)
+        distribution_ref = next(it)
+    else:
+        kv_lens_ref = page_indices_ref = cu_q_lens_ref = None
+        cu_kv_lens_ref = distribution_ref = None
 
     # Bridge 1b inputs.
     stream_chip_hbm = next(it)
@@ -156,12 +179,19 @@ def _b1_moe_b2_chip_sharded_kernel(
     next_w_gate_hbm = next(it)
     next_s_gate_ref = next(it)
     cos_sin_ref = next(it) if has_rope else None
+    kv_cache_hbm_ref = next(it) if has_rpad else None
 
     # Outputs.
     out_stream_chip_hbm = next(it)
-    out_qkv_or_q_ref = next(it)
-    out_kv_or_gate_ref = next(it)
-    out_gate_epi_ref = next(it) if fuse_qkv_epi else None
+    if has_rpad:
+        out_gated_ref = next(it)
+        out_kv_cache_hbm_ref = next(it)
+        out_qkv_or_q_ref = out_kv_or_gate_ref = out_gate_epi_ref = None
+    else:
+        out_qkv_or_q_ref = next(it)
+        out_kv_or_gate_ref = next(it)
+        out_gate_epi_ref = next(it) if fuse_qkv_epi else None
+        out_gated_ref = out_kv_cache_hbm_ref = None
 
     # MoE scratch.
     msc = _unpack_muse_sparse_scratch(
@@ -215,11 +245,19 @@ def _b1_moe_b2_chip_sharded_kernel(
     sq_pair_pre_buf = next(it)
     exp_3d_buf = next(it)
     logits_vmem = next(it)
-    if (not interpret_mode) and sharded_moe_in:
+    use_3d_x = msc["x_3d_buf"] is not None
+    if use_3d_x:
+        expert_in_vmem = None
+    elif (not interpret_mode) and sharded_moe_in:
         expert_in_vmem = next_in_vmem.at[:, pl.ds(0, 4096)]
     else:
         expert_in_vmem = next(it)
     moe_sh_vmem = next(it) if sharded_moe_in else None
+    moe_rep_vmem = (
+        next(it)
+        if ((not sharded_moe_in) and use_3d_x and interpret_mode)
+        else None
+    )
     b2_scalar_dummy_post = next(it)  # (8, 128)
     b2_scalar_dummy_cols = next(it)  # (8, 128)
 
@@ -354,6 +392,7 @@ def _b1_moe_b2_chip_sharded_kernel(
             holder_slot_expert_smem=msc["holder_slot_expert_smem"],
             holder_cand_smem=msc["holder_cand_smem"],
             spec_slot_ref=spec_slot_ref,
+            free_params_ref=free_params_ref,
             ep=world_size,
             batch_size=rows,
             scale_block=scale_block,
@@ -376,7 +415,7 @@ def _b1_moe_b2_chip_sharded_kernel(
         )
 
     # =========================================================================
-    # Stage 1-3: Bridge 1b -> live s_buf + logits_vmem + expert_in_vmem + MoE plan
+    # Stage 1-3: Bridge 1b -> live s_buf + logits_vmem + x_3d_buf + MoE plan
     # =========================================================================
     _run_chip_b1_vmem_core(
         stream_chip_hbm,
@@ -392,7 +431,7 @@ def _b1_moe_b2_chip_sharded_kernel(
         pre_exp_gain_ref,
         out_stream_chip_hbm,
         logits_vmem,
-        expert_in_vmem,
+        None if use_3d_x else expert_in_vmem,
         wo_buf,
         w_pre_core_buf,
         w_router_buf,
@@ -450,12 +489,18 @@ def _b1_moe_b2_chip_sharded_kernel(
         early_router_and_log_ag=True,
         during_ag_exp_ici_fn=_during_ag_exp_ici,
         during_ag_exp_d2d2_fn=None if r_pair == 8 else _during_ag_exp_d2d2,
+        out_expert_3d_ref=msc["x_3d_buf"] if use_3d_x else None,
     )
 
     # =========================================================================
     # Stage 4: Sparse NVFP4 MoE + PAIR_RS (launching b2 weight DMAs in parallel!)
     # =========================================================================
-    moe_dst_vmem = moe_sh_vmem if sharded_moe_in else expert_in_vmem
+    if sharded_moe_in:
+        moe_dst_vmem = moe_sh_vmem
+    elif use_3d_x:
+        moe_dst_vmem = moe_rep_vmem if interpret_mode else next_in_vmem.at[:, pl.ds(0, 4096)]
+    else:
+        moe_dst_vmem = expert_in_vmem
 
     def _on_experts_done() -> None:
         # All w1/w2/spec_prime DMAs have completed; launch 34 MiB b2 weights under PAIR_RS!
@@ -465,7 +510,7 @@ def _b1_moe_b2_chip_sharded_kernel(
 
     run_muse_sparse_experts_and_rs_from_vmem(
         me,
-        expert_in_vmem,
+        None if use_3d_x else expert_in_vmem,
         plan_holder[0],
         d_scratch=msc["d_scratch"],
         r_scratch=msc["r_scratch"],
@@ -511,7 +556,7 @@ def _b1_moe_b2_chip_sharded_kernel(
         return_sharded=sharded_moe_in,
         ep_axis_name=ep_axis_name,
         cfg=cfg,
-        x_is_3d=False,
+        x_is_3d=use_3d_x,
         wait_entry_barrier=False,
         write_output_ref=True,
         on_experts_done_fn=_on_experts_done,
@@ -525,6 +570,67 @@ def _b1_moe_b2_chip_sharded_kernel(
     qkv_vmem_slice = mate_recv.at[:, pl.ds(0, qkv_cols)]
     mate_tok_slice = send_half.at[pl.ds(0, rows_per_rank), :]
     moe_full_slice = mate_recv.at[pl.ds(0, r_pair), :]
+
+    if has_rpad:
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
+            _run_rpad_vmem_core,
+            prepare_and_start_rpad_dmas,
+        )
+
+        rpad_q_vmem = next(it)
+        rpad_kv_vmem = next(it)
+        rpad_gate_vmem = next(it)
+        bkv_vmem_ref = next(it)
+        state_vmem_ref = next(it)
+        o_vmem_ref = next(it)
+        kv_write_vmem_ref = next(it) if rpa_kv_pack_dense2 else None
+        init_sv_vmem_ref = (
+            next(it) if getattr(rpa_cfg, "hoist_new_kv", False) else None
+        )
+        written_cnt_smem_ref = next(it)
+        if world_size == 16:
+            rpad_bkv_sems = msc["rs_pair_ssem"].at[pl.ds(0, rpa_cfg.num_slots)]
+            rpad_cache_write_sem = msc["rs_pair_ssem"].at[
+                pl.ds(rpa_cfg.num_slots, 1)
+            ]
+        else:
+            rpad_bkv_sems = next(it)
+            rpad_cache_write_sem = next(it)
+
+        pre_state_holder = []
+
+        def _after_qkv_epi() -> None:
+            pre_state = prepare_and_start_rpad_dmas(
+                kv_lens_ref=kv_lens_ref,
+                page_indices_ref=page_indices_ref,
+                cu_q_lens_ref=cu_q_lens_ref,
+                cu_kv_lens_ref=cu_kv_lens_ref,
+                distribution_ref=distribution_ref,
+                kv_cache_hbm_ref=kv_cache_hbm_ref,
+                bkv_vmem_ref=bkv_vmem_ref,
+                bkv_sems=rpad_bkv_sems,
+                sliding_window=rpa_sliding_window,
+                cfg=rpa_cfg,
+                one_block_per_seq=rpa_one_block_per_seq,
+                decode_query_size=1,
+                kv_pack_dense2=rpa_kv_pack_dense2,
+                interpret_mode=interpret_mode,
+            )
+            pre_state_holder.append(pre_state)
+
+        b2_out_q = rpad_q_vmem
+        b2_out_kv = rpad_kv_vmem
+        b2_out_gate_arg = rpad_gate_vmem
+        b2_gate_dst = rpad_gate_vmem
+        b2_after_qkv_fn = _after_qkv_epi
+        defer_store_wait = True
+    else:
+        b2_out_q = out_qkv_or_q_ref
+        b2_out_kv = out_kv_or_gate_ref
+        b2_out_gate_arg = out_gate_epi_ref
+        b2_gate_dst = None
+        b2_after_qkv_fn = None
+        defer_store_wait = False
 
     _run_chip_b2_vmem_core(
         stream_chip_hbm,
@@ -541,9 +647,9 @@ def _b1_moe_b2_chip_sharded_kernel(
         next_s_gate_ref,
         cos_sin_ref,
         out_stream_chip_hbm,
-        out_qkv_or_q_ref,
-        out_kv_or_gate_ref,
-        out_gate_epi_ref,
+        b2_out_q,
+        b2_out_kv,
+        b2_out_gate_arg,
         w_post_buf,
         w_qkv_buf,
         w_gate_buf,
@@ -598,10 +704,61 @@ def _b1_moe_b2_chip_sharded_kernel(
         prestarted_w_post_dma=True,
         prestarted_w_qkv_dma=True,
         prestarted_w_gate_dma=True,
+        gate_dst_ref=b2_gate_dst,
+        after_qkv_epi_fn=b2_after_qkv_fn,
+        defer_stream_store_wait=defer_store_wait,
     )
 
+    if has_rpad:
+        q_for_rpa = rpad_q_vmem.at[:, pl.ds(0, 8), :] if world_size == 16 else rpad_q_vmem
+        _run_rpad_vmem_core(
+            kv_lens_ref=kv_lens_ref,
+            page_indices_ref=page_indices_ref,
+            cu_q_lens_ref=cu_q_lens_ref,
+            cu_kv_lens_ref=cu_kv_lens_ref,
+            distribution_ref=distribution_ref,
+            q_vmem_ref=q_for_rpa,
+            kv_merged_vmem_ref=rpad_kv_vmem,
+            gate_vmem_ref=rpad_gate_vmem,
+            kv_cache_hbm_ref=kv_cache_hbm_ref,
+            o_out_vmem_ref=out_gated_ref,
+            updated_kv_cache_hbm_ref=out_kv_cache_hbm_ref,
+            bkv_vmem_ref=bkv_vmem_ref,
+            state_vmem_ref=state_vmem_ref,
+            o_vmem_ref=o_vmem_ref,
+            kv_write_vmem_ref=kv_write_vmem_ref,
+            init_sv_vmem_ref=init_sv_vmem_ref,
+            written_cnt_smem_ref=written_cnt_smem_ref,
+            bkv_sems=rpad_bkv_sems,
+            cache_write_sem=rpad_cache_write_sem,
+            sm_scale=rpa_sm_scale,
+            sliding_window=rpa_sliding_window,
+            k_scale=rpa_k_scale,
+            v_scale=rpa_v_scale,
+            cfg=rpa_cfg,
+            one_block_per_seq=rpa_one_block_per_seq,
+            decode_query_size=1,
+            in_kernel_pack2=True,
+            has_gate=True,
+            out_norm_eps=rpa_out_norm_eps,
+            kv_pack_dense2=rpa_kv_pack_dense2,
+            interpret_mode=interpret_mode,
+            prestarted_bkv_state=(pre_state_holder[0] if pre_state_holder else None),
+        )
+        _dma_wait(out_stream_chip_hbm, s_out_sem.at[0])
 
-def b1_moe_b2_chip_sharded_jax(
+
+def _b1_moe_b2_chip_sharded_kernel(*all_refs, **kwargs) -> None:
+    """Fused Step (b) ``[chip_b1 + muse_sparse(fb0) + chip_b2]`` Pallas kernel body."""
+    _b1_moe_b2_chip_sharded_impl(all_refs, has_rpad=False, **kwargs)
+
+
+def _b1_moe_b2_rpad_chip_sharded_kernel(*all_refs, **kwargs) -> None:
+    """Fused Step (c) ``[chip_b1 + muse_sparse(3d) + chip_b2 + RPAd]`` Pallas kernel body."""
+    _b1_moe_b2_chip_sharded_impl(all_refs, has_rpad=True, **kwargs)
+
+
+def _prepare_chip_b1_moe_b2_setup(
     rank: jax.Array,
     stream_chip: jax.Array,
     gated_attn: jax.Array,
@@ -630,43 +787,27 @@ def b1_moe_b2_chip_sharded_jax(
     next_s_qkv: jax.Array,
     next_w_gate_w8k: jax.Array,
     next_s_gate: jax.Array,
-    cos_sin_step: jax.Array | None = None,
-    rep_w1: jax.Array | None = None,
-    rep_s1: jax.Array | None = None,
-    rep_w2: jax.Array | None = None,
-    rep_s2: jax.Array | None = None,
-    replica_meta: jax.Array | None = None,
-    spec_home_slot: jax.Array | None = None,
+    cos_sin_step: jax.Array | None,
+    rep_w1: jax.Array | None,
+    rep_s1: jax.Array | None,
+    rep_w2: jax.Array | None,
+    rep_s2: jax.Array | None,
+    replica_meta: jax.Array | None,
+    spec_home_slot: jax.Array | None,
+    free_params: jax.Array | None,
     *,
-    world_size: int = 8,
-    pa_eps: float = 1e-8,
-    pre_ff_eps: float = 1e-5,
-    pre_ff_scale_input: bool = False,
-    router_multiplier: float = 1.0,
-    pre_exp_eps: float = 1e-5,
-    pre_exp_scale_input: bool = False,
-    post_ff_eps: float = 1e-8,
-    post_ff_scale_input: bool = True,
-    next_in_eps: float = 1e-5,
-    next_in_scale_input: bool = False,
-    fuse_qkv_epi: bool = True,
-    qkv_norm_eps: float = 1e-5,
-    query_scale: float = 1.0,
-    k_scale: float = 1.0,
-    v_scale: float = 1.0,
-    replica_cost_mode: str = "active",
-    ep_axis_name: str = "model",
-    config: SparseDecodeConfig | None = None,
-    collective_id: int = _W8_CID_BASE + 20,
-    interpret: bool = False,
-):
-    """Fused Step (b) superkernel: ``attn_{L} -> MoE_{L} -> attn_{L+1}``."""
+    world_size: int,
+    fuse_qkv_epi: bool,
+    config: SparseDecodeConfig | None,
+    interpret,
+) -> dict:
+    """Validate shapes and construct shared specs/scratches for Step (b) and Step (c)."""
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
 
     if world_size not in SUPPORTED_WORLD_SIZES:
         raise ValueError(
-            f"b1_moe_b2_chip_sharded_jax requires world_size in {SUPPORTED_WORLD_SIZES}, got {world_size}"
+            f"b1_moe_b2 superkernel requires world_size in {SUPPORTED_WORLD_SIZES}, got {world_size}"
         )
     rows, o_in = gated_attn.shape
     r_pair, hidden = stream_chip.shape
@@ -733,7 +874,7 @@ def b1_moe_b2_chip_sharded_jax(
     use_pair_rs = config.pair_rs and (world_size in (8, 16))
     if world_size == 16 and not use_pair_rs:
         raise ValueError(
-            "TP=16 b1_moe_b2_chip_sharded_jax requires config.pair_rs=True to stay <= 64 DMA semaphores"
+            "TP=16 b1_moe_b2 superkernel requires config.pair_rs=True to stay <= 64 DMA semaphores"
         )
     has_rope = bool(fuse_qkv_epi and cos_sin_step is not None)
     cs_in = cos_sin_step[:rows] if (has_rope and cos_sin_step.shape[0] != rows) else cos_sin_step
@@ -760,6 +901,7 @@ def b1_moe_b2_chip_sharded_jax(
         return_sharded=sharded_moe_in,
         config=config,
     )
+    use_3d_x = config.row_mode != "dense"
     w_pre_cols_buf = pre_pair_cols if interpret_mode else max(pre_pair_cols, qkv_cols + gate_cols)
     alias_mate_recv = (
         (not interpret_mode)
@@ -773,7 +915,7 @@ def b1_moe_b2_chip_sharded_jax(
         vmem((hidden, w_pre_cols_buf), w_pre_pair_w8k.dtype),
         vmem((hidden, n_exp), w_router_km.dtype),
         vmem((r_pair, hidden), jnp.float32),
-        vmem((rows, hidden), jnp.bfloat16),  # next_in_vmem (holds own_half/send_half/expert_in earlier)
+        vmem((rows, hidden), jnp.bfloat16),  # next_in_vmem (holds own_half/send_half/moe_out earlier)
         *(() if alias_mate_recv else [vmem((rows, half), jnp.bfloat16)]),  # mate_recv
         *(([vmem((rows, half), jnp.bfloat16), vmem((rows, half), jnp.bfloat16)]) if interpret_mode else []),
         vmem(
@@ -804,8 +946,17 @@ def b1_moe_b2_chip_sharded_jax(
         vmem((r_pair, 128), jnp.float32),
         vmem((n_chips, 8, h_pre) if r_pair == 8 else (8, 128), jnp.bfloat16),
         vmem((rows, n_exp), jnp.float32),
-        *(([vmem((rows, h_pre), jnp.bfloat16)]) if (interpret_mode or not sharded_moe_in) else []),
+        *(
+            [vmem((rows, h_pre), jnp.bfloat16)]
+            if ((not use_3d_x) and (interpret_mode or not sharded_moe_in))
+            else []
+        ),
         *(([vmem((rows_per_rank, h_pre), jnp.bfloat16)]) if sharded_moe_in else []),
+        *(
+            [vmem((rows, h_pre), jnp.bfloat16)]
+            if ((not sharded_moe_in) and use_3d_x and interpret_mode)
+            else []
+        ),
         vmem((8, 128), jnp.bfloat16),  # b2_scalar_dummy_post
         vmem((8, 128), jnp.bfloat16),  # b2_scalar_dummy_cols
         # Semaphores.
@@ -858,11 +1009,17 @@ def b1_moe_b2_chip_sharded_jax(
     bias_2d = bias.reshape(1, _E_TOTAL)
     norm_2d = post_exp_norm.reshape(1, _H)
     has_spec_slot_arg = spec_home_slot is not None
+    has_free_params_arg = free_params is not None
     scalar_args = [jnp.atleast_1d(rank).astype(jnp.int32)]
     if has_replicas:
         scalar_args.append(replica_meta)
     if has_spec_slot_arg:
         scalar_args.append(jnp.atleast_1d(spec_home_slot).astype(jnp.int32))
+    if has_free_params_arg:
+        fp_arg = free_params.reshape(-1).astype(jnp.float32)
+        if fp_arg.shape != (4,):
+            raise ValueError(f"Expected free_params shape (4,), got {free_params.shape}")
+        scalar_args.append(fp_arg)
 
     b1_in_specs = (
         h_sp, v_sp, h_sp, v_sp, v_sp, v_sp, v_sp, h_sp, v_sp, h_sp, v_sp,
@@ -903,7 +1060,118 @@ def b1_moe_b2_chip_sharded_jax(
         next_w_gate_w8k,
         _as_dot_scale_f32(next_s_gate, gate_cols),
     ) + ((cs_in,) if has_rope else ())
-    call_args = (*scalar_args, *b1_args, *moe_args, *b2_args)
+
+    return dict(
+        rows=rows,
+        r_pair=r_pair,
+        hidden=hidden,
+        qkv_cols=qkv_cols,
+        gate_cols=gate_cols,
+        scale_block=scale_block,
+        num_replicas=num_replicas,
+        sharded_moe_in=sharded_moe_in,
+        is_r16=is_r16,
+        has_rope=has_rope,
+        config=config,
+        interpret_arg=interpret_arg,
+        interpret_mode=interpret_mode,
+        alias_mate_recv=alias_mate_recv,
+        has_spec_slot_arg=has_spec_slot_arg,
+        has_free_params_arg=has_free_params_arg,
+        v_sp=v_sp,
+        h_sp=h_sp,
+        vmem=vmem,
+        hbm=hbm,
+        sem=sem,
+        scalar_args=scalar_args,
+        in_specs=in_specs,
+        base_call_tensors=(*b1_args, *moe_args, *b2_args),
+        scratch_shapes=moe_scratch + shared_scratch,
+    )
+
+
+def b1_moe_b2_chip_sharded_jax(
+    rank: jax.Array,
+    stream_chip: jax.Array,
+    gated_attn: jax.Array,
+    wo_w8k: jax.Array,
+    wo_scale: jax.Array,
+    pa_alpha: jax.Array,
+    pa_beta: jax.Array,
+    pre_ff_gain: jax.Array,
+    w_pre_pair_w8k: jax.Array,
+    w_pre_pair_scale: jax.Array,
+    w_router_km: jax.Array,
+    pre_exp_gain: jax.Array,
+    bias: jax.Array,
+    w1: jax.Array,
+    s1: jax.Array,
+    w2: jax.Array,
+    s2: jax.Array,
+    post_exp_norm: jax.Array,
+    w_post_tp2_w8k: jax.Array,
+    s_post_tp2: jax.Array,
+    post_ff_gain: jax.Array,
+    pf_alpha: jax.Array,
+    pf_beta: jax.Array,
+    next_in_gain: jax.Array,
+    next_w_qkv_w8k: jax.Array,
+    next_s_qkv: jax.Array,
+    next_w_gate_w8k: jax.Array,
+    next_s_gate: jax.Array,
+    cos_sin_step: jax.Array | None = None,
+    rep_w1: jax.Array | None = None,
+    rep_s1: jax.Array | None = None,
+    rep_w2: jax.Array | None = None,
+    rep_s2: jax.Array | None = None,
+    replica_meta: jax.Array | None = None,
+    spec_home_slot: jax.Array | None = None,
+    free_params: jax.Array | None = None,
+    *,
+    world_size: int = 8,
+    pa_eps: float = 1e-8,
+    pre_ff_eps: float = 1e-5,
+    pre_ff_scale_input: bool = False,
+    router_multiplier: float = 1.0,
+    pre_exp_eps: float = 1e-5,
+    pre_exp_scale_input: bool = False,
+    post_ff_eps: float = 1e-8,
+    post_ff_scale_input: bool = True,
+    next_in_eps: float = 1e-5,
+    next_in_scale_input: bool = False,
+    fuse_qkv_epi: bool = True,
+    qkv_norm_eps: float = 1e-5,
+    query_scale: float = 1.0,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    replica_cost_mode: str = "active",
+    ep_axis_name: str = "model",
+    config: SparseDecodeConfig | None = None,
+    collective_id: int = _W8_CID_BASE + 20,
+    interpret: bool = False,
+):
+    """Fused Step (b) superkernel: ``attn_{L} -> MoE_{L} -> attn_{L+1}``."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    st = _prepare_chip_b1_moe_b2_setup(
+        rank, stream_chip, gated_attn, wo_w8k, wo_scale, pa_alpha, pa_beta,
+        pre_ff_gain, w_pre_pair_w8k, w_pre_pair_scale, w_router_km, pre_exp_gain,
+        bias, w1, s1, w2, s2, post_exp_norm,
+        w_post_tp2_w8k, s_post_tp2, post_ff_gain, pf_alpha, pf_beta, next_in_gain,
+        next_w_qkv_w8k, next_s_qkv, next_w_gate_w8k, next_s_gate,
+        cos_sin_step, rep_w1, rep_s1, rep_w2, rep_s2, replica_meta,
+        spec_home_slot, free_params,
+        world_size=world_size, fuse_qkv_epi=fuse_qkv_epi, config=config, interpret=interpret,
+    )
+    rows = st["rows"]
+    r_pair = st["r_pair"]
+    hidden = st["hidden"]
+    qkv_cols = st["qkv_cols"]
+    gate_cols = st["gate_cols"]
+    v_sp, h_sp = st["v_sp"], st["h_sp"]
+    scalar_args = st["scalar_args"]
+    call_args = (*scalar_args, *st["base_call_tensors"])
 
     if fuse_qkv_epi:
         out_shape = (
@@ -924,9 +1192,9 @@ def b1_moe_b2_chip_sharded_jax(
     kernel_fn = functools.partial(
         _b1_moe_b2_chip_sharded_kernel,
         world_size=world_size,
-        scale_block=scale_block,
-        num_replicas=num_replicas,
-        sharded_moe_in=bool(sharded_moe_in),
+        scale_block=st["scale_block"],
+        num_replicas=st["num_replicas"],
+        sharded_moe_in=bool(st["sharded_moe_in"]),
         replica_cost_mode=replica_cost_mode,
         ep_axis_name=ep_axis_name,
         pa_eps=float(pa_eps),
@@ -944,11 +1212,12 @@ def b1_moe_b2_chip_sharded_jax(
         query_scale=float(query_scale),
         k_scale=float(k_scale),
         v_scale=float(v_scale),
-        has_rope=has_rope,
-        cfg=config,
-        has_spec_slot_arg=has_spec_slot_arg,
-        interpret_mode=interpret_mode,
-        alias_mate_recv=alias_mate_recv,
+        has_rope=st["has_rope"],
+        cfg=st["config"],
+        has_spec_slot_arg=st["has_spec_slot_arg"],
+        has_free_params_arg=st["has_free_params_arg"],
+        interpret_mode=st["interpret_mode"],
+        alias_mate_recv=st["alias_mate_recv"],
     )
 
     res = pl.pallas_call(
@@ -957,23 +1226,307 @@ def b1_moe_b2_chip_sharded_jax(
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=len(scalar_args),
             grid=(1,),
-            in_specs=in_specs,
+            in_specs=st["in_specs"],
             out_specs=out_specs,
-            scratch_shapes=moe_scratch + shared_scratch,
+            scratch_shapes=st["scratch_shapes"],
         ),
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=(64 if rows > 64 else 60) * 1024**2,
             collective_id=collective_id,
             disable_bounds_checks=True,
         ),
-        interpret=interpret_arg,
+        interpret=st["interpret_arg"],
         name=(
-            f"muse_w9_b1_moe_b2_b{rows}_tp{world_size}_k{scale_block}"
-            f"_r{num_replicas}_{'r16' if is_r16 else 'r32'}"
-            f"{'_epi_' + ('rope' if has_rope else 'nope') if fuse_qkv_epi else ''}"
+            f"muse_w9_b1_moe_b2_b{rows}_tp{world_size}_k{st['scale_block']}"
+            f"_r{st['num_replicas']}_{'r16' if st['is_r16'] else 'r32'}"
+            f"{'_dfp' if st['has_free_params_arg'] else ''}"
+            f"{'_epi_' + ('rope' if st['has_rope'] else 'nope') if fuse_qkv_epi else ''}"
         ),
     )(*call_args)
     if fuse_qkv_epi:
         st_ch, q_3d, kv_m, gate = res
         return st_ch, q_3d.reshape(1, rows, 8, 2, 128), kv_m, gate
     return res
+
+
+def b1_moe_b2_rpad_chip_sharded_jax(
+    rank: jax.Array,
+    stream_chip: jax.Array,
+    gated_attn: jax.Array,
+    wo_w8k: jax.Array,
+    wo_scale: jax.Array,
+    pa_alpha: jax.Array,
+    pa_beta: jax.Array,
+    pre_ff_gain: jax.Array,
+    w_pre_pair_w8k: jax.Array,
+    w_pre_pair_scale: jax.Array,
+    w_router_km: jax.Array,
+    pre_exp_gain: jax.Array,
+    bias: jax.Array,
+    w1: jax.Array,
+    s1: jax.Array,
+    w2: jax.Array,
+    s2: jax.Array,
+    post_exp_norm: jax.Array,
+    w_post_tp2_w8k: jax.Array,
+    s_post_tp2: jax.Array,
+    post_ff_gain: jax.Array,
+    pf_alpha: jax.Array,
+    pf_beta: jax.Array,
+    next_in_gain: jax.Array,
+    next_w_qkv_w8k: jax.Array,
+    next_s_qkv: jax.Array,
+    next_w_gate_w8k: jax.Array,
+    next_s_gate: jax.Array,
+    kv_cache_fused: jax.Array,
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    cu_kv_lens: jax.Array,
+    distribution: jax.Array,
+    cos_sin_step: jax.Array | None = None,
+    rep_w1: jax.Array | None = None,
+    rep_s1: jax.Array | None = None,
+    rep_w2: jax.Array | None = None,
+    rep_s2: jax.Array | None = None,
+    replica_meta: jax.Array | None = None,
+    spec_home_slot: jax.Array | None = None,
+    free_params: jax.Array | None = None,
+    layer_idx: jax.Array | None = None,
+    *,
+    world_size: int = 8,
+    pa_eps: float = 1e-8,
+    pre_ff_eps: float = 1e-5,
+    pre_ff_scale_input: bool = False,
+    router_multiplier: float = 1.0,
+    pre_exp_eps: float = 1e-5,
+    pre_exp_scale_input: bool = False,
+    post_ff_eps: float = 1e-8,
+    post_ff_scale_input: bool = True,
+    next_in_eps: float = 1e-5,
+    next_in_scale_input: bool = False,
+    qkv_norm_eps: float = 1e-5,
+    query_scale: float = 1.0,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    rpa_sm_scale: float = 1.0,
+    rpa_sliding_window: int | None = None,
+    rpa_k_scale: float = 1.0,
+    rpa_v_scale: float = 1.0,
+    rpa_out_norm_eps: float = 1e-5,
+    rpa_mode_str: str | None = None,
+    kv_pack_dense2: bool = False,
+    replica_cost_mode: str = "active",
+    ep_axis_name: str = "model",
+    config: SparseDecodeConfig | None = None,
+    collective_id: int = _W8_CID_BASE + 22,
+    interpret: bool = False,
+):
+    """Fused Step (c) superkernel: ``[chip_b1 + muse_sparse(3d) + chip_b2 + RPAd]``."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+    from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
+        align_to,
+        cdiv,
+        parse_decode_fast_config,
+    )
+
+    st = _prepare_chip_b1_moe_b2_setup(
+        rank, stream_chip, gated_attn, wo_w8k, wo_scale, pa_alpha, pa_beta,
+        pre_ff_gain, w_pre_pair_w8k, w_pre_pair_scale, w_router_km, pre_exp_gain,
+        bias, w1, s1, w2, s2, post_exp_norm,
+        w_post_tp2_w8k, s_post_tp2, post_ff_gain, pf_alpha, pf_beta, next_in_gain,
+        next_w_qkv_w8k, next_s_qkv, next_w_gate_w8k, next_s_gate,
+        cos_sin_step, rep_w1, rep_s1, rep_w2, rep_s2, replica_meta,
+        spec_home_slot, free_params,
+        world_size=world_size, fuse_qkv_epi=True, config=config, interpret=interpret,
+    )
+    rows = st["rows"]
+    r_pair = st["r_pair"]
+    hidden = st["hidden"]
+    if rows > 64:
+        raise ValueError(f"Step (c) requires B <= 64 to fit bkv VMEM, got B={rows}")
+
+    eff_sw = None if (rpa_sliding_window is None or rpa_sliding_window <= 0) else int(rpa_sliding_window)
+    kv_cache_flat = kv_cache_fused
+    eff_page_indices = page_indices
+    if layer_idx is not None:
+        num_blocks, layer_num = kv_cache_fused.shape[:2]
+        kv_cache_flat = kv_cache_fused.reshape(
+            (num_blocks * layer_num,) + kv_cache_fused.shape[2:]
+        )
+        eff_page_indices = page_indices * jnp.int32(layer_num) + layer_idx.reshape(()).astype(jnp.int32)
+
+    if rpa_mode_str is None:
+        try:
+            from sglang_tpu.envs import envs as tpu_envs
+
+            rpa_mode_str = str(tpu_envs.SGLANG_TPU_RPA_V3_DECODE_FAST.get()).strip()
+        except Exception:
+            rpa_mode_str = ""
+        if not rpa_mode_str:
+            rpa_mode_str = "v2"
+
+    max_num_seqs = kv_lens.shape[0]
+    pages_per_seq = eff_page_indices.shape[0] // max_num_seqs
+    phys_page_rows = kv_cache_flat.shape[1]
+    page_size = phys_page_rows * 2 if kv_pack_dense2 else phys_page_rows
+    cfg_rpa = parse_decode_fast_config(
+        rpa_mode_str,
+        sliding_window=eff_sw,
+        pages_per_seq=pages_per_seq,
+        page_size=page_size,
+        decode_query_size=1,
+        shared_group=0,
+        kv_pack_dense2=kv_pack_dense2,
+    )
+    if (
+        cfg_rpa.shared_group_size > 0
+        or cfg_rpa.loop_kind == "shared16"
+        or cfg_rpa.num_slots * cfg_rpa.max_ring_pages * phys_page_rows > 20 * 512
+    ):
+        raise ValueError(
+            "Step (c) requires RPAd bkv <= 20*512 rows (5 MiB) and non-shared loop_kind; "
+            f"got num_slots={cfg_rpa.num_slots}, max_ring_pages={cfg_rpa.max_ring_pages}, "
+            f"phys_page_rows={phys_page_rows}, loop_kind={cfg_rpa.loop_kind!r}"
+        )
+    if world_size == 16 and cfg_rpa.num_slots > 4:
+        raise ValueError(
+            f"TP=16 Step (c) aliases bkv_sems on rs_pair_ssem (8); requires num_slots <= 4, got {cfg_rpa.num_slots}"
+        )
+    one_block_per_seq = (
+        False
+        if cfg_rpa.loop_kind == "ring4k"
+        else (True if eff_sw is not None else (pages_per_seq <= cfg_rpa.max_ring_pages))
+    )
+
+    q_heads = 8 if world_size == 16 else 16
+    pack2_cols = 512 if world_size == 16 else 1024
+    vmem, hbm, sem = st["vmem"], st["hbm"], st["sem"]
+    v_sp, h_sp = st["v_sp"], st["h_sp"]
+    interpret_mode = st["interpret_mode"]
+    smem = pltpu.SMEM
+
+    max_blks_4k = (
+        cdiv(max(pages_per_seq, 1), cfg_rpa.max_ring_pages)
+        if cfg_rpa.loop_kind == "ring4k"
+        else 0
+    )
+    smem_words = 2 + cfg_rpa.num_slots + 4 * max(max_num_seqs * max_blks_4k, 0)
+    b_pad32 = align_to(max(rows, 1), 32)
+    rpad_scratch = [
+        vmem((rows, 16, 128), jnp.bfloat16),  # rpad_q_vmem
+        vmem((rows, 1, 4, 128), jnp.float8_e4m3fn),  # rpad_kv_vmem
+        vmem((rows, pack2_cols), jnp.bfloat16),  # rpad_gate_vmem
+        vmem(
+            (cfg_rpa.num_slots, cfg_rpa.max_ring_pages, phys_page_rows, 1, 4, 128),
+            kv_cache_flat.dtype,
+        ),
+        vmem((3, q_heads, 128), jnp.float32),
+        vmem((rows, q_heads, 128), jnp.bfloat16),
+        *(
+            [vmem((max(rows, 8), 8, 1, 4, 128), kv_cache_flat.dtype)]
+            if kv_pack_dense2
+            else []
+        ),
+        *(
+            [vmem((2, b_pad32, q_heads, 128), jnp.float32)]
+            if cfg_rpa.hoist_new_kv
+            else []
+        ),
+        smem((smem_words,), jnp.int32),
+        *(([sem((cfg_rpa.num_slots,)), sem((1,))]) if world_size == 8 else []),
+    ]
+
+    scalar_args = [
+        *st["scalar_args"],
+        kv_lens,
+        eff_page_indices,
+        cu_q_lens,
+        cu_kv_lens,
+        distribution,
+    ]
+    in_specs = st["in_specs"] + (h_sp,)
+    kv_in_arg = (
+        kv_cache_flat
+        if interpret_mode
+        else pltpu.with_memory_space_constraint(kv_cache_flat, hbm)
+    )
+    call_args = (*scalar_args, *st["base_call_tensors"], kv_in_arg)
+    kv_cache_pallas_in = len(scalar_args) + len(st["base_call_tensors"])
+
+    out_shape = (
+        jax.ShapeDtypeStruct((r_pair, hidden), jnp.float32),
+        jax.ShapeDtypeStruct((rows, pack2_cols), jnp.bfloat16),
+        (
+            jax.ShapeDtypeStruct(kv_cache_flat.shape, kv_cache_flat.dtype)
+            if interpret_mode
+            else pltpu.HBM(kv_cache_flat.shape, kv_cache_flat.dtype)
+        ),
+    )
+    out_specs = (h_sp, v_sp, h_sp)
+
+    kernel_fn = functools.partial(
+        _b1_moe_b2_rpad_chip_sharded_kernel,
+        world_size=world_size,
+        scale_block=st["scale_block"],
+        num_replicas=st["num_replicas"],
+        sharded_moe_in=bool(st["sharded_moe_in"]),
+        replica_cost_mode=replica_cost_mode,
+        ep_axis_name=ep_axis_name,
+        pa_eps=float(pa_eps),
+        pre_ff_eps=float(pre_ff_eps),
+        pre_ff_scale_input=bool(pre_ff_scale_input),
+        router_multiplier=float(router_multiplier),
+        pre_exp_eps=float(pre_exp_eps),
+        pre_exp_scale_input=bool(pre_exp_scale_input),
+        post_ff_eps=float(post_ff_eps),
+        post_ff_scale_input=bool(post_ff_scale_input),
+        next_in_eps=float(next_in_eps),
+        next_in_scale_input=bool(next_in_scale_input),
+        fuse_qkv_epi=True,
+        qkv_norm_eps=float(qkv_norm_eps),
+        query_scale=float(query_scale),
+        k_scale=float(k_scale),
+        v_scale=float(v_scale),
+        has_rope=st["has_rope"],
+        cfg=st["config"],
+        has_spec_slot_arg=st["has_spec_slot_arg"],
+        has_free_params_arg=st["has_free_params_arg"],
+        interpret_mode=interpret_mode,
+        alias_mate_recv=st["alias_mate_recv"],
+        rpa_sm_scale=float(rpa_sm_scale),
+        rpa_sliding_window=eff_sw,
+        rpa_k_scale=float(rpa_k_scale) if rpa_k_scale is not None else None,
+        rpa_v_scale=float(rpa_v_scale) if rpa_v_scale is not None else None,
+        rpa_out_norm_eps=float(rpa_out_norm_eps),
+        rpa_cfg=cfg_rpa,
+        rpa_one_block_per_seq=bool(one_block_per_seq),
+        rpa_kv_pack_dense2=bool(kv_pack_dense2),
+    )
+
+    st_ch, next_gated, updated_kv = pl.pallas_call(
+        kernel_fn,
+        out_shape=out_shape,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=len(scalar_args),
+            grid=(1,),
+            in_specs=in_specs,
+            out_specs=out_specs,
+            scratch_shapes=st["scratch_shapes"] + rpad_scratch,
+        ),
+        input_output_aliases={kv_cache_pallas_in: 2},
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=62 * 1024**2,
+            collective_id=collective_id,
+            disable_bounds_checks=True,
+        ),
+        interpret=st["interpret_arg"],
+        name=(
+            f"muse_w9_b1_moe_b2_rpad_b{rows}_tp{world_size}_k{st['scale_block']}"
+            f"_r{st['num_replicas']}_{'r16' if st['is_r16'] else 'r32'}"
+            f"{'_dfp' if st['has_free_params_arg'] else ''}"
+            f"_{'rope' if st['has_rope'] else 'nope'}"
+        ),
+    )(*call_args)
+    return st_ch, next_gated, updated_kv.reshape(kv_cache_fused.shape)
