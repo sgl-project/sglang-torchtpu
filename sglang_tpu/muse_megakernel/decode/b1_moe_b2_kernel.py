@@ -28,6 +28,7 @@ in a single ``pallas_call`` across ``TP = EP in (8, 16)`` and ``B in (32, 64, 12
 
 # PEP 563 must stay off so cpu_export_jax_op sees real jax.Array annotations.
 
+import dataclasses
 import functools
 import jax
 import jax.numpy as jnp
@@ -118,8 +119,16 @@ def _b1_moe_b2_chip_sharded_impl(
     rpa_cfg=None,
     rpa_one_block_per_seq: bool = True,
     rpa_kv_pack_dense2: bool = False,
+    rpa_use_grp_vec: bool = False,
+    rpa_skip_kv_write: bool = False,
+    step_c_moe_is_scope1: tuple[bool, ...] = (),
+    step_c_n_moe_outer: int = 0,
+    step_c_n_moe_scope1: int = 0,
+    step_c_n_b1_scope1: int = 0,
+    step_c_scope1_shapes: tuple = (),
+    step_c_scope2_shapes: tuple = (),
 ) -> None:
-    """Shared Pallas kernel body for Step (b) and Step (c) (``+ RPAd``)."""
+    """Shared Pallas kernel body for Step (b) and 2-scope Step (c) (``+ RPAd``)."""
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
 
@@ -185,23 +194,18 @@ def _b1_moe_b2_chip_sharded_impl(
     out_stream_chip_hbm = next(it)
     if has_rpad:
         out_gated_ref = next(it)
-        out_kv_cache_hbm_ref = next(it)
+        if rpa_skip_kv_write:
+            out_kv_merged_ref = next(it)
+            out_kv_cache_hbm_ref = None
+        else:
+            out_kv_cache_hbm_ref = next(it)
+            out_kv_merged_ref = None
         out_qkv_or_q_ref = out_kv_or_gate_ref = out_gate_epi_ref = None
     else:
         out_qkv_or_q_ref = next(it)
         out_kv_or_gate_ref = next(it)
         out_gate_epi_ref = next(it) if fuse_qkv_epi else None
-        out_gated_ref = out_kv_cache_hbm_ref = None
-
-    # MoE scratch.
-    msc = _unpack_muse_sparse_scratch(
-        it,
-        ep=world_size,
-        scale_block=scale_block,
-        num_replicas=num_replicas,
-        return_sharded=sharded_moe_in,
-        cfg=cfg,
-    )
+        out_gated_ref = out_kv_cache_hbm_ref = out_kv_merged_ref = None
 
     rows = gated_ref.shape[0]
     o_in = gated_ref.shape[1]
@@ -214,133 +218,8 @@ def _b1_moe_b2_chip_sharded_impl(
     gate_cols = next_w_gate_hbm.shape[1]
     n_chips = world_size // 2
     use_xy = world_size == 8 and r_pair >= 16
-
-    # Shared Bridge 1b + Bridge 2b VMEM scratch.
-    w_pre_pair_buf = next(it)
-    w_router_buf = next(it)
-    s_buf = next(it)
-    next_in_vmem = next(it)
-    if alias_mate_recv:
-        mate_bf = msc["y_stage_buf"].bitcast(jnp.bfloat16)
-        mate_recv = mate_bf if mate_bf.shape[0] == rows else mate_bf.at[pl.ds(0, rows), :]
-    else:
-        mate_recv = next(it)
-    if interpret_mode:
-        send_half = next(it)
-        own_half = next(it)
-    else:
-        own_half = next_in_vmem.at[:, pl.ds(0, 4096)]
-        send_half = next_in_vmem.at[:, pl.ds(4096, 4096)]
-    rs1_a_or_z_recv = next(it)
-    rs1_b_or_y_recv = next(it)
-    rs2_a_or_x_recv = next(it)
-    rs2_b_recv = next(it)
-    my_pair_bf16 = next(it)
-    recv_pair_bf16 = next(it)
-    sq_pair_pa_buf = next(it)
-    ffn_pair_buf = next(it)
-    router_pair_buf = next(it)
-    pre_my_half = next(it)
-    pre_mate_half = next(it)
-    sq_pair_pre_buf = next(it)
-    exp_3d_buf = next(it)
-    logits_vmem = next(it)
-    use_3d_x = msc["x_3d_buf"] is not None
-    if use_3d_x:
-        expert_in_vmem = None
-    elif (not interpret_mode) and sharded_moe_in:
-        expert_in_vmem = next_in_vmem.at[:, pl.ds(0, 4096)]
-    else:
-        expert_in_vmem = next(it)
-    moe_sh_vmem = next(it) if sharded_moe_in else None
-    moe_rep_vmem = (
-        next(it)
-        if ((not sharded_moe_in) and use_3d_x and interpret_mode)
-        else None
-    )
-    b2_scalar_dummy_post = next(it)  # (8, 128)
-    b2_scalar_dummy_cols = next(it)  # (8, 128)
-
-    # Semaphores: keep RS receive sems (rs_pair_rsem, rs_chip_rsem) and Stage-4 fan_* 100%
-    # disjoint from Stage-5 b2 sems! When TP=16 B=64 (not sharded_moe_in and world_size == 16):
-    # - w_pre/w_router/s_in drain in Stages 1-3, so w_post/w_qkv/w_gate alias them sequentially
-    #   (while s_out_sem stays dedicated because Stage-5 stream store overlaps w_gate DMA wait);
-    # - ag_exp_recv is used ONLY in Stage-3 ag_exp (is_tp2_wpost=True skips Stage-5 post_ici) and
-    #   is separated from Stage-4 fan_out by MoE PAIR_RS, so aliasing msc["fan_send_sem"] is safe;
-    # - ag_log_recv (Stage-5 in_ici_recv!) stays strictly dedicated (7,) so total sems <= 63 <= 64.
-    w_pre_sem = next(it)
-    w_router_sem = next(it)
-    s_in_sem = next(it)
-    s_out_sem = next(it)
-    if sharded_moe_in or world_size == 8:
-        w_post_sem = next(it)
-        w_qkv_sem = next(it)
-        w_gate_sem = next(it)
-    else:
-        w_post_sem = w_pre_sem
-        w_qkv_sem = w_router_sem
-        w_gate_sem = s_in_sem
-    c1a_send = next(it)
-    c1a_recv = next(it)
-    rs1_send = next(it)
-    rs1_recv = next(it)
-
-    if use_xy:
-        rs2_send = next(it)
-        rs2_recv = next(it)
-    else:
-        rs2_send, rs2_recv = rs1_send, rs1_recv
-    rs3_send, rs3_recv = rs1_send, rs1_recv
-
-    if sharded_moe_in or world_size == 8:
-        c1c_send = next(it)
-        c1c_recv = next(it)
-        pre_send = next(it)
-        pre_recv = next(it)
-        ag_exp_d2d_send = next(it)
-        ag_exp_d2d_recv = next(it)
-        ag_exp_recv = next(it)
-        ag_log_recv = next(it)
-    else:
-        c1c_send, c1c_recv = c1a_send, c1a_recv
-        pre_send, pre_recv = rs1_send, rs1_recv
-        ag_exp_d2d_send, ag_exp_d2d_recv = c1a_send, c1a_recv
-        ag_exp_recv = msc["fan_send_sem"].at[pl.ds(0, n_chips - 1)]
-        ag_log_recv = next(it)
-
-    if msc["rs_pair_ssem"] is not None:
-        ag_exp_send = msc["rs_pair_ssem"]
-        ag_log_send = msc["rs_chip_ssem"]
-    else:
-        ag_exp_send = next(it)
-        ag_log_send = next(it)
-
-    if interpret_mode:
-        wo_buf = next(it)
-        w_pre_core_buf = w_pre_pair_buf
-        w_post_buf = next(it)
-        w_qkv_buf = next(it)
-        w_gate_buf = next(it)
-    else:
-        wo_buf = _alias_wo_buf(
-            msc["w1_buf"],
-            msc["w2_buf"],
-            w_mode=msc["w_mode"],
-            o_in=o_in,
-            half=half,
-        )
-        w_pre_core_buf = (
-            w_pre_pair_buf
-            if w_pre_pair_buf.shape[1] == pre_pair_cols
-            else w_pre_pair_buf.at[:, pl.ds(0, pre_pair_cols)]
-        )
-        w_post_buf, w_qkv_buf, w_gate_buf = _alias_b2_weights(
-            msc["w1_buf"],
-            w_pre_pair_buf,
-            w_mode=msc["w_mode"],
-            qkv_cols=qkv_cols,
-            gate_cols=gate_cols,
-        )
+    use_3d_x = cfg.row_mode != "dense"
+    need_b1_exp_in = (not use_3d_x) and (interpret_mode or not sharded_moe_in)
 
     me = rank_ref[0]
     w1_u32 = w1_ref if w1_ref.dtype == jnp.uint32 else w1_ref.bitcast(jnp.uint32)
@@ -356,396 +235,792 @@ def _b1_moe_b2_chip_sharded_impl(
         else None
     )
 
-    plan_holder = []
+    def _unpack_sems(cur_it, *, rs_pair_ssem, rs_chip_ssem, fan_send_sem) -> dict:
+        w_pre_sem = next(cur_it)
+        w_router_sem = next(cur_it)
+        s_in_sem = next(cur_it)
+        s_out_sem = next(cur_it)
+        if sharded_moe_in or world_size == 8:
+            w_post_sem = next(cur_it)
+            w_qkv_sem = next(cur_it)
+            w_gate_sem = next(cur_it)
+        else:
+            w_post_sem, w_qkv_sem, w_gate_sem = w_pre_sem, w_router_sem, s_in_sem
+        c1a_send = next(cur_it)
+        c1a_recv = next(cur_it)
+        rs1_send = next(cur_it)
+        rs1_recv = next(cur_it)
+        if use_xy:
+            rs2_send = next(cur_it)
+            rs2_recv = next(cur_it)
+        else:
+            rs2_send, rs2_recv = rs1_send, rs1_recv
+        rs3_send, rs3_recv = rs1_send, rs1_recv
+        if sharded_moe_in or world_size == 8:
+            c1c_send = next(cur_it)
+            c1c_recv = next(cur_it)
+            pre_send = next(cur_it)
+            pre_recv = next(cur_it)
+            ag_exp_d2d_send = next(cur_it)
+            ag_exp_d2d_recv = next(cur_it)
+            ag_exp_recv = next(cur_it)
+            ag_log_recv = next(cur_it)
+        else:
+            c1c_send, c1c_recv = c1a_send, c1a_recv
+            pre_send, pre_recv = rs1_send, rs1_recv
+            ag_exp_d2d_send, ag_exp_d2d_recv = c1a_send, c1a_recv
+            ag_exp_recv = fan_send_sem.at[pl.ds(0, n_chips - 1)]
+            ag_log_recv = next(cur_it)
+        if rs_pair_ssem is not None:
+            ag_exp_send = rs_pair_ssem
+            ag_log_send = rs_chip_ssem
+        else:
+            ag_exp_send = next(cur_it)
+            ag_log_send = next(cur_it)
+        return dict(
+            w_pre_sem=w_pre_sem, w_router_sem=w_router_sem, s_in_sem=s_in_sem, s_out_sem=s_out_sem,
+            w_post_sem=w_post_sem, w_qkv_sem=w_qkv_sem, w_gate_sem=w_gate_sem,
+            c1a_send=c1a_send, c1a_recv=c1a_recv, rs1_send=rs1_send, rs1_recv=rs1_recv,
+            rs2_send=rs2_send, rs2_recv=rs2_recv, rs3_send=rs3_send, rs3_recv=rs3_recv,
+            c1c_send=c1c_send, c1c_recv=c1c_recv, pre_send=pre_send, pre_recv=pre_recv,
+            ag_exp_d2d_send=ag_exp_d2d_send, ag_exp_d2d_recv=ag_exp_d2d_recv,
+            ag_exp_send=ag_exp_send, ag_exp_recv=ag_exp_recv,
+            ag_log_send=ag_log_send, ag_log_recv=ag_log_recv,
+        )
 
-    def _during_ag_exp_ici() -> None:
-        plan_res = plan_and_prime_muse_sparse_from_vmem(
-            me,
+    def _run_stage1_4_b1_moe(
+        *,
+        msc: dict,
+        w_pre_core_buf,
+        wo_buf,
+        w_router_buf,
+        s_buf,
+        send_half,
+        mate_recv,
+        own_half,
+        b1_ephem: tuple,
+        my_pair_bf16,
+        recv_pair_bf16,
+        ffn_pair_buf,
+        exp_3d_buf,
+        moe_dst_vmem,
+        expert_in_vmem,
+        w_post_buf,
+        w_qkv_buf,
+        w_gate_buf,
+        sems: dict,
+    ) -> None:
+        (
+            rs1_a_or_z_recv,
+            rs1_b_or_y_recv,
+            rs2_a_or_x_recv,
+            rs2_b_recv,
+            sq_pair_pa_buf,
+            router_pair_buf,
+            pre_my_half,
+            pre_mate_half,
+            sq_pair_pre_buf,
             logits_vmem,
-            bias_ref,
-            post_exp_norm_ref,
-            w1_u32,
-            s1_ref,
-            w2_u32,
-            s2_ref,
+        ) = b1_ephem
+        plan_holder = []
+
+        def _during_ag_exp_ici() -> None:
+            plan_res = plan_and_prime_muse_sparse_from_vmem(
+                me,
+                logits_vmem,
+                bias_ref,
+                post_exp_norm_ref,
+                w1_u32,
+                s1_ref,
+                w2_u32,
+                s2_ref,
+                d_scratch=msc["d_scratch"],
+                r_scratch=msc["r_scratch"],
+                w1_buf=msc["w1_buf"],
+                s1_buf=msc["s1_buf"],
+                w2_buf=msc["w2_buf"],
+                s2_buf=msc["s2_buf"],
+                w1_sem=msc["w1_sem"],
+                w2_sem=msc["w2_sem"],
+                misc_sem=msc["misc_sem"],
+                gain_f32_buf=msc["gain_f32_buf"],
+                accum_3d=msc["accum_3d"],
+                io_3d_buf=msc["io_3d_buf"],
+                accum_2d=msc["accum_2d"],
+                rep_w1_u32=rep_w1_u32,
+                rep_s1_ref=rep_s1_ref,
+                rep_w2_u32=rep_w2_u32,
+                rep_s2_ref=rep_s2_ref,
+                replica_meta_ref=replica_meta_ref,
+                owner_load_smem=msc["owner_load_smem"],
+                moved_flag_smem=msc["moved_flag_smem"],
+                local_suppress_smem=msc["local_suppress_smem"],
+                holder_slot_expert_smem=msc["holder_slot_expert_smem"],
+                holder_cand_smem=msc["holder_cand_smem"],
+                spec_slot_ref=spec_slot_ref,
+                free_params_ref=free_params_ref,
+                ep=world_size,
+                batch_size=rows,
+                scale_block=scale_block,
+                num_replicas=num_replicas,
+                replica_cost_mode=replica_cost_mode,
+                cfg=cfg,
+                zero_and_pack=(r_pair == 8),
+            )
+            plan_holder.append(plan_res)
+
+        def _during_ag_exp_d2d2() -> None:
+            zero_and_pack_muse_sparse_from_vmem(
+                plan_holder[0],
+                r_scratch=msc["r_scratch"],
+                accum_3d=msc["accum_3d"],
+                io_3d_buf=msc["io_3d_buf"],
+                accum_2d=msc["accum_2d"],
+                batch_size=rows,
+                cfg=cfg,
+            )
+
+        _run_chip_b1_vmem_core(
+            stream_chip_hbm,
+            gated_ref,
+            wo_hbm,
+            wo_scale_ref,
+            pa_alpha_ref,
+            pa_beta_ref,
+            pre_ff_gain_ref,
+            w_pre_pair_hbm,
+            w_pre_pair_scale_ref,
+            w_router_hbm,
+            pre_exp_gain_ref,
+            out_stream_chip_hbm,
+            logits_vmem,
+            None if use_3d_x else expert_in_vmem,
+            wo_buf,
+            w_pre_core_buf,
+            w_router_buf,
+            s_buf,
+            send_half,
+            mate_recv,
+            own_half,
+            rs1_a_or_z_recv,
+            rs1_b_or_y_recv,
+            rs2_a_or_x_recv,
+            rs2_b_recv,
+            my_pair_bf16,
+            recv_pair_bf16,
+            sq_pair_pa_buf,
+            ffn_pair_buf,
+            router_pair_buf,
+            pre_my_half,
+            pre_mate_half,
+            sq_pair_pre_buf,
+            exp_3d_buf,
+            msc["w1_sem"],
+            sems["w_pre_sem"],
+            sems["w_router_sem"],
+            sems["s_in_sem"],
+            sems["s_out_sem"],
+            sems["c1a_send"],
+            sems["c1a_recv"],
+            sems["rs1_send"],
+            sems["rs1_recv"],
+            sems["rs2_send"],
+            sems["rs2_recv"],
+            sems["rs3_send"],
+            sems["rs3_recv"],
+            sems["c1c_send"],
+            sems["c1c_recv"],
+            sems["pre_send"],
+            sems["pre_recv"],
+            sems["ag_exp_send"],
+            sems["ag_exp_recv"],
+            sems["ag_exp_d2d_send"],
+            sems["ag_exp_d2d_recv"],
+            sems["ag_log_send"],
+            sems["ag_log_recv"],
+            world_size=world_size,
+            pa_eps=pa_eps,
+            pre_ff_eps=pre_ff_eps,
+            pre_ff_scale_input=pre_ff_scale_input,
+            router_multiplier=router_multiplier,
+            pre_exp_eps=pre_exp_eps,
+            pre_exp_scale_input=pre_exp_scale_input,
+            skip_barrier_signal=False,
+            skip_barrier_wait=False,
+            skip_stream_load=False,
+            skip_stream_store=True,
+            early_router_and_log_ag=True,
+            during_ag_exp_ici_fn=_during_ag_exp_ici,
+            during_ag_exp_d2d2_fn=None if r_pair == 8 else _during_ag_exp_d2d2,
+            out_expert_3d_ref=msc["x_3d_buf"] if use_3d_x else None,
+        )
+
+        def _on_experts_done() -> None:
+            pltpu.make_async_copy(w_post_hbm, w_post_buf, sems["w_post_sem"].at[0]).start()
+            pltpu.make_async_copy(next_w_qkv_hbm, w_qkv_buf, sems["w_qkv_sem"].at[0]).start()
+            pltpu.make_async_copy(next_w_gate_hbm, w_gate_buf, sems["w_gate_sem"].at[0]).start()
+
+        run_muse_sparse_experts_and_rs_from_vmem(
+            me,
+            None if use_3d_x else expert_in_vmem,
+            plan_holder[0],
             d_scratch=msc["d_scratch"],
             r_scratch=msc["r_scratch"],
             w1_buf=msc["w1_buf"],
             s1_buf=msc["s1_buf"],
             w2_buf=msc["w2_buf"],
             s2_buf=msc["s2_buf"],
-            w1_sem=msc["w1_sem"],
-            w2_sem=msc["w2_sem"],
-            misc_sem=msc["misc_sem"],
+            w1_acc_buf=msc["w1_acc_buf"],
+            x_3d_buf=msc["x_3d_buf"],
+            io_3d_buf=msc["io_3d_buf"],
+            lhs_2d_buf=msc["lhs_2d_buf"],
+            act_2d_buf=msc["act_2d_buf"],
+            y_stage_buf=msc["y_stage_buf"],
+            lhs_fp8_buf=msc["lhs_fp8_buf"],
+            lhs_sc_buf=msc["lhs_sc_buf"],
+            masked_x_buf=msc["masked_x_buf"],
+            bd_sc_buf=msc["bd_sc_buf"],
             gain_f32_buf=msc["gain_f32_buf"],
             accum_3d=msc["accum_3d"],
-            io_3d_buf=msc["io_3d_buf"],
             accum_2d=msc["accum_2d"],
-            rep_w1_u32=rep_w1_u32,
-            rep_s1_ref=rep_s1_ref,
-            rep_w2_u32=rep_w2_u32,
-            rep_s2_ref=rep_s2_ref,
-            replica_meta_ref=replica_meta_ref,
-            owner_load_smem=msc["owner_load_smem"],
-            moved_flag_smem=msc["moved_flag_smem"],
-            local_suppress_smem=msc["local_suppress_smem"],
-            holder_slot_expert_smem=msc["holder_slot_expert_smem"],
-            holder_cand_smem=msc["holder_cand_smem"],
-            spec_slot_ref=spec_slot_ref,
-            free_params_ref=free_params_ref,
+            fan_3d_buf=msc["fan_3d_buf"],
+            rs_send_bf16=msc["rs_send_bf16"],
+            rs_pair_recv=msc["rs_pair_recv"],
+            rs_chip_send=msc["rs_chip_send"],
+            rs_chip_recv=msc["rs_chip_recv"],
+            rs_pair_ssem=msc["rs_pair_ssem"],
+            rs_pair_rsem=msc["rs_pair_rsem"],
+            rs_chip_ssem=msc["rs_chip_ssem"],
+            rs_chip_rsem=msc["rs_chip_rsem"],
+            rs_recv_3d=msc["rs_recv_3d"],
+            rs_send_sem=msc["rs_send_sem"],
+            rs_recv_sem=msc["rs_recv_sem"],
+            owner_3d=msc["owner_3d"],
+            fan_send_sem=msc["fan_send_sem"],
+            fan_recv_sem=msc["fan_recv_sem"],
+            fan_s2_send_sem=msc["fan_s2_send_sem"],
+            fan_s2_recv_sem=msc["fan_s2_recv_sem"],
+            barrier_sem=None,
+            output_ref=moe_dst_vmem,
             ep=world_size,
             batch_size=rows,
             scale_block=scale_block,
-            num_replicas=num_replicas,
-            replica_cost_mode=replica_cost_mode,
+            return_sharded=sharded_moe_in,
+            ep_axis_name=ep_axis_name,
             cfg=cfg,
-            zero_and_pack=(r_pair == 8),
-        )
-        plan_holder.append(plan_res)
-
-    def _during_ag_exp_d2d2() -> None:
-        zero_and_pack_muse_sparse_from_vmem(
-            plan_holder[0],
-            r_scratch=msc["r_scratch"],
-            accum_3d=msc["accum_3d"],
-            io_3d_buf=msc["io_3d_buf"],
-            accum_2d=msc["accum_2d"],
-            batch_size=rows,
-            cfg=cfg,
+            x_is_3d=use_3d_x,
+            wait_entry_barrier=False,
+            write_output_ref=True,
+            on_experts_done_fn=_on_experts_done,
         )
 
-    # =========================================================================
-    # Stage 1-3: Bridge 1b -> live s_buf + logits_vmem + x_3d_buf + MoE plan
-    # =========================================================================
-    _run_chip_b1_vmem_core(
-        stream_chip_hbm,
-        gated_ref,
-        wo_hbm,
-        wo_scale_ref,
-        pa_alpha_ref,
-        pa_beta_ref,
-        pre_ff_gain_ref,
-        w_pre_pair_hbm,
-        w_pre_pair_scale_ref,
-        w_router_hbm,
-        pre_exp_gain_ref,
-        out_stream_chip_hbm,
-        logits_vmem,
-        None if use_3d_x else expert_in_vmem,
-        wo_buf,
-        w_pre_core_buf,
-        w_router_buf,
+    def _run_stage5_6_b2_rpad(
+        *,
+        moe_dst_vmem,
+        w_post_buf,
+        w_qkv_buf,
+        w_gate_buf,
         s_buf,
+        next_in_vmem,
         send_half,
         mate_recv,
-        own_half,
-        rs1_a_or_z_recv,
-        rs1_b_or_y_recv,
-        rs2_a_or_x_recv,
-        rs2_b_recv,
         my_pair_bf16,
         recv_pair_bf16,
-        sq_pair_pa_buf,
         ffn_pair_buf,
-        router_pair_buf,
-        pre_my_half,
-        pre_mate_half,
-        sq_pair_pre_buf,
+        b2_scalar_dummy_post,
+        b2_scalar_dummy_cols,
         exp_3d_buf,
-        msc["w1_sem"],
-        w_pre_sem,
-        w_router_sem,
-        s_in_sem,
-        s_out_sem,
-        c1a_send,
-        c1a_recv,
-        rs1_send,
-        rs1_recv,
-        rs2_send,
-        rs2_recv,
-        rs3_send,
-        rs3_recv,
-        c1c_send,
-        c1c_recv,
-        pre_send,
-        pre_recv,
-        ag_exp_send,
-        ag_exp_recv,
-        ag_exp_d2d_send,
-        ag_exp_d2d_recv,
-        ag_log_send,
-        ag_log_recv,
-        world_size=world_size,
-        pa_eps=pa_eps,
-        pre_ff_eps=pre_ff_eps,
-        pre_ff_scale_input=pre_ff_scale_input,
-        router_multiplier=router_multiplier,
-        pre_exp_eps=pre_exp_eps,
-        pre_exp_scale_input=pre_exp_scale_input,
-        skip_barrier_signal=False,
-        skip_barrier_wait=False,
-        skip_stream_load=False,
-        skip_stream_store=True,
-        early_router_and_log_ag=True,
-        during_ag_exp_ici_fn=_during_ag_exp_ici,
-        during_ag_exp_d2d2_fn=None if r_pair == 8 else _during_ag_exp_d2d2,
-        out_expert_3d_ref=msc["x_3d_buf"] if use_3d_x else None,
-    )
+        sems: dict,
+        rpad_refs: tuple | None,
+        written_cnt_smem_ref=None,
+        rpad_bkv_sems=None,
+        rpad_cache_write_sem=None,
+    ) -> None:
+        qkv_vmem_slice = mate_recv.at[:, pl.ds(0, qkv_cols)]
+        mate_tok_slice = send_half.at[pl.ds(0, rows_per_rank), :]
+        moe_full_slice = mate_recv.at[pl.ds(0, r_pair), :]
 
-    # =========================================================================
-    # Stage 4: Sparse NVFP4 MoE + PAIR_RS (launching b2 weight DMAs in parallel!)
-    # =========================================================================
-    if sharded_moe_in:
-        moe_dst_vmem = moe_sh_vmem
-    elif use_3d_x:
-        moe_dst_vmem = moe_rep_vmem if interpret_mode else next_in_vmem.at[:, pl.ds(0, 4096)]
-    else:
-        moe_dst_vmem = expert_in_vmem
+        if rpad_refs is not None:
+            from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
+                _run_rpad_vmem_core,
+                prepare_and_start_rpad_dmas,
+            )
 
-    def _on_experts_done() -> None:
-        # All w1/w2/spec_prime DMAs have completed; launch 34 MiB b2 weights under PAIR_RS!
-        pltpu.make_async_copy(w_post_hbm, w_post_buf, w_post_sem.at[0]).start()
-        pltpu.make_async_copy(next_w_qkv_hbm, w_qkv_buf, w_qkv_sem.at[0]).start()
-        pltpu.make_async_copy(next_w_gate_hbm, w_gate_buf, w_gate_sem.at[0]).start()
+            (
+                rpad_q_vmem,
+                rpad_kv_vmem,
+                rpad_gate_vmem,
+                bkv_vmem_ref,
+                state_vmem_ref,
+                o_vmem_ref,
+                kv_write_vmem_ref,
+                init_sv_vmem_ref,
+            ) = rpad_refs
+            pre_state_holder = []
 
-    run_muse_sparse_experts_and_rs_from_vmem(
-        me,
-        None if use_3d_x else expert_in_vmem,
-        plan_holder[0],
-        d_scratch=msc["d_scratch"],
-        r_scratch=msc["r_scratch"],
-        w1_buf=msc["w1_buf"],
-        s1_buf=msc["s1_buf"],
-        w2_buf=msc["w2_buf"],
-        s2_buf=msc["s2_buf"],
-        w1_acc_buf=msc["w1_acc_buf"],
-        x_3d_buf=msc["x_3d_buf"],
-        io_3d_buf=msc["io_3d_buf"],
-        lhs_2d_buf=msc["lhs_2d_buf"],
-        act_2d_buf=msc["act_2d_buf"],
-        y_stage_buf=msc["y_stage_buf"],
-        lhs_fp8_buf=msc["lhs_fp8_buf"],
-        lhs_sc_buf=msc["lhs_sc_buf"],
-        masked_x_buf=msc["masked_x_buf"],
-        bd_sc_buf=msc["bd_sc_buf"],
-        gain_f32_buf=msc["gain_f32_buf"],
-        accum_3d=msc["accum_3d"],
-        accum_2d=msc["accum_2d"],
-        fan_3d_buf=msc["fan_3d_buf"],
-        rs_send_bf16=msc["rs_send_bf16"],
-        rs_pair_recv=msc["rs_pair_recv"],
-        rs_chip_send=msc["rs_chip_send"],
-        rs_chip_recv=msc["rs_chip_recv"],
-        rs_pair_ssem=msc["rs_pair_ssem"],
-        rs_pair_rsem=msc["rs_pair_rsem"],
-        rs_chip_ssem=msc["rs_chip_ssem"],
-        rs_chip_rsem=msc["rs_chip_rsem"],
-        rs_recv_3d=msc["rs_recv_3d"],
-        rs_send_sem=msc["rs_send_sem"],
-        rs_recv_sem=msc["rs_recv_sem"],
-        owner_3d=msc["owner_3d"],
-        fan_send_sem=msc["fan_send_sem"],
-        fan_recv_sem=msc["fan_recv_sem"],
-        fan_s2_send_sem=msc["fan_s2_send_sem"],
-        fan_s2_recv_sem=msc["fan_s2_recv_sem"],
-        barrier_sem=None,
-        output_ref=moe_dst_vmem,
-        ep=world_size,
-        batch_size=rows,
-        scale_block=scale_block,
-        return_sharded=sharded_moe_in,
-        ep_axis_name=ep_axis_name,
-        cfg=cfg,
-        x_is_3d=use_3d_x,
-        wait_entry_barrier=False,
-        write_output_ref=True,
-        on_experts_done_fn=_on_experts_done,
-    )
+            def _after_qkv_epi() -> None:
+                pre_state = prepare_and_start_rpad_dmas(
+                    kv_lens_ref=kv_lens_ref,
+                    page_indices_ref=page_indices_ref,
+                    cu_q_lens_ref=cu_q_lens_ref,
+                    cu_kv_lens_ref=cu_kv_lens_ref,
+                    distribution_ref=distribution_ref,
+                    kv_cache_hbm_ref=kv_cache_hbm_ref,
+                    bkv_vmem_ref=bkv_vmem_ref,
+                    bkv_sems=rpad_bkv_sems,
+                    sliding_window=rpa_sliding_window,
+                    cfg=rpa_cfg,
+                    one_block_per_seq=rpa_one_block_per_seq,
+                    decode_query_size=1,
+                    kv_pack_dense2=rpa_kv_pack_dense2,
+                    interpret_mode=interpret_mode,
+                    b_tokens=rows,
+                    init_sv_vmem_ref=init_sv_vmem_ref,
+                    use_grp_vec=rpa_use_grp_vec,
+                )
+                pre_state_holder.append(pre_state)
 
-    # =========================================================================
-    # Stage 5: Bridge 2b from live VMEM (s_buf + moe_dst_vmem + prestarted weights)
-    # =========================================================================
-    # Reuse dead chip_b1 activation VMEM & sems cleanly (NEVER touch RS recv buffers/sems,
-    # and never alias qkv_vmem into next_in_vmem since next_in_vmem feeds qkv dot!).
-    qkv_vmem_slice = mate_recv.at[:, pl.ds(0, qkv_cols)]
-    mate_tok_slice = send_half.at[pl.ds(0, rows_per_rank), :]
-    moe_full_slice = mate_recv.at[pl.ds(0, r_pair), :]
-
-    if has_rpad:
-        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
-            _run_rpad_vmem_core,
-            prepare_and_start_rpad_dmas,
-        )
-
-        rpad_q_vmem = next(it)
-        rpad_kv_vmem = next(it)
-        rpad_gate_vmem = next(it)
-        bkv_vmem_ref = next(it)
-        state_vmem_ref = next(it)
-        o_vmem_ref = next(it)
-        kv_write_vmem_ref = next(it) if rpa_kv_pack_dense2 else None
-        init_sv_vmem_ref = (
-            next(it) if getattr(rpa_cfg, "hoist_new_kv", False) else None
-        )
-        written_cnt_smem_ref = next(it)
-        if world_size == 16:
-            rpad_bkv_sems = msc["rs_pair_ssem"].at[pl.ds(0, rpa_cfg.num_slots)]
-            rpad_cache_write_sem = msc["rs_pair_ssem"].at[
-                pl.ds(rpa_cfg.num_slots, 1)
-            ]
+            b2_out_q = rpad_q_vmem
+            b2_out_kv = out_kv_merged_ref if rpa_skip_kv_write else rpad_kv_vmem
+            b2_out_gate_arg = rpad_gate_vmem
+            b2_gate_dst = rpad_gate_vmem
+            b2_after_qkv_fn = _after_qkv_epi
+            defer_store_wait = True
         else:
-            rpad_bkv_sems = next(it)
-            rpad_cache_write_sem = next(it)
+            b2_out_q = out_qkv_or_q_ref
+            b2_out_kv = out_kv_or_gate_ref
+            b2_out_gate_arg = out_gate_epi_ref
+            b2_gate_dst = None
+            b2_after_qkv_fn = None
+            defer_store_wait = False
 
-        pre_state_holder = []
+        _run_chip_b2_vmem_core(
+            stream_chip_hbm,
+            moe_dst_vmem,
+            w_post_hbm,
+            s_post_ref,
+            post_ff_gain_ref,
+            pf_alpha_ref,
+            pf_beta_ref,
+            next_in_gain_ref,
+            next_w_qkv_hbm,
+            next_s_qkv_ref,
+            next_w_gate_hbm,
+            next_s_gate_ref,
+            cos_sin_ref,
+            out_stream_chip_hbm,
+            b2_out_q,
+            b2_out_kv,
+            b2_out_gate_arg,
+            w_post_buf,
+            w_qkv_buf,
+            w_gate_buf,
+            s_buf,
+            ffn_pair_buf,
+            next_in_vmem,
+            qkv_vmem_slice,
+            mate_tok_slice,
+            moe_full_slice,
+            b2_scalar_dummy_post,
+            my_pair_bf16,
+            recv_pair_bf16,
+            ffn_pair_buf,
+            b2_scalar_dummy_cols,
+            exp_3d_buf,
+            sems["w_post_sem"],
+            sems["w_qkv_sem"],
+            sems["w_gate_sem"],
+            sems["s_in_sem"],
+            sems["s_out_sem"],
+            sems["c1a_send"],
+            sems["c1a_recv"],
+            sems["ag_log_send"],
+            sems["ag_log_recv"],
+            sems["ag_exp_d2d_send"],
+            sems["ag_exp_d2d_recv"],
+            sems["pre_send"],
+            sems["pre_recv"],
+            sems["ag_exp_send"],
+            sems["ag_exp_recv"],
+            sems["ag_log_send"],
+            sems["ag_log_recv"],
+            sems["c1c_send"],
+            sems["c1c_recv"],
+            world_size=world_size,
+            sharded_moe_in=sharded_moe_in,
+            post_ff_eps=post_ff_eps,
+            post_ff_scale_input=post_ff_scale_input,
+            next_in_eps=next_in_eps,
+            next_in_scale_input=next_in_scale_input,
+            fuse_qkv_epi=fuse_qkv_epi,
+            qkv_norm_eps=qkv_norm_eps,
+            query_scale=query_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            has_rope=has_rope,
+            interpret_mode=interpret_mode,
+            skip_barrier_signal=True,
+            skip_barrier_wait=True,
+            skip_stream_load=True,
+            skip_stream_store=False,
+            prestarted_w_post_dma=True,
+            prestarted_w_qkv_dma=True,
+            prestarted_w_gate_dma=True,
+            gate_dst_ref=b2_gate_dst,
+            after_qkv_epi_fn=b2_after_qkv_fn,
+            defer_stream_store_wait=defer_store_wait,
+        )
 
-        def _after_qkv_epi() -> None:
-            pre_state = prepare_and_start_rpad_dmas(
+        if rpad_refs is not None:
+            q_for_rpa = rpad_q_vmem.at[:, pl.ds(0, 8), :] if world_size == 16 else rpad_q_vmem
+            _run_rpad_vmem_core(
                 kv_lens_ref=kv_lens_ref,
                 page_indices_ref=page_indices_ref,
                 cu_q_lens_ref=cu_q_lens_ref,
                 cu_kv_lens_ref=cu_kv_lens_ref,
                 distribution_ref=distribution_ref,
+                q_vmem_ref=q_for_rpa,
+                kv_merged_vmem_ref=b2_out_kv,
+                gate_vmem_ref=rpad_gate_vmem,
                 kv_cache_hbm_ref=kv_cache_hbm_ref,
+                o_out_vmem_ref=out_gated_ref,
+                updated_kv_cache_hbm_ref=out_kv_cache_hbm_ref,
                 bkv_vmem_ref=bkv_vmem_ref,
+                state_vmem_ref=state_vmem_ref,
+                o_vmem_ref=o_vmem_ref,
+                kv_write_vmem_ref=kv_write_vmem_ref,
+                init_sv_vmem_ref=init_sv_vmem_ref,
+                written_cnt_smem_ref=written_cnt_smem_ref,
                 bkv_sems=rpad_bkv_sems,
+                cache_write_sem=rpad_cache_write_sem,
+                sm_scale=rpa_sm_scale,
                 sliding_window=rpa_sliding_window,
+                k_scale=rpa_k_scale,
+                v_scale=rpa_v_scale,
                 cfg=rpa_cfg,
                 one_block_per_seq=rpa_one_block_per_seq,
                 decode_query_size=1,
+                in_kernel_pack2=True,
+                has_gate=True,
+                out_norm_eps=rpa_out_norm_eps,
                 kv_pack_dense2=rpa_kv_pack_dense2,
                 interpret_mode=interpret_mode,
+                prestarted_bkv_state=(pre_state_holder[0] if pre_state_holder else None),
+                use_grp_vec=rpa_use_grp_vec,
+                skip_kv_write=rpa_skip_kv_write,
             )
-            pre_state_holder.append(pre_state)
+            _dma_wait(out_stream_chip_hbm, sems["s_out_sem"].at[0])
 
-        b2_out_q = rpad_q_vmem
-        b2_out_kv = rpad_kv_vmem
-        b2_out_gate_arg = rpad_gate_vmem
-        b2_gate_dst = rpad_gate_vmem
-        b2_after_qkv_fn = _after_qkv_epi
-        defer_store_wait = True
-    else:
-        b2_out_q = out_qkv_or_q_ref
-        b2_out_kv = out_kv_or_gate_ref
-        b2_out_gate_arg = out_gate_epi_ref
-        b2_gate_dst = None
-        b2_after_qkv_fn = None
-        defer_store_wait = False
-
-    _run_chip_b2_vmem_core(
-        stream_chip_hbm,
-        moe_dst_vmem,
-        w_post_hbm,
-        s_post_ref,
-        post_ff_gain_ref,
-        pf_alpha_ref,
-        pf_beta_ref,
-        next_in_gain_ref,
-        next_w_qkv_hbm,
-        next_s_qkv_ref,
-        next_w_gate_hbm,
-        next_s_gate_ref,
-        cos_sin_ref,
-        out_stream_chip_hbm,
-        b2_out_q,
-        b2_out_kv,
-        b2_out_gate_arg,
-        w_post_buf,
-        w_qkv_buf,
-        w_gate_buf,
-        s_buf,
-        ffn_pair_buf,  # next_in_pair (used only when r_pair == 8)
-        next_in_vmem,
-        qkv_vmem_slice,
-        mate_tok_slice,
-        moe_full_slice,
-        b2_scalar_dummy_post,
-        my_pair_bf16,  # mate_post_shard [r_pair, half]
-        recv_pair_bf16,  # chip_cols_buf [r_pair, half]
-        ffn_pair_buf,  # post_pair_full [r_pair, hidden]
-        b2_scalar_dummy_cols,
-        exp_3d_buf,  # ag_3d_buf [n_chips, 8, half] (r_pair == 8)
-        w_post_sem,
-        w_qkv_sem,
-        w_gate_sem,
-        s_in_sem,
-        s_out_sem,
-        c1a_send,  # tok_s1_send (1)
-        c1a_recv,  # tok_s1_recv (1)
-        ag_log_send,  # tok_s2_send (reuses rs_chip_ssem, shape (n_chips,))
-        ag_log_recv,  # tok_s2_recv (reuses ag_log_recv)
-        ag_exp_d2d_send,  # tok_d2d2_send
-        ag_exp_d2d_recv,  # tok_d2d2_recv
-        pre_send,  # post_d2d_send
-        pre_recv,  # post_d2d_recv
-        ag_exp_send,  # post_ici_send
-        ag_exp_recv,  # post_ici_recv
-        ag_log_send,  # in_ici_send
-        ag_log_recv,  # in_ici_recv
-        c1c_send,  # in_d2d2_send
-        c1c_recv,  # in_d2d2_recv
-        world_size=world_size,
-        sharded_moe_in=sharded_moe_in,
-        post_ff_eps=post_ff_eps,
-        post_ff_scale_input=post_ff_scale_input,
-        next_in_eps=next_in_eps,
-        next_in_scale_input=next_in_scale_input,
-        fuse_qkv_epi=fuse_qkv_epi,
-        qkv_norm_eps=qkv_norm_eps,
-        query_scale=query_scale,
-        k_scale=k_scale,
-        v_scale=v_scale,
-        has_rope=has_rope,
-        interpret_mode=interpret_mode,
-        skip_barrier_signal=True,
-        skip_barrier_wait=True,
-        skip_stream_load=True,
-        skip_stream_store=False,
-        prestarted_w_post_dma=True,
-        prestarted_w_qkv_dma=True,
-        prestarted_w_gate_dma=True,
-        gate_dst_ref=b2_gate_dst,
-        after_qkv_epi_fn=b2_after_qkv_fn,
-        defer_stream_store_wait=defer_store_wait,
-    )
-
-    if has_rpad:
-        q_for_rpa = rpad_q_vmem.at[:, pl.ds(0, 8), :] if world_size == 16 else rpad_q_vmem
-        _run_rpad_vmem_core(
-            kv_lens_ref=kv_lens_ref,
-            page_indices_ref=page_indices_ref,
-            cu_q_lens_ref=cu_q_lens_ref,
-            cu_kv_lens_ref=cu_kv_lens_ref,
-            distribution_ref=distribution_ref,
-            q_vmem_ref=q_for_rpa,
-            kv_merged_vmem_ref=rpad_kv_vmem,
-            gate_vmem_ref=rpad_gate_vmem,
-            kv_cache_hbm_ref=kv_cache_hbm_ref,
-            o_out_vmem_ref=out_gated_ref,
-            updated_kv_cache_hbm_ref=out_kv_cache_hbm_ref,
-            bkv_vmem_ref=bkv_vmem_ref,
-            state_vmem_ref=state_vmem_ref,
-            o_vmem_ref=o_vmem_ref,
-            kv_write_vmem_ref=kv_write_vmem_ref,
-            init_sv_vmem_ref=init_sv_vmem_ref,
-            written_cnt_smem_ref=written_cnt_smem_ref,
-            bkv_sems=rpad_bkv_sems,
-            cache_write_sem=rpad_cache_write_sem,
-            sm_scale=rpa_sm_scale,
-            sliding_window=rpa_sliding_window,
-            k_scale=rpa_k_scale,
-            v_scale=rpa_v_scale,
-            cfg=rpa_cfg,
-            one_block_per_seq=rpa_one_block_per_seq,
-            decode_query_size=1,
-            in_kernel_pack2=True,
-            has_gate=True,
-            out_norm_eps=rpa_out_norm_eps,
-            kv_pack_dense2=rpa_kv_pack_dense2,
-            interpret_mode=interpret_mode,
-            prestarted_bkv_state=(pre_state_holder[0] if pre_state_holder else None),
+    if not has_rpad:
+        msc = _unpack_muse_sparse_scratch(
+            it,
+            ep=world_size,
+            scale_block=scale_block,
+            num_replicas=num_replicas,
+            return_sharded=sharded_moe_in,
+            cfg=cfg,
         )
-        _dma_wait(out_stream_chip_hbm, s_out_sem.at[0])
+        w_pre_pair_buf = next(it)
+        w_router_buf = next(it)
+        s_buf = next(it)
+        next_in_vmem = next(it)
+        if alias_mate_recv:
+            mate_bf = msc["y_stage_buf"].bitcast(jnp.bfloat16)
+            mate_recv = mate_bf if mate_bf.shape[0] == rows else mate_bf.at[pl.ds(0, rows), :]
+        else:
+            mate_recv = next(it)
+        if interpret_mode:
+            send_half = next(it)
+            own_half = next(it)
+        else:
+            own_half = next_in_vmem.at[:, pl.ds(0, 4096)]
+            send_half = next_in_vmem.at[:, pl.ds(4096, 4096)]
+        rs1_a_or_z_recv = next(it)
+        rs1_b_or_y_recv = next(it)
+        rs2_a_or_x_recv = next(it)
+        rs2_b_recv = next(it)
+        my_pair_bf16 = next(it)
+        recv_pair_bf16 = next(it)
+        sq_pair_pa_buf = next(it)
+        ffn_pair_buf = next(it)
+        router_pair_buf = next(it)
+        pre_my_half = next(it)
+        pre_mate_half = next(it)
+        sq_pair_pre_buf = next(it)
+        exp_3d_buf = next(it)
+        logits_vmem = next(it)
+        if use_3d_x:
+            expert_in_vmem = None
+        elif (not interpret_mode) and sharded_moe_in:
+            expert_in_vmem = next_in_vmem.at[:, pl.ds(0, 4096)]
+        else:
+            expert_in_vmem = next(it)
+        moe_sh_vmem = next(it) if sharded_moe_in else None
+        moe_rep_vmem = (
+            next(it) if ((not sharded_moe_in) and use_3d_x and interpret_mode) else None
+        )
+        b2_scalar_dummy_post = next(it)
+        b2_scalar_dummy_cols = next(it)
+        sems = _unpack_sems(
+            it,
+            rs_pair_ssem=msc["rs_pair_ssem"],
+            rs_chip_ssem=msc["rs_chip_ssem"],
+            fan_send_sem=msc["fan_send_sem"],
+        )
+        if interpret_mode:
+            wo_buf = next(it)
+            w_pre_core_buf = w_pre_pair_buf
+            w_post_buf, w_qkv_buf, w_gate_buf = next(it), next(it), next(it)
+        else:
+            wo_buf = _alias_wo_buf(
+                msc["w1_buf"], msc["w2_buf"], w_mode=msc["w_mode"], o_in=o_in, half=half,
+            )
+            w_pre_core_buf = (
+                w_pre_pair_buf
+                if w_pre_pair_buf.shape[1] == pre_pair_cols
+                else w_pre_pair_buf.at[:, pl.ds(0, pre_pair_cols)]
+            )
+            w_post_buf, w_qkv_buf, w_gate_buf = _alias_b2_weights(
+                msc["w1_buf"], w_pre_pair_buf, w_mode=msc["w_mode"], qkv_cols=qkv_cols, gate_cols=gate_cols,
+            )
+        if sharded_moe_in:
+            moe_dst_vmem = moe_sh_vmem
+        elif use_3d_x:
+            moe_dst_vmem = moe_rep_vmem if interpret_mode else next_in_vmem.at[:, pl.ds(0, 4096)]
+        else:
+            moe_dst_vmem = expert_in_vmem
+
+        _run_stage1_4_b1_moe(
+            msc=msc,
+            w_pre_core_buf=w_pre_core_buf,
+            wo_buf=wo_buf,
+            w_router_buf=w_router_buf,
+            s_buf=s_buf,
+            send_half=send_half,
+            mate_recv=mate_recv,
+            own_half=own_half,
+            b1_ephem=(
+                rs1_a_or_z_recv, rs1_b_or_y_recv, rs2_a_or_x_recv, rs2_b_recv,
+                sq_pair_pa_buf, router_pair_buf, pre_my_half, pre_mate_half,
+                sq_pair_pre_buf, logits_vmem,
+            ),
+            my_pair_bf16=my_pair_bf16,
+            recv_pair_bf16=recv_pair_bf16,
+            ffn_pair_buf=ffn_pair_buf,
+            exp_3d_buf=exp_3d_buf,
+            moe_dst_vmem=moe_dst_vmem,
+            expert_in_vmem=expert_in_vmem,
+            w_post_buf=w_post_buf,
+            w_qkv_buf=w_qkv_buf,
+            w_gate_buf=w_gate_buf,
+            sems=sems,
+        )
+        _run_stage5_6_b2_rpad(
+            moe_dst_vmem=moe_dst_vmem,
+            w_post_buf=w_post_buf,
+            w_qkv_buf=w_qkv_buf,
+            w_gate_buf=w_gate_buf,
+            s_buf=s_buf,
+            next_in_vmem=next_in_vmem,
+            send_half=send_half,
+            mate_recv=mate_recv,
+            my_pair_bf16=my_pair_bf16,
+            recv_pair_bf16=recv_pair_bf16,
+            ffn_pair_buf=ffn_pair_buf,
+            b2_scalar_dummy_post=b2_scalar_dummy_post,
+            b2_scalar_dummy_cols=b2_scalar_dummy_cols,
+            exp_3d_buf=exp_3d_buf,
+            sems=sems,
+            rpad_refs=None,
+        )
+        return
+
+    # 2-Scope Step (c): Outer (live + sems) -> Scope 1 (Stage 1..4) -> Scope 2 (b2 + RPAd)
+    moe_outer_refs = [next(it) for _ in range(step_c_n_moe_outer)]
+    w_pre_pair_buf = next(it)
+    s_buf = next(it)
+    next_in_vmem = next(it)
+    mate_recv = next(it)
+    if interpret_mode:
+        send_half = next(it)
+        own_half = next(it)
+    else:
+        own_half = next_in_vmem.at[:, pl.ds(0, 4096)]
+        send_half = next_in_vmem.at[:, pl.ds(4096, 4096)]
+    my_pair_bf16 = next(it)
+    recv_pair_bf16 = next(it)
+    ffn_pair_buf = next(it)
+    exp_3d_buf = next(it)
+    moe_sh_vmem = next(it) if sharded_moe_in else None
+    moe_rep_vmem = (
+        next(it) if ((not sharded_moe_in) and use_3d_x and interpret_mode) else None
+    )
+    b2_scalar_dummy_post = next(it)
+    b2_scalar_dummy_cols = next(it)
+
+    o_it_init = iter(moe_outer_refs)
+    stitched_outer_only = [
+        None if flg else next(o_it_init) for flg in step_c_moe_is_scope1
+    ]
+    msc_outer = _unpack_muse_sparse_scratch(
+        iter(stitched_outer_only),
+        ep=world_size,
+        scale_block=scale_block,
+        num_replicas=num_replicas,
+        return_sharded=sharded_moe_in,
+        cfg=cfg,
+    )
+    sems = _unpack_sems(
+        it,
+        rs_pair_ssem=msc_outer["rs_pair_ssem"],
+        rs_chip_ssem=msc_outer["rs_chip_ssem"],
+        fan_send_sem=msc_outer["fan_send_sem"],
+    )
+    if interpret_mode:
+        w_post_outer, w_qkv_outer, w_gate_outer = next(it), next(it), next(it)
+        w_pre_core_buf = w_pre_pair_buf
+    else:
+        w_pre_core_buf = (
+            w_pre_pair_buf
+            if w_pre_pair_buf.shape[1] == pre_pair_cols
+            else w_pre_pair_buf.at[:, pl.ds(0, pre_pair_cols)]
+        )
+        w_mode_eff = (
+            "stream3"
+            if (cfg.weight_mode == "stream3_k2" and (_H // scale_block) < 16)
+            else cfg.weight_mode
+        )
+        w_post_outer, w_qkv_outer, w_gate_outer = _alias_b2_weights(
+            msc_outer["w1_buf"],
+            w_pre_pair_buf,
+            w_mode=w_mode_eff,
+            qkv_cols=qkv_cols,
+            gate_cols=gate_cols,
+        )
+
+    written_cnt_smem_ref = next(it)
+    if world_size == 16:
+        rpad_bkv_sems = msc_outer["rs_pair_ssem"].at[pl.ds(0, rpa_cfg.num_slots)]
+        rpad_cache_write_sem = (
+            None
+            if rpa_skip_kv_write
+            else msc_outer["rs_pair_ssem"].at[pl.ds(rpa_cfg.num_slots, 1)]
+        )
+    else:
+        rpad_bkv_sems = next(it)
+        rpad_cache_write_sem = None if rpa_skip_kv_write else next(it)
+
+    if sharded_moe_in:
+        moe_dst_vmem = moe_sh_vmem
+    elif use_3d_x:
+        moe_dst_vmem = moe_rep_vmem if interpret_mode else next_in_vmem.at[:, pl.ds(0, 4096)]
+    else:
+        moe_dst_vmem = None
+
+    def _run_scope1(*s1_refs) -> None:
+        moe_s1 = list(s1_refs[:step_c_n_moe_scope1])
+        b1_s1 = s1_refs[step_c_n_moe_scope1 : step_c_n_moe_scope1 + step_c_n_b1_scope1]
+        b1_i_s1 = s1_refs[step_c_n_moe_scope1 + step_c_n_b1_scope1 :]
+
+        o_it = iter(moe_outer_refs)
+        s1_it = iter(moe_s1)
+        stitched_moe = [next(s1_it) if flg else next(o_it) for flg in step_c_moe_is_scope1]
+        msc = _unpack_muse_sparse_scratch(
+            iter(stitched_moe),
+            ep=world_size,
+            scale_block=scale_block,
+            num_replicas=num_replicas,
+            return_sharded=sharded_moe_in,
+            cfg=cfg,
+        )
+        w_router_buf = b1_s1[0]
+        b1_ephem = b1_s1[1:11]
+        exp_in_s1 = b1_s1[11] if need_b1_exp_in else None
+        if use_3d_x:
+            expert_in_vmem = None
+        elif (not interpret_mode) and sharded_moe_in:
+            expert_in_vmem = next_in_vmem.at[:, pl.ds(0, 4096)]
+        else:
+            expert_in_vmem = exp_in_s1
+        wo_buf = (
+            b1_i_s1[0]
+            if interpret_mode
+            else _alias_wo_buf(
+                msc["w1_buf"], msc["w2_buf"], w_mode=msc["w_mode"], o_in=o_in, half=half,
+            )
+        )
+        _run_stage1_4_b1_moe(
+            msc=msc,
+            w_pre_core_buf=w_pre_core_buf,
+            wo_buf=wo_buf,
+            w_router_buf=w_router_buf,
+            s_buf=s_buf,
+            send_half=send_half,
+            mate_recv=mate_recv,
+            own_half=own_half,
+            b1_ephem=b1_ephem,
+            my_pair_bf16=my_pair_bf16,
+            recv_pair_bf16=recv_pair_bf16,
+            ffn_pair_buf=ffn_pair_buf,
+            exp_3d_buf=exp_3d_buf,
+            moe_dst_vmem=(moe_dst_vmem if moe_dst_vmem is not None else expert_in_vmem),
+            expert_in_vmem=expert_in_vmem,
+            w_post_buf=w_post_outer,
+            w_qkv_buf=w_qkv_outer,
+            w_gate_buf=w_gate_outer,
+            sems=sems,
+        )
+
+    pl.run_scoped(_run_scope1, *step_c_scope1_shapes)
+
+    def _run_scope2(*s2_refs) -> None:
+        s2_it = iter(s2_refs)
+        rpad_q_vmem = next(s2_it)
+        rpad_kv_vmem = None if rpa_skip_kv_write else next(s2_it)
+        rpad_gate_vmem = next(s2_it)
+        bkv_vmem_ref = next(s2_it)
+        state_vmem_ref = next(s2_it)
+        o_vmem_ref = next(s2_it)
+        kv_write_vmem_ref = (
+            next(s2_it) if (rpa_kv_pack_dense2 and not rpa_skip_kv_write) else None
+        )
+        init_sv_vmem_ref = (
+            next(s2_it)
+            if (getattr(rpa_cfg, "hoist_new_kv", False) or rpa_use_grp_vec)
+            else None
+        )
+        _run_stage5_6_b2_rpad(
+            moe_dst_vmem=moe_dst_vmem,
+            w_post_buf=w_post_outer,
+            w_qkv_buf=w_qkv_outer,
+            w_gate_buf=w_gate_outer,
+            s_buf=s_buf,
+            next_in_vmem=next_in_vmem,
+            send_half=send_half,
+            mate_recv=mate_recv,
+            my_pair_bf16=my_pair_bf16,
+            recv_pair_bf16=recv_pair_bf16,
+            ffn_pair_buf=ffn_pair_buf,
+            b2_scalar_dummy_post=b2_scalar_dummy_post,
+            b2_scalar_dummy_cols=b2_scalar_dummy_cols,
+            exp_3d_buf=exp_3d_buf,
+            sems=sems,
+            rpad_refs=(
+                rpad_q_vmem,
+                rpad_kv_vmem,
+                rpad_gate_vmem,
+                bkv_vmem_ref,
+                state_vmem_ref,
+                o_vmem_ref,
+                kv_write_vmem_ref,
+                init_sv_vmem_ref,
+            ),
+            written_cnt_smem_ref=written_cnt_smem_ref,
+            rpad_bkv_sems=rpad_bkv_sems,
+            rpad_cache_write_sem=rpad_cache_write_sem,
+        )
+
+    pl.run_scoped(_run_scope2, *step_c_scope2_shapes)
 
 
 def _b1_moe_b2_chip_sharded_kernel(*all_refs, **kwargs) -> None:
@@ -800,6 +1075,7 @@ def _prepare_chip_b1_moe_b2_setup(
     fuse_qkv_epi: bool,
     config: SparseDecodeConfig | None,
     interpret,
+    has_rpad: bool = False,
 ) -> dict:
     """Validate shapes and construct shared specs/scratches for Step (b) and Step (c)."""
     from jax.experimental import pallas as pl
@@ -904,62 +1180,63 @@ def _prepare_chip_b1_moe_b2_setup(
     use_3d_x = config.row_mode != "dense"
     w_pre_cols_buf = pre_pair_cols if interpret_mode else max(pre_pair_cols, qkv_cols + gate_cols)
     alias_mate_recv = (
-        (not interpret_mode)
+        (not has_rpad)
+        and (not interpret_mode)
         and config.row_mode != "dense"
         and config.norm_f32_stage
         and (not config.loop32_in_tile)
         and (not (scale_block >= 256 and config.lhs_fp8))
         and (2 * config.tile_m >= rows)
     )
-    shared_scratch = [
-        vmem((hidden, w_pre_cols_buf), w_pre_pair_w8k.dtype),
-        vmem((hidden, n_exp), w_router_km.dtype),
-        vmem((r_pair, hidden), jnp.float32),
-        vmem((rows, hidden), jnp.bfloat16),  # next_in_vmem (holds own_half/send_half/moe_out earlier)
-        *(() if alias_mate_recv else [vmem((rows, half), jnp.bfloat16)]),  # mate_recv
-        *(([vmem((rows, half), jnp.bfloat16), vmem((rows, half), jnp.bfloat16)]) if interpret_mode else []),
-        vmem(
-            (two_pair, q_cols)
-            if use_xy
-            else ((four_pair, half) if world_size == 16 else (8, 128)),
-            jnp.bfloat16,
-        ),
-        vmem((two_pair, q_cols) if use_xy else (two_pair, half), jnp.bfloat16),
-        vmem((r_pair, q_cols) if use_xy else (r_pair, half), jnp.bfloat16),
-        vmem(
-            (r_pair, q_cols)
-            if use_xy
-            else ((r_pair, half) if r_pair == 8 else (8, 128)),
-            jnp.bfloat16,
-        ),
-        vmem((r_pair, half), jnp.bfloat16),
-        vmem((r_pair, half), jnp.bfloat16),
-        vmem((r_pair, 128), jnp.float32),
-        vmem((r_pair, hidden), jnp.bfloat16),
-        vmem((8, 128) if is_r16 else (r_pair, hidden), jnp.float32),
-        vmem((r_pair, pre_pair_cols), jnp.bfloat16),
-        (
-            vmem((r_pair, pre_pair_cols), jnp.bfloat16)
-            if r_pair == 8
-            else vmem((r_pair, 128), jnp.float32)
-        ),
-        vmem((r_pair, 128), jnp.float32),
-        vmem((n_chips, 8, h_pre) if r_pair == 8 else (8, 128), jnp.bfloat16),
-        vmem((rows, n_exp), jnp.float32),
-        *(
-            [vmem((rows, h_pre), jnp.bfloat16)]
-            if ((not use_3d_x) and (interpret_mode or not sharded_moe_in))
-            else []
-        ),
-        *(([vmem((rows_per_rank, h_pre), jnp.bfloat16)]) if sharded_moe_in else []),
-        *(
-            [vmem((rows, h_pre), jnp.bfloat16)]
-            if ((not sharded_moe_in) and use_3d_x and interpret_mode)
-            else []
-        ),
-        vmem((8, 128), jnp.bfloat16),  # b2_scalar_dummy_post
-        vmem((8, 128), jnp.bfloat16),  # b2_scalar_dummy_cols
-        # Semaphores.
+    v_w_pre_pair_buf = vmem((hidden, w_pre_cols_buf), w_pre_pair_w8k.dtype)
+    v_w_router_buf = vmem((hidden, n_exp), w_router_km.dtype)
+    v_s_buf = vmem((r_pair, hidden), jnp.float32)
+    v_next_in_vmem = vmem((rows, hidden), jnp.bfloat16)
+    v_mate_recv = [] if alias_mate_recv else [vmem((rows, half), jnp.bfloat16)]
+    v_interp_halves = (
+        [vmem((rows, half), jnp.bfloat16), vmem((rows, half), jnp.bfloat16)]
+        if interpret_mode
+        else []
+    )
+    v_rs1_a = vmem(
+        (two_pair, q_cols) if use_xy else ((four_pair, half) if world_size == 16 else (8, 128)),
+        jnp.bfloat16,
+    )
+    v_rs1_b = vmem((two_pair, q_cols) if use_xy else (two_pair, half), jnp.bfloat16)
+    v_rs2_a = vmem((r_pair, q_cols) if use_xy else (r_pair, half), jnp.bfloat16)
+    v_rs2_b = vmem(
+        (r_pair, q_cols) if use_xy else ((r_pair, half) if r_pair == 8 else (8, 128)),
+        jnp.bfloat16,
+    )
+    v_my_pair_bf16 = vmem((r_pair, half), jnp.bfloat16)
+    v_recv_pair_bf16 = vmem((r_pair, half), jnp.bfloat16)
+    v_sq_pair_pa = vmem((r_pair, 128), jnp.float32)
+    v_ffn_pair = vmem((r_pair, hidden), jnp.bfloat16)
+    v_router_pair = vmem((8, 128) if is_r16 else (r_pair, hidden), jnp.float32)
+    v_pre_my = vmem((r_pair, pre_pair_cols), jnp.bfloat16)
+    v_pre_mate = (
+        vmem((r_pair, pre_pair_cols), jnp.bfloat16)
+        if r_pair == 8
+        else vmem((r_pair, 128), jnp.float32)
+    )
+    v_sq_pair_pre = vmem((r_pair, 128), jnp.float32)
+    v_exp_3d = vmem((n_chips, 8, h_pre) if r_pair == 8 else (8, 128), jnp.bfloat16)
+    v_logits = vmem((rows, n_exp), jnp.float32)
+    v_exp_in = (
+        [vmem((rows, h_pre), jnp.bfloat16)]
+        if ((not use_3d_x) and (interpret_mode or not sharded_moe_in))
+        else []
+    )
+    v_moe_sh = [vmem((rows_per_rank, h_pre), jnp.bfloat16)] if sharded_moe_in else []
+    v_moe_rep = (
+        [vmem((rows, h_pre), jnp.bfloat16)]
+        if ((not sharded_moe_in) and use_3d_x and interpret_mode)
+        else []
+    )
+    v_b2_dummy_post = vmem((8, 128), jnp.bfloat16)
+    v_b2_dummy_cols = vmem((8, 128), jnp.bfloat16)
+
+    outer_sems = [
         sem((1,)),  # w_pre_sem
         sem((1,)),  # w_router_sem
         sem((1,)),  # s_in_sem
@@ -996,15 +1273,90 @@ def _prepare_chip_b1_moe_b2_setup(
         ),
         *(() if use_pair_rs else [sem((n_chips - 1,)), sem((n_chips - 1,))]),
     ]
-    if interpret_mode:
-        shared_scratch.extend(
-            [
-                vmem((2, o_in, half), wo_w8k.dtype),
-                vmem((_H, post_cols), w_post_tp2_w8k.dtype),
-                vmem((hidden, qkv_cols), next_w_qkv_w8k.dtype),
-                vmem((hidden, gate_cols), next_w_gate_w8k.dtype),
-            ]
-        )
+    v_interp_wo = [vmem((2, o_in, half), wo_w8k.dtype)] if interpret_mode else []
+    v_interp_b2 = (
+        [
+            vmem((_H, post_cols), w_post_tp2_w8k.dtype),
+            vmem((hidden, qkv_cols), next_w_qkv_w8k.dtype),
+            vmem((hidden, gate_cols), next_w_gate_w8k.dtype),
+        ]
+        if interpret_mode
+        else []
+    )
+    shared_scratch = [
+        v_w_pre_pair_buf,
+        v_w_router_buf,
+        v_s_buf,
+        v_next_in_vmem,
+        *v_mate_recv,
+        *v_interp_halves,
+        v_rs1_a,
+        v_rs1_b,
+        v_rs2_a,
+        v_rs2_b,
+        v_my_pair_bf16,
+        v_recv_pair_bf16,
+        v_sq_pair_pa,
+        v_ffn_pair,
+        v_router_pair,
+        v_pre_my,
+        v_pre_mate,
+        v_sq_pair_pre,
+        v_exp_3d,
+        v_logits,
+        *v_exp_in,
+        *v_moe_sh,
+        *v_moe_rep,
+        v_b2_dummy_post,
+        v_b2_dummy_cols,
+        *outer_sems,
+        *v_interp_wo,
+        *v_interp_b2,
+    ]
+
+    is_dense_cfg = config.row_mode == "dense"
+    n_route_sc = 6 if is_dense_cfg else 12
+    n_rep_sc = (
+        0
+        if num_replicas == 0
+        else (4 if (is_dense_cfg or config.static_holder_mask) else 5)
+    )
+    w1_idx = n_route_sc + n_rep_sc
+    moe_is_scope1 = tuple(
+        (idx != w1_idx) and (getattr(sp, "memory_space", None) == vmem)
+        for idx, sp in enumerate(moe_scratch)
+    )
+    moe_outer = [sp for sp, flg in zip(moe_scratch, moe_is_scope1) if not flg]
+    moe_scope1 = [sp for sp, flg in zip(moe_scratch, moe_is_scope1) if flg]
+    outer_shared_vmem = [
+        v_w_pre_pair_buf,
+        v_s_buf,
+        v_next_in_vmem,
+        *v_mate_recv,
+        *v_interp_halves,
+        v_my_pair_bf16,
+        v_recv_pair_bf16,
+        v_ffn_pair,
+        v_exp_3d,
+        *v_moe_sh,
+        *v_moe_rep,
+        v_b2_dummy_post,
+        v_b2_dummy_cols,
+    ]
+    scope1_b1_vmem = [
+        v_w_router_buf,
+        v_rs1_a,
+        v_rs1_b,
+        v_rs2_a,
+        v_rs2_b,
+        v_sq_pair_pa,
+        v_router_pair,
+        v_pre_my,
+        v_pre_mate,
+        v_sq_pair_pre,
+        v_logits,
+        *v_exp_in,
+    ]
 
     bias_2d = bias.reshape(1, _E_TOTAL)
     norm_2d = post_exp_norm.reshape(1, _H)
@@ -1087,6 +1439,12 @@ def _prepare_chip_b1_moe_b2_setup(
         in_specs=in_specs,
         base_call_tensors=(*b1_args, *moe_args, *b2_args),
         scratch_shapes=moe_scratch + shared_scratch,
+        step_c_outer_scratch=moe_outer + outer_shared_vmem + outer_sems + v_interp_b2,
+        step_c_moe_is_scope1=moe_is_scope1,
+        step_c_n_moe_outer=len(moe_outer),
+        step_c_n_moe_scope1=len(moe_scope1),
+        step_c_n_b1_scope1=len(scope1_b1_vmem),
+        step_c_scope1_shapes=tuple(moe_scope1 + scope1_b1_vmem + v_interp_wo),
     )
 
 
@@ -1249,6 +1607,82 @@ def b1_moe_b2_chip_sharded_jax(
     return res
 
 
+_STEP_C_BASE_MAX_BKV_ROWS = 20 * 512
+_STEP_C_GROUP_MAX_BKV_ROWS = 80 * 512
+
+
+def resolve_step_c_rpa_plan(
+    rpa_mode_str: str,
+    *,
+    sliding_window: int | None,
+    pages_per_seq: int,
+    phys_page_rows: int,
+    kv_pack_dense2: bool = False,
+    b_tokens: int | None = None,
+    max_num_seqs: int | None = None,
+):
+    """Resolve Step (c) RPAd config, ``one_block_per_seq``, ``bkv_slot_pages``, and ``use_grp_vec``."""
+    from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
+        _uses_swabatch_group,
+        get_shared_group_size,
+        parse_decode_fast_config,
+    )
+
+    page_size = phys_page_rows * 2 if kv_pack_dense2 else phys_page_rows
+    cfg_rpa = parse_decode_fast_config(
+        rpa_mode_str,
+        sliding_window=sliding_window,
+        pages_per_seq=pages_per_seq,
+        page_size=page_size,
+        decode_query_size=1,
+        shared_group=get_shared_group_size(rpa_mode_str),
+        kv_pack_dense2=kv_pack_dense2,
+    )
+    one_block_per_seq = (
+        False
+        if cfg_rpa.loop_kind == "ring4k"
+        else (True if sliding_window is not None else (pages_per_seq <= cfg_rpa.max_ring_pages))
+    )
+    if (
+        cfg_rpa.shared_group_size > 0
+        or cfg_rpa.loop_kind.startswith("shared")
+        or cfg_rpa.num_slots * cfg_rpa.max_ring_pages * phys_page_rows > _STEP_C_BASE_MAX_BKV_ROWS
+    ):
+        return cfg_rpa, one_block_per_seq, cfg_rpa.max_ring_pages, False, False
+
+    eff_grp = 1
+    use_grp_vec = False
+    eff_b = int(b_tokens) if b_tokens is not None else 64
+    eff_seqs = int(max_num_seqs) if max_num_seqs is not None else eff_b
+    if cfg_rpa.swabatch_group_size > 1 and eff_b == eff_seqs:
+        for cand_grp in (4, 2):
+            if cand_grp > cfg_rpa.swabatch_group_size or (eff_b % cand_grp) != 0:
+                continue
+            cand_cfg = dataclasses.replace(cfg_rpa, swabatch_group_size=cand_grp)
+            if (
+                _uses_swabatch_group(
+                    cand_cfg,
+                    one_block_per_seq=one_block_per_seq,
+                    decode_query_size=1,
+                    kv_pack_dense2=kv_pack_dense2,
+                    probe=None,
+                    b_tokens=eff_b,
+                    max_num_seqs=eff_seqs,
+                )
+                and cand_cfg.num_slots * cand_grp * cand_cfg.max_ring_pages * phys_page_rows
+                <= _STEP_C_GROUP_MAX_BKV_ROWS
+            ):
+                cfg_rpa = cand_cfg
+                eff_grp = cand_grp
+                use_grp_vec = True
+                break
+    if not use_grp_vec:
+        cfg_rpa = dataclasses.replace(cfg_rpa, swabatch_group_size=1)
+
+    bkv_slot_pages = eff_grp * cfg_rpa.max_ring_pages
+    return cfg_rpa, one_block_per_seq, bkv_slot_pages, use_grp_vec, True
+
+
 def b1_moe_b2_rpad_chip_sharded_jax(
     rank: jax.Array,
     stream_chip: jax.Array,
@@ -1321,15 +1755,12 @@ def b1_moe_b2_rpad_chip_sharded_jax(
     config: SparseDecodeConfig | None = None,
     collective_id: int = _W8_CID_BASE + 22,
     interpret: bool = False,
+    skip_kv_write: bool = False,
 ):
     """Fused Step (c) superkernel: ``[chip_b1 + muse_sparse(3d) + chip_b2 + RPAd]``."""
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
-    from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
-        align_to,
-        cdiv,
-        parse_decode_fast_config,
-    )
+    from sglang_tpu.attention.pallas.rpa_v3_decode_fast import align_to, cdiv
 
     st = _prepare_chip_b1_moe_b2_setup(
         rank, stream_chip, gated_attn, wo_w8k, wo_scale, pa_alpha, pa_beta,
@@ -1340,6 +1771,7 @@ def b1_moe_b2_rpad_chip_sharded_jax(
         cos_sin_step, rep_w1, rep_s1, rep_w2, rep_s2, replica_meta,
         spec_home_slot, free_params,
         world_size=world_size, fuse_qkv_epi=True, config=config, interpret=interpret,
+        has_rpad=True,
     )
     rows = st["rows"]
     r_pair = st["r_pair"]
@@ -1370,21 +1802,16 @@ def b1_moe_b2_rpad_chip_sharded_jax(
     max_num_seqs = kv_lens.shape[0]
     pages_per_seq = eff_page_indices.shape[0] // max_num_seqs
     phys_page_rows = kv_cache_flat.shape[1]
-    page_size = phys_page_rows * 2 if kv_pack_dense2 else phys_page_rows
-    cfg_rpa = parse_decode_fast_config(
+    cfg_rpa, one_block_per_seq, bkv_slot_pages, use_grp_vec, is_ok = resolve_step_c_rpa_plan(
         rpa_mode_str,
         sliding_window=eff_sw,
         pages_per_seq=pages_per_seq,
-        page_size=page_size,
-        decode_query_size=1,
-        shared_group=0,
+        phys_page_rows=phys_page_rows,
         kv_pack_dense2=kv_pack_dense2,
+        b_tokens=rows,
+        max_num_seqs=max_num_seqs,
     )
-    if (
-        cfg_rpa.shared_group_size > 0
-        or cfg_rpa.loop_kind == "shared16"
-        or cfg_rpa.num_slots * cfg_rpa.max_ring_pages * phys_page_rows > 20 * 512
-    ):
+    if not is_ok:
         raise ValueError(
             "Step (c) requires RPAd bkv <= 20*512 rows (5 MiB) and non-shared loop_kind; "
             f"got num_slots={cfg_rpa.num_slots}, max_ring_pages={cfg_rpa.max_ring_pages}, "
@@ -1394,11 +1821,6 @@ def b1_moe_b2_rpad_chip_sharded_jax(
         raise ValueError(
             f"TP=16 Step (c) aliases bkv_sems on rs_pair_ssem (8); requires num_slots <= 4, got {cfg_rpa.num_slots}"
         )
-    one_block_per_seq = (
-        False
-        if cfg_rpa.loop_kind == "ring4k"
-        else (True if eff_sw is not None else (pages_per_seq <= cfg_rpa.max_ring_pages))
-    )
 
     q_heads = 8 if world_size == 16 else 16
     pack2_cols = 512 if world_size == 16 else 1024
@@ -1414,28 +1836,42 @@ def b1_moe_b2_rpad_chip_sharded_jax(
     )
     smem_words = 2 + cfg_rpa.num_slots + 4 * max(max_num_seqs * max_blks_4k, 0)
     b_pad32 = align_to(max(rows, 1), 32)
-    rpad_scratch = [
+    scope2_rpad_vmem = (
         vmem((rows, 16, 128), jnp.bfloat16),  # rpad_q_vmem
-        vmem((rows, 1, 4, 128), jnp.float8_e4m3fn),  # rpad_kv_vmem
+        *(
+            ()
+            if skip_kv_write
+            else (vmem((rows, 1, 4, 128), jnp.float8_e4m3fn),)  # rpad_kv_vmem
+        ),
         vmem((rows, pack2_cols), jnp.bfloat16),  # rpad_gate_vmem
         vmem(
-            (cfg_rpa.num_slots, cfg_rpa.max_ring_pages, phys_page_rows, 1, 4, 128),
+            (cfg_rpa.num_slots, bkv_slot_pages, phys_page_rows, 1, 4, 128),
             kv_cache_flat.dtype,
         ),
         vmem((3, q_heads, 128), jnp.float32),
         vmem((rows, q_heads, 128), jnp.bfloat16),
         *(
-            [vmem((max(rows, 8), 8, 1, 4, 128), kv_cache_flat.dtype)]
-            if kv_pack_dense2
-            else []
+            (vmem((max(rows, 8), 8, 1, 4, 128), kv_cache_flat.dtype),)
+            if (kv_pack_dense2 and not skip_kv_write)
+            else ()
         ),
         *(
-            [vmem((2, b_pad32, q_heads, 128), jnp.float32)]
-            if cfg_rpa.hoist_new_kv
+            (vmem((2, b_pad32, q_heads, 128), jnp.float32),)
+            if (cfg_rpa.hoist_new_kv or use_grp_vec)
+            else ()
+        ),
+    )
+    outer_rpad_meta = [
+        smem((smem_words,), jnp.int32),
+        *(
+            (
+                ([sem((cfg_rpa.num_slots,))])
+                if skip_kv_write
+                else ([sem((cfg_rpa.num_slots,)), sem((1,))])
+            )
+            if world_size == 8
             else []
         ),
-        smem((smem_words,), jnp.int32),
-        *(([sem((cfg_rpa.num_slots,)), sem((1,))]) if world_size == 8 else []),
     ]
 
     scalar_args = [
@@ -1455,16 +1891,25 @@ def b1_moe_b2_rpad_chip_sharded_jax(
     call_args = (*scalar_args, *st["base_call_tensors"], kv_in_arg)
     kv_cache_pallas_in = len(scalar_args) + len(st["base_call_tensors"])
 
-    out_shape = (
-        jax.ShapeDtypeStruct((r_pair, hidden), jnp.float32),
-        jax.ShapeDtypeStruct((rows, pack2_cols), jnp.bfloat16),
-        (
+    if skip_kv_write:
+        kv_out_shape = jax.ShapeDtypeStruct((rows, 1, 4, 128), jnp.float8_e4m3fn)
+        kv_out_spec = v_sp
+        pallas_aliases = {}
+    else:
+        kv_out_shape = (
             jax.ShapeDtypeStruct(kv_cache_flat.shape, kv_cache_flat.dtype)
             if interpret_mode
             else pltpu.HBM(kv_cache_flat.shape, kv_cache_flat.dtype)
-        ),
+        )
+        kv_out_spec = h_sp
+        pallas_aliases = {kv_cache_pallas_in: 2}
+
+    out_shape = (
+        jax.ShapeDtypeStruct((r_pair, hidden), jnp.float32),
+        jax.ShapeDtypeStruct((rows, pack2_cols), jnp.bfloat16),
+        kv_out_shape,
     )
-    out_specs = (h_sp, v_sp, h_sp)
+    out_specs = (h_sp, v_sp, kv_out_spec)
 
     kernel_fn = functools.partial(
         _b1_moe_b2_rpad_chip_sharded_kernel,
@@ -1503,9 +1948,17 @@ def b1_moe_b2_rpad_chip_sharded_jax(
         rpa_cfg=cfg_rpa,
         rpa_one_block_per_seq=bool(one_block_per_seq),
         rpa_kv_pack_dense2=bool(kv_pack_dense2),
+        rpa_use_grp_vec=bool(use_grp_vec),
+        rpa_skip_kv_write=bool(skip_kv_write),
+        step_c_moe_is_scope1=st["step_c_moe_is_scope1"],
+        step_c_n_moe_outer=st["step_c_n_moe_outer"],
+        step_c_n_moe_scope1=st["step_c_n_moe_scope1"],
+        step_c_n_b1_scope1=st["step_c_n_b1_scope1"],
+        step_c_scope1_shapes=st["step_c_scope1_shapes"],
+        step_c_scope2_shapes=scope2_rpad_vmem,
     )
 
-    st_ch, next_gated, updated_kv = pl.pallas_call(
+    st_ch, next_gated, kv_out = pl.pallas_call(
         kernel_fn,
         out_shape=out_shape,
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -1513,11 +1966,11 @@ def b1_moe_b2_rpad_chip_sharded_jax(
             grid=(1,),
             in_specs=in_specs,
             out_specs=out_specs,
-            scratch_shapes=st["scratch_shapes"] + rpad_scratch,
+            scratch_shapes=st["step_c_outer_scratch"] + outer_rpad_meta,
         ),
-        input_output_aliases={kv_cache_pallas_in: 2},
+        input_output_aliases=pallas_aliases,
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=62 * 1024**2,
+            vmem_limit_bytes=64 * 1024**2,
             collective_id=collective_id,
             disable_bounds_checks=True,
         ),
@@ -1529,4 +1982,150 @@ def b1_moe_b2_rpad_chip_sharded_jax(
             f"_{'rope' if st['has_rope'] else 'nope'}"
         ),
     )(*call_args)
-    return st_ch, next_gated, updated_kv.reshape(kv_cache_fused.shape)
+    return st_ch, next_gated, (kv_out if skip_kv_write else kv_out.reshape(kv_cache_fused.shape))
+
+
+def write_decode_kv_merged_jax(
+    kv_new: jax.Array,
+    kv_cache_fused: jax.Array,
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    cu_kv_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    kv_pack_dense2: bool = False,
+    interpret: bool | object = False,
+) -> jax.Array:
+    """Fast per-device KV append for Step (c) (single VMEM staging + single-sem async scatter)."""
+    if kv_pack_dense2 or kv_new.shape[0] > 64:
+        from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import (
+            write_kv_only_rpa_v3,
+        )
+
+        return write_kv_only_rpa_v3(
+            kv_new,
+            kv_cache_fused,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            distribution,
+            interpret=bool(interpret),
+            kv_pack_dense2=kv_pack_dense2,
+        )
+
+    from jax import lax
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+    from sglang_tpu.attention.pallas.util import cdiv, get_tpu_version
+
+    if kv_new.shape[1:] != kv_cache_fused.shape[2:]:
+        raise ValueError(
+            f"kv_new trailing shape {kv_new.shape[1:]} != kv_cache trailing shape {kv_cache_fused.shape[2:]}"
+        )
+    if kv_new.dtype != kv_cache_fused.dtype:
+        raise ValueError(f"kv_new dtype {kv_new.dtype} != kv_cache dtype {kv_cache_fused.dtype}")
+
+    phys_page_size = kv_cache_fused.shape[1]
+    num_page_indices = page_indices.shape[0]
+    flat_cache = kv_cache_fused.reshape(
+        (kv_cache_fused.shape[0] * phys_page_size, *kv_cache_fused.shape[2:])
+    )
+
+    def _kv_write_small_vmem_kernel(
+        kv_lens_ref,
+        page_indices_ref,
+        cu_q_lens_ref,
+        cu_kv_lens_ref,
+        distribution_ref,
+        kv_new_ref,
+        cache_in_ref,
+        cache_out_ref,
+        out_sem,
+        wr_cnt_smem,
+    ):
+        del cache_in_ref
+        n_seqs = jnp.clip(distribution_ref[2], 0, kv_lens_ref.shape[0])
+
+        def _seq_body(seq_idx, wr_cnt):
+            q_start = cu_q_lens_ref[seq_idx]
+            q_len = cu_q_lens_ref[seq_idx + 1] - q_start
+            kv_len = kv_lens_ref[seq_idx]
+            active = (q_len > 0) & (kv_len >= q_len)
+
+            @pl.when(active)
+            def _write_seq():
+                kv_start = kv_len - q_len
+                p_start = kv_start // phys_page_size
+                p_end = cdiv(kv_len, phys_page_size)
+                seq_pg_base = cdiv(cu_kv_lens_ref[seq_idx], phys_page_size)
+
+                @pl.loop(p_start, p_end)
+                def _page(p):
+                    tok_lo = jnp.maximum(kv_start, p * phys_page_size)
+                    tok_hi = jnp.minimum(kv_len, (p + 1) * phys_page_size)
+                    n = tok_hi - tok_lo
+                    src_row = q_start + (tok_lo - kv_start)
+                    pg = page_indices_ref[jnp.minimum(seq_pg_base + p, num_page_indices - 1)]
+                    dst_row = pg * phys_page_size + (tok_lo - p * phys_page_size)
+                    pltpu.make_async_copy(
+                        src_ref=kv_new_ref.at[pl.ds(src_row, n)],
+                        dst_ref=cache_out_ref.at[pl.ds(dst_row, n)],
+                        sem=out_sem.at[0],
+                    ).start()
+
+            return wr_cnt + jnp.where(active, q_len, jnp.int32(0))
+
+        wr_cnt_smem[0] = lax.fori_loop(0, n_seqs, _seq_body, jnp.int32(0))
+        w_cnt = wr_cnt_smem[0]
+
+        @pl.when(w_cnt > 0)
+        def _wait_all():
+            src = kv_new_ref.at[pl.ds(0, w_cnt)]
+            pltpu.make_async_copy(src, src, out_sem.at[0]).wait()
+
+    interpret_mode = interpret is not False
+    tpu_version = 0 if interpret_mode else get_tpu_version()
+    out_shape = (
+        pltpu.HBM(shape=flat_cache.shape, dtype=flat_cache.dtype)
+        if tpu_version >= 7
+        else jax.ShapeDtypeStruct(shape=flat_cache.shape, dtype=flat_cache.dtype)
+    )
+    pallas_kwargs = {
+        "grid_spec": pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=5,
+            in_specs=[
+                pl.BlockSpec(memory_space=pltpu.VMEM),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+            ],
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            grid=(1,),
+            scratch_shapes=[
+                pltpu.SemaphoreType.DMA((1,)),
+                pltpu.SMEM((1,), jnp.int32),
+            ],
+        ),
+        "out_shape": out_shape,
+        "input_output_aliases": {6: 0},
+        "name": f"StepC_write_kv_only-p_{phys_page_size}",
+    }
+    if interpret_mode:
+        pallas_kwargs["interpret"] = (
+            pltpu.InterpretParams(detect_races=True, uninitialized_memory="nan")
+            if isinstance(interpret, bool)
+            else interpret
+        )
+    else:
+        pallas_kwargs["compiler_params"] = pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            disable_bounds_checks=True,
+        )
+    kernel = pl.pallas_call(_kv_write_small_vmem_kernel, **pallas_kwargs)
+    cache_in = (
+        pltpu.with_memory_space_constraint(flat_cache, pltpu.HBM)
+        if tpu_version >= 7
+        else flat_cache
+    )
+    updated = kernel(kv_lens, page_indices, cu_q_lens, cu_kv_lens, distribution, kv_new, cache_in)
+    return updated.reshape(kv_cache_fused.shape)

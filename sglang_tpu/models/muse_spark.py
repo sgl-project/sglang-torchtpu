@@ -3988,6 +3988,7 @@ class MuseSparkDecoderLayer(nn.Module):
             get_b1_moe_b2_chip_sharded_op,
             get_b1_moe_b2_rpad_chip_sharded_op,
             get_b1_moe_chip_sharded_op,
+            get_step_c_kv_write_op,
         )
 
         mlp = self.mlp
@@ -4082,8 +4083,8 @@ class MuseSparkDecoderLayer(nn.Module):
                 and getattr(next_layer_attn, "decode_attn_gate_fuse", False)
                 and (capture_mode is None or not capture_mode.is_full())
             ):
-                from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
-                    parse_decode_fast_config,
+                from sglang_tpu.muse_megakernel.decode.b1_moe_b2_kernel import (
+                    resolve_step_c_rpa_plan,
                 )
                 from sglang_tpu.attention_pallas_rpa_base import _fused_kv_operands
                 from sglang_tpu.decode_qkv_epilogue_tpu import (
@@ -4134,25 +4135,19 @@ class MuseSparkDecoderLayer(nn.Module):
                         )
                     )
                     phys_rows = int(kv_cache.shape[1 if kv_layer_idx is None else 2])
-                    page_size = phys_rows * 2 if dense2 else phys_rows
                     pages_per_seq = int(page_indices.shape[0]) // max(
                         1, int(kv_lens.shape[0])
                     )
-                    cfg_rpa = parse_decode_fast_config(
+                    cfg_rpa, _, _, _, step_c_rpa_ok = resolve_step_c_rpa_plan(
                         rpa_mode_str,
                         sliding_window=sw,
                         pages_per_seq=pages_per_seq,
-                        page_size=page_size,
-                        decode_query_size=1,
-                        shared_group=0,
+                        phys_page_rows=phys_rows,
                         kv_pack_dense2=dense2,
+                        b_tokens=n_tok,
+                        max_num_seqs=int(kv_lens.shape[0]),
                     )
-                    if (
-                        cfg_rpa.shared_group_size == 0
-                        and cfg_rpa.loop_kind != "shared16"
-                        and cfg_rpa.num_slots * cfg_rpa.max_ring_pages * phys_rows <= 20 * 512
-                        and (tp != 16 or cfg_rpa.num_slots <= 4)
-                    ):
+                    if step_c_rpa_ok and (tp != 16 or cfg_rpa.num_slots <= 4):
                         op_c = get_b1_moe_b2_rpad_chip_sharded_op(
                             tp,
                             bf16_router=bf16_router,
@@ -4166,7 +4161,7 @@ class MuseSparkDecoderLayer(nn.Module):
                             rpa_mode_str=rpa_mode_str,
                         )
                         lidx_tail = (kv_layer_idx,) if kv_layer_idx is not None else ()
-                        next_stream_c, next_gated_c = op_c(
+                        next_stream_c, next_gated_c, kv_merged_c = op_c(
                             mlp._fused_decode_rank,
                             stream,
                             gated,
@@ -4222,6 +4217,16 @@ class MuseSparkDecoderLayer(nn.Module):
                             float(getattr(next_layer_attn.attn, "k_scale_float", None) or 1.0),
                             float(getattr(next_layer_attn.attn, "v_scale_float", None) or 1.0),
                             float(next_layer_attn.norm_eps),
+                        )
+                        get_step_c_kv_write_op(kv_pack_dense2=dense2)(
+                            kv_merged_c,
+                            kv_cache,
+                            kv_lens,
+                            page_indices,
+                            cu_q_lens,
+                            cu_kv_lens,
+                            distribution,
+                            kv_layer_idx,
                         )
                         return next_stream_c, next_gated_c, None, None, None
 

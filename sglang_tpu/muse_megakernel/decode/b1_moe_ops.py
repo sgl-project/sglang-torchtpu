@@ -29,6 +29,7 @@ _B1_MOE_LOCK = Lock()
 _B1_MOE_B2_OPS: dict[tuple, Callable] = {}
 _B1_MOE_B2_B16_OPS: dict[tuple, Callable] = {}
 _B1_MOE_B2_RPAD_OPS: dict[tuple, Callable] = {}
+_STEP_C_KV_WRITE_OPS: dict[bool, Callable] = {}
 _B1_MOE_OPS: dict[tuple, Callable] = {}
 
 _B1_BASE_TENSOR_NAMES = (
@@ -97,14 +98,6 @@ _EPI_STATIC_SPECS: tuple[tuple[str, type], ...] = (
 )
 
 
-def _custom_op_device_types() -> Optional[list[str]]:
-    try:
-        torch._C._dispatch_key_for_device("tpu")
-        return ["tpu"]
-    except RuntimeError:
-        return None
-
-
 def _export_superkernel_op(
     op_name: str,
     world_size: int,
@@ -158,132 +151,6 @@ def _export_superkernel_op(
         input_partition_specs=in_specs,
         output_partition_specs=out_specs,
     )
-
-
-def _export_step_c_mutating_op(
-    op_name: str,
-    world_size: int,
-    tensor_names: tuple[str, ...],
-    static_specs: tuple[tuple[str, type], ...],
-    local_kernel_fn: Callable,
-):
-    """Export Step (c) op with 3-level zero-copy in-place ``kv_cache_fused`` aliasing."""
-    import jax
-    from jax.sharding import NamedSharding, PartitionSpec as P
-    from torch_tpu._internal.pallas import pallas as pallas_impl
-
-    from sglang_tpu.pallas_export import tpu_info_for_cpu_export
-    from sglang_tpu.pallas_jax_op import (
-        _CpuExportJaxCallable,
-        _jax_placeholders,
-        _torch_placeholder,
-    )
-
-    class _StepCExportJaxCallable(_CpuExportJaxCallable):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.__signature__ = self.__signature__.replace(
-                return_annotation=tuple[torch.Tensor, torch.Tensor]
-            )
-
-        def __call__(self, *args, **kwargs):
-            res = super().__call__(*args, **kwargs)
-            return res[:2]
-
-    mesh = _get_tp_mesh(world_size)
-    n_t = len(tensor_names)
-    t_specs = (P(),) * n_t
-    out_specs = (P(),) * 3
-    in_specs = t_specs + (None,) * len(static_specs)
-    params = [
-        inspect.Parameter(name, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=jax.Array)
-        for name in tensor_names
-    ] + [
-        inspect.Parameter(name, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=typ)
-        for name, typ in static_specs
-    ]
-
-    def _wrapped(*args):
-        tensors = args[:n_t]
-        scalars = args[n_t:]
-
-        def _local(*t_args):
-            return local_kernel_fn(*t_args, *scalars)
-
-        return jax.shard_map(
-            _local,
-            mesh=mesh,
-            in_specs=t_specs,
-            out_specs=out_specs,
-            check_vma=False,
-        )(*tensors)
-
-    _wrapped.__name__ = op_name.split("::")[-1]
-    _wrapped.__signature__ = inspect.Signature(
-        parameters=params, return_annotation=tuple[jax.Array, jax.Array, jax.Array]
-    )
-
-    signature = _wrapped.__signature__
-    pallas_impl._verify_signature(signature)
-    static_argnums = pallas_impl._infer_static_argnums(signature)
-    kv_idx = list(signature.parameters.keys()).index("kv_cache_fused")
-    donate_argnums_tuple = (kv_idx,)
-    aliases = {kv_idx: 2}
-    output_shardings = tuple(NamedSharding(mesh, spec) for spec in out_specs)
-    jit_function = jax.jit(
-        _wrapped,
-        static_argnums=static_argnums,
-        donate_argnums=donate_argnums_tuple,
-        keep_unused=True,
-        out_shardings=output_shardings,
-    )
-    trace_key = pallas_impl._get_kernel_invocation_key(
-        op_name,
-        [],
-        {
-            "static_argnums": static_argnums,
-            "donate_argnums": donate_argnums_tuple,
-            "output_partition_specs": tuple(map(str, out_specs)),
-        },
-    )
-    wrapped = _StepCExportJaxCallable(
-        name=op_name,
-        jit_fn=jit_function,
-        trace_key=trace_key,
-        mesh=mesh,
-        input_partition_specs=in_specs,
-        static_argnums=static_argnums,
-        donate_argnums=list(donate_argnums_tuple),
-        input_output_aliases=aliases,
-    )
-    wrapped.sglang_output_shardings = output_shardings
-    custom_op = torch.library.custom_op(
-        op_name,
-        wrapped,
-        mutates_args=("kv_cache_fused",),
-        device_types=_custom_op_device_types(),
-    )
-
-    def fake_function(*args, **kwargs):
-        jax_args = _jax_placeholders(
-            args,
-            mesh=mesh,
-            partition_specs=in_specs,
-        )
-        with (
-            tpu_info_for_cpu_export(),
-            jax._src.config.export_ignore_forward_compatibility(True),
-        ):
-            lowered = wrapped.exported(*jax_args, **kwargs)
-        shardings = output_shardings or (None,) * len(lowered.out_avals)
-        unflat = lowered.out_tree.unflatten(
-            _torch_placeholder(aval, sharding, mesh)
-            for aval, sharding in zip(lowered.out_avals, shardings)
-        )
-        return unflat[:2]
-
-    custom_op.register_fake(fake_function)
-    return custom_op
 
 
 def get_b1_moe_b2_chip_sharded_op(
@@ -703,6 +570,7 @@ def get_b1_moe_b2_rpad_chip_sharded_op(
                     rpa_mode_str=(str(rpa_mode_str) if rpa_mode_str else None),
                     kv_pack_dense2=bool(kv_pack_dense2),
                     replica_cost_mode=str(replica_cost_mode),
+                    skip_kv_write=True,
                 )
 
             rtag = "r16" if bf16_router else "r32"
@@ -720,14 +588,119 @@ def get_b1_moe_b2_rpad_chip_sharded_op(
                 f"sglang_tpu_pallas::muse_w9_b1_moe_b2_rpad_tp{world_size}"
                 f"_{rtag}_rep{num_replicas}_{replica_cost_mode}{stag}{ftag}{ltag}{d2tag}{mtag}{etag}"
             )
-            op = _export_step_c_mutating_op(
+            op = _export_superkernel_op(
                 op_name,
                 world_size,
                 tensor_names,
                 static_specs,
+                3,
                 _local_step_c,
             )
             _B1_MOE_B2_RPAD_OPS[key] = op
+    return op
+
+
+def get_step_c_kv_write_op(kv_pack_dense2: bool = False) -> Callable:
+    """Return cached per-device in-place KV writer op (0 copies) for Step (c)."""
+    key = bool(kv_pack_dense2)
+    op = _STEP_C_KV_WRITE_OPS.get(key)
+    if op is not None:
+        return op
+
+    with _B1_MOE_LOCK:
+        op = _STEP_C_KV_WRITE_OPS.get(key)
+        if op is None:
+            import jax
+            from torch_tpu._internal import pallas as _torch_pallas
+
+            from sglang_tpu.muse_megakernel.decode.b1_moe_b2_kernel import (
+                write_decode_kv_merged_jax,
+            )
+            from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+            op_name = (
+                "sglang_tpu_pallas::muse_w9_step_c_write_kv_d2"
+                if key
+                else "sglang_tpu_pallas::muse_w9_step_c_write_kv"
+            )
+
+            def _wrapped(
+                kv_new: jax.Array,
+                kv_cache_fused: jax.Array,
+                kv_lens: jax.Array,
+                page_indices: jax.Array,
+                cu_q_lens: jax.Array,
+                cu_kv_lens: jax.Array,
+                distribution: jax.Array,
+                layer_idx: jax.Array | None = None,
+            ) -> jax.Array:
+                kv_cache_flat = kv_cache_fused
+                if layer_idx is not None:
+                    num_blocks, layer_num = kv_cache_fused.shape[:2]
+                    kv_cache_flat = kv_cache_fused.reshape(
+                        (num_blocks * layer_num,) + kv_cache_fused.shape[2:]
+                    )
+                    page_indices = page_indices * layer_num + layer_idx.reshape(()).astype(page_indices.dtype)
+                updated = write_decode_kv_merged_jax(
+                    kv_new,
+                    kv_cache_flat,
+                    kv_lens,
+                    page_indices,
+                    cu_q_lens,
+                    cu_kv_lens,
+                    distribution,
+                    kv_pack_dense2=key,
+                )
+                return updated.reshape(kv_cache_fused.shape)
+
+            jax_kernel = _torch_pallas.custom_jax_kernel(
+                _wrapped,
+                name=f"jax_{op_name}",
+                static_argnums=(),
+                donate_argnums=(1,),
+                input_output_aliases={1: 0},
+                warn_deprecated=False,
+            )
+
+            try:
+                torch._C._dispatch_key_for_device("tpu")
+                dev_types = ["tpu"]
+            except RuntimeError:
+                dev_types = None
+
+            @torch.library.custom_op(
+                op_name,
+                mutates_args=("kv_cache_fused",),
+                device_types=dev_types,
+            )
+            def step_c_kv_write_op(
+                kv_new: torch.Tensor,
+                kv_cache_fused: torch.Tensor,
+                kv_lens: torch.Tensor,
+                page_indices: torch.Tensor,
+                cu_q_lens: torch.Tensor,
+                cu_kv_lens: torch.Tensor,
+                distribution: torch.Tensor,
+                layer_idx: torch.Tensor | None = None,
+            ) -> None:
+                with tpu_info_for_cpu_export():
+                    jax_kernel(
+                        kv_new,
+                        kv_cache_fused,
+                        kv_lens,
+                        page_indices,
+                        cu_q_lens,
+                        cu_kv_lens,
+                        distribution,
+                        layer_idx,
+                    )
+
+            @step_c_kv_write_op.register_fake
+            def _(*args, **kwargs) -> None:
+                return None
+
+            _STEP_C_KV_WRITE_OPS[key] = step_c_kv_write_op
+            op = step_c_kv_write_op
     return op
 
 
@@ -923,3 +896,4 @@ def prewarm_b1_moe_superkernel_ops(
                         kv_pack_dense2=dense2,
                         rpa_mode_str=rpa_m,
                     )
+                    get_step_c_kv_write_op(kv_pack_dense2=bool(dense2))

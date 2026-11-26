@@ -3433,6 +3433,227 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
                         self.assertIn("RPAd_fast-s4-c2048-swabatch-mp5", hlo)
                         self.assertNotIn("c1024-swabatch-mp2", hlo)
 
+    def test_cand16_swabatch_group_predicate_alignment_and_adaptive_c1024_gate(self):
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
+            _run_rpad_vmem_core,
+            can_use_swabatch_group_runtime,
+            parse_decode_fast_config,
+            prepare_and_start_rpad_dmas,
+            run_decode_fast_rpa,
+        )
+
+        cfg = parse_decode_fast_config(
+            "w8,s4,batchfull,g4k,foldcol,batch4",
+            sliding_window=2049,
+            pages_per_seq=4,
+            page_size=512,
+            decode_query_size=1,
+        )
+        self.assertTrue(
+            can_use_swabatch_group_runtime(
+                cfg,
+                one_block_per_seq=True,
+                decode_query_size=1,
+                kv_pack_dense2=False,
+                probe=None,
+                b_tokens=64,
+                max_num_seqs=64,
+                bkv_slot_pages=cfg.swabatch_group_size * cfg.max_ring_pages,
+                has_init_sv=True,
+            )
+        )
+        # Missing init_sv or undersized bkv or mismatched b_tokens must return False.
+        self.assertFalse(
+            can_use_swabatch_group_runtime(
+                cfg,
+                one_block_per_seq=True,
+                decode_query_size=1,
+                kv_pack_dense2=False,
+                probe=None,
+                b_tokens=64,
+                max_num_seqs=64,
+                bkv_slot_pages=cfg.swabatch_group_size * cfg.max_ring_pages,
+                has_init_sv=False,
+            )
+        )
+        self.assertFalse(
+            can_use_swabatch_group_runtime(
+                cfg,
+                one_block_per_seq=True,
+                decode_query_size=1,
+                kv_pack_dense2=False,
+                probe=None,
+                b_tokens=64,
+                max_num_seqs=64,
+                bkv_slot_pages=cfg.max_ring_pages,
+                has_init_sv=True,
+            )
+        )
+        self.assertFalse(
+            can_use_swabatch_group_runtime(
+                cfg,
+                one_block_per_seq=True,
+                decode_query_size=1,
+                kv_pack_dense2=False,
+                probe=None,
+                b_tokens=32,
+                max_num_seqs=64,
+                bkv_slot_pages=cfg.swabatch_group_size * cfg.max_ring_pages,
+                has_init_sv=True,
+            )
+        )
+
+        # Explicit use_grp_vec=True with missing init_sv or undersized bkv must fail fast.
+        bs, sw, pps, ps = 8, 2049, 4, 512
+        cfg_s = parse_decode_fast_config(
+            "w8,s4,batchfull,g4k,foldcol,batch4",
+            sliding_window=sw,
+            pages_per_seq=pps,
+            page_size=ps,
+            decode_query_size=1,
+        )
+        v_sp, h_sp = pl.BlockSpec(memory_space=pltpu.VMEM), pl.BlockSpec(memory_space=pltpu.HBM)
+
+        def _bad_prestart(klr, pir, cqr, ckvr, dr, chbm, out, bkv_r, bkv_s):
+            prepare_and_start_rpad_dmas(
+                kv_lens_ref=klr, page_indices_ref=pir, cu_q_lens_ref=cqr, cu_kv_lens_ref=ckvr,
+                distribution_ref=dr, kv_cache_hbm_ref=chbm, bkv_vmem_ref=bkv_r, bkv_sems=bkv_s,
+                sliding_window=sw, cfg=cfg_s, one_block_per_seq=True, decode_query_size=1,
+                kv_pack_dense2=False, interpret_mode=True, b_tokens=bs, init_sv_vmem_ref=None,
+                use_grp_vec=True,
+            )
+
+        with self.assertRaisesRegex(ValueError, "use_grp_vec=True"):
+            pl.pallas_call(
+                _bad_prestart,
+                out_shape=jax.ShapeDtypeStruct((bs, 16, 128), jnp.bfloat16),
+                grid_spec=pltpu.PrefetchScalarGridSpec(
+                    num_scalar_prefetch=5,
+                    in_specs=(h_sp,),
+                    out_specs=v_sp,
+                    grid=(1,),
+                    scratch_shapes=(
+                        pltpu.VMEM((cfg_s.num_slots, 4 * cfg_s.max_ring_pages, ps, 1, 4, 128), jnp.float8_e4m3fn),
+                        pltpu.SemaphoreType.DMA((cfg_s.num_slots,)),
+                    ),
+                ),
+                interpret=True,
+            )(
+                jnp.ones((bs,), jnp.int32),
+                jnp.arange(bs * pps, dtype=jnp.int32),
+                jnp.arange(bs + 1, dtype=jnp.int32),
+                jnp.arange(bs + 1, dtype=jnp.int32) * (pps * ps),
+                jnp.asarray([bs, bs, bs], jnp.int32),
+                jnp.zeros((bs * pps, ps, 1, 4, 128), jnp.float8_e4m3fn),
+            )
+
+        def _bad_core(klr, pir, cqr, ckvr, dr, q_r, kv_r, chbm, oout, upd, bkv_r, st_r, o_r, sm_r, s1, s2):
+            _run_rpad_vmem_core(
+                kv_lens_ref=klr, page_indices_ref=pir, cu_q_lens_ref=cqr, cu_kv_lens_ref=ckvr,
+                distribution_ref=dr, q_vmem_ref=q_r, kv_merged_vmem_ref=kv_r, gate_vmem_ref=None,
+                kv_cache_hbm_ref=chbm, o_out_vmem_ref=oout, updated_kv_cache_hbm_ref=upd,
+                bkv_vmem_ref=bkv_r, state_vmem_ref=st_r, o_vmem_ref=o_r, kv_write_vmem_ref=None,
+                init_sv_vmem_ref=None, written_cnt_smem_ref=sm_r, bkv_sems=s1, cache_write_sem=s2,
+                sm_scale=128.0 ** -0.5, sliding_window=sw, k_scale=1.0, v_scale=1.0, cfg=cfg_s,
+                one_block_per_seq=True, decode_query_size=1, in_kernel_pack2=True, has_gate=False,
+                kv_pack_dense2=False, interpret_mode=True, use_grp_vec=True,
+            )
+
+        with self.assertRaisesRegex(ValueError, "use_grp_vec=True"):
+            pl.pallas_call(
+                _bad_core,
+                out_shape=(
+                    jax.ShapeDtypeStruct((bs, 16, 128), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((bs * pps, ps, 1, 4, 128), jnp.float8_e4m3fn),
+                ),
+                grid_spec=pltpu.PrefetchScalarGridSpec(
+                    num_scalar_prefetch=5,
+                    in_specs=(v_sp, v_sp, h_sp),
+                    out_specs=(v_sp, h_sp),
+                    grid=(1,),
+                    scratch_shapes=(
+                        pltpu.VMEM((cfg_s.num_slots, cfg_s.max_ring_pages, ps, 1, 4, 128), jnp.float8_e4m3fn),
+                        pltpu.VMEM((3, 16, 128), jnp.float32),
+                        pltpu.VMEM((bs, 16, 128), jnp.bfloat16),
+                        pltpu.SMEM((2 + cfg_s.num_slots,), jnp.int32),
+                        pltpu.SemaphoreType.DMA((cfg_s.num_slots,)),
+                        pltpu.SemaphoreType.DMA((1,)),
+                    ),
+                ),
+                input_output_aliases={7: 1},
+                interpret=True,
+            )(
+                jnp.ones((bs,), jnp.int32),
+                jnp.arange(bs * pps, dtype=jnp.int32),
+                jnp.arange(bs + 1, dtype=jnp.int32),
+                jnp.arange(bs + 1, dtype=jnp.int32) * (pps * ps),
+                jnp.asarray([bs, bs, bs], jnp.int32),
+                jnp.zeros((bs, 16, 128), jnp.bfloat16),
+                jnp.zeros((bs, 1, 4, 128), jnp.float8_e4m3fn),
+                jnp.zeros((bs * pps, ps, 1, 4, 128), jnp.float8_e4m3fn),
+            )
+
+        # Verify use_adaptive_c1024 only bypasses lax.switch when _uses_swabatch_group is True
+        # at runtime (not just cfg.swabatch_group_size > 1 with dense2/mismatched seqs).
+        try:
+            from jax._src import tpu_info  # noqa: F401
+        except ImportError:
+            return
+        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+        with (
+            patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+            tpu_info_for_cpu_export(),
+        ):
+            hlo_adapt = jax_export.export(
+                jax.jit(
+                    lambda q_, kv_, g_, c_, kl_, pi_, cq_, ckv_, d_: run_decode_fast_rpa(
+                        q_, kv_, None, c_, kl_, pi_, cq_, ckv_, d_,
+                        sm_scale=128.0 ** -0.5, sliding_window=2049, k_scale=1.0, v_scale=1.0,
+                        mode_str="w8,s4,batchfull,g4k,foldcol,batch4,dense2",
+                        decode_query_size=1, fused_out_pack=2, prepared_inputs=True,
+                        gate=g_, out_norm_eps=1e-5, kv_pack_dense2=True,
+                    )
+                ),
+                platforms=["tpu"],
+            )(
+                jax.ShapeDtypeStruct((1, 64, 8, 2, 128), jnp.bfloat16),
+                jax.ShapeDtypeStruct((64, 1, 4, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((64, 1024), jnp.bfloat16),
+                jax.ShapeDtypeStruct((264, 256, 1, 4, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((64,), jnp.int32),
+                jax.ShapeDtypeStruct((256,), jnp.int32),
+                jax.ShapeDtypeStruct((65,), jnp.int32),
+                jax.ShapeDtypeStruct((65,), jnp.int32),
+                jax.ShapeDtypeStruct((3,), jnp.int32),
+            ).mlir_module()
+            self.assertIn("stablehlo.case", hlo_adapt)
+            hlo_direct = jax_export.export(
+                jax.jit(
+                    lambda q_, kv_, g_, c_, kl_, pi_, cq_, ckv_, d_: run_decode_fast_rpa(
+                        q_, kv_, None, c_, kl_, pi_, cq_, ckv_, d_,
+                        sm_scale=128.0 ** -0.5, sliding_window=2049, k_scale=1.0, v_scale=1.0,
+                        mode_str="w8,s4,batchfull,g4k,foldcol,batch4",
+                        decode_query_size=1, fused_out_pack=2, prepared_inputs=True,
+                        gate=g_, out_norm_eps=1e-5, kv_pack_dense2=False,
+                    )
+                ),
+                platforms=["tpu"],
+            )(
+                jax.ShapeDtypeStruct((1, 64, 8, 2, 128), jnp.bfloat16),
+                jax.ShapeDtypeStruct((64, 1, 4, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((64, 1024), jnp.bfloat16),
+                jax.ShapeDtypeStruct((264, 512, 1, 4, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((64,), jnp.int32),
+                jax.ShapeDtypeStruct((256,), jnp.int32),
+                jax.ShapeDtypeStruct((65,), jnp.int32),
+                jax.ShapeDtypeStruct((65,), jnp.int32),
+                jax.ShapeDtypeStruct((3,), jnp.int32),
+            ).mlir_module()
+            self.assertNotIn("stablehlo.case", hlo_direct)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -90,6 +90,68 @@ def _uses_swabatch_group(
     )
 
 
+def can_use_swabatch_group_runtime(
+    cfg: DecodeFastConfig,
+    *,
+    one_block_per_seq: bool,
+    decode_query_size: int,
+    kv_pack_dense2: bool,
+    probe: str | None,
+    b_tokens: int,
+    max_num_seqs: int,
+    bkv_slot_pages: int,
+    has_init_sv: bool,
+) -> bool:
+    """Single source of truth for group-vectorized ``swabatch`` across pre-DMA and compute."""
+    return (
+        _uses_swabatch_group(
+            cfg,
+            one_block_per_seq=one_block_per_seq,
+            decode_query_size=decode_query_size,
+            kv_pack_dense2=kv_pack_dense2,
+            probe=probe,
+            b_tokens=b_tokens,
+            max_num_seqs=max_num_seqs,
+        )
+        and bkv_slot_pages >= cfg.swabatch_group_size * cfg.max_ring_pages
+        and has_init_sv
+    )
+
+
+def _resolve_swabatch_group_flag(
+    use_grp_vec: bool | None,
+    *,
+    cfg: DecodeFastConfig,
+    one_block_per_seq: bool,
+    decode_query_size: int,
+    kv_pack_dense2: bool,
+    probe: str | None,
+    b_tokens: int,
+    max_num_seqs: int,
+    bkv_slot_pages: int,
+    has_init_sv: bool,
+) -> bool:
+    """Validates explicit ``use_grp_vec`` against runtime invariants or computes it."""
+    can_grp_runtime = can_use_swabatch_group_runtime(
+        cfg,
+        one_block_per_seq=one_block_per_seq,
+        decode_query_size=decode_query_size,
+        kv_pack_dense2=kv_pack_dense2,
+        probe=probe,
+        b_tokens=b_tokens,
+        max_num_seqs=max_num_seqs,
+        bkv_slot_pages=bkv_slot_pages,
+        has_init_sv=has_init_sv,
+    )
+    if use_grp_vec is None:
+        return can_grp_runtime
+    if bool(use_grp_vec) and not can_grp_runtime:
+        raise ValueError(
+            "use_grp_vec=True requires sized bkv, init_sv, and valid swabatch_group_size"
+        )
+    return bool(use_grp_vec)
+
+
 def get_shared_group_size(mode_str: str) -> int:
     raw = mode_str.strip().lower() if mode_str else ""
     if not raw:
@@ -1172,6 +1234,9 @@ def prepare_and_start_rpad_dmas(
     kv_pack_dense2: bool = False,
     probe: str | None = None,
     interpret_mode: bool = False,
+    b_tokens: int | None = None,
+    init_sv_vmem_ref=None,
+    use_grp_vec: bool | None = None,
 ) -> tuple[jax.Array, ...] | None:
     """Optionally pre-zeroes ``bkv_vmem_ref`` and fires initial RPAd page DMAs.
 
@@ -1247,13 +1312,22 @@ def prepare_and_start_rpad_dmas(
 
         def _prep_swa(w_pg: int):
             grp_sz = cfg.swabatch_group_size
-            can_grp_pre = (
-                grp_sz > 1
-                and not kv_pack_dense2
-                and not cfg.fp8_dots
-                and probe is None
-                and max_num_seqs % grp_sz == 0
-                and bkv_vmem_ref.shape[1] >= grp_sz * cfg.max_ring_pages
+            eff_b_tokens = max_num_seqs if b_tokens is None else int(b_tokens)
+            can_grp_pre = _resolve_swabatch_group_flag(
+                use_grp_vec,
+                cfg=cfg,
+                one_block_per_seq=one_block_per_seq,
+                decode_query_size=decode_query_size,
+                kv_pack_dense2=kv_pack_dense2,
+                probe=probe,
+                b_tokens=eff_b_tokens,
+                max_num_seqs=max_num_seqs,
+                bkv_slot_pages=bkv_vmem_ref.shape[1],
+                has_init_sv=(
+                    True
+                    if (use_grp_vec is None and init_sv_vmem_ref is None)
+                    else (init_sv_vmem_ref is not None)
+                ),
             )
 
             def _prep_single():
@@ -1372,6 +1446,8 @@ def _run_rpad_vmem_core(
     probe: str | None = None,
     interpret_mode: bool = False,
     prestarted_bkv_state: tuple[jax.Array, ...] | None = None,
+    use_grp_vec: bool | None = None,
+    skip_kv_write: bool = False,
 ):
     """Executes VMEM-resident decode RPA core (reusable in fused superkernels)."""
     max_num_tokens = q_vmem_ref.shape[0]
@@ -1384,18 +1460,17 @@ def _run_rpad_vmem_core(
     bkv_slot_pages = bkv_vmem_ref.shape[1]
     max_ring_rows = max_ring_pages * page_size
     use_branchless_sanitize = cfg.loop_kind in ("stream0b", "swabatch", "swafast")
-    can_grp_vec = (
-        _uses_swabatch_group(
-            cfg,
-            one_block_per_seq=one_block_per_seq,
-            decode_query_size=decode_query_size,
-            kv_pack_dense2=kv_pack_dense2,
-            probe=probe,
-            b_tokens=max_num_tokens,
-            max_num_seqs=max_num_seqs,
-        )
-        and bkv_slot_pages >= cfg.swabatch_group_size * max_ring_pages
-        and init_sv_vmem_ref is not None
+    can_grp_vec = _resolve_swabatch_group_flag(
+        use_grp_vec,
+        cfg=cfg,
+        one_block_per_seq=one_block_per_seq,
+        decode_query_size=decode_query_size,
+        kv_pack_dense2=kv_pack_dense2,
+        probe=probe,
+        b_tokens=max_num_tokens,
+        max_num_seqs=max_num_seqs,
+        bkv_slot_pages=bkv_slot_pages,
+        has_init_sv=(init_sv_vmem_ref is not None),
     )
     use_hoist_kv = (cfg.hoist_new_kv or can_grp_vec) and decode_query_size == 1
 
@@ -1469,7 +1544,7 @@ def _run_rpad_vmem_core(
     def enqueue_kv_write(
         seq, q_row, active, kv_len, slot=jnp.int32(0), prev_loc_tok=jnp.int32(0)
     ):
-        if probe == "nokvwrite":
+        if skip_kv_write or probe == "nokvwrite":
             return
 
         @pl.when(active)
@@ -3801,7 +3876,7 @@ def _run_rpad_vmem_core(
                     def _one_u4(seq, sl: int):
                         q_r, _, kvl, rf, re, _, _ = seq_info(seq)
                         _wait_s(sl)
-                        if probe != "nokvwrite":
+                        if not skip_kv_write and probe != "nokvwrite":
                             seq_base = cdiv(cu_kv_lens_ref[seq], page_size)
                             pos = kvl - 1
                             dst_pg = page_indices_ref[jnp.minimum(seq_base + (pos // page_size), num_page_indices - 1)]
@@ -4035,17 +4110,19 @@ def _run_rpad_vmem_core(
                         rf_list.append(rf_seq)
                         re_list.append(re)
                         act_list.append(act)
-                        wr_cnt = wr_cnt + jnp.where(act, jnp.int32(1), jnp.int32(0))
-                        @pl.when(act)
-                        def _(s=seq, qr=q_r, kv=kvl):
-                            sb = cdiv(cu_kv_lens_ref[s], page_size)
-                            pos = kv - 1
-                            dp = page_indices_ref[jnp.minimum(sb + (pos // page_size), num_page_indices - 1)]
-                            pltpu.make_async_copy(
-                                kv_merged_vmem_ref.at[pl.ds(qr, 1)],
-                                updated_kv_cache_hbm_ref.at[dp, pl.ds(pos % page_size, 1)],
-                                cache_write_sem.at[0],
-                            ).start()
+                        if not skip_kv_write and probe != "nokvwrite":
+                            wr_cnt = wr_cnt + jnp.where(act, jnp.int32(1), jnp.int32(0))
+
+                            @pl.when(act)
+                            def _(s=seq, qr=q_r, kv=kvl):
+                                sb = cdiv(cu_kv_lens_ref[s], page_size)
+                                pos = kv - 1
+                                dp = page_indices_ref[jnp.minimum(sb + (pos // page_size), num_page_indices - 1)]
+                                pltpu.make_async_copy(
+                                    kv_merged_vmem_ref.at[pl.ds(qr, 1)],
+                                    updated_kv_cache_hbm_ref.at[dp, pl.ds(pos % page_size, 1)],
+                                    cache_write_sem.at[0],
+                                ).start()
 
                         pg_base_sl = sub * w_pg
                         if w_pg <= 2:
@@ -4309,7 +4386,7 @@ def _run_rpad_vmem_core(
                     )
                     _finish_pair_tile(pair_hi, r_sl, 512 + p * 128)
 
-    if probe != "nokvwrite":
+    if not skip_kv_write and probe != "nokvwrite":
         w_cnt = written_cnt_smem_ref[0]
 
         @pl.when(w_cnt > 0)
@@ -4816,7 +4893,15 @@ def run_decode_fast_rpa(
     # wrapping it in an outer lax.switch adds ~5.5-6.5 us/occ XLA overhead.
     if (
         use_adaptive_c1024
-        and not (cfg.loop_kind == "swabatch" and cfg.swabatch_group_size > 1)
+        and not _uses_swabatch_group(
+            cfg,
+            one_block_per_seq=one_block_per_seq,
+            decode_query_size=decode_query_size,
+            kv_pack_dense2=kv_pack_dense2,
+            probe=probe,
+            b_tokens=b_tokens,
+            max_num_seqs=max_num_seqs,
+        )
         and not (
             cfg.loop_kind in ("stream0b", "swafast2")
             and cfg.max_ring_pages <= (1024 // page_size)

@@ -1146,14 +1146,10 @@ def test_b1_moe_ops_env_default_ast_and_lock_free_prewarm():
     with (
         mock.patch.object(sk_ops, "_get_tp_mesh", return_value=fake_mesh),
         mock.patch("sglang_tpu.pallas_jax_op.cpu_export_jax_op", side_effect=_fake_export),
-        mock.patch.object(
-            sk_ops,
-            "_export_step_c_mutating_op",
-            side_effect=lambda name, *_a, **_kw: captured.setdefault(name, "step_c_ok"),
-        ),
         mock.patch.dict(sk_ops._B1_MOE_B2_OPS, {}, clear=True),
         mock.patch.dict(sk_ops._B1_MOE_OPS, {}, clear=True),
         mock.patch.dict(sk_ops._B1_MOE_B2_RPAD_OPS, {}, clear=True),
+        mock.patch.dict(sk_ops._STEP_C_KV_WRITE_OPS, {}, clear=True),
     ):
         sk_ops.prewarm_b1_moe_superkernel_ops(
             8,
@@ -1165,6 +1161,10 @@ def test_b1_moe_ops_env_default_ast_and_lock_free_prewarm():
         )
         with mock.patch.object(sk_ops, "_B1_MOE_LOCK", _ExplodingLock()):
             for has_lidx, dense2, rpa_m in step_c_cfgs:
+                assert (
+                    sk_ops.get_step_c_kv_write_op(kv_pack_dense2=bool(dense2))
+                    is not None
+                )
                 assert (
                     sk_ops.get_b1_moe_b2_rpad_chip_sharded_op(
                         8,
@@ -1178,7 +1178,7 @@ def test_b1_moe_ops_env_default_ast_and_lock_free_prewarm():
                         kv_pack_dense2=dense2,
                         rpa_mode_str=rpa_m,
                     )
-                    == "step_c_ok"
+                    is not None
                 )
 
 
@@ -1766,40 +1766,57 @@ def _make_step_c_rpad_inputs(
     batch_size: int,
     sliding_window: int | None,
     pages_per_seq: int = 4,
+    page_size: int = 128,
+    n_active: int | None = None,
+    poison_nan: bool = False,
 ):
+    import jax
     import jax.numpy as jnp
 
     n_kv = 1
-    kv_len_max = (sliding_window - 1) if sliding_window is not None else 512
-    kv_lens_np = rng.integers(16, min(kv_len_max, pages_per_seq * 128), size=(batch_size,), dtype=np.int32)
-    kv_lens_np = np.clip(kv_lens_np, 1, pages_per_seq * 128 - 1)
+    n_act = batch_size if n_active is None else n_active
+    kv_len_max = (sliding_window - 1) if sliding_window is not None else (pages_per_seq * page_size)
+    kv_lens_np = rng.integers(16, min(kv_len_max, pages_per_seq * page_size), size=(batch_size,), dtype=np.int32)
+    kv_lens_np = np.clip(kv_lens_np, 1, pages_per_seq * page_size - 1)
+    if n_act < batch_size:
+        kv_lens_np[n_act:] = 0
     num_blocks = batch_size * pages_per_seq + 8
-    kv_cache_np = (rng.standard_normal((num_blocks, 128, n_kv, 4, 128)) * 0.25).astype(np.float32)
-    kv_cache = jnp.asarray(kv_cache_np, dtype=jnp.float8_e4m3fn)
+    page_indices_np = np.arange(batch_size * pages_per_seq, dtype=np.int32) % num_blocks
+    if poison_nan:
+        kv_u8 = np.full((num_blocks, page_size, n_kv, 4, 128), 0x7F, dtype=np.uint8)
+        rng.shuffle(page_indices_np)
+        pi_2d = page_indices_np.reshape(batch_size, pages_per_seq)
+        for seq in range(n_act):
+            old_len = int(kv_lens_np[seq]) - 1
+            for p_o in range((old_len + page_size - 1) // page_size):
+                pg = int(pi_2d[seq, p_o])
+                rows_p = min(page_size, old_len - p_o * page_size)
+                rand_f8 = jnp.asarray((rng.standard_normal((rows_p, 2, 128)) * 0.25).astype(np.float32), jnp.float8_e4m3fn)
+                kv_u8[pg, :rows_p, 0, :2, :] = np.asarray(jax.lax.bitcast_convert_type(rand_f8, jnp.uint8))
+        kv_cache = jax.lax.bitcast_convert_type(jnp.asarray(kv_u8, dtype=jnp.uint8), jnp.float8_e4m3fn)
+    else:
+        kv_cache_np = (rng.standard_normal((num_blocks, page_size, n_kv, 4, 128)) * 0.25).astype(np.float32)
+        kv_cache = jnp.asarray(kv_cache_np, dtype=jnp.float8_e4m3fn)
     kv_lens = jnp.asarray(kv_lens_np, dtype=jnp.int32)
-    page_indices = jnp.asarray(
-        np.arange(batch_size * pages_per_seq, dtype=np.int32) % num_blocks,
-        dtype=jnp.int32,
-    )
+    page_indices = jnp.asarray(page_indices_np, dtype=jnp.int32)
     cu_q_lens = jnp.arange(batch_size + 1, dtype=jnp.int32)
-    cu_kv_lens = jnp.concatenate(
-        [jnp.zeros((1,), dtype=jnp.int32), jnp.cumsum(kv_lens)]
-    ).astype(jnp.int32)
-    distribution = jnp.asarray([batch_size, batch_size, batch_size], dtype=jnp.int32)
+    cu_kv_lens = jnp.arange(batch_size + 1, dtype=jnp.int32) * (pages_per_seq * page_size)
+    distribution = jnp.asarray([n_act, n_act, n_act], dtype=jnp.int32)
     return kv_cache, kv_lens, page_indices, cu_q_lens, cu_kv_lens, distribution
 
 
-@pytest.mark.parametrize(
-    "world_size,batch_size,sliding_window",
-    [
-        (8, 32, 2049),
-        (16, 64, 2049),
-    ],
-)
-def test_step_c_b1_moe_b2_rpad_interpret_parity_and_tpu7x_aot(
-    world_size: int, batch_size: int, sliding_window: int | None
+def _run_step_c_parity_and_aot(
+    *,
+    world_size: int,
+    batch_size: int,
+    sliding_window: int | None,
+    rpa_mode: str,
+    seed: int,
+    page_size: int = 128,
+    n_active: int | None = None,
+    poison_nan: bool = False,
+    skip_kv_write: bool = False,
 ):
-    """Verify Step (c) [chip_b1 + MoE(3d) + chip_b2 + RPAd] Interpret parity + TPU7x AOT."""
     import jax
     import jax.numpy as jnp
     from jax.experimental import pallas as pl
@@ -1810,7 +1827,6 @@ def test_step_c_b1_moe_b2_rpad_interpret_parity_and_tpu7x_aot(
     if len(jax.devices("cpu")) < world_size:
         pytest.skip(f"Requires XLA_FLAGS=--xla_force_host_platform_device_count={world_size}")
 
-    from sglang_tpu.attention.pallas.decode_qkv_epilogue import build_decode_rope_step_tables
     from sglang_tpu.attention.pallas.rpa_v3_decode_fast import run_decode_fast_rpa
     from sglang_tpu.kernels.decode_collective_bridges_w8 import (
         attn_to_moe_chip_sharded_bridge_jax,
@@ -1836,7 +1852,7 @@ def test_step_c_b1_moe_b2_rpad_interpret_parity_and_tpu7x_aot(
         detect_races=True,
         uninitialized_memory="nan",
     )
-    rng = np.random.default_rng(20261130 + world_size + batch_size)
+    rng = np.random.default_rng(seed)
     d = _build_b1_moe_inputs(
         rng,
         world_size=world_size,
@@ -1877,10 +1893,11 @@ def test_step_c_b1_moe_b2_rpad_interpret_parity_and_tpu7x_aot(
         world_size=world_size,
         batch_size=batch_size,
         sliding_window=sliding_window,
+        page_size=page_size,
+        n_active=n_active,
+        poison_nan=poison_nan,
     )
     free_params = jnp.asarray([0.84, 2.0, 0.20, 1.0], dtype=jnp.float32)
-    n_chips = world_size // 2
-    r_pair = batch_size // n_chips
     sharded_moe_in = (batch_size // world_size) >= 8 and (batch_size // world_size) % 8 == 0
     cfg = dataclasses.replace(
         default_sparse_decode_config(batch_size, world_size, scale_block),
@@ -1899,7 +1916,6 @@ def test_step_c_b1_moe_b2_rpad_interpret_parity_and_tpu7x_aot(
         k256_strip_mode="wide",
         nc_split512=False,
     )
-    rpa_mode = "swabatch_tp16" if world_size == 16 else "w8_noz"
 
     def _run_standalone(
         rank, stream_chip, gated_attn, wo, wo_scale, pa_alpha, pa_beta, pre_ff_gain,
@@ -1981,7 +1997,7 @@ def test_step_c_b1_moe_b2_rpad_interpret_parity_and_tpu7x_aot(
         w_post, s_post, post_ff_g, pf_a, pf_b, next_in_g, w_qkv, s_qkv, w_gate, s_gate,
         kv_c, kvl, pg, cq, ckv, dist, cos_sin, fp,
     ):
-        return b1_moe_b2_rpad_chip_sharded_jax(
+        st2, ng, kv_out = b1_moe_b2_rpad_chip_sharded_jax(
             rank, stream_chip, gated_attn, wo, wo_scale, pa_alpha, pa_beta, pre_ff_gain,
             w_pre_pair, s_pre_pair, w_router, pre_exp_gain,
             bias, w1, s1, w2, s2, norm,
@@ -1994,7 +2010,17 @@ def test_step_c_b1_moe_b2_rpad_interpret_parity_and_tpu7x_aot(
             rpa_k_scale=0.9, rpa_v_scale=1.1, rpa_out_norm_eps=1e-5,
             rpa_mode_str=rpa_mode, kv_pack_dense2=False,
             replica_cost_mode="tiles", config=cfg, interpret=ip_race,
+            skip_kv_write=skip_kv_write,
         )
+        if skip_kv_write:
+            from sglang_tpu.muse_megakernel.decode.b1_moe_b2_kernel import (
+                write_decode_kv_merged_jax,
+            )
+
+            kv_out = write_decode_kv_merged_jax(
+                kv_out, kv_c, kvl, pg, cq, ckv, dist, kv_pack_dense2=False, interpret=ip_race,
+            )
+        return st2, ng, kv_out
 
     mesh = Mesh(np.array(jax.devices("cpu")[:world_size]), ("model",))
     call_args = (
@@ -2022,8 +2048,18 @@ def test_step_c_b1_moe_b2_rpad_interpret_parity_and_tpu7x_aot(
     fused_outs = jax.jit(jax.shard_map(_run_fused, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False))(*call_args)
 
     for idx, name in enumerate(("stream_chip", "next_gated", "updated_kv")):
-        r_np = np.asarray(ref_outs[idx], dtype=np.float32)
-        f_np = np.asarray(fused_outs[idx], dtype=np.float32)
+        r_raw = np.asarray(ref_outs[idx])
+        f_raw = np.asarray(fused_outs[idx])
+        if idx == 2 and poison_nan:
+            r_u8 = r_raw.view(np.uint8)
+            f_u8 = f_raw.view(np.uint8)
+            assert np.array_equal(r_u8 == 0x7F, f_u8 == 0x7F), "0x7F NaN poisoning mask changed"
+            valid_mask = r_u8 != 0x7F
+            r_np = r_raw.astype(np.float32)[valid_mask]
+            f_np = f_raw.astype(np.float32)[valid_mask]
+        else:
+            r_np = r_raw.astype(np.float32)
+            f_np = f_raw.astype(np.float32)
         assert np.all(np.isfinite(f_np)), f"{name} non-finite"
         assert _cosine_sim(r_np, f_np) > 0.9999, f"{name} cosine mismatch: {_cosine_sim(r_np, f_np)}"
 
@@ -2055,13 +2091,126 @@ def test_step_c_b1_moe_b2_rpad_interpret_parity_and_tpu7x_aot(
             rpa_sm_scale=0.125, rpa_k_scale=0.9, rpa_v_scale=1.1, rpa_out_norm_eps=1e-5,
             rpa_mode_str=rpa_mode, kv_pack_dense2=False,
             replica_cost_mode="tiles", config=cfg, interpret=False,
+            skip_kv_write=skip_kv_write,
         )
 
     compiled = jax.jit(
         jax.shard_map(_aot_step_c, mesh=mesh_aot, in_specs=in_specs, out_specs=out_specs, check_vma=False),
-        donate_argnums=(28,),
+        donate_argnums=(() if skip_kv_write else (28,)),
     ).lower(*abstract).compile()
     assert compiled is not None
+
+
+@pytest.mark.parametrize(
+    "world_size,batch_size,sliding_window",
+    [
+        (8, 32, 2049),
+        (16, 64, 2049),
+    ],
+)
+def test_step_c_b1_moe_b2_rpad_interpret_parity_and_tpu7x_aot(
+    world_size: int, batch_size: int, sliding_window: int | None
+):
+    """Verify Step (c) [chip_b1 + MoE(3d) + chip_b2 + RPAd] Interpret parity + TPU7x AOT."""
+    _run_step_c_parity_and_aot(
+        world_size=world_size,
+        batch_size=batch_size,
+        sliding_window=sliding_window,
+        rpa_mode="swabatch_tp16" if world_size == 16 else "w8_noz",
+        seed=20261130 + world_size + batch_size,
+    )
+
+
+@pytest.mark.parametrize("world_size", [8, 16])
+def test_step_c_2scope_batch4_interpret_races_and_tpu7x_aot(world_size: int):
+    """Verify 2-scope Step (c) + SWA_b4_s4 (80pg bkv) race-free Interpret parity + TPU7x AOT."""
+    _run_step_c_parity_and_aot(
+        world_size=world_size,
+        batch_size=64,
+        sliding_window=2049,
+        rpa_mode="w8,s4,batchfull,g4k,foldcol,batch4",
+        seed=20261160 + world_size,
+        page_size=512,
+        n_active=59,
+        poison_nan=True,
+        skip_kv_write=True,
+    )
+
+
+def test_step_c_rpa_plan_group_sizing_and_fallback():
+    """Verify resolve_step_c_rpa_plan 4->2->1 batch grouping fallback and VMEM ceiling checks."""
+    from sglang_tpu.muse_megakernel.decode.b1_moe_b2_kernel import resolve_step_c_rpa_plan
+
+    # 1. Full b4_s4 (4*4*5*512 = 80*512) fits 2-scope Step (c).
+    cfg_4, one_blk, slot_pg, use_grp, is_ok = resolve_step_c_rpa_plan(
+        "w8,s4,batchfull,g4k,foldcol,batch4",
+        sliding_window=2049,
+        pages_per_seq=4,
+        phys_page_rows=512,
+        kv_pack_dense2=False,
+        b_tokens=64,
+        max_num_seqs=64,
+    )
+    assert (one_blk, slot_pg, use_grp, is_ok) == (True, 20, True, True)
+    assert cfg_4.swabatch_group_size == 4
+
+    # 2. Graceful 4 -> 2 fallback when batch tokens only divisible by 2.
+    cfg_2, one_blk_2, slot_pg_2, use_grp_2, is_ok_2 = resolve_step_c_rpa_plan(
+        "w8,s4,batchfull,g4k,foldcol,batch4",
+        sliding_window=2049,
+        pages_per_seq=4,
+        phys_page_rows=512,
+        kv_pack_dense2=False,
+        b_tokens=6,
+        max_num_seqs=6,
+    )
+    assert (one_blk_2, slot_pg_2, use_grp_2, is_ok_2) == (True, 10, True, True)
+    assert cfg_2.swabatch_group_size == 2
+
+    # 3. Graceful fallback to 1 when b_tokens != max_num_seqs or kv_pack_dense2=True.
+    cfg_1a, _, slot_pg_1a, use_grp_1a, is_ok_1a = resolve_step_c_rpa_plan(
+        "w8,s4,batchfull,g4k,foldcol,batch4",
+        sliding_window=2049,
+        pages_per_seq=4,
+        phys_page_rows=512,
+        kv_pack_dense2=False,
+        b_tokens=32,
+        max_num_seqs=64,
+    )
+    assert (slot_pg_1a, use_grp_1a, is_ok_1a) == (5, False, True)
+    assert cfg_1a.swabatch_group_size == 1
+
+    cfg_1b, _, slot_pg_1b, use_grp_1b, is_ok_1b = resolve_step_c_rpa_plan(
+        "w8,s4,batchfull,g4k,foldcol,batch4,dense2",
+        sliding_window=2049,
+        pages_per_seq=2,
+        phys_page_rows=256,
+        kv_pack_dense2=True,
+        b_tokens=64,
+        max_num_seqs=64,
+    )
+    assert (slot_pg_1b, use_grp_1b, is_ok_1b) == (5, False, True)
+    assert cfg_1b.swabatch_group_size == 1
+
+    # 4. Base > 20*512 rows or shared16 must return is_ok=False.
+    _, _, _, _, ok_too_big = resolve_step_c_rpa_plan(
+        "w8,s4,batchfull,g4k,foldcol,batch4",
+        sliding_window=None,
+        pages_per_seq=6,
+        phys_page_rows=512,
+        kv_pack_dense2=False,
+        b_tokens=64,
+        max_num_seqs=64,
+    )
+    assert ok_too_big is False
+
+    _, _, _, _, ok_shared = resolve_step_c_rpa_plan(
+        "shared16",
+        sliding_window=None,
+        pages_per_seq=4,
+        phys_page_rows=512,
+    )
+    assert ok_shared is False
 
 
 @pytest.mark.parametrize("has_layer_idx", [False, True])
@@ -2114,10 +2263,10 @@ def test_step_c_kv_cache_alias_zero_copy_hlo(has_layer_idx: bool):
             kv_pack_dense2=False,
             rpa_mode_str="w8_noz",
         )
-    assert captured["mutates_args"] == ("kv_cache_fused",)
+    assert captured["mutates_args"] == ()
     wrapped = captured["fn"]
-    kv_idx = wrapped.donate_argnums[0]
-    assert wrapped.input_output_aliases == {kv_idx: 2}
+    assert not wrapped.donate_argnums
+    assert not wrapped.input_output_aliases
 
     kv_shape = (64, 2, 128, 1, 4, 128) if has_layer_idx else (128, 128, 1, 4, 128)
     s = lambda sh, dt: jax.ShapeDtypeStruct(sh, dt)
@@ -2170,14 +2319,61 @@ def test_step_c_kv_cache_alias_zero_copy_hlo(has_layer_idx: bool):
     ):
         lowered = wrapped.jit_fn.lower(*jax_args)
     hlo_text = lowered.compiler_ir("hlo").as_hlo_text()
-    # Assert kv_cache_fused aliases output 2 with ZERO HLO copy op on kv_cache!
+    # Read-only kv_cache_fused + 32 KiB kv_merged return must emit ZERO copy or alias on kv_cache!
     kv_shape_tok = "f8e4m3fn[64,2,128,1,4,128]" if has_layer_idx else "f8e4m3fn[128,128,1,4,128]"
     kv_copy_lines = [
         ln for ln in hlo_text.splitlines()
         if kv_shape_tok in ln and "copy." in ln
     ]
     assert not kv_copy_lines, f"Unexpected kv_cache copy in HLO: {kv_copy_lines}"
-    assert "input_output_alias" in hlo_text or "output_to_operand_aliasing" in hlo_text
+    assert "input_output_alias" not in hlo_text and "output_to_operand_aliasing" not in hlo_text
+
+    # Guard against regression: calling wrapped must NEVER invoke kv_cache.copy_(...) (#4210).
+    from sglang_tpu import pallas_jax_op
+    from torch_tpu._internal.pallas import pallas as pallas_impl
+
+    class _NoCopyTensor(torch.Tensor):
+        @staticmethod
+        def __new__(cls, data):
+            return torch.Tensor._make_subclass(cls, data)
+
+        def copy_(self, *_a, **_kw):
+            raise AssertionError("Step (c) must never invoke kv_cache.copy_()")
+
+    torch_args = [
+        _NoCopyTensor(torch.empty(a.shape, dtype=pallas_impl.JAX_TO_TORCH_DTYPE_MAP[a.dtype]))
+        if isinstance(a, jax.ShapeDtypeStruct)
+        else a
+        for a in jax_args
+    ]
+    with (
+        tpu_info_for_cpu_export(),
+        mock.patch.object(pallas_impl.tpu_torch_pallas, "register_custom_kernel"),
+        mock.patch.object(
+            pallas_jax_op,
+            "_torch_placeholder",
+            side_effect=lambda aval, sharding, mesh: torch.empty(
+                pallas_jax_op._convert_partitioned_shape(
+                    aval.shape,
+                    mesh,
+                    getattr(sharding, "spec", None),
+                    lambda sz, ax: sz // ax,
+                ),
+                dtype=pallas_impl.JAX_TO_TORCH_DTYPE_MAP[aval.dtype],
+            ),
+        ),
+        mock.patch.object(
+            pallas_impl.tpu_torch_pallas,
+            "call_custom_kernel",
+            return_value=[
+                torch.zeros((r_pair, hidden), dtype=torch.float32),
+                torch.zeros((batch_size, 1024), dtype=torch.bfloat16),
+                torch.zeros((batch_size, 1, 4, 128), dtype=torch.float8_e4m3fn),
+            ],
+        ),
+    ):
+        res = wrapped(*torch_args)
+    assert len(res) == 3 and tuple(res[2].shape) == (batch_size, 1, 4, 128)
 
 
 @pytest.mark.parametrize(
@@ -2635,9 +2831,14 @@ def test_nonuniform_free_params_zero_compile_and_step_c_dispatch():
                     or (
                         torch.zeros((r_pair, h_dim), dtype=torch.float32),
                         torch.full((batch, 1024), 3.0, dtype=torch.bfloat16),
+                        torch.zeros((batch, 1, 4, 128), dtype=torch.float8_e4m3fn),
                     )
                 )
             ),
+        ),
+        mock.patch(
+            "sglang_tpu.muse_megakernel.decode.b1_moe_ops.get_step_c_kv_write_op",
+            side_effect=lambda **_kw: (lambda *_args: op_calls.append("write_kv_only")),
         ),
         mock.patch(
             "sglang_tpu.muse_megakernel.decode.b1_moe_ops.get_b1_moe_chip_sharded_op",
@@ -2659,7 +2860,7 @@ def test_nonuniform_free_params_zero_compile_and_step_c_dispatch():
         out_c = m_c.forward(torch.zeros((batch,), dtype=torch.int32), torch.arange(batch, dtype=torch.int32), fb_c, input_embeds=torch.randn(batch, h_dim, dtype=torch.bfloat16))
     assert out_c.shape == (batch, h_dim)
     assert attn_calls == [0], f"Layer 1 self_attn must be skipped by Step (c), got attn_calls={attn_calls}"
-    assert op_calls == ["step_c", ("step_a", 3.0)]
+    assert op_calls == ["step_c", "write_kv_only", ("step_a", 3.0)]
 
     # 4. Verify B=16 replicated Step (b) dispatch when chip_sharded is off for B=16.
     attn_calls.clear()
