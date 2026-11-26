@@ -10,12 +10,14 @@ the raiden manager is a fake.
 
 import heapq
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -57,6 +59,41 @@ class TestPrefillPusher(PrefillPusherFixture, CustomTestCase):
         self.pusher.retire_settled_pushes()
         self.assertFalse(self.pusher.has_pushes_in_flight())
         self.assertEqual(self.pusher.stats["declined"], 1)
+
+    def test_pushed_length_uses_current_path_and_preserves_other_candidates(self):
+        """A completed push excludes only that length; a longer current path
+        must remain eligible, and other routes must still be considered."""
+        _, first, tokens, pages, swa = self.pusher._pick_coldest_host_leaf()
+        self.pusher._pushed_len[first] = len(tokens)
+        _, second, second_tokens, _, _ = self.pusher._pick_coldest_host_leaf()
+        self.assertIsNot(first, second)
+        self.pusher._pushed_len[second] = len(second_tokens)
+        self.assertIsNone(self.pusher._pick_coldest_host_leaf())
+        # The remembered push was shorter than the current path. The length
+        # guard must not exclude it solely because this route was pushed before.
+        self.pusher._pushed_len[first] = len(tokens) - 4
+        result = self.pusher._pick_coldest_host_leaf()
+        self.assertIs(result[1], first)
+        self.assertEqual(result[2:], (tokens, pages, swa))
+
+    def test_path_count_matches_raw_tokens_for_capped_and_bigram_keys(self):
+        """Using logical RadixKey lengths would misclassify already-pushed
+        paths when a key has a limit or encodes bigrams."""
+        root = self.cache.tree_core.root_node
+        parent = SimpleNamespace(
+            parent=root,
+            key=RadixKey(token_ids=array("q", [10, 11, 12]), is_bigram=True),
+        )
+        leaf = SimpleNamespace(
+            parent=parent,
+            key=RadixKey(token_ids=array("q", [13, 14, 15]), limit=2),
+        )
+        self.assertNotEqual(len(parent.key) + len(leaf.key), 6)
+        self.assertEqual(
+            radix_host_ops.path_tokens(self.cache, leaf), [10, 11, 12, 13, 14, 15]
+        )
+        self.assertEqual(radix_host_ops.path_token_count(self.cache, leaf), 6)
+        self.assertEqual(radix_host_ops.path_token_count(self.cache, root), 0)
 
     def test_stored_victim_path_evicts_in_the_same_order_on_every_rank(self):
         """A stored victim's path must take unique access stamps, each older

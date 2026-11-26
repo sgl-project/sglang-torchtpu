@@ -58,6 +58,15 @@ def path_tokens(cache: Any, leaf: Any) -> List[int]:
     return [t for node in reversed(path) for t in node.key.token_ids]
 
 
+def path_token_count(cache: Any, leaf: Any) -> int:
+    """Count the raw tokens ``path_tokens`` would concatenate, without copying.
+
+    RadixKey's logical length can differ for bigrams or capped views; use its
+    raw token-array length to preserve the existing path_tokens contract.
+    """
+    return sum(len(node.key.token_ids) for node in _path_to_root(cache, leaf))
+
+
 def host_page_ids(host_pool: Any, indices: Any) -> List[int]:
     """The host page ids of the host KV ``indices``."""
     return [int(p) for p in host_pool._to_page_ids(indices)]
