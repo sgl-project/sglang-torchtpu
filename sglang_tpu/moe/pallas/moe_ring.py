@@ -565,77 +565,31 @@ def moe_ring(
     )(counts, offsets, tok, active, ends, wt, x, w1, s1, w2, s2)
 
 
-# Cost model: TensorCore cycles of one call on tpu7x, for this kernel and for the
-# gmm_v2 path it replaces, as functions of the model's shape: E experts, H
-# hidden, n expert width on this rank, T tokens, k experts per token. Only the
-# difference between the two matters (prefers_ring).
-#
-# Nothing here is fitted to timings. There are two kinds of numbers:
-#
-#   * Compiled-code cycle counts. The compiler's schedule of each kernel (the
-#     LLO dump) has one bundle of instructions per cycle, so the cycles of one
-#     pass of a loop can be read off it; a term is that count times how often
-#     the code runs the loop. The counts were read for 7 weight shapes (E 96 to
-#     288, H 2048 to 8192, n 128 to 512), 2 to 256 tokens and k = 8 and 16; a
-#     coefficient below is the least-squares line through those counts.
-#   * DMA times, from the model XLA uses for this chip.
-#
-# The counts belong to this file's kernel, gmm_v2 and the compiler they were
-# dumped from: re-derive them after changing _kernel, _route, _TILE_ROWS or
-# _SLOTS, or when gmm_v2 or the compiler changes. PR #2468's description links
-# the write-up with the dump commands, the scripts and the comparison with
-# timed calls (the ring within 7%, gmm_v2 from 11% under to 33% over). Not
-# covered by any dump: other chips, k other than 8 and 16, more than 288
-# experts, H above 8192.
+# Cost model: TensorCore cycles of one call on tpu7x, for this kernel
+# (_ring_cycles) and for the gmm_v2 path it replaces (_gmm_cycles). Only their
+# difference matters (prefers_ring). The numbers are not fitted to timings; each
+# is explained where it is used. PR #2468's description links the write-up of
+# how they were read and how to re-derive them, which is needed after changing
+# _kernel, _route, _TILE_ROWS or _SLOTS, or when gmm_v2 or the compiler changes.
 
-# XLA's DMA model for tpu7x (kGhostfish in dma_latency_model.cc): a copy takes
-# a latency plus its bytes at a bandwidth.
+# The model counts work in the blocks the hardware moves:
+#   VMEM tile: 4096 bytes ([8, 128] f32 or int32, [16, 128] bf16, [32, 128] fp8).
+#   row block: one row of 128 columns.
+_VMEM_TILE_BYTES = 4096
+_ROW_BLOCK_COLUMNS = 128
+
+# XLA's DMA model for tpu7x (kGhostfish in dma_latency_model.cc): a copy takes a
+# latency plus its bytes at a bandwidth.
 _HBM_BYTES_PER_CYCLE = 1688
 _HBM_TO_VMEM_LATENCY = 692
 _VMEM_TO_HBM_LATENCY = 594
 _SMEM_BYTES_PER_CYCLE = 32
 _VMEM_TO_SMEM_LATENCY = 578
 _HBM_TO_SMEM_LATENCY = 722
-_STRIDED_BYTES_PER_CYCLE = 343  # dma.general, which gmm_v2 moves its row tiles with
-_STRIDED_LATENCY = 2796
 
-# moe_ring, cycles read from its LLO.
-# One row tile through one expert (gather, gate/up, activation, down, add), by
-# tile size: (constant, per H, per H * n).
-_RING_TILE_CYCLES = {
-    8: (933, 0.0498, 0.000722),
-    16: (1235, 0.1165, 0.000726),
-    32: (1703, 0.2699, 0.000621),
-}
-_RING_MULTI_TILE_EXPERT_CYCLES = 181  # per expert of the last size: its tile loop
-_RING_ROW_ADD_CYCLES = (9, 0.00586)  # (constant, per H): skipped for a padding row
-_RING_PROLOGUE_CYCLES = (514, 0.00149)  # (constant, per T * H): quantize x, zero acc
-_RING_EPILOGUE_CYCLES = (171, 0.00035)  # (constant, per T * H): cast the output
-# _route and the XLA code around the kernel: (constant, per E, per (T * k)^2).
-# The last one is the pairwise compare; it is the largest dumped size's value
-# and overstates smaller sizes (by 7k cycles at T * k = 2048).
-_RING_ROUTE_CYCLES = (3703, 3.86, 0.00563)
-_RING_SMEM_COPIES = 6  # counts, offsets, tok, active, ends, wt
 
-# gmm_v2, cycles read from its LLO. It runs two kernels (gate/up, then down);
-# each first scans all E groups, then runs one step per (expert, row tile).
-_GMM_SCAN_CYCLES = (37, 17)  # (per expert, per step), in each kernel
-_GMM_KERNEL_CYCLES = (150, 135)  # straight-line code of the gate/up and down kernels
-# One step: (constant, per H * n, per tile row, per H * tile row).
-_GMM_GATE_UP_STEP_CYCLES = (578, 0.000544, 2.27, 0.000198)
-_GMM_DOWN_STEP_CYCLES = (687, 0.000124, -0.21, 0.00111)
-# A step starts the next step's weight copy 110 cycles in and waits for its own
-# 240 cycles in, so a copy has one step plus this many cycles.
-_GMM_WEIGHT_COPY_LEAD_CYCLES = 130
-_GMM_MAX_TILE_ROWS = 128
-# The XLA code around the two kernels (sort, gather, unsort): a constant, plus
-# per T * k * H up to 256 pairs and from 512 pairs, where it switches to a
-# gather over all rows. The weakest numbers here: those fusions have loops
-# whose trip counts depend on the data, so their static count is rough.
-_GMM_XLA_CYCLES = 3387
-_GMM_XLA_CYCLES_PER_PAIR_H = 0.0016
-_GMM_XLA_GATHER_PAIRS = 512
-_GMM_XLA_GATHER_CYCLES_PER_PAIR_H = 0.00677
+def _vmem_tiles(num_bytes: int) -> int:
+    return pl.cdiv(num_bytes, _VMEM_TILE_BYTES)
 
 
 def _expected_experts_with_rows(
@@ -660,44 +614,79 @@ def _ring_cycles(
     n: int,
 ) -> float:
     """Cycles of one moe_ring call in which experts_with_rows[c] experts have c
-    rows each."""
+    rows each.
+
+    The cycle counts below were read from the compiled kernel: its schedule (the
+    LLO dump) has one bundle of instructions per cycle, so the cycles of one
+    pass of a loop are its bundles. They were read for 7 weight shapes (96 to
+    288 experts, hidden 2048 to 8192, width 128 to 512), 2 to 256 tokens and
+    top-k 8 and 16, and each "cycles per block" is the least-squares slope over
+    those kernels. It is not a whole number because one cycle issues several
+    instructions (up to 3 vector loads, 2 stores, 4 ALU and 2 MXU operations):
+    the 256 row blocks of an 8-row tile at hidden 4096 take 204 cycles.
+    """
     pairs = tokens * topk
-    # XLA before the kernel: _route, while both scale arrays and x are copied
-    # into VMEM.
+    x_tiles = _vmem_tiles(2 * tokens * hidden)  # x, bf16 [T, H]
+    weight_bytes = 3 * hidden * n  # one expert: w1 [H, 2n] + w2 [n, H], fp8
+    weight_tiles = _vmem_tiles(weight_bytes)
+    row_blocks = hidden // _ROW_BLOCK_COLUMNS  # in one row of x
+
+    # XLA before the kernel. _route and the op calls around it: 4003 cycles,
+    # plus 10.2 per VMEM tile of the experts x experts compare that orders the
+    # hit experts, plus 5.76 per tile of the pairs x pairs compares that order
+    # the pairs (int32, 1024 compares per tile). The last one is the 4096-pair
+    # count; it overstates 2048 pairs by 7k cycles.
+    compares_per_tile = _VMEM_TILE_BYTES // 4
     route = (
-        _RING_ROUTE_CYCLES[0]
-        + _RING_ROUTE_CYCLES[1] * num_experts
-        + _RING_ROUTE_CYCLES[2] * pairs * pairs
+        4003
+        + 10.2 * pl.cdiv(num_experts * num_experts, compares_per_tile)
+        + 5.76 * pl.cdiv(pairs * pairs, compares_per_tile)
     )
+    # Meanwhile XLA copies both scale arrays and x into VMEM.
     scale_bytes = 4 * num_experts * (2 * n + hidden) + 2 * tokens * hidden
     scales = _HBM_TO_VMEM_LATENCY + scale_bytes / _HBM_BYTES_PER_CYCLE
-    # The routing arrays go to SMEM, counted one copy after another.
+    # counts, offsets, tok, active, ends and wt go to SMEM, counted one copy
+    # after another.
     smem = (
-        _RING_SMEM_COPIES * _VMEM_TO_SMEM_LATENCY
+        6 * _VMEM_TO_SMEM_LATENCY
         + 4 * (3 * num_experts + 2 * pairs) / _SMEM_BYTES_PER_CYCLE
     )
-    prologue = _RING_PROLOGUE_CYCLES[0] + _RING_PROLOGUE_CYCLES[1] * tokens * hidden
+    # Kernel prologue: 514 cycles, plus 3.06 per tile of x to quantize it and
+    # zero the accumulator.
+    prologue = 514 + 3.06 * x_tiles
     # One expert's weights. The copies in flight share the bandwidth, so in the
     # loop an expert costs the longer of its copy and its row tiles; the first
     # expert's copy also pays the latency, less the prologue it overlaps.
-    copy = 3 * hidden * n / _HBM_BYTES_PER_CYCLE
+    copy = weight_bytes / _HBM_BYTES_PER_CYCLE
     first_copy = max(0.0, _HBM_TO_VMEM_LATENCY + copy - prologue)
-    row_add = _RING_ROW_ADD_CYCLES[0] + _RING_ROW_ADD_CYCLES[1] * hidden
+    # One row tile through one expert, by tile size: (cycles, plus per row
+    # block of the tile, plus per VMEM tile of the expert's weights). The row
+    # blocks are the gather and the add into the accumulator; a weight tile is
+    # one MXU operand.
+    tile_cycles = {8: (933, 0.80, 0.99), 16: (1235, 0.93, 0.99), 32: (1703, 1.08, 0.85)}
+    # A padding row skips its add: 9 cycles plus 0.75 per row block.
+    row_add = 9 + 0.75 * row_blocks
+    # An expert of the last tile size also runs its tile loop's 181 cycles.
+    tile_loop = 181
     experts = 0.0
     for rows_routed, count in enumerate(experts_with_rows):
         if rows_routed == 0 or count == 0:
             continue
         rows = next((r for r in _TILE_ROWS if rows_routed <= r), _TILE_ROWS[-1])
         tiles = pl.cdiv(rows_routed, rows)
-        const, per_h, per_hn = _RING_TILE_CYCLES[rows]
-        run = tiles * (const + per_h * hidden + per_hn * hidden * n)
+        const, per_row_block, per_weight_tile = tile_cycles[rows]
+        run = tiles * (
+            const + per_row_block * rows * row_blocks + per_weight_tile * weight_tiles
+        )
         run -= (tiles * rows - rows_routed) * row_add
         if rows == _TILE_ROWS[-1]:
-            run += _RING_MULTI_TILE_EXPERT_CYCLES
+            run += tile_loop
         experts += count * max(run, copy)
+    # Kernel epilogue: 171 cycles plus 0.72 per tile of x to cast the output,
+    # then XLA copies it to HBM.
     output = (
-        _RING_EPILOGUE_CYCLES[0]
-        + _RING_EPILOGUE_CYCLES[1] * tokens * hidden
+        171
+        + 0.72 * x_tiles
         + _VMEM_TO_HBM_LATENCY
         + 2 * tokens * hidden / _HBM_BYTES_PER_CYCLE
     )
@@ -707,59 +696,71 @@ def _ring_cycles(
 def _gmm_cycles(
     experts_hit: float, tokens: int, topk: int, num_experts: int, hidden: int, n: int
 ) -> float:
-    """Cycles of the gmm_v2 path for one call that hits experts_hit experts."""
+    """Cycles of the gmm_v2 path for one call that hits experts_hit experts.
+
+    gmm_v2 runs two kernels (gate/up, then down). Each scans all the experts'
+    groups, then runs one step per (expert, row tile). The cycle counts were
+    read from their compiled schedules the same way as in _ring_cycles.
+    """
     pairs = tokens * topk
     # gmm_v2's row tile: the pairs rounded up to a power of two, 16 to 128 rows.
-    tile_rows = min(_GMM_MAX_TILE_ROWS, max(16, 1 << (pairs - 1).bit_length()))
+    tile_rows = min(128, max(16, 1 << (pairs - 1).bit_length()))
     tiles = pl.cdiv(pairs, tile_rows)
     steps = experts_hit + tiles - 1
-    total = _GMM_XLA_CYCLES + pairs * hidden * (
-        _GMM_XLA_CYCLES_PER_PAIR_H
-        if pairs < _GMM_XLA_GATHER_PAIRS
-        else _GMM_XLA_GATHER_CYCLES_PER_PAIR_H
-    )
-    # Per kernel: its step cycles, its fixed code, the bytes of one step's
-    # weights, and of one row tile in and out.
+    # XLA around the two kernels sorts the pairs' rows and adds the results
+    # back: 3387 cycles, plus 3.27 per VMEM tile of the sorted rows (bf16
+    # [pairs, H]): 2 to gather them and 1.1 to combine the output. From 512
+    # pairs XLA gathers in loops whose trip counts depend on the data; 13.4 per
+    # tile is their static count and the roughest number here.
+    sorted_row_tiles = _vmem_tiles(2 * pairs * hidden)
+    total = 3387 + (3.27 if pairs < 512 else 13.4) * sorted_row_tiles
+    # dma.general, which moves the row tiles, in XLA's DMA model.
+    strided_latency, strided_bytes_per_cycle = 2796, 343
+    # Per kernel: one step's cycles as (constant, per VMEM tile of the step's
+    # weights, per tile row, per VMEM tile of the bf16 [tile_rows, H] side of
+    # the row tile); its straight-line cycles; the bytes of one step's weights,
+    # of a row tile coming in and of one going out.
     kernels = (
-        (
-            _GMM_GATE_UP_STEP_CYCLES,
-            _GMM_KERNEL_CYCLES[0],
+        (  # gate/up: [tile_rows, H] in, [tile_rows, n] out
+            (578, 1.12, 2.27, 0.40),
+            150,
             2 * hidden * n,
             2 * tile_rows * hidden,
             2 * tile_rows * n,
         ),
-        (
-            _GMM_DOWN_STEP_CYCLES,
-            _GMM_KERNEL_CYCLES[1],
+        (  # down: [tile_rows, n] in, [tile_rows, H] out
+            (687, 0.51, -0.21, 2.28),
+            135,
             hidden * n,
             2 * tile_rows * n,
             2 * tile_rows * hidden,
         ),
     )
     for step_cycles, fixed, weight_bytes, in_bytes, out_bytes in kernels:
-        const, per_hn, per_row, per_h_row = step_cycles
+        const, per_weight_tile, per_row, per_row_tile = step_cycles
         step = (
             const
-            + per_hn * hidden * n
+            + per_weight_tile * _vmem_tiles(weight_bytes)
             + per_row * tile_rows
-            + per_h_row * hidden * tile_rows
+            + per_row_tile * _vmem_tiles(2 * tile_rows * hidden)
         )
+        # The group scan: the group sizes come to SMEM, then 37 cycles per
+        # expert and 17 per step.
         scan = (
             _HBM_TO_SMEM_LATENCY
             + 4 * num_experts / _SMEM_BYTES_PER_CYCLE
-            + _GMM_SCAN_CYCLES[0] * num_experts
-            + _GMM_SCAN_CYCLES[1] * steps
+            + 37 * num_experts
+            + 17 * steps
         )
-        # The next step's weights are copied during the current step.
+        # A step starts the next step's weight copy 110 cycles in and waits for
+        # its own 240 cycles in, so a copy has one step plus 130 cycles.
         weight_copy = _HBM_TO_VMEM_LATENCY + weight_bytes / _HBM_BYTES_PER_CYCLE
-        weight_wait = weight_copy + steps * max(
-            0.0, weight_copy - step - _GMM_WEIGHT_COPY_LEAD_CYCLES
-        )
+        weight_wait = weight_copy + steps * max(0.0, weight_copy - step - 130)
         # The first row tile in and the last one out are waited for in full. A
         # later tile comes in during the step before it; a tile goes out while
         # the next tile's steps run, which is not counted.
-        row_in = _STRIDED_LATENCY + in_bytes / _STRIDED_BYTES_PER_CYCLE
-        row_out = _STRIDED_LATENCY + out_bytes / _STRIDED_BYTES_PER_CYCLE
+        row_in = strided_latency + in_bytes / strided_bytes_per_cycle
+        row_out = strided_latency + out_bytes / strided_bytes_per_cycle
         row_wait = row_in + row_out + (tiles - 1) * max(0.0, row_in - step)
         total += fixed + scan + steps * step + weight_wait + row_wait
     return total
@@ -782,7 +783,7 @@ def ring_cost_cycles(
 def gmm_cost_cycles(
     tokens: int, topk: int, num_experts: int, hidden: int, n: int
 ) -> float:
-    """Modelled cycles of the gmm_v2 path for the same call."""
+    """Modelled cycles of the gmm_v2 path for the same call under uniform routing."""
     missed = _expected_experts_with_rows(tokens, topk, num_experts)[0]
     return _gmm_cycles(num_experts - missed, tokens, topk, num_experts, hidden, n)
 
