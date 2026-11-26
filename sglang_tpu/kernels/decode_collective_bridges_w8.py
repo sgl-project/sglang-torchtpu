@@ -54,7 +54,7 @@ _ATTN_TO_MOE_TOK_SH_OPS: dict[tuple[int, bool, bool], Callable] = {}
 _MOE_TO_ATTN_TOK_SH_OPS: dict[tuple[int, bool, bool, bool], Callable] = {}
 _MOE_POST_TOK_SH_FINAL_OPS: dict[tuple[int, bool, bool], Callable] = {}
 _EMBED_CHIP_SHARDED_OPS: dict[int, Callable] = {}
-_ATTN_TO_MOE_CHIP_SH_OPS: dict[tuple[int, bool, bool], Callable] = {}
+_ATTN_TO_MOE_CHIP_SH_OPS: dict[tuple[int, bool, bool, bool], Callable] = {}
 _MOE_TO_ATTN_CHIP_SH_OPS: dict[tuple[int, bool, bool, bool], Callable] = {}
 _MOE_POST_CHIP_SH_FINAL_OPS: dict[tuple[int, bool, bool], Callable] = {}
 _AG_CHIP_CAP_OPS: dict[int, Callable] = {}
@@ -5063,6 +5063,12 @@ def _tp16_parallel_rs_enabled() -> bool:
     return bool(envs.SGLANG_TPU_MUSE_DECODE_TP16_PARALLEL_RS.get())
 
 
+def _bug_c_oneshot_enabled() -> bool:
+    from sglang_tpu.envs import envs
+
+    return bool(envs.SGLANG_TPU_MUSE_DECODE_BUG_C_ONESHOT.get())
+
+
 def _tile_spans(total: int, max_step: int = 512) -> tuple[tuple[int, int], ...]:
     """Split a 128-aligned width into ``(offset, width)`` spans <= ``max_step``."""
     spans: list[tuple[int, int]] = []
@@ -5331,6 +5337,7 @@ def _run_chip_b1_vmem_core(
     during_ag_exp_d2d2_fn=None,
     out_expert_3d_ref=None,
     parallel_rs: bool | None = None,
+    bug_c_oneshot: bool | None = None,
 ) -> None:
     """Reusable VMEM-resident Wave-9 chip-sharded Bridge 1b core (`standalone` & `b1+MoE(+b2)`).
 
@@ -5388,6 +5395,7 @@ def _run_chip_b1_vmem_core(
     other_c0 = pl.multiple_of(other_side * half, 128)
     chip_r0 = pl.multiple_of(chip * r_pair, r_align)
     own_pre_c0 = pl.multiple_of(side * pre_pair_cols, 128)
+    other_pre_c0 = pl.multiple_of(other_side * pre_pair_cols, 128)
     side_t0 = pl.multiple_of(side * half_tiles, 16)
 
     if not skip_barrier_signal:
@@ -5427,6 +5435,7 @@ def _run_chip_b1_vmem_core(
     use_prs = (
         world_size == 16
         and r_pair == 8
+        and half >= 384
         and (_tp16_parallel_rs_enabled() if parallel_rs is None else bool(parallel_rs))
     )
 
@@ -5897,7 +5906,12 @@ def _run_chip_b1_vmem_core(
         n_r=r_pair, n_cols=pre_pair_cols, align=r_align,
     )
 
-    if r_pair == 8:
+    use_bugc_1shot = (
+        r_pair == 8
+        and (_bug_c_oneshot_enabled() if bug_c_oneshot is None else bool(bug_c_oneshot))
+    )
+
+    if r_pair == 8 and use_bugc_1shot:
         # Bug C + 1-shot half-col ag_exp (TP=8 B=32 & TP=16 B=64): swap 4 KiB sq_pair_pre_buf
         # <-> sq_pair_pa_buf (idle for r_pair=8), normalize own half (-50% VPU), gather 1-shot
         # half-cols over ICI (-50% ICI bytes), unpack pairs, then overlap d2d2 with during_d2d2_fn.
@@ -5937,7 +5951,7 @@ def _run_chip_b1_vmem_core(
             y_own = (x_own * g_own) * inv if pre_exp_scale_input else (x_own * inv) * g_own
             exp_3d_buf[chip, :, c_l] = y_own.astype(exp_dtype)
 
-        if early_router_and_log_ag:
+        if early_router_and_log_ag or use_prs:
             _wait_log_ag()
 
         half_exp_slice = exp_3d_buf.at[chip, :, pl.ds(0, pre_pair_cols)]
@@ -5954,7 +5968,7 @@ def _run_chip_b1_vmem_core(
             )
             op_e.start()
             ag_exp_ops.append(op_e)
-        if not early_router_and_log_ag:
+        if not (early_router_and_log_ag or use_prs):
             _wait_log_ag()
         if during_ag_exp_ici_fn is not None:
             during_ag_exp_ici_fn()
@@ -6003,6 +6017,101 @@ def _run_chip_b1_vmem_core(
         if during_ag_exp_d2d2_fn is not None:
             during_ag_exp_d2d2_fn()
         op_d2d2.wait()
+    elif r_pair == 8:
+        op_pre = pltpu.make_async_remote_copy(
+            pre_my_half, pre_mate_half, pre_send.at[0], pre_recv.at[0],
+            device_id=(mate,), device_id_type=pl.DeviceIdType.MESH,
+        )
+        op_pre.start()
+
+        if not early_router_and_log_ag:
+            _run_router_and_start_log_ag()
+
+        p_blk = min(pre_pair_cols, 1024)
+        own_pre_sq = jnp.zeros((r_pair, 128), dtype=jnp.float32)
+        for c0 in range(0, pre_pair_cols, p_blk):
+            c_l = pl.ds(c0, p_blk)
+            c_own = pl.ds(pl.multiple_of(own_pre_c0 + c0, 128), p_blk)
+            xf = pre_my_half[:, c_l].astype(jnp.float32)
+            if pre_exp_scale_input:
+                xf = xf * pre_exp_gain_ref[0:1, c_own]
+            own_pre_sq = own_pre_sq + _fold_cols_to_128(xf * xf)
+        op_pre.wait()
+        oth_pre_sq = jnp.zeros((r_pair, 128), dtype=jnp.float32)
+        for c0 in range(0, pre_pair_cols, p_blk):
+            c_l = pl.ds(c0, p_blk)
+            c_oth = pl.ds(pl.multiple_of(other_pre_c0 + c0, 128), p_blk)
+            xf = pre_mate_half[:, c_l].astype(jnp.float32)
+            if pre_exp_scale_input:
+                xf = xf * pre_exp_gain_ref[0:1, c_oth]
+            oth_pre_sq = oth_pre_sq + _fold_cols_to_128(xf * xf)
+        pre_sq = own_pre_sq + oth_pre_sq
+        inv = lax.rsqrt(
+            jnp.sum(pre_sq, axis=-1, keepdims=True) * jnp.float32(1.0 / h_pre)
+            + jnp.float32(pre_exp_eps)
+        )
+        for c0 in range(0, pre_pair_cols, p_blk):
+            c_l = pl.ds(c0, p_blk)
+            c_own = pl.ds(pl.multiple_of(own_pre_c0 + c0, 128), p_blk)
+            c_oth = pl.ds(pl.multiple_of(other_pre_c0 + c0, 128), p_blk)
+            x_own = pre_my_half[:, c_l].astype(jnp.float32)
+            x_oth = pre_mate_half[:, c_l].astype(jnp.float32)
+            g_own = pre_exp_gain_ref[0:1, c_own]
+            g_oth = pre_exp_gain_ref[0:1, c_oth]
+            y_own = (x_own * g_own) * inv if pre_exp_scale_input else (x_own * inv) * g_own
+            y_oth = (x_oth * g_oth) * inv if pre_exp_scale_input else (x_oth * inv) * g_oth
+            exp_3d_buf[chip, :, c_own] = y_own.astype(exp_dtype)
+            exp_3d_buf[chip, :, c_oth] = y_oth.astype(exp_dtype)
+
+        if early_router_and_log_ag or use_prs:
+            _wait_log_ag()
+
+        ag_exp_ops = []
+        for d in range(1, n_chips):
+            peer = me ^ jnp.int32(d << 1)
+            op_e = pltpu.make_async_remote_copy(
+                exp_3d_buf.at[chip],
+                exp_3d_buf.at[chip],
+                ag_exp_send.at[d - 1],
+                ag_exp_recv.at[d - 1],
+                device_id=(peer,),
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+            op_e.start()
+            ag_exp_ops.append(op_e)
+        if not (early_router_and_log_ag or use_prs):
+            _wait_log_ag()
+        if during_ag_exp_ici_fn is not None:
+            during_ag_exp_ici_fn()
+        if during_ag_exp_d2d2_fn is not None:
+            during_ag_exp_d2d2_fn()
+        for op in ag_exp_ops:
+            op.wait()
+        if out_expert_3d_ref is not None:
+            for p in range(n_chips // 2):
+                r16 = pl.ds(16 * p, 16)
+                for h_i in range(2):
+                    h_c0 = pl.multiple_of(h_i * pre_pair_cols, 128)
+                    h_t0 = pl.multiple_of(h_i * half_tiles, 16)
+                    v16 = jnp.concatenate(
+                        [
+                            exp_3d_buf[2 * p, :, pl.ds(h_c0, pre_pair_cols)],
+                            exp_3d_buf[2 * p + 1, :, pl.ds(h_c0, pre_pair_cols)],
+                        ],
+                        axis=0,
+                    )
+                    out_expert_3d_ref[r16, pl.ds(h_t0, half_tiles), :] = v16.reshape(
+                        16, half_tiles, 128
+                    )
+        else:
+            e_w = min(h_pre, 1024)
+            for p in range(n_chips // 2):
+                r16 = pl.ds(16 * p, 16)
+                for c0 in range(0, h_pre, e_w):
+                    c_sl = pl.ds(c0, e_w)
+                    out_expert_in_ref[r16, c_sl] = jnp.concatenate(
+                        [exp_3d_buf[2 * p, :, c_sl], exp_3d_buf[2 * p + 1, :, c_sl]], axis=0
+                    )
     else:
         # Bug C Fix (r_pair >= 16): swap 8..48 KiB `sq_pair_pre_buf [r_pair, 128]`, normalize ONLY
         # own half (`-50%` VPU), and launch half-col `ag_exp` ICI overlapped under `W_router`!
@@ -6132,6 +6241,7 @@ def _attn_to_moe_chip_sharded_bridge_kernel(
     pre_exp_eps: float,
     pre_exp_scale_input: bool,
     parallel_rs: bool | None = None,
+    bug_c_oneshot: bool | None = None,
 ) -> None:
     """Wave-9 Chip-Sharded Bridge 1b (`TP=8` & `TP=16`): 0 `op_pair`/`op_rpair`, 0 concat, 0 `scf.for`!"""
     _run_chip_b1_vmem_core(
@@ -6144,6 +6254,7 @@ def _attn_to_moe_chip_sharded_bridge_kernel(
         pre_exp_eps=pre_exp_eps,
         pre_exp_scale_input=pre_exp_scale_input,
         parallel_rs=parallel_rs,
+        bug_c_oneshot=bug_c_oneshot,
     )
 
 
@@ -6168,6 +6279,7 @@ def attn_to_moe_chip_sharded_bridge_jax(
     pre_exp_eps: float = 1e-5,
     pre_exp_scale_input: bool = False,
     parallel_rs: bool | None = None,
+    bug_c_oneshot: bool | None = None,
     collective_id: int = _W8_CID_BASE + 8,
     interpret: bool = False,
 ):
@@ -6216,6 +6328,7 @@ def attn_to_moe_chip_sharded_bridge_jax(
             pre_exp_eps=float(pre_exp_eps),
             pre_exp_scale_input=bool(pre_exp_scale_input),
             parallel_rs=parallel_rs,
+            bug_c_oneshot=bug_c_oneshot,
         ),
         interpret=interpret,
         out_shape=(
@@ -8359,8 +8472,10 @@ def get_attn_to_moe_chip_sharded_bridge_op(
     if world_size not in SUPPORTED_WORLD_SIZES:
         raise ValueError(f"Chip-sharded Bridge 1b requires world_size in (8, 16), got {world_size}")
     prs_flag = _tp16_parallel_rs_enabled() if world_size == 16 else False
+    bc1s_flag = _bug_c_oneshot_enabled()
     prs_sfx = "_prs" if prs_flag else ""
-    key = (int(world_size), bool(bf16_router), prs_flag)
+    bc1s_sfx = "_bc1s" if bc1s_flag else ""
+    key = (int(world_size), bool(bf16_router), prs_flag, bc1s_flag)
     op = _ATTN_TO_MOE_CHIP_SH_OPS.get(key)
     if op is not None:
         return op
@@ -8419,6 +8534,7 @@ def get_attn_to_moe_chip_sharded_bridge_op(
                         pre_exp_eps=float(pre_exp_eps),
                         pre_exp_scale_input=bool(pre_exp_scale_input),
                         parallel_rs=prs_flag,
+                        bug_c_oneshot=bc1s_flag,
                     )
 
                 return jax.shard_map(
@@ -8430,7 +8546,7 @@ def get_attn_to_moe_chip_sharded_bridge_op(
 
             tag = "r16" if bf16_router else "r32"
             op = cpu_export_jax_op(
-                f"sglang_tpu_pallas::muse_w9_chip_attn_to_moe_{tag}_tp{world_size}{prs_sfx}",
+                f"sglang_tpu_pallas::muse_w9_chip_attn_to_moe_{tag}_tp{world_size}{prs_sfx}{bc1s_sfx}",
                 _wrapped,
                 mesh=mesh,
                 input_partition_specs=in_specs,

@@ -34,6 +34,7 @@ def test_w9_env_default_and_lock_free_prewarm():
 
     assert envs.SGLANG_TPU_MUSE_DECODE_CHIP_SHARDED_BRIDGES.default is False
     assert envs.SGLANG_TPU_MUSE_DECODE_TP16_PARALLEL_RS.default is False
+    assert envs.SGLANG_TPU_MUSE_DECODE_BUG_C_ONESHOT.default is False
     assert envs.SGLANG_TPU_MUSE_DECODE_TP16_QKV_EPI.default is False
     assert envs.SGLANG_TPU_MUSE_DECODE_CHIP_B2_TP2_WPOST.default is False
 
@@ -50,6 +51,7 @@ def test_w9_env_default_and_lock_free_prewarm():
                 for env_name in (
                     "SGLANG_TPU_MUSE_DECODE_CHIP_SHARDED_BRIDGES",
                     "SGLANG_TPU_MUSE_DECODE_TP16_PARALLEL_RS",
+                    "SGLANG_TPU_MUSE_DECODE_BUG_C_ONESHOT",
                     "SGLANG_TPU_MUSE_DECODE_TP16_QKV_EPI",
                     "SGLANG_TPU_MUSE_DECODE_CHIP_B2_TP2_WPOST",
                 ):
@@ -3138,7 +3140,7 @@ def test_tp16_b64_prs_and_bug_c_oneshot_interpret_and_aot():
     )
     w_rt = jnp.asarray((rng.standard_normal((H, 256)) * 0.03).astype(np.float32), dtype=jnp.bfloat16)
 
-    def _run_standalone(parallel_rs: bool):
+    def _run_standalone(parallel_rs: bool, bug_c_oneshot: bool):
         return jax.jit(
             jax.shard_map(
                 lambda *a: w8.attn_to_moe_chip_sharded_bridge_jax(
@@ -3151,6 +3153,7 @@ def test_tp16_b64_prs_and_bug_c_oneshot_interpret_and_aot():
                     pre_exp_eps=1e-5,
                     pre_exp_scale_input=False,
                     parallel_rs=parallel_rs,
+                    bug_c_oneshot=bug_c_oneshot,
                     interpret=ip_race,
                 ),
                 mesh=mesh,
@@ -3163,8 +3166,16 @@ def test_tp16_b64_prs_and_bug_c_oneshot_interpret_and_aot():
             )
         )(st_stacked, gated, wo, s_wo, pa_a, pa_b, g_pre, w_pre, s_pre, w_rt, g_exp)
 
-    st_ser, log_ser, exp_ser = _run_standalone(False)
-    st_prs, log_prs, exp_prs = _run_standalone(True)
+    st_ser, log_ser, exp_ser = _run_standalone(False, False)
+    st_bc1s, log_bc1s, exp_bc1s = _run_standalone(False, True)
+    st_prs, log_prs, exp_prs = _run_standalone(True, True)
+
+    np.testing.assert_array_equal(
+        np.asarray(st_bc1s).reshape(tp, r_pair, H)[:, :7],
+        np.asarray(st_ser).reshape(tp, r_pair, H)[:, :7],
+    )
+    np.testing.assert_array_equal(np.asarray(log_bc1s)[:valid], np.asarray(log_ser)[:valid])
+    np.testing.assert_array_equal(np.asarray(exp_bc1s)[:valid], np.asarray(exp_ser)[:valid])
 
     st_ser_np = np.asarray(st_ser).reshape(tp, r_pair, H)
     st_prs_np = np.asarray(st_prs).reshape(tp, r_pair, H)
@@ -3184,7 +3195,7 @@ def test_tp16_b64_prs_and_bug_c_oneshot_interpret_and_aot():
     assert st_cos >= 0.99999
     assert exp_cos >= 0.99999
 
-    # Verify _run_chip_b1_vmem_core with 3D output + during_ag_exp_d2d2_fn + env override (0-ULP vs standalone PRS!)
+    # Verify _run_chip_b1_vmem_core with 3D output + during_ag_exp_d2d2_fn + b1_moe_b2 sem aliasing + env overrides!
     vmem, hbm, sem = pltpu.VMEM, pltpu.HBM, pltpu.SemaphoreType.DMA
     v_sp, h_sp = pl.BlockSpec(memory_space=vmem), pl.BlockSpec(memory_space=hbm)
     four_pair = 4 * r_pair
@@ -3196,7 +3207,7 @@ def test_tp16_b64_prs_and_bug_c_oneshot_interpret_and_aot():
             out_st_hbm, out_log_ref, out_exp3d_ref, out_snap_ref,
             wo_buf, wpre_buf, wrt_buf, s_buf, send_half, mate_recv, own_half,
             r1a, r1b, r2a, r2b, my_p, recv_p, sq_pa, ffn_p, rt_p, pre_my, pre_mate, sq_pre, exp_3d,
-            sems_local, d2d_s, d2d_r, ici_s, ici_r, log_s, log_r,
+            sems_local, d2d_s, d2d_r, rs1_s, rs1_r, ici_s, ici_r, log_s, log_r,
         ) = refs
         w8._run_chip_b1_vmem_core(
             st_hbm, g_ref, wo_hbm, swo_ref, a_ref, b_ref, gpre_ref,
@@ -3208,8 +3219,8 @@ def test_tp16_b64_prs_and_bug_c_oneshot_interpret_and_aot():
             sems_local.at[0:2], sems_local.at[2:3], sems_local.at[3:4],
             sems_local.at[4:5], sems_local.at[5:6],
             d2d_s.at[0:1], d2d_r.at[0:1],
-            ici_s, ici_r, ici_s, ici_r, ici_s, ici_r,
-            d2d_s.at[0:1], d2d_r.at[0:1], d2d_s.at[0:1], d2d_r.at[0:1],
+            rs1_s, rs1_r, rs1_s, rs1_r, rs1_s, rs1_r,
+            d2d_s.at[0:1], d2d_r.at[0:1], rs1_s, rs1_r,
             ici_s, ici_r, d2d_s.at[0:1], d2d_r.at[0:1], log_s, log_r,
             world_size=tp,
             pa_eps=1e-8,
@@ -3256,13 +3267,17 @@ def test_tp16_b64_prs_and_bug_c_oneshot_interpret_and_aot():
             vmem((r_pair, 128), jnp.float32),
             vmem((n_chips, 8, H_PRE), jnp.bfloat16),
             sem((6,)), sem((1,)), sem((1,)),
+            sem((1,)), sem((1,)),
             sem((n_chips - 1,)), sem((n_chips - 1,)),
             sem((n_chips - 1,)), sem((n_chips - 1,)),
         ],
         compiler_params=pltpu.CompilerParams(collective_id=w8._W8_CID_BASE + 109, disable_bounds_checks=True),
     )
 
-    with envs.SGLANG_TPU_MUSE_DECODE_TP16_PARALLEL_RS.override(True):
+    with (
+        envs.SGLANG_TPU_MUSE_DECODE_TP16_PARALLEL_RS.override(True),
+        envs.SGLANG_TPU_MUSE_DECODE_BUG_C_ONESHOT.override(True),
+    ):
         got_st, got_log, got_exp3d, got_snap = jax.jit(
             jax.shard_map(
                 lambda st, ga, w_o, swo, a, b, gp, wp, sp, wr, ge: core_call(
@@ -3297,7 +3312,7 @@ def test_tp16_b64_prs_and_bug_c_oneshot_interpret_and_aot():
         np.asarray(exp_prs)[:valid],
     )
 
-    # 2. Verify op-cache isolation when SGLANG_TPU_MUSE_DECODE_TP16_PARALLEL_RS flips
+    # 2. Verify op-cache isolation when SGLANG_TPU_MUSE_DECODE_TP16_PARALLEL_RS / BUG_C_ONESHOT flip
     seen_names: list[str] = []
 
     def _rec_export(name, fn, *, mesh=None, input_partition_specs=None, output_partition_specs=None):
@@ -3310,11 +3325,17 @@ def test_tp16_b64_prs_and_bug_c_oneshot_interpret_and_aot():
         mock.patch.dict(w8._ATTN_TO_MOE_CHIP_SH_OPS, {}, clear=True),
     ):
         w8.get_attn_to_moe_chip_sharded_bridge_op(16, bf16_router=True)
-        with envs.SGLANG_TPU_MUSE_DECODE_TP16_PARALLEL_RS.override(True):
+        with envs.SGLANG_TPU_MUSE_DECODE_BUG_C_ONESHOT.override(True):
+            w8.get_attn_to_moe_chip_sharded_bridge_op(16, bf16_router=True)
+        with (
+            envs.SGLANG_TPU_MUSE_DECODE_TP16_PARALLEL_RS.override(True),
+            envs.SGLANG_TPU_MUSE_DECODE_BUG_C_ONESHOT.override(True),
+        ):
             w8.get_attn_to_moe_chip_sharded_bridge_op(16, bf16_router=True)
     assert seen_names == [
         "sglang_tpu_pallas::muse_w9_chip_attn_to_moe_r16_tp16",
-        "sglang_tpu_pallas::muse_w9_chip_attn_to_moe_r16_tp16_prs",
+        "sglang_tpu_pallas::muse_w9_chip_attn_to_moe_r16_tp16_bc1s",
+        "sglang_tpu_pallas::muse_w9_chip_attn_to_moe_r16_tp16_prs_bc1s",
     ]
 
     # 3. Offline TPU7x 2x2x2 AOT compilation at exact production B=64 TP=16 H=8192 H_PRE=4096!
@@ -3342,11 +3363,11 @@ def test_tp16_b64_prs_and_bug_c_oneshot_interpret_and_aot():
         jax.ShapeDtypeStruct((1, prod_HPRE), jnp.float32),
     )
     b1_in_sp = tuple(P() for _ in b1_local)
-    for prs_flag in (False, True):
+    for prs_flag, bc_flag in ((False, False), (False, True), (True, True)):
         sm_b1 = jax.jit(
             jax.shard_map(
-                lambda *a, _p=prs_flag: w8.attn_to_moe_chip_sharded_bridge_jax(
-                    *a, world_size=16, parallel_rs=_p, interpret=False
+                lambda *a, _p=prs_flag, _b=bc_flag: w8.attn_to_moe_chip_sharded_bridge_jax(
+                    *a, world_size=16, parallel_rs=_p, bug_c_oneshot=_b, interpret=False
                 ),
                 mesh=aot_mesh,
                 in_specs=b1_in_sp,
@@ -3392,8 +3413,11 @@ def test_tp16_b64_prs_and_bug_c_oneshot_interpret_and_aot():
         jax.ShapeDtypeStruct((B, 2, 128), jnp.float32),
     )
     stepb_sp = tuple(P() for _ in stepb_shapes)
-    for prs_flag in (False, True):
-        with envs.SGLANG_TPU_MUSE_DECODE_TP16_PARALLEL_RS.override(prs_flag):
+    for prs_flag, bc_flag in ((False, False), (False, True), (True, True)):
+        with (
+            envs.SGLANG_TPU_MUSE_DECODE_TP16_PARALLEL_RS.override(prs_flag),
+            envs.SGLANG_TPU_MUSE_DECODE_BUG_C_ONESHOT.override(bc_flag),
+        ):
             sm_stepb = jax.jit(
                 jax.shard_map(
                     lambda *a: b1_moe_b2_chip_sharded_jax(*a, world_size=16, fuse_qkv_epi=True, interpret=False),
