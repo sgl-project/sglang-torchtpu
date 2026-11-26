@@ -793,6 +793,15 @@ def _invoke_v3_kernel(
             and sw2048_fuse_env.get()
         ):
             prefill_opts.add("sw2048_fuse")
+        topk_slices = int(envs.SGLANG_TPU_RPA_V3_PREFILL_TOPK_SLICES.get())
+        topk_qstride = int(envs.SGLANG_TPU_RPA_V3_PREFILL_TOPK_QSTRIDE.get())
+        if (
+            topk_slices > 0
+            and is_lc_full
+            and "prefix_fast" in prefill_opts
+        ):
+            extra["_prefill_topk_slices"] = topk_slices
+            extra["_prefill_topk_qstride"] = topk_qstride
     else:
         if mixed_blocks:
             extra["m_block_sizes"] = mixed_blocks

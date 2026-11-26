@@ -1113,6 +1113,13 @@ class TpuEnvs:
     # writes unpacked bf16[T, 1024] directly from its epilogue (16 MiB vs 32 MiB), dropping
     # prepare_outputs copy, KV_PACK pair-sum, and A3 attn_ref relayout copy. Exact.
     SGLANG_TPU_RPA_V3_PREFILL_A3_LAYOUT = EnvBool(False)
+    # Opt-in 2-kernel LC Full prefill top-k slice pruning (default 0 = disabled).
+    # When > 0 (multiple of 4, < half-slices per bkv block), keeps the top-k
+    # 128-key half-slices per prefix bkv block while keeping sink (bkv=0) and
+    # causal tail dense.
+    SGLANG_TPU_RPA_V3_PREFILL_TOPK_SLICES = EnvInt(0)
+    # Query pooling stride for Stage-1 All-QK scoring (2 = pair-averaged Q, 1 = full Q).
+    SGLANG_TPU_RPA_V3_PREFILL_TOPK_QSTRIDE = EnvInt(2)
     # Muse prefill kernel path with SGLANG_TPU_KV_PACK_HEADS: A1 (two-half bf16 variants)
     # writes q and kv in RPA v3's packed layout, dropping the XLA expand/repack glue.
     SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT = EnvBool(False)
