@@ -92,7 +92,12 @@ def _kernel(
     live_hbm_ref: Any = None,
     guard_tail: bool = False,
     rope_words: int = ROPE_WORDS,
+    phase_stride: int = 0,
+    query_batch_shift: int = 0,
+    compact_rope_output: bool = False,
+    rows_per_dma: int = NUM_LANES,
 ):
+    streams = OCCURRENCES_PER_ATOM // rows_per_dma
     owner = lax.axis_index((core_axis_name, subcore_axis_name))
     live_batches = None
     if live_hbm_ref is not None:
@@ -111,28 +116,44 @@ def _kernel(
     def serve_batch(indices_ref):
         owner_batch = pl.program_id(0)
         logical_batch = owner + owner_batch * num_owners
-        occurrence_base = logical_batch * atoms_per_batch * OCCURRENCES_PER_ATOM
+
+        def scheduled_atom(atom):
+            # Stagger owners serving different queries without rearranging indices
+            # in HBM. Apply the same permutation to input and output addresses.
+            if not phase_stride:
+                return atom
+            query = logical_batch >> query_batch_shift
+            return (atom + query * phase_stride) & (atoms_per_batch - 1)
 
         def values(atom, stream):
-            return indices_ref[0, atom, stream, :]
+            if rows_per_dma == NUM_LANES:
+                return indices_ref[0, scheduled_atom(atom), stream, :]
+            # Give the indirect DMA a rank-1 VMEM ref, so its offsets can
+            # span more than one SparseCore SIMD register. The outer pipeline
+            # owns this buffer until all DMAs for this batch have drained.
+            return indices_ref.at[
+                0, scheduled_atom(atom), pl.ds(stream * rows_per_dma, rows_per_dma)
+            ]
 
-        def destinations(atom, stream):
+        def destinations(step, atom, stream):
+            occurrence_base = logical_batch * atoms_per_batch * OCCURRENCES_PER_ATOM
             return pl.ds(
-                occurrence_base + atom * OCCURRENCES_PER_ATOM + stream * NUM_LANES,
-                NUM_LANES,
+                occurrence_base + atom * OCCURRENCES_PER_ATOM + stream * rows_per_dma,
+                rows_per_dma,
             )
 
         def body(*refs):
-            atom = pl.program_id(0)
-            nope_inputs = refs[:ROPE_PACKING]
-            rope_inputs = refs[ROPE_PACKING : 2 * ROPE_PACKING]
+            step = pl.program_id(0)
+            atom = scheduled_atom(step)
+            nope_inputs = refs[:streams]
+            rope_inputs = refs[streams : 2 * streams]
             rope_output = refs[-1]
 
             nope_copies = []
-            for stream in range(ROPE_PACKING):
+            for stream in range(streams):
                 copy = pltpu.make_async_copy(
                     nope_inputs[stream],
-                    nope_out_hbm_ref.at[destinations(atom, stream), :],
+                    nope_out_hbm_ref.at[destinations(step, atom, stream), :],
                     sem_ref.at[stream],
                 )
                 copy.start()
@@ -145,8 +166,7 @@ def _kernel(
                 data = []
                 for token_slot in range(ROPE_PACKING):
                     logical_rank = row * ROPE_PACKING + token_slot
-                    input_stream = logical_rank // NUM_LANES
-                    input_lane = logical_rank % NUM_LANES
+                    input_stream, input_lane = divmod(logical_rank, rows_per_dma)
                     data.append(
                         rope_inputs[input_stream][
                             pl.ds(input_lane, 1), pl.ds(0, rope_words)
@@ -154,10 +174,19 @@ def _kernel(
                     )
 
                 data = transpose_quad(data)
+                # Pair token groups [0:32] and [32:64] within the same atom.
+                # Each original quad still uses its usual four-token bit transpose.
+                out_row = row % (QUADS_PER_ATOM // 2) if compact_rope_output else row
+                out_col = (
+                    64 * (row // (QUADS_PER_ATOM // 2)) if compact_rope_output else 0
+                )
                 for band in range(ROPE_PACKING):
-                    rope_output[pl.ds(row, 1), pl.ds(band * rope_words, rope_words)] = (
-                        data[band]
-                    )
+                    rope_output[
+                        pl.ds(out_row, 1),
+                        pl.ds(out_col + band * rope_words, rope_words),
+                    ] = data[band]
+                if compact_rope_output:
+                    continue
                 # Packed rope fills only the first ROPE_PACKING * rope_words
                 # lanes; zero the rest, which the consumer reads as the
                 # (zero-padded) rope tail, as the padded cache stores it.
@@ -174,21 +203,24 @@ def _kernel(
 
         nope_specs = tuple(
             pl.BlockSpec(
-                (pl.Indirect(NUM_LANES), 128),
+                (pl.Indirect(rows_per_dma), 128),
                 lambda atom, stream=stream: (values(atom, stream), 0),
             )
-            for stream in range(ROPE_PACKING)
+            for stream in range(streams)
         )
         rope_specs = tuple(
             pl.BlockSpec(
-                (pl.Indirect(NUM_LANES), rope_words),
+                (pl.Indirect(rows_per_dma), rope_words),
                 lambda atom, stream=stream: (values(atom, stream), 0),
             )
-            for stream in range(ROPE_PACKING)
+            for stream in range(streams)
         )
         rope_out_spec = pl.BlockSpec(
-            (QUADS_PER_ATOM, 128),
-            lambda atom: (logical_batch * atoms_per_batch + atom, 0),
+            (QUADS_PER_ATOM // (2 if compact_rope_output else 1), 128),
+            lambda atom: (
+                logical_batch * atoms_per_batch + scheduled_atom(atom),
+                0,
+            ),
         )
 
         def run_inner():
@@ -199,8 +231,8 @@ def _kernel(
                 out_specs=(rope_out_spec,),
                 no_pipelining=not serve_pipelined,
             )(
-                *([nope_hbm_ref] * ROPE_PACKING),
-                *([rope_hbm_ref] * ROPE_PACKING),
+                *([nope_hbm_ref] * streams),
+                *([rope_hbm_ref] * streams),
                 rope_out_hbm_ref,
             )
 
@@ -211,10 +243,16 @@ def _kernel(
         else:
             run_inner()
 
-    indices_spec = pl.BlockSpec(
-        (1, atoms_per_batch, ROPE_PACKING, NUM_LANES),
-        lambda batch: (owner + batch * num_owners, 0, 0, 0),
-    )
+    if rows_per_dma == NUM_LANES:
+        indices_spec = pl.BlockSpec(
+            (1, atoms_per_batch, ROPE_PACKING, NUM_LANES),
+            lambda batch: (owner + batch * num_owners, 0, 0, 0),
+        )
+    else:
+        indices_spec = pl.BlockSpec(
+            (1, atoms_per_batch, OCCURRENCES_PER_ATOM),
+            lambda batch: (owner + batch * num_owners, 0, 0),
+        )
     if live_batches is None:
         pltpu.emit_pipeline(
             serve_batch,
@@ -249,6 +287,9 @@ def _kernel(
         "wait_mode",
         "serve_pipelined",
         "live_multiple",
+        "phase_stride",
+        "compact_rope_output",
+        "rows_per_dma",
     ),
 )
 def dsa_gather_native_sc(
@@ -262,6 +303,9 @@ def dsa_gather_native_sc(
     serve_pipelined: bool = True,
     num_live_indices: jax.Array | None = None,
     live_multiple: int = 1,
+    phase_stride: int = 0,
+    compact_rope_output: bool = False,
+    rows_per_dma: int = NUM_LANES,
 ) -> tuple[jax.Array, jax.Array]:
     """Gather explicit native-SC ``uint32`` NOPE and ROPE cache rows.
 
@@ -277,9 +321,15 @@ def dsa_gather_native_sc(
     unwritten. ``live_multiple`` is a static promise that ``num_live_indices``
     is a multiple of it; when that multiple covers whole owner rounds the
     per-owner tail guard is dropped.
+
+    A nonzero ``phase_stride`` rotates each query's atom issue order, retaining
+    the original output order for both caches. The experiment requires a power
+    of two atoms per owner batch and a power of two owner batches per query.
     """
     if wait_mode not in ("overlap_rope", "before_rope"):
         raise ValueError(f"unknown {wait_mode=}")
+    if rows_per_dma not in (16, 32, 64):
+        raise ValueError("rows_per_dma must be 16, 32, or 64")
     if nope_cache.dtype != jnp.uint32 or nope_cache.shape[-1] != 128:
         raise ValueError("native-SC NOPE must be explicit uint32[...,128]")
     if rope_cache.dtype != jnp.uint32 or rope_cache.shape[-1] != 128:
@@ -297,6 +347,12 @@ def dsa_gather_native_sc(
             f"NOPE tokens ({num_tokens})"
         )
     rope_words = rope_cache.size // num_tokens
+    if compact_rope_output and (
+        rope_words != 16 or indices.shape[-1] % OCCURRENCES_PER_ATOM
+    ):
+        raise ValueError(
+            "compact RoPE output requires 64-byte RoPE and full 64-occurrence atoms per query"
+        )
     if (
         rope_words <= 0
         or rope_words % NUM_LANES != 0
@@ -325,6 +381,21 @@ def dsa_gather_native_sc(
         )
 
     occurrences_per_batch = atoms_per_batch * OCCURRENCES_PER_ATOM
+    query_batch_shift = 0
+    if phase_stride:
+        batches_per_query, tail = divmod(indices.shape[1], occurrences_per_batch)
+        if (
+            phase_stride < 0
+            or atoms_per_batch & (atoms_per_batch - 1)
+            or tail
+            or batches_per_query < 1
+            or batches_per_query & (batches_per_query - 1)
+        ):
+            raise ValueError(
+                "phase rotation requires a nonnegative stride, power-of-two "
+                "atoms and full power-of-two batches per query"
+            )
+        query_batch_shift = batches_per_query.bit_length() - 1
     owner_batch_size = num_owners * occurrences_per_batch
     if out_size % owner_batch_size != 0:
         raise ValueError(
@@ -334,12 +405,15 @@ def dsa_gather_native_sc(
     num_batches = out_size // occurrences_per_batch
     batches_per_owner = num_batches // num_owners
     live = num_live_indices is not None
-    scratch_types = {"sem_ref": pltpu.SemaphoreType.DMA((ROPE_PACKING,))}
-    operands = [
-        nope_rows_view,
-        rope_rows_view,
-        indices.reshape(num_batches, atoms_per_batch, ROPE_PACKING, NUM_LANES),
-    ]
+    streams = OCCURRENCES_PER_ATOM // rows_per_dma
+    index_shape = (
+        (ROPE_PACKING, NUM_LANES)
+        if rows_per_dma == NUM_LANES
+        else (OCCURRENCES_PER_ATOM,)
+    )
+    scratch_types = {"sem_ref": pltpu.SemaphoreType.DMA((streams,))}
+    index_input = indices.reshape(num_batches, atoms_per_batch, *index_shape)
+    operands = [nope_rows_view, rope_rows_view, index_input]
     guard_tail = False
     if live:
         # Live logical batches = cdiv(num_live_indices, occurrences/batch),
@@ -383,6 +457,10 @@ def dsa_gather_native_sc(
         serve_pipelined=serve_pipelined,
         guard_tail=guard_tail,
         rope_words=rope_words,
+        phase_stride=phase_stride,
+        query_batch_shift=query_batch_shift,
+        compact_rope_output=compact_rope_output,
+        rows_per_dma=rows_per_dma,
     )
     if live:
         inner = body
@@ -394,7 +472,10 @@ def dsa_gather_native_sc(
         body,
         out_type=(
             jax.ShapeDtypeStruct((out_size, 128), jnp.uint32),
-            jax.ShapeDtypeStruct((out_size // ROPE_PACKING, 128), jnp.uint32),
+            jax.ShapeDtypeStruct(
+                (out_size // (ROPE_PACKING * (2 if compact_rope_output else 1)), 128),
+                jnp.uint32,
+            ),
         ),
         compiler_params=pltpu.CompilerParams(
             use_tc_tiling_on_sc=False,
@@ -406,5 +487,8 @@ def dsa_gather_native_sc(
         name=(
             f"sc_native_sc_gather_a{atoms_per_batch}_rw{rope_words}_{wait_mode}_"
             f"{'pipe' if serve_pipelined else 'nopipe'}{'_live' if live else ''}"
+            + (f"_phase{phase_stride}" if phase_stride else "")
+            + ("_compactrope" if compact_rope_output else "")
+            + (f"_rows{rows_per_dma}" if rows_per_dma != NUM_LANES else "")
         ),
     )(*operands)
