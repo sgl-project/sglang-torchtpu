@@ -14,6 +14,25 @@ PREFILL_POST_MOE_COLLECTIVE_ID = 10
 # The SP prefill program's MoE dispatch (11) and combine (12) all-to-alls.
 SP_DISPATCH_COLLECTIVE_ID = 11
 SP_COMBINE_COLLECTIVE_ID = 12
+# The SP + TP prefill prototype's fused x_norm AG + qkvg (15) and in-kernel-a2a o proj (17).
+SPTP_XAG_QKVG_COLLECTIVE_ID = 15
+SPTP_PA_COLLECTIVE_ID = 17
+# its pool kernel's remote-DMA all-gather of the expert input (SPTP_PA_XE_AG)
+SPTP_PA_XE_COLLECTIVE_ID = 18
+# every remote-DMA kernel of one program needs its own id (fused-RS MoE 0, all-reduce 7)
+_IDS = (
+    0,
+    7,
+    _COLLECTIVE_ID,
+    PREFILL_ATTN_OUT_COLLECTIVE_ID,
+    PREFILL_POST_MOE_COLLECTIVE_ID,
+    SP_DISPATCH_COLLECTIVE_ID,
+    SP_COMBINE_COLLECTIVE_ID,
+    SPTP_XAG_QKVG_COLLECTIVE_ID,
+    SPTP_PA_COLLECTIVE_ID,
+    SPTP_PA_XE_COLLECTIVE_ID,
+)
+assert len(set(_IDS)) == len(_IDS), f"collective ids collide: {_IDS}"
 FP4_PACK = 8
 FP4_GROUP = 16
 E2M1_MAX = 6.0  # fp4 e2m1's largest magnitude

@@ -27,6 +27,7 @@ from sglang_tpu.muse_megakernel_v2.common.consts import (
 )
 from sglang_tpu.muse_megakernel_v2.common.numerics import _rms
 from sglang_tpu.muse_megakernel_v2.common.qkv import attention_inputs
+from sglang_tpu.muse_megakernel_v2.common.trace import _scope
 
 # Pad slots, checked against the peers' wait chains of the two-phase all-gathers.
 _SLOTS = 5
@@ -154,14 +155,16 @@ def post_moe_call(c: PFConfig, tm: int, *, next_rope: bool | None, axis: str = "
         def s3(j):
             """Post-expert projection of tile j: this rank's output columns."""
             s = j % _SLOTS
-            col.ag_wait(y_kp, s)
-            y = jnp.concatenate([y_pad[s, r] for r in range(tp)], axis=0)
-            u = jnp.dot(y, wu_v[...], preferred_element_type=jnp.float32)
-            u = (u * small_row(sm, "wunpool_s")[:, :Hl]).astype(jnp.bfloat16)
-            if fp8:
-                u_pad[s, me], usc_pad[s, me] = to_fp8(u.astype(jnp.float32))
-            else:
-                u_pad[s, me] = u
+            with _scope("pm_y_wait"):
+                col.ag_wait(y_kp, s)
+            with _scope("pm_unpool"):
+                y = jnp.concatenate([y_pad[s, r] for r in range(tp)], axis=0)
+                u = jnp.dot(y, wu_v[...], preferred_element_type=jnp.float32)
+                u = (u * small_row(sm, "wunpool_s")[:, :Hl]).astype(jnp.bfloat16)
+                if fp8:
+                    u_pad[s, me], usc_pad[s, me] = to_fp8(u.astype(jnp.float32))
+                else:
+                    u_pad[s, me] = u
             col.ag_start(u_kp, s)
 
         def s4(j):
@@ -179,17 +182,23 @@ def post_moe_call(c: PFConfig, tm: int, *, next_rope: bool | None, axis: str = "
         def s5(j):
             """Residual of tile j, then the next layer's attention inputs."""
             s, b = j % _SLOTS, j % 2
-            col.ag_wait(u_kp, s)
-            for cp in x_loads(j):
-                cp.wait()
-            u = gathered(u_pad, usc_pad, s, tp)
-            u = _rms(u.astype(jnp.float32) * small_row(sm, "post_ffn_w"), c.post_eps)
-            x = small_row(sm, "ffn_alpha") * x_v[b] + small_row(sm, "ffn_beta") * u
-            x_v[b] = x
-            if with_next:
-                q_v[b], kv_v[b], g_v[b] = attention_inputs(
-                    c, x, smn_v[...], wq_v[...], rope_v[b] if next_rope else None
+            with _scope("pm_u_wait"):
+                col.ag_wait(u_kp, s)
+            with _scope("pm_x_wait"):
+                for cp in x_loads(j):
+                    cp.wait()
+            with _scope("pm_residual"):
+                u = gathered(u_pad, usc_pad, s, tp)
+                u = _rms(
+                    u.astype(jnp.float32) * small_row(sm, "post_ffn_w"), c.post_eps
                 )
+                x = small_row(sm, "ffn_alpha") * x_v[b] + small_row(sm, "ffn_beta") * u
+                x_v[b] = x
+            if with_next:
+                with _scope("pm_qkvg"):
+                    q_v[b], kv_v[b], g_v[b] = attention_inputs(
+                        c, x, smn_v[...], wq_v[...], rope_v[b] if next_rope else None
+                    )
             for cp in out_writes(j):
                 cp.start()
 

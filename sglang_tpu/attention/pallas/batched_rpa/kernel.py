@@ -246,7 +246,9 @@ def rpa_body(
     cfgs: configs.RpaConfigs,
 ):
     if cfgs.use_transposed:
-        qt_scratch_ref, qkey_scratch_ref, lse_stage_ref = rest_scratch_refs
+        qt_scratch_ref, qkey_scratch_ref, *tok_scratch, lse_stage_ref = (
+            rest_scratch_refs
+        )
     else:
         (lse_stage_ref,) = rest_scratch_refs
     step = pl.program_id(0)
@@ -476,8 +478,38 @@ def rpa_body(
                 step, schedule_ref, processed_q_len, processed_kv_len, cfgs
             )
             pl.when(full_tile)(lambda: run_tile(apply_mask=False))
-            pl.when(jnp.logical_not(full_tile))(lambda: run_tile(apply_mask=True))
-        transposed.store_tile(step, schedule_ref, acc_scratch_ref, o_vref, cfgs=cfgs)
+            masked = jnp.logical_not(full_tile)
+            if cfgs.serve.transposed_tri:
+                assert cfgs.serve.no_max and cfgs.serve.causal
+                s_tri = jnp.maximum(0, schedule_ref.s_idx[step, 0])
+                q_rows_tri = (
+                    cu_q_lens_ref[s_tri + 1]
+                    - cu_q_lens_ref[s_tri]
+                    - schedule_ref.q_idx[step, 0] * cfgs.bq_sz
+                )
+                tri_ok = jnp.logical_and(
+                    jnp.logical_and(masked, q_rows_tri >= cfgs.bq_sz),
+                    schedule_ref.s_idx[step, 0] != -1,
+                )
+                rel = processed_q_len[0] - processed_kv_len[0]
+                for r in transposed.tri_offsets(cfgs):
+                    hit = jnp.logical_and(tri_ok, rel == r)
+                    pl.when(hit)(
+                        functools.partial(
+                            transposed.tile_tri,
+                            k,
+                            v,
+                            acc_scratch_ref,
+                            qt_scratch_ref,
+                            rel=r,
+                            cfgs=cfgs,
+                        )
+                    )
+                    masked = jnp.logical_and(masked, jnp.logical_not(hit))
+            pl.when(masked)(lambda: run_tile(apply_mask=True))
+        transposed.store_tile(
+            step, schedule_ref, acc_scratch_ref, o_vref, cfgs=cfgs, tok_ref=tok_scratch
+        )
         return
 
     # Step 3: Perform compute, then step 4: write back outputs.
@@ -635,6 +667,10 @@ def _carry_scratch_shapes(cfgs: configs.RpaConfigs):
         pltpu.VMEM(cfgs.acct_scratch_shape, dtype=jnp.float32),  # O^T and l
         pltpu.VMEM(cfgs.qt_scratch_shape, dtype=cfgs.serve.dtype_kv),  # Q^T
         pltpu.SMEM((2,), dtype=jnp.int32),  # (s_idx, q_idx) of the cached Q^T
+    ) + (
+        (pltpu.VMEM(cfgs.tok_scratch_shape, dtype=cfgs.serve.dtype_out),)
+        if cfgs.serve.transposed_out_tok
+        else ()
     )
 
 
@@ -734,7 +770,21 @@ def get_kernel_name(cfgs: configs.RpaConfigs) -> str:
             name += "-spq"
         if cfgs.serve.no_max:
             name += "-nm"
+        if cfgs.serve.transposed_tri:
+            name += "-tri"
+        if cfgs.serve.transposed_qt_bf16:
+            name += "-qtb"
+        if cfgs.serve.transposed_out_tok:
+            name += "-otok"
     return name
+
+
+# ServingConfigs fields only sptp/rpa.py sets (prefill SP + TP prototype).
+SPTP_ONLY_OPTIONS = (
+    "serve.transposed_tri",
+    "serve.transposed_qt_bf16",
+    "serve.transposed_out_tok",
+)
 
 
 def get_kernel_metadata(
@@ -744,6 +794,8 @@ def get_kernel_metadata(
     ret = {}
     for path, val in jax.tree_util.tree_leaves_with_path(cfgs_dict):
         key = jax.tree_util.keystr(path, simple=True, separator=".")
+        if key in SPTP_ONLY_OPTIONS and not val:
+            continue  # off keeps the shared kernels' metadata unchanged
         if not isinstance(val, str | int | float):
             val = str(val)
         ret[key] = val

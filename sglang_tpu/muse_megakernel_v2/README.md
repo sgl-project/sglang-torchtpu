@@ -278,6 +278,7 @@ Both arms need replicated wpool / wunpool and 32 whole experts per rank. Serving
 |---|---|
 | Program selection, weight packing | [ops.py](ops.py) |
 | Prefill TP | [prefill/tp/program.py](prefill/tp/program.py), [attn_out.py](prefill/tp/attn_out.py), [post_moe.py](prefill/tp/post_moe.py) |
+| Prefill SP + TP (default with TP experts, `SGLANG_TPU_MUSE_MK_PREFILL_SPTP`) | [prefill/sptp/program.py](prefill/sptp/program.py), [xag_qkvg.py](prefill/sptp/xag_qkvg.py) (in-kernel x_norm AG + qkvg), [postattn.py](prefill/sptp/postattn.py) (in-kernel a2a o proj, pool), [rpa.py](prefill/sptp/rpa.py); replicated wo / pool / unpool (`ops._append_sptp_weights`) |
 | Prefill SP + EP | [prefill/spep/program.py](prefill/spep/program.py), [common/a2a.py](common/a2a.py) (remote-DMA MoE a2a), [moe/pallas/gmm_v2.py](../moe/pallas/gmm_v2.py) |
 | Decode TP | [decode/tp/kernel.py](decode/tp/kernel.py) (build, layer loop), [attn.py](decode/tp/attn.py) / [moe.py](decode/tp/moe.py) (untiled), [tiled_attn.py](decode/tp/tiled_attn.py) / [tiled_moe.py](decode/tp/tiled_moe.py) / [tiled_layer.py](decode/tp/tiled_layer.py) (row-tiled), [common/stream.py](common/stream.py), [common/plan.py](common/plan.py) |
 | Decode SP + EP | [decode/spep/](decode/spep/) (EPHook arms), [common/a2a.py](common/a2a.py), [common/ep_layout.py](common/ep_layout.py) (weight layout shared with prefill SP) |

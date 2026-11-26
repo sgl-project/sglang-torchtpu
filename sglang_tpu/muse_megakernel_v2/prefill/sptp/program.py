@@ -1,0 +1,929 @@
+# SPDX-License-Identifier: Apache-2.0
+"""The per-device body of the SP + TP prefill program (serving: SGLANG_TPU_MUSE_MK_PREFILL_SPTP).
+
+Dense path as prefill/spep (rank m owns rows [m * Ts, (m + 1) * Ts), Ts = rows / tp), MoE as
+prefill/tp (expert-TP fused-RS, every rank 1/tp of every expert's intermediate). Per layer:
+
+    own rows --AG (e4m3 + row scale)--> qkvg and attention on every row with this rank's heads
+      -> gated output --a2a by row (e4m3 + row scale)--> o proj on own rows (replicated wo)
+      -> attention residual, router + replicated pool + pre-expert norm on own rows
+      -> AG of the expert input (e4m3 + row scale) and routing: every row
+      -> fused-RS expert-TP MoE: this rank's rows of the combined output
+      -> replicated unpool and FFN residual on own rows
+
+Weights: wqkvg this rank's heads (as both programs); wo / wpool / wunpool replicated as
+prefill/spep; experts in prefill/tp's layout (expert units, W4A16 layers).
+"""
+
+import os
+
+import jax
+import jax.numpy as jnp
+
+from sglang_tpu.muse_megakernel_v2.common import plan
+from sglang_tpu.muse_megakernel_v2.common.config import PFConfig
+from sglang_tpu.muse_megakernel_v2.common.consts import (
+    LANE,
+    SPTP_PA_COLLECTIVE_ID,
+    SPTP_PA_XE_COLLECTIVE_ID,
+    small_row,
+)
+from sglang_tpu.muse_megakernel_v2.common.numerics import _rms, heads_rms_xla
+from sglang_tpu.muse_megakernel_v2.common.qkv import qkv_from_proj
+from sglang_tpu.muse_megakernel_v2.common.trace import _scope
+from sglang_tpu.muse_megakernel_v2.prefill.spep.program import (
+    _BF16,
+    _F32,
+    _bf,
+    _fp8_rows,
+    ag,
+    attention,
+    dense,
+    residual,
+    route,
+    to_owner,
+)
+from sglang_tpu.muse_megakernel_v2.prefill.sptp.ogate import o_gate_call, o_gate_pk_call
+from sglang_tpu.muse_megakernel_v2.prefill.sptp.post_ffn import post_ffn_call
+from sglang_tpu.muse_megakernel_v2.prefill.sptp.postattn import (
+    oproj_a2a_call,
+    oproj_call,
+    pool_ag_call,
+    pool_call,
+    xe_wait_call,
+)
+from sglang_tpu.muse_megakernel_v2.prefill.sptp.qkvg import (
+    _heads_rms_mxu,
+    dequant_rows_call,
+    qkvg_call,
+)
+from sglang_tpu.muse_megakernel_v2.prefill.sptp.rpa import (
+    RpaOpts,
+    rpa_prepared,
+    tok_rows,
+)
+from sglang_tpu.muse_megakernel_v2.prefill.sptp.xag_qkvg import xag_qkvg_call
+from sglang_tpu.muse_megakernel_v2.prefill.sptp.xe_ag import xe_ag_dequant_call
+from sglang_tpu.muse_megakernel_v2.prefill.tp.program import (
+    _layer_experts,
+    fused_rs_moe,
+)
+
+# Numerics debugging only: bf16 activations (scale 1) where the program quantizes rows to e4m3,
+# to separate layout bugs from e4m3 rounding. The recipe sets it at build time.
+DEBUG_BF16_ACTIVATIONS = False
+# row tile of the Pallas qkvg card
+QKVG_TILE = 256
+# x_norm AG chunks overlapped with the chunked qkvg card, and that card's row tile
+XAG_CHUNKS = 4
+XAG_TILE = 128
+
+
+def _bf16_rows(x):
+    return x.astype(_BF16), jnp.ones((x.shape[0], 1), _F32)
+
+
+def route_top_k(c: PFConfig, ffn, wrouter, sm):
+    """prefill/spep's route with XLA's TopK instead of top_k argmax rounds: the same picks (ties
+    to the lower id) and order."""
+    ep = wrouter.shape[1]
+    sc = jax.nn.sigmoid(
+        jnp.dot(ffn, wrouter, preferred_element_type=_F32) * c.router_mult
+    )
+    _, ids = jax.lax.top_k(sc + small_row(sm, "expert_bias")[:, :ep], c.top_k)
+    w = jnp.take_along_axis(sc, ids, axis=1)
+    return ids, w / (jnp.sum(w, axis=1, keepdims=True) + c.router_eps) * c.route_scale
+
+
+def _rms_fp8_rows(x, eps: float, w):
+    """_fp8_rows(_rms(x, eps) * w) with the row amax taken in the rms pass: rms scales a row by
+    one positive factor, so amax = rsqrt(ms + eps) * max|x * w| (two passes over x, not three)."""
+    x32 = x.astype(_F32)
+    r = jax.lax.rsqrt(jnp.mean(jnp.square(x32), axis=-1, keepdims=True) + eps)
+    m = jnp.max(jnp.abs(x32 * w), axis=-1, keepdims=True)
+    s = jnp.maximum(m * r, 1e-30) / 448.0
+    return (x32 * (r / s) * w).astype(jnp.float8_e4m3fn), s
+
+
+def n_expert_refs(c: PFConfig) -> int:
+    """prefill/tp's expert operands: (w13, s13, w2, s2) per expert unit."""
+    return plan.n_expert_refs(c)
+
+
+def build_forward(c: PFConfig, axis: str = "model"):
+    """prefill/tp's (meta, pos, kv_lens, cu_q, dist, pf, psw, emb, *weights, *experts, *kv) ->
+    (hidden, aux, *kv), dense path sequence-parallel, MoE expert-TP."""
+    c.validate()
+    if c.sp or c.fp8_gather:
+        raise ValueError("SP + TP takes prefill/tp's config without sp / fp8_gather")
+    L, T, tp, hd = c.n_layers, c.rows, c.tp, c.head_dim
+    Ts = T // tp
+    H, He, qd = c.hidden, c.expert_hidden, c.q_dim
+    if Ts % 8:
+        raise ValueError(f"{T} rows: rows / tp must be a multiple of 8")
+    ne = n_expert_refs(c)
+    layer_experts = _layer_experts(c)
+    q8 = _bf16_rows if DEBUG_BF16_ACTIVATIONS else _fp8_rows
+    # SPTP_RMS_QUANT_3PASS=1: rms, then a separate amax pass, then the cast
+    fused_rq = (
+        not DEBUG_BF16_ACTIVATIONS
+        and os.environ.get("SPTP_RMS_QUANT_3PASS", "0") != "1"
+    )
+
+    def rms_q8(x, w):
+        return (
+            _rms_fp8_rows(x, c.rms_eps, w) if fused_rq else q8(_rms(x, c.rms_eps) * w)
+        )
+
+    # SPTP_OGATE_MXU_NORM=1: the o gate head norm as MXU dots (measured 0.8 ms / chunk slower
+    # than XLA's 3-D norm with its relayout copy)
+    ogate_mxu = os.environ.get("SPTP_OGATE_MXU_NORM", "0") == "1"
+    # SPTP_A2A_U8=1: the gated output a2a as bytes (prefill/spep) instead of e4m3 itself
+    a2a_u8 = os.environ.get("SPTP_A2A_U8", "0") == "1"
+
+    def to_owner_x(x):
+        if a2a_u8 or x.dtype != jnp.float8_e4m3fn:
+            return to_owner(x, tp, axis)
+        b = jax.lax.all_to_all(x, axis, 0, 0, tiled=True).reshape(tp, Ts, -1)
+        return b.transpose(1, 0, 2)
+
+    # SPTP_ROUTE_TOPK=1: XLA TopK (same picks; measured 1.6 ms / chunk slower than the rounds)
+    router = route_top_k if os.environ.get("SPTP_ROUTE_TOPK", "0") == "1" else route
+    # prototype A/B knobs, read at build time (anvil --env): SPTP_XLA_QKVG=1 the XLA qkvg card
+    xla_qkvg = DEBUG_BF16_ACTIVATIONS or os.environ.get("SPTP_XLA_QKVG", "0") == "1"
+    # SPTP_QKVG_SLICE_NORM=1: per-head lane-slice norms (common/qkv) in the Pallas card
+    mxu_norm = os.environ.get("SPTP_QKVG_SLICE_NORM", "0") != "1"
+    qkvg_tile = int(os.environ.get("SPTP_QKVG_TILE", str(QKVG_TILE)))
+    kc = int(os.environ.get("SPTP_QKVG_KC", "512"))
+    # SPTP_RPA_WRAPPER=1: q [T, H, D] through batched_rpa.wrapper (its relayouts) instead of
+    # the qkvg card writing the kernel's query layout and reading its raw output (sptp/rpa.py)
+    q_rpa = not xla_qkvg and os.environ.get("SPTP_RPA_WRAPPER", "0") != "1"
+    qkvg_k = {r: qkvg_call(c, qkvg_tile, r, mxu_norm, kc, q_rpa) for r in (True, False)}
+    # SPTP_XAG_CHUNKS=n: the x_norm AG in n row chunks, each chunk's qkvg as it lands (the
+    # next chunk's AG in flight meanwhile); 1 = one AG, then qkvg
+    xag_env = os.environ.get("SPTP_XAG_CHUNKS")
+    n_xag = int(xag_env or XAG_CHUNKS)
+    xag_tile = int(os.environ.get("SPTP_XAG_TILE", str(XAG_TILE)))
+    if n_xag > 1 and Ts % (n_xag * xag_tile):
+        if xag_env:
+            raise ValueError(
+                f"SPTP_XAG_CHUNKS={n_xag}: {Ts} own rows do not split into {n_xag} chunks of "
+                f"{xag_tile}-row tiles"
+            )
+        # the default chunk count, cut to what rows / tp tiles (1: one AG, then qkvg)
+        while n_xag > 1 and Ts % (n_xag * xag_tile):
+            n_xag -= 1
+    qkvg_c = {r: qkvg_call(c, xag_tile, r, mxu_norm, kc, q_rpa) for r in (True, False)}
+    gq = c.q_heads // c.kv_heads
+    # SPTP_GLOBAL_COUNTS=1: the MoE counts every rank's slots itself
+    local_counts = os.environ.get("SPTP_GLOBAL_COUNTS", "0") != "1"
+    # SPTP_OGATE_KERNEL=1: the Pallas o-gate card (its 64-lane head relayouts and f32 MXU head
+    # norm measured 72 us / layer, 171.6 vs 169.4 ms / chunk for XLA on the RPA layout)
+    # SPTP_AUX_LATE_AG=1: one AG of every capture after the last layer
+    aux_early = os.environ.get("SPTP_AUX_LATE_AG", "0") != "1"
+
+    def capture(x):
+        """A captured stream: gathered at capture time (the AG overlaps the later layers instead
+        of one [T, 5H] AG after the last layer), or own rows for one AG at the end."""
+        return ag(x.astype(_BF16), axis) if aux_early else x.astype(_BF16)
+
+    # SPTP_XE_PALLAS_DEQUANT=1: row-major Pallas xe dequant (measured 171.1 vs 169.7 ms / chunk
+    # for XLA's fusion + layout copy, which overlap the MoE routing glue)
+    xe_pallas = (
+        not DEBUG_BF16_ACTIVATIONS
+        and os.environ.get("SPTP_XE_PALLAS_DEQUANT", "0") == "1"
+    )
+    dequant = dequant_rows_call(T, He)
+    # SPTP_XE_AG_CHUNKS=n (with SPTP_POSTATTN=1): xe AG in n row chunks, each dequantized by
+    # Pallas as it lands (sptp/xe_ag.py)
+    xe_n = int(os.environ.get("SPTP_XE_AG_CHUNKS", "0"))
+    # SPTP_XE_TILED=1: write it in the MoE's [T, He / 128, 128] lhs layout
+    xe_ag_k = (
+        xe_ag_dequant_call(
+            T, He, tp, xe_n, axis, int(os.environ.get("SPTP_XE_TILED", "0"))
+        )
+        if xe_n
+        else None
+    )
+    # SPTP_XAG_FUSED=1: the x_norm AG by in-kernel remote DMA inside the qkvg kernel, one row
+    # tile of SPTP_XAG_SEG rows per rank at a time (sptp/xag_qkvg.py)
+    xag_fused = not xla_qkvg and os.environ.get("SPTP_XAG_FUSED", "1") == "1"
+    xag_seg = int(os.environ.get("SPTP_XAG_SEG", "32"))
+    xag_gap = int(os.environ.get("SPTP_XAG_GAP", "0"))
+    # SPTP_XAG_NORM=1 (with SPTP_XAG_FUSED=1): the input norm and e4m3 row quant per tile in
+    # that kernel too, the row scales gathered with the rows
+    xag_norm = xag_fused and fused_rq and os.environ.get("SPTP_XAG_NORM", "1") == "1"
+    # SPTP_XAG_ORDER=0: common.coll.run_pipeline's stage order (partner share issued late)
+    xag_dma_first = os.environ.get("SPTP_XAG_ORDER", "1") != "0"
+    # SPTP_XAG_EPI=1: head norms as split-bf16 dots (2 passes, not HIGHEST) and vreg-wide rope
+    xag_split_epi = os.environ.get("SPTP_XAG_EPI", "1") == "1"
+    # SPTP_XAG_GATE4=1: gate in the [Hkv, T, G, 128] head layout (no transpose before the o gate)
+    xag_gate4 = xag_fused and q_rpa and os.environ.get("SPTP_XAG_GATE4", "0") == "1"
+    # SPTP_OGATE_KERNEL=1: the Pallas o-gate card (sptp/ogate.py; gate4-aware) instead of XLA
+    ogate_k = (
+        o_gate_call(c, gate4=xag_gate4)
+        if q_rpa and os.environ.get("SPTP_OGATE_KERNEL", "0") == "1"
+        else None
+    )
+    ogate_kernel = ogate_k is not None
+    o_gate = ogate_k
+    # SPTP_XAG_QSTRIDED=1: q written as [Hkv, T * G, 128] by strided stores (same HBM bytes)
+    xag_q_strided = (
+        xag_fused and q_rpa and os.environ.get("SPTP_XAG_QSTRIDED", "1") == "1"
+    )
+    xag_norm_dbg = xag_norm and os.environ.get("SPTP_XAG_NORM_DBG", "0") == "1"  # debug
+    # debug: 2 / 3 / 4 take only q / kv / gate from the fused-norm kernel, the rest from the
+    # unfused-norm kernel on XLA's rows
+    xag_mix = int(os.environ.get("SPTP_XAG_NORM_DBG", "0")) if xag_norm else 0
+    # SPTP_XAG_KV_RPA=1: the fused qkvg kernel writes k / v as batched RPA's e4m3 new-KV
+    # operand itself (no XLA cast / relayout copies before the RPA)
+    xag_kv_rpa = xag_fused and q_rpa and os.environ.get("SPTP_XAG_KV_RPA", "0") == "1"
+    if xag_kv_rpa and (xag_mix or os.environ.get("SPTP_XAG_OWNFIRST", "0") == "1"):
+        raise ValueError("SPTP_XAG_KV_RPA: no SPTP_XAG_NORM_DBG / SPTP_XAG_OWNFIRST")
+    xag_k = {
+        r: xag_qkvg_call(
+            c,
+            xag_seg,
+            r,
+            mxu_norm=mxu_norm,
+            kc=int(os.environ.get("SPTP_XAG_KC", str(kc))),
+            q_rpa=q_rpa,
+            gap=xag_gap,
+            fuse_norm=xag_norm,
+            axis=axis,
+            dbg_xs=xag_norm_dbg,
+            dma_first=xag_dma_first,
+            split_epi=xag_split_epi,
+            gate4=xag_gate4,
+            # SPTP_XAG_RNE=1: explicit ties-to-even e4m3 rounding in the fused norm (same bits
+            # as the plain cast in the 1-layer check, 1.5 us / tile)
+            exact_cast=os.environ.get("SPTP_XAG_RNE", "0") == "1",
+            w_start=int(os.environ.get("SPTP_XAG_WSTART", "0")),
+            m_split=int(os.environ.get("SPTP_XAG_MSPLIT", "2")),
+            dma_split=int(os.environ.get("SPTP_XAG_DSPLIT", "1")),
+            n_tail=os.environ.get("SPTP_XAG_NTAIL", "0") == "1",
+            route=int(os.environ.get("SPTP_XAG_ROUTE", "0")),
+            own_first=os.environ.get("SPTP_XAG_OWNFIRST", "0") == "1",
+            q_strided=xag_q_strided,
+            kv_rpa=xag_kv_rpa,
+        )
+        for r in (True, False)
+    }
+
+    xag_mix_k = {
+        r: xag_qkvg_call(
+            c,
+            xag_seg,
+            r,
+            mxu_norm=mxu_norm,
+            kc=kc,
+            q_rpa=q_rpa,
+            gap=xag_gap,
+            axis=axis,
+            dma_first=xag_dma_first,
+            split_epi=xag_split_epi,
+            gate4=xag_gate4,
+        )
+        for r in (True, False)
+    }
+    # SPTP_POSTATTN=1: requant, o proj, attention residual, router, pool and pre-expert norm of
+    # own rows in two Pallas kernels (sptp/postattn.py)
+    pa = os.environ.get("SPTP_POSTATTN", "1" if q_rpa and fused_rq else "0") == "1"
+    if pa and not (q_rpa and fused_rq):
+        raise ValueError("SPTP_POSTATTN needs the q_rpa path and the fused rms quant")
+    pa_tn, pa_tp, pa_rc = (
+        int(os.environ.get(k, d))
+        for k, d in (
+            ("SPTP_PA_TN", "512"),
+            ("SPTP_PA_TP", "1024"),
+            ("SPTP_PA_RC", "64"),
+        )
+    )
+    # SPTP_PA_A2A=1: the gated-output a2a by remote DMA inside the o proj kernel
+    pa_a2a = pa and os.environ.get("SPTP_PA_A2A", "1") == "1"
+    # SPTP_PA_HEAD=0: that kernel takes a token-major [T, qd] copy of the o gate's output
+    # instead of its head layout [Hkv, T, G * d] as is
+    pa_head = pa_a2a and os.environ.get("SPTP_PA_HEAD", "1") == "1"
+    # SPTP_PA_OGATE_TOK=1: the o gate's math laid out token major (o transposed instead of gate)
+    pa_gtok = pa_a2a and os.environ.get("SPTP_PA_OGATE_TOK", "0") == "1"
+    if pa_gtok and (xag_gate4 or ogate_kernel):
+        raise ValueError(
+            "SPTP_PA_OGATE_TOK reads the token-major gate: no XAG_GATE4 / OGATE_KERNEL"
+        )
+    # the in-kernel a2a takes the o gate output as [qd, T] (the gate fusion's T-minor layout, no
+    # relayout copy); SPTP_PA_TMAJ=0: the [Hkv, T, G * d] head layout (SPTP_PA_HEAD). The Pallas
+    # o-gate card writes token-major rows, which neither reads.
+    pa_tmaj = (
+        pa_a2a
+        and not pa_gtok
+        and not ogate_kernel
+        and os.environ.get("SPTP_PA_TMAJ", "1") == "1"
+    )
+    # SPTP_OGATE_PK=12 (with SPTP_PA_OGATE_TOK=1): that o gate as one Pallas pass over the raw RPA
+    # output (u32 head pairs), not XLA's slice / transpose copies and four passes (1, 2: older
+    # kernel variants, sptp/ogate.py)
+    ogate_pk = (
+        o_gate_pk_call(
+            c,
+            int(os.environ.get("SPTP_OGATE_PK_TM", "512")),
+            int(os.environ.get("SPTP_OGATE_PK", "0")),
+        )
+        if pa_gtok and os.environ.get("SPTP_OGATE_PK", "0") != "0"
+        else None
+    )
+    # SPTP_RPA_OUT_TOK=1: the RPA leaves o token major in slot 0; only the XLA token-major o
+    # gate reads that layout so far (the padded-layout readers would take garbage)
+    rpa_out_tok = RpaOpts.from_env().out_tok
+    if rpa_out_tok and not (q_rpa and pa_gtok and ogate_pk is None):
+        raise ValueError(
+            "SPTP_RPA_OUT_TOK needs SPTP_PA_OGATE_TOK=1 without SPTP_OGATE_PK (the only o"
+            " consumer of the token-major layout)"
+        )
+    # SPTP_OGATE_PK=13 (with SPTP_PA_TMAJ): the same Pallas o gate writing the [qd, T] layout
+    ogate_tm = (
+        o_gate_pk_call(c, int(os.environ.get("SPTP_OGATE_PK_TM", "512")), 13)
+        if pa_tmaj and not xag_gate4 and os.environ.get("SPTP_OGATE_PK", "13") == "13"
+        else None
+    )
+    pa_head = pa_head and not pa_gtok and not pa_tmaj
+    pa_pool = pool_call(c, pa_tp, pa_rc, pa_head, pa_tmaj) if pa else None
+    # SPTP_PA_XE_AG=1: the pool kernel all-gathers the expert input by remote DMA (sends started
+    # in its last step, waited for by a small kernel before the MoE); xe_all / xs_all replace
+    # the XLA AG of xe8 / xs
+    pa_xag = pa_a2a and os.environ.get("SPTP_PA_XE_AG", "0") == "1"
+    # SPTP_PA_XE_AG_SPLIT=n: each peer's rows in n DMAs
+    pa_xag_n = int(os.environ.get("SPTP_PA_XE_AG_SPLIT", "1"))
+    if pa_xag and (
+        pa_head or xe_n or xe_pallas or os.environ.get("SPTP_PA_FUSE_POOL", "0") != "0"
+    ):
+        raise ValueError(
+            "SPTP_PA_XE_AG goes with the tmaj / ogate-tok layouts and the XLA dequant"
+        )
+    # the in-kernel a2a's row groups: up to 512 own rows each (its o accumulator lives in VMEM)
+    pa_ng = 1
+    if pa_a2a and Ts > 512:
+        pa_ng = -(-Ts // 512)
+        while Ts % pa_ng or (Ts // pa_ng) % 128:
+            pa_ng += 1
+            if pa_ng > Ts // 128:
+                raise ValueError(
+                    f"SPTP_PA_A2A: {T} rows do not split into 128-row groups"
+                )
+    if pa_a2a and Ts % 128:
+        raise ValueError(f"SPTP_PA_A2A needs rows / tp a multiple of 128, got {T} rows")
+    if pa_gtok and pa_ng > 1:
+        # the in-kernel a2a's row groups read only the [qd, T] layout: the token-major one keeps
+        # every own row's o accumulator in VMEM (R=8192: 82 MB of 64)
+        raise ValueError(
+            f"SPTP_PA_OGATE_TOK takes rows / tp <= 512, got {T} rows: use SPTP_PA_TMAJ "
+            "(SPTP_OGATE_PK=13 for the Pallas o gate)"
+        )
+    # SPTP_PA_A2A_LA=n: its sends in flight ahead of use (7: all at the start)
+    pa_la = int(os.environ.get("SPTP_PA_A2A_LA", "7"))
+    # SPTP_PA_FUSE_POOL=n: the pool steps (column tiles of n) inside that kernel; 0 = own kernel
+    pa_fp = int(os.environ.get("SPTP_PA_FUSE_POOL", "0")) if pa_a2a else 0
+    # SPTP_PA_NS=n: stream chunks the residual keeps in flight + 1 (prefetched under the o proj)
+    pa_ns = int(os.environ.get("SPTP_PA_NS", "4"))
+    # SPTP_PA_ORDER=0,1,...: the in-kernel a2a's source order as xor offsets from this rank
+    pa_order = tuple(
+        int(x) for x in os.environ.get("SPTP_PA_ORDER", "").split(",") if x
+    )
+
+    # SPTP_XAG_PRE=n (with FUSED and NORM): a Pallas post-FFN card (unpool, FFN residual) that
+    # also norms and gathers the next layer's first n row tiles; that layer's xag_qkvg computes
+    # them while its own gather fills (sptp/post_ffn.py)
+    n_pre = int(os.environ.get("SPTP_XAG_PRE", "0")) if xag_norm else 0
+    # SPTP_POST_DEFER=1: post_ffn finishes only the n_pre tiles' residual; the next xag_qkvg
+    # does the rest per tile in its gather iterations
+    defer_res = bool(n_pre) and os.environ.get("SPTP_POST_DEFER", "0") == "1"
+    if n_pre:
+        xag_pre_k = {
+            r: xag_qkvg_call(
+                c,
+                xag_seg,
+                r,
+                mxu_norm=mxu_norm,
+                kc=int(os.environ.get("SPTP_XAG_KC", str(kc))),
+                q_rpa=q_rpa,
+                gap=xag_gap,
+                fuse_norm=True,
+                axis=axis,
+                split_epi=xag_split_epi,
+                gate4=xag_gate4,
+                m_split=int(os.environ.get("SPTP_XAG_MSPLIT", "2")),
+                q_strided=xag_q_strided,
+                n_pre=n_pre,
+                wk=int(os.environ.get("SPTP_XAG_WK", "1")),
+                defer_res=defer_res,
+                kv_rpa=xag_kv_rpa,
+            )
+            for r in (True, False)
+        }
+        post_k = post_ffn_call(
+            c,
+            xag_seg,
+            n_pre,
+            ncw=int(os.environ.get("SPTP_POST_NCW", "512")),
+            axis=axis,
+            two_pass=os.environ.get("SPTP_POST_2PASS", "0") == "1",
+            defer_res=defer_res,
+        )
+
+    def forward(
+        meta,
+        pos,
+        kv_lens,
+        cu_q,
+        dist,
+        pf,
+        psw,
+        emb,
+        rope,
+        final_norm,
+        smalls,
+        wqkvg,
+        wo,
+        wpool,
+        wrouter,
+        wunpool,
+        *rest,
+    ):
+        experts, kv = rest[:ne], list(rest[ne:])
+        # the TP rank from meta: axis_index lowers to partition-id, which this export rejects
+        me = meta[1]
+        # expert TP: this rank's slices are virtual experts [rank * E, (rank + 1) * E)
+        group_offset = (me * c.n_experts).reshape(1).astype(jnp.int32)
+        rope_rows = jnp.take(rope, pos, axis=0)
+        own = jax.lax.dynamic_slice_in_dim(emb, me * Ts, Ts, axis=0)
+        # the native decoder streams the bf16-rounded normalized embedding
+        stream = _bf(_rms(own, c.rms_eps))
+        aux = []
+        # post_ffn's hand-over to the next layer (SPTP_XAG_PRE / SPTP_POST_DEFER)
+        stn = fpf = invpf = xg = xsc = None
+        for l in range(L):
+            sm = smalls[l]
+            if defer_res and l > 0:
+                with _scope("sp_xag_qkvg"):
+                    q, kvs, gate, stream = xag_pre_k[c.use_rope(l)](
+                        jnp.full((1,), l, jnp.int32),
+                        stream,
+                        stn,
+                        fpf,
+                        invpf,
+                        xg,
+                        xsc,
+                        rope_rows,
+                        wqkvg,
+                        smalls,
+                    )
+                if l - 1 in c.capture_layers:
+                    aux.append(capture(stream))
+            elif n_pre and l > 0:
+                with _scope("sp_xag_qkvg"):
+                    q, kvs, gate = xag_pre_k[c.use_rope(l)](
+                        jnp.full((1,), l, jnp.int32),
+                        stream,
+                        xg,
+                        xsc,
+                        rope_rows,
+                        wqkvg,
+                        smalls,
+                    )
+            elif xag_norm:
+                with _scope("sp_xag_qkvg"):
+                    dbg = []
+                    if xag_norm_dbg:
+                        dbg = [ag(rms_q8(stream, small_row(sm, "pre_attn_w"))[1], axis)]
+                    q, kvs, gate = xag_k[c.use_rope(l)](
+                        jnp.full((1,), l, jnp.int32),
+                        stream,
+                        *dbg,
+                        rope_rows,
+                        wqkvg,
+                        smalls,
+                    )
+                    if xag_mix >= 2:
+                        a8, a_s = rms_q8(stream, small_row(sm, "pre_attn_w"))
+                        ref = xag_mix_k[c.use_rope(l)](
+                            jnp.full((1,), l, jnp.int32),
+                            a8,
+                            ag(a_s, axis),
+                            rope_rows,
+                            wqkvg,
+                            smalls,
+                        )
+                        mine = (q, kvs, gate)
+                        q, kvs, gate = [
+                            mine[i] if i == xag_mix - 2 else ref[i] for i in range(3)
+                        ]
+            else:
+                with _scope("sp_in_norm"):
+                    a8, a_s = rms_q8(stream, small_row(sm, "pre_attn_w"))
+            if xag_norm:
+                pass
+            elif xag_fused:
+                with _scope("sp_xag_qkvg"):
+                    q, kvs, gate = xag_k[c.use_rope(l)](
+                        jnp.full((1,), l, jnp.int32),
+                        a8,
+                        ag(a_s, axis),
+                        rope_rows,
+                        wqkvg,
+                        smalls,
+                    )
+            elif n_xag > 1 and not xla_qkvg:
+                with _scope("sp_xag_qkvg"):
+                    sub = Ts // n_xag
+                    out = None
+                    # every row's scale in one small AG (a scale gather per chunk paid a wait each)
+                    s_all = ag(a_s, axis)
+                    for i in range(n_xag):
+                        rs = slice(i * sub, (i + 1) * sub)
+                        out = qkvg_c[c.use_rope(l)].chunk(
+                            i,
+                            n_xag,
+                            ag(a8[rs], axis),
+                            s_all,
+                            wqkvg[l],
+                            sm,
+                            rope_rows,
+                            out,
+                        )
+                    q, kvs, gate = out
+            else:
+                with _scope("sp_x_ag"):
+                    a8, a_s = ag(a8, axis), ag(a_s, axis)
+            with _scope("sp_qkvg"):
+                if xag_fused or (n_xag > 1 and not xla_qkvg):  # done above
+                    pass
+                elif xla_qkvg:
+                    qkvg = dense(a8, a_s, wqkvg[l], sm, "wqkvg", c.qkvg_dim)
+                    q, kvs, gate = qkv_from_proj(
+                        c, qkvg, rope_rows if c.use_rope(l) else None, xla=True
+                    )
+                else:
+                    q, kvs, gate = qkvg_k[c.use_rope(l)](
+                        a8, a_s, wqkvg[l], sm, rope_rows
+                    )
+            if q_rpa:
+                kvd = c.kv_dim
+                is_global = l in c.global_layers
+                if kvs.ndim == 4:  # SPTP_XAG_KV_RPA: already the RPA's new-KV operand
+                    k_in, v_in = kvs, None
+                else:
+                    k_in = (
+                        kvs[:, :kvd]
+                        .astype(jnp.float8_e4m3fn)
+                        .reshape(T, c.kv_heads, hd)
+                    )
+                    v_in = (
+                        kvs[:, kvd:]
+                        .astype(jnp.float8_e4m3fn)
+                        .reshape(T, c.kv_heads, hd)
+                    )
+                o, kv[l] = rpa_prepared(
+                    q.reshape(c.kv_heads, T, gq // 2, 2, 128),
+                    k_in,
+                    v_in,
+                    kv[l],
+                    kv_lens,
+                    pf if is_global else psw,
+                    cu_q,
+                    dist,
+                    num_q_heads=c.q_heads,
+                    sm_scale=c.attn_scale,
+                    sliding_window=None if is_global else c.window,
+                )
+                if pa_gtok:
+                    if ogate_pk is not None:
+                        with _scope("sp_o_gate"):
+                            g8, g_s = ogate_pk(o, gate)
+                    else:
+                        with _scope("sp_o_gate"):
+                            # the same per-element math as below, laid out token major (o moved
+                            # instead of gate): the in-kernel a2a reads it without a relayout
+                            if rpa_out_tok:  # already [T, (kv, g, d)]
+                                o4 = tok_rows(o).reshape(T, c.kv_heads, gq, hd)
+                                o4 = o4.astype(_F32)
+                            else:
+                                o4 = o.reshape(c.kv_heads, T, gq, 128)[..., :hd].astype(
+                                    _F32
+                                )
+                                o4 = o4.transpose(1, 0, 2, 3)
+                            o4 = o4 * jax.lax.rsqrt(
+                                jnp.mean(o4 * o4, axis=-1, keepdims=True) + c.rms_eps
+                            )
+                            g4 = gate.reshape(T, c.kv_heads, gq, hd)
+                            a4 = jax.nn.sigmoid(g4.astype(_F32)) * o4
+                            g_s = (
+                                jnp.maximum(
+                                    jnp.max(jnp.abs(a4), axis=(1, 2, 3)), 1e-30
+                                ).reshape(T, 1)
+                                / 448.0
+                            )
+                            g8 = (a4 / g_s.reshape(T, 1, 1, 1)).astype(
+                                jnp.float8_e4m3fn
+                            )
+                    with _scope("sp_postattn"):
+                        pa_o = oproj_a2a_call(
+                            c,
+                            wrouter.shape[-1],
+                            SPTP_PA_COLLECTIVE_ID,
+                            pa_tn,
+                            pa_rc,
+                            pa_la,
+                            pa_fp,
+                            pa_ns,
+                            pa_order,
+                            False,
+                        )
+                        args = (
+                            l, me, g8.reshape(T, qd), g_s.reshape(1, T), stream, smalls, wo,
+                            wrouter,
+                        )  # fmt: skip
+                        if pa_fp:
+                            stream, ids, tw, xe8, xs = pa_o(*args, wpool)
+                        else:
+                            stream, ids, tw, f8, f_s = pa_o(*args)
+                            if pa_xag:
+                                xa_out = pool_ag_call(
+                                    c,
+                                    SPTP_PA_XE_COLLECTIVE_ID,
+                                    pa_tp,
+                                    pa_rc,
+                                    n_send=pa_xag_n,
+                                )(l, me, f8, f_s, smalls, wpool)
+                            else:
+                                xe8, xs = pa_pool(l, f8, f_s, smalls, wpool)
+                else:
+                    if ogate_tm is not None:
+                        with _scope("sp_o_gate"):
+                            g8, g_s = ogate_tm(o, gate)
+                    elif ogate_kernel:
+                        with _scope("sp_o_gate"):
+                            g8, g_s = o_gate(o, gate)
+                    else:
+                        with _scope("sp_o_gate"):
+                            # o, gate in the kernel's [Hkv, T, G, d] head layout; rows quantized
+                            # per token
+                            o4 = o.reshape(c.kv_heads, T, gq, 128)[..., :hd].astype(
+                                _F32
+                            )
+                            o4 = o4 * jax.lax.rsqrt(
+                                jnp.mean(o4 * o4, axis=-1, keepdims=True) + c.rms_eps
+                            )
+                            if xag_gate4:
+                                g4 = gate[..., :hd]
+                            else:
+                                g4 = gate.reshape(T, c.kv_heads, gq, hd).transpose(
+                                    1, 0, 2, 3
+                                )
+                            a4 = jax.nn.sigmoid(g4.astype(_F32)) * o4
+                            if xag_gate4:
+                                # per kv head first: one reduce over (0, 2, 3) with gate4's
+                                # operands fuses into a 10x slower reduction
+                                amax = jnp.max(
+                                    jnp.max(jnp.abs(a4), axis=(2, 3)), axis=0
+                                )
+                            else:
+                                amax = jnp.max(jnp.abs(a4), axis=(0, 2, 3))
+                            g_s = jnp.maximum(amax, 1e-30).reshape(T, 1) / 448.0
+                            g8 = (a4 / g_s.reshape(1, T, 1, 1)).astype(
+                                jnp.float8_e4m3fn
+                            )
+                    if pa_a2a:
+                        with _scope("sp_postattn"):
+                            if ogate_kernel:
+                                if pa_head or pa_tmaj:
+                                    raise ValueError(
+                                        "SPTP_OGATE_KERNEL writes token-major rows: "
+                                        "SPTP_PA_HEAD=0, SPTP_PA_TMAJ=0"
+                                    )
+                            elif pa_tmaj:
+                                if ogate_tm is None:
+                                    g8 = g8.transpose(0, 2, 3, 1).reshape(qd, T)
+                            elif pa_head:
+                                g8 = g8.reshape(c.kv_heads, T, gq * hd)
+                            else:
+                                g8 = g8.transpose(1, 0, 2, 3).reshape(T, qd)
+                            # one call per row group of up to 512 own rows (VMEM)
+                            ids = tw = xe8 = xs = None
+                            for gj in range(pa_ng):
+                                grp = (gj, pa_ng) if pa_ng > 1 else ()
+                                pa_o = oproj_a2a_call(
+                                    c,
+                                    wrouter.shape[-1],
+                                    SPTP_PA_COLLECTIVE_ID,
+                                    pa_tn,
+                                    pa_rc,
+                                    pa_la,
+                                    pa_fp,
+                                    pa_ns,
+                                    pa_order,
+                                    pa_head,
+                                    pa_tmaj,
+                                    grp,
+                                )
+                                args = (
+                                    l,
+                                    me,
+                                    g8,
+                                    g_s.reshape(1, T),
+                                    stream,
+                                    smalls,
+                                    wo,
+                                    wrouter,
+                                )
+                                if pa_fp:
+                                    stream, ids, tw, xe8, xs = pa_o(*args, wpool)
+                                    continue
+                                prev = (ids, tw) if gj else ()
+                                stream, ids, tw, f8, f_s = pa_o(*args, prev=prev)
+                                pool = (
+                                    pool_call(c, pa_tp, pa_rc, pa_head, pa_tmaj, grp)
+                                    if grp
+                                    else pa_pool
+                                )
+                                if pa_xag:
+                                    pk = pool_ag_call(
+                                        c,
+                                        SPTP_PA_XE_COLLECTIVE_ID,
+                                        pa_tp,
+                                        pa_rc,
+                                        pa_tmaj,
+                                        grp,
+                                        pa_xag_n,
+                                    )
+                                    prev = xa_out[:2] if gj else ()
+                                    out = pk(l, me, f8, f_s, smalls, wpool, prev=prev)
+                                    xa_out = (
+                                        out[:2] + (xa_out[2:] if gj else ()) + out[2:]
+                                    )
+                                    continue
+                                prev = (xe8, xs) if gj else ()
+                                xe8, xs = pool(l, f8, f_s, smalls, wpool, prev=prev)
+                    elif pa:
+                        with _scope("sp_o_a2a"):
+                            # the token-major [T, qd] gated output (the o gate's layout to come)
+                            if not ogate_kernel:
+                                g8 = g8.transpose(1, 0, 2, 3).reshape(T, qd)
+                            g8 = jax.lax.all_to_all(g8, axis, 0, 0, tiled=True)
+                            g_s = jax.lax.all_to_all(g_s, axis, 0, 0, tiled=True)
+                            g8, g_s = g8.reshape(tp, Ts, qd), g_s.reshape(tp, Ts, 1)
+                        with _scope("sp_postattn"):
+                            pa_o = oproj_call(c, wrouter.shape[-1], pa_tn, pa_rc)
+                            stream, ids, tw, f8, f_s = pa_o(
+                                l, g8, g_s, stream, smalls, wo, wrouter
+                            )
+                            xe8, xs = pa_pool(l, f8, f_s, smalls, wpool)
+                    elif ogate_kernel:
+                        with _scope("sp_o_a2a"):
+                            g8, g_s = to_owner_x(g8), to_owner(g_s, tp, axis)
+                        with _scope("sp_o_proj"):
+                            g8, g_s = q8((g8.astype(_F32) * g_s).reshape(Ts, tp * qd))
+                            o_own = dense(g8, g_s, wo[l], sm, "wo", H)
+                    else:
+                        with _scope("sp_o_a2a"):
+                            g8 = jax.lax.all_to_all(
+                                g8.reshape(c.kv_heads, tp, Ts, gq, hd),
+                                axis,
+                                1,
+                                1,
+                                tiled=True,
+                            )
+                            g_s = to_owner(g_s, tp, axis)
+                        with _scope("sp_o_proj"):
+                            # [Hkv, src, Ts, G, d] -> own rows x (src rank, head, d): wo's row order
+                            a = g8.astype(_F32).transpose(2, 1, 0, 3, 4) * g_s.reshape(
+                                Ts, tp, 1, 1, 1
+                            )
+                            g8, g_s = q8(a.reshape(Ts, tp * qd))
+                            o_own = dense(g8, g_s, wo[l], sm, "wo", H)
+            else:
+                o, kv[l] = attention(c, l, q, kvs, kv[l], kv_lens, pf, psw, cu_q, dist)
+                with _scope("sp_o_gate"):
+                    if ogate_mxu:
+                        attn = _heads_rms_mxu(
+                            o.reshape(T, qd).astype(_F32), c.q_heads, hd, c.rms_eps
+                        )
+                    else:
+                        attn = heads_rms_xla(o.reshape(T, qd), c.q_heads, hd, c.rms_eps)
+                    g8, g_s = q8(jax.nn.sigmoid(gate.astype(_F32)) * attn)
+                with _scope("sp_o_a2a"):
+                    g8, g_s = to_owner_x(g8), to_owner(g_s, tp, axis)
+                # own rows' every head, then the o proj on the whole wo: no partial sums
+                with _scope("sp_o_proj"):
+                    g8, g_s = q8((g8.astype(_F32) * g_s).reshape(Ts, tp * qd))
+                    o_own = dense(g8, g_s, wo[l], sm, "wo", H)
+            if not pa:
+                with _scope("sp_attn_res"):
+                    stream = residual(c, stream, sm, "attn", o_own)
+                with _scope("sp_router"):
+                    ffn = _rms(stream, c.rms_eps) * small_row(sm, "pre_ffn_w")
+                    ids, tw = router(c, ffn.astype(_BF16), wrouter[l], sm)
+                with _scope("sp_pool"):
+                    if fused_rq:
+                        f8, f_s = rms_q8(stream, small_row(sm, "pre_ffn_w"))
+                    else:
+                        f8, f_s = q8(ffn)
+                    pooled = dense(f8, f_s, wpool[l], sm, "wpool", He)
+                    xe8, xs = rms_q8(pooled, small_row(sm, "pre_expert_w")[:, :He])
+            with _scope("sp_xe_ag"):
+                if pa:
+                    # lane-dense [k, Ts] / [1, Ts] kernel outputs: gather on the row axis
+                    def ag1(x):
+                        return jax.lax.all_gather(x, axis, axis=1, tiled=True)
+
+                    ids_all, tw_all = ag1(ids).T, ag1(tw).T
+                    ids_own = ids.T
+                    if pa_xag:
+                        xe_all, xs_row = xe_wait_call(c, 1 if pa_gtok else pa_ng)(
+                            *xa_out
+                        )
+                        xs_all = xs_row.reshape(T, 1)
+                        # the MoE takes the tiled [T, He / 128, 128] lhs as is
+                        xe = (xe_all.astype(_F32) * xs_row.reshape(T, 1, 1)).astype(
+                            _BF16
+                        )
+                    else:
+                        xs_all = ag1(xs).reshape(T, 1)
+                    if pa_xag:
+                        pass
+                    elif xe_ag_k is not None:
+                        xe = xe_ag_k(xe8, xs_all)
+                    elif xe_pallas:
+                        xe = dequant(ag(xe8, axis), xs_all)
+                    else:
+                        xe = (ag(xe8, axis).astype(_F32) * xs_all).astype(_BF16)
+                else:
+                    # the switch-off op order (lowers as the un-integrated sptp program)
+                    if xe_pallas:
+                        xe = dequant(ag(xe8, axis), ag(xs, axis))
+                    else:
+                        xe = (ag(xe8, axis).astype(_F32) * ag(xs, axis)).astype(_BF16)
+                    ids_all, tw_all = ag(ids, axis), ag(tw, axis)
+                    ids_own = ids
+                counts = None
+                if local_counts:
+                    # per-expert counts of own rows' slots, summed over ranks (the MoE's one-hot
+                    # count over every rank's slots, 1/tp of the compares); out-of-range ids
+                    # count as expert 0, as the MoE routes them
+                    ids_c = jnp.where(
+                        (ids_own >= 0) & (ids_own < c.n_experts), ids_own, 0
+                    ).reshape(-1)
+                    own = jnp.sum(
+                        (ids_c[:, None] == jnp.arange(c.n_experts)[None, :]).astype(
+                            jnp.int32
+                        ),
+                        axis=0,
+                    )
+                    counts = jnp.sum(ag(own[None], axis), axis=0)
+            with _scope("sp_moe"):
+                y = fused_rs_moe(
+                    c,
+                    layer_experts,
+                    l,
+                    xe,
+                    ids_all,
+                    tw_all,
+                    experts,
+                    group_offset,
+                    sm,
+                    axis,
+                    # ids / tw are all-gathered: equal on every rank, no rank-0 broadcast
+                    skip_routing_psum=True,
+                    group_sizes=counts,
+                )
+            if defer_res and l + 1 < L:
+                # stream stays the pre-residual one until the next layer's kernel finishes it
+                with _scope("sp_unpool"):
+                    stn, xg, xsc, fpf, invpf = post_k(
+                        jnp.full((1,), l, jnp.int32), y, stream, wunpool, smalls
+                    )
+            elif n_pre and l + 1 < L:
+                with _scope("sp_unpool"):
+                    stream, xg, xsc = post_k(
+                        jnp.full((1,), l, jnp.int32), y, stream, wunpool, smalls
+                    )
+            else:
+                with _scope("sp_unpool"):
+                    u8, u_s = q8(y.astype(_F32))
+                    # bf16: the unpool output feeds the post-FFN norm
+                    f = dense(u8, u_s, wunpool[l], sm, "wunpool", H).astype(_BF16)
+                with _scope("sp_ffn_res"):
+                    stream = residual(
+                        c,
+                        stream,
+                        sm,
+                        "ffn",
+                        f.astype(_F32) * small_row(sm, "post_ffn_w"),
+                    )
+            if l in c.capture_layers and not (defer_res and l + 1 < L):
+                aux.append(capture(stream))
+        hidden = (_rms(stream.astype(_BF16), c.rms_eps) * final_norm[0]).astype(_BF16)
+        aux_out = jnp.concatenate(aux, axis=1) if aux else jnp.zeros((Ts, LANE), _BF16)
+        if not aux_early or not aux:
+            aux_out = ag(aux_out, axis)
+        return (ag(hidden, axis), aux_out, *kv)
+
+    return forward

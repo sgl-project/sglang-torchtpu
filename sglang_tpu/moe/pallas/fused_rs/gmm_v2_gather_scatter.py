@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
 import dataclasses
 import functools
 import os
@@ -108,6 +109,11 @@ class InputConfigs:
     has_scale: bool = False
     packing: int = 1
     num_quant_blocks: int = 1
+    # lhs only: one quant scale per row over the whole tile K (EP gmm_v2 style).
+    row_scale: bool = False
+    # rhs only, fp4 with the block scale applied after each block's dot: the fp4 codes go
+    # to the MXU as e4m3 (exact) instead of bf16, half the weight pushes.
+    e4m3_codes: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -257,6 +263,18 @@ def generate_block_specs(
 
 
 # Define kernels.
+def _frs_scope(name: str):
+    """Inner detail-trace span (MUSE_MK_TRACE >= 2, read at trace time); a no-op otherwise.
+
+    The spans fence the schedule (dequant and matmul stop overlapping) and push the kernel
+    past the instruction-memory cliff (37k -> 68k bundles, 7x slower), so level 1 leaves
+    them out.
+    """
+    if int(os.environ.get("MUSE_MK_TRACE", "0")) >= 2:
+        return jax.named_scope(name)
+    return contextlib.nullcontext()
+
+
 def inner_kernel(
     # In
     tiled_lhs_ref: jax.Array,
@@ -278,6 +296,7 @@ def inner_kernel(
     _num_k: int | None = None,
     _gm_id: int | None = None,
     _n_id: int | None = None,
+    skip_row_mask: bool = False,
 ):
     """Inner kernel invoked by emit_pipeline to perform matmul.
 
@@ -431,6 +450,21 @@ def inner_kernel(
             apply_rhs_scale_after_matmul = cfgs.rhs_cfgs.has_scale and (
                 rhs_scale_matches_lhs_block
             )
+            row_scale = cfgs.lhs_cfgs.row_scale
+            if row_scale:
+                if not (is_first_k_step and is_last_k_step):
+                    raise ValueError("row-scaled lhs needs the whole K in one tile")
+                q_max = float(jnp.finfo(cfgs.lhs_cfgs.quant_dtype).max)
+                row_s = jnp.max(jnp.abs(tiled_lhs), axis=1, keepdims=True) / q_max
+                row_s_inv = jnp.where(row_s == 0, 0, 1 / row_s)
+                lhs_src = (tiled_lhs * row_s_inv).astype(cfgs.lhs_cfgs.quant_dtype)
+            else:
+                lhs_src = tiled_lhs
+
+            def _row_rescale(acc_n):
+                if not row_scale:
+                    return acc_n
+                return acc_n * row_s.astype(acc_n.dtype)
 
             # Without n outer loop, result of quantized matmul becomes available only
             # at the last iteration of the loop. This means [tile_m, tile_n] value
@@ -456,6 +490,8 @@ def inner_kernel(
                         f"{q_block_size}. Check MUSE_FUSED_RS_W4A16_KBLOCK or unset "
                         "SGLANG_TPU_MUSE_MK_KPERM."
                     )
+                _w_scope = _frs_scope("frs_w_dequant")
+                _w_scope.__enter__()
                 block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
                 if cfgs.rhs_cfgs.has_scale and not apply_rhs_scale_after_matmul:
                     if moe_kperm and rhs_qbs == 16 and (end_k - start_k) % 256 == 0:
@@ -489,10 +525,31 @@ def inner_kernel(
                             scaled_rhs_slices.append(scaled_rhs_slice)
                             rhs_k_start = rhs_k_end
                         block_rhs_for_quant = jnp.concatenate(scaled_rhs_slices, axis=0)
+                elif cfgs.rhs_cfgs.e4m3_codes:
+                    if (
+                        not apply_rhs_scale_after_matmul
+                        or block_rhs.dtype != jnp.float4_e2m1fn
+                    ):
+                        raise ValueError(
+                            "e4m3_codes needs fp4 weights with the scale applied after the dot"
+                        )
+                    block_rhs_for_quant = block_rhs.astype(jnp.float8_e4m3fn)
                 else:
                     block_rhs_for_quant = _to_bf16(block_rhs)
 
-                if fp8_activation_quant:
+                lhs_scale = None
+                if row_scale:
+                    block_lhs_for_matmul = block_lhs
+                    if cfgs.rhs_cfgs.has_scale and not apply_rhs_scale_after_matmul:
+                        block_rhs_for_matmul, rhs_online_scale = _online_quantize(
+                            block_rhs_for_quant,
+                            axis=0,
+                            quant_dtype=cfgs.lhs_cfgs.quant_dtype,
+                        )
+                    else:
+                        block_rhs_for_matmul = block_rhs
+                        rhs_online_scale = None
+                elif fp8_activation_quant:
                     block_lhs_for_matmul, lhs_scale = _online_quantize(
                         block_lhs, axis=1, quant_dtype=cfgs.lhs_cfgs.quant_dtype
                     )
@@ -512,14 +569,17 @@ def inner_kernel(
                     block_lhs_for_matmul = block_lhs.astype(jnp.bfloat16)
                     block_rhs_for_matmul = block_rhs_for_quant
 
-                block_acc = jnp.matmul(
-                    block_lhs_for_matmul,
-                    block_rhs_for_matmul,
-                    preferred_element_type=jnp.float32,
-                ).astype(acc_ref.dtype)
+                _w_scope.__exit__(None, None, None)
+                with _frs_scope("frs_mxu"):
+                    block_acc = jnp.matmul(
+                        block_lhs_for_matmul,
+                        block_rhs_for_matmul,
+                        preferred_element_type=jnp.float32,
+                    ).astype(acc_ref.dtype)
 
                 if fp8_activation_quant:
-                    block_acc *= lhs_scale.astype(acc_ref.dtype)
+                    if lhs_scale is not None:
+                        block_acc *= lhs_scale.astype(acc_ref.dtype)
                     if rhs_online_scale is not None:
                         block_acc *= rhs_online_scale.astype(acc_ref.dtype)
 
@@ -541,7 +601,11 @@ def inner_kernel(
                 sls_out = pltpu.get_tpu_info().get_sublane_tiling(tiled_out_ref.dtype)
                 cols_per_grp = sls_out * num_lanes
                 if rhs_tile_n % cols_per_grp == 0 and cols_per_grp % mxu_size == 0:
-                    mask_col = _valid_m_mask((cfgs.tiles.tile_m, mxu_size))
+                    mask_col = (
+                        None
+                        if skip_row_mask
+                        else _valid_m_mask((cfgs.tiles.tile_m, mxu_size))
+                    )
                     has_gs = cfgs.rhs_cfgs.has_scale and gs_gate_ref is not None
                     _gid = (
                         metadata_ref.gm_id_to_group_id[_resolved_gm_id] if has_gs else 0
@@ -559,20 +623,25 @@ def inner_kernel(
                             ]
                             for start_k in range(0, cfgs.tiles.tile_k, q_block_size):
                                 end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
-                                block_lhs = tiled_lhs[:, start_k:end_k]
+                                block_lhs = lhs_src[:, start_k:end_k]
                                 for c in range(n_grp):
                                     sn = g_col + c * mxu_size
                                     accs[c] += _quant_col_step(
                                         block_lhs, start_k, end_k, sn, sn + mxu_size
                                     )
+                            _e_scope = _frs_scope("frs_epilogue")
+                            _e_scope.__enter__()
                             grp_outs = []
                             for acc_n in accs:
+                                acc_n = _row_rescale(acc_n)
                                 if gs_2 is not None:
                                     acc_n *= gs_2
                                 grp_outs.append(
-                                    jnp.where(mask_col, acc_n, 0).astype(
-                                        tiled_out_ref.dtype
-                                    )
+                                    (
+                                        acc_n
+                                        if mask_col is None
+                                        else jnp.where(mask_col, acc_n, 0)
+                                    ).astype(tiled_out_ref.dtype)
                                 )
                         else:
                             grp_outs = []
@@ -586,7 +655,7 @@ def inner_kernel(
                                     end_k = min(
                                         cfgs.tiles.tile_k, start_k + q_block_size
                                     )
-                                    block_lhs = tiled_lhs[:, start_k:end_k]
+                                    block_lhs = lhs_src[:, start_k:end_k]
                                     acc_n += _quant_col_step(
                                         block_lhs,
                                         start_k,
@@ -594,17 +663,29 @@ def inner_kernel(
                                         start_n,
                                         start_n + mxu_size,
                                     )
+                                acc_n = _row_rescale(acc_n)
                                 if gs_2 is not None:
                                     acc_n *= gs_2
                                 grp_outs.append(
-                                    jnp.where(mask_col, acc_n, 0).astype(
-                                        tiled_out_ref.dtype
-                                    )
+                                    (
+                                        acc_n
+                                        if mask_col is None
+                                        else jnp.where(mask_col, acc_n, 0)
+                                    ).astype(tiled_out_ref.dtype)
                                 )
                         g_blk = g_col // num_lanes
-                        tiled_out_ref[:, pl.ds(g_blk, sls_out), :] = jnp.concatenate(
-                            grp_outs, axis=1
-                        ).reshape(cfgs.tiles.tile_m, sls_out, num_lanes)
+                        with (
+                            contextlib.nullcontext()
+                            if share_lhs
+                            else _frs_scope("frs_epilogue")
+                        ):
+                            tiled_out_ref[:, pl.ds(g_blk, sls_out), :] = (
+                                jnp.concatenate(grp_outs, axis=1).reshape(
+                                    cfgs.tiles.tile_m, sls_out, num_lanes
+                                )
+                            )
+                        if share_lhs:
+                            _e_scope.__exit__(None, None, None)
                     return
 
             for start_n in range(0, rhs_tile_n, mxu_size):
@@ -615,15 +696,19 @@ def inner_kernel(
 
                 for start_k in range(0, cfgs.tiles.tile_k, q_block_size):
                     end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
-                    block_lhs = tiled_lhs[:, start_k:end_k]
+                    block_lhs = lhs_src[:, start_k:end_k]
                     acc_n += _quant_col_step(block_lhs, start_k, end_k, start_n, end_n)
 
-                acc_list.append(acc_n)
+                acc_list.append(_row_rescale(acc_n))
             acc = jnp.concatenate(acc_list, axis=1)
 
         if not is_first_k_step:
             acc += acc_ref[...]
 
+        _e_scope = (
+            _frs_scope("frs_epilogue") if is_last_k_step else contextlib.nullcontext()
+        )
+        _e_scope.__enter__()
         if is_last_k_step:
             if cfgs.rhs_cfgs.has_scale and gs_gate_ref is not None:
                 _gid = metadata_ref.gm_id_to_group_id[_resolved_gm_id]
@@ -658,7 +743,7 @@ def inner_kernel(
                 # In scatter mode, write masked acc directly to 2D output.
                 # No 3D reshape needed — avoids VMEM tiling mismatch with DMA.
                 # No partial_out needed — each scatter tile is independent.
-                acc_masked = jnp.where(mask, acc, 0)
+                acc_masked = acc if skip_row_mask else jnp.where(mask, acc, 0)
                 tiled_out_ref[...] = acc_masked.astype(tiled_out_ref.dtype).reshape(
                     tiled_out_ref.shape
                 )
@@ -704,6 +789,7 @@ def inner_kernel(
                 )
         else:
             acc_ref[...] = acc
+        _e_scope.__exit__(None, None, None)
 
     # Define matmul wrapper functions.
     @jax.named_scope("matmul_first_last")

@@ -35,6 +35,7 @@ from sglang_tpu.muse_megakernel_v2.common import trace as mk_trace
 from sglang_tpu.muse_megakernel_v2.common.config import (
     PREFILL_TP,
     ROW_ALIGN,
+    SPTP_ROW_ALIGN,
     MKConfig,
     PFConfig,
 )
@@ -71,6 +72,7 @@ from sglang_tpu.muse_megakernel_v2.decode.spep.kernel import (
 )
 from sglang_tpu.muse_megakernel_v2.decode.tp import kernel as K
 from sglang_tpu.muse_megakernel_v2.prefill import spep as PF_SP
+from sglang_tpu.muse_megakernel_v2.prefill import sptp as PF_SPTP
 from sglang_tpu.muse_megakernel_v2.prefill import tp as PF
 
 logger = logging.getLogger(__name__)
@@ -271,6 +273,39 @@ def _unpool_weight(weight: torch.Tensor, *, ep: bool) -> torch.Tensor:
     )
 
 
+# prefill/sptp's replicated operands, in place of the TP slices of the same names
+SPTP_WEIGHT_NAMES = ("smalls", "wo", "wpool", "wunpool")
+
+
+def _append_sptp_weights(
+    out: dict[str, list[torch.Tensor]],
+    sm: torch.Tensor,
+    o_proj: torch.Tensor,
+    moe: torch.nn.Module,
+) -> None:
+    """One layer of prefill/sptp's operands: the whole wo [tp * qd, H], pool [H, H_e] and
+    unpool [H_e, H] in fp8, each quantized whole, and a copy of the TP smalls sm with their
+    scales. The decode slices keep their own quantization (wo's K is split over ranks)."""
+    from sglang.srt.distributed import tensor_model_parallel_all_gather
+
+    whole = {
+        "wo": tensor_model_parallel_all_gather(_k_major(o_proj), dim=0),
+        "wpool": _k_major(
+            tensor_model_parallel_all_gather(
+                moe.pre_expert_proj.weight.detach().contiguous(), dim=0
+            )
+        ),
+        "wunpool": _unpool_weight(moe.post_expert_proj.weight, ep=True),
+    }
+    sm = sm.clone()
+    for name, w in whole.items():
+        q, scale = _fp8_channelwise(w)
+        out[name].append(q)
+        sm[SMALL[name + "_s"]] = 0.0
+        sm[SMALL[name + "_s"], : scale.numel()] = scale
+    out["smalls"].append(sm)
+
+
 def w4a16_layers_of(kinds: tuple, qblock: int) -> tuple:
     """Layers whose experts the native fused-RS MoE runs as W4A16: the fp4 ones, once
     requantized to qblock (the fp8 layers keep per-channel scales)."""
@@ -376,12 +411,15 @@ class MuseMegakernel(torch.nn.Module):
         moe_mode: MoeMode,
         prefill: bool = False,
         prefill_fp8_gather: bool = False,
+        prefill_sptp: bool = False,
         w4a16_layers: tuple = (),
     ) -> None:
         super().__init__()
         self.geo = geo
         # extend steps run the prefill program
         self.prefill = prefill
+        # the prefill program is prefill/sptp (weights["sptp_*"]) rather than prefill/tp
+        self.prefill_sptp = prefill_sptp
         self.prefill_fp8_gather = prefill_fp8_gather
         # layers of block-requantized fp4 experts, which the fused-RS MoE runs as W4A16
         self.w4a16_layers = w4a16_layers
@@ -408,6 +446,11 @@ class MuseMegakernel(torch.nn.Module):
         self.prefill_whole_wo = "wo_full" in weights
         if self.prefill_whole_wo:
             self.register_buffer("w_wo_full", weights["wo_full"], persistent=False)
+        if prefill_sptp:
+            for name in SPTP_WEIGHT_NAMES:
+                self.register_buffer(
+                    f"w_sptp_{name}", weights[f"sptp_{name}"], persistent=False
+                )
         for i, t in enumerate(experts):
             self.register_buffer(f"expert_{i}", t, persistent=False)
         self.n_expert_refs = len(experts)
@@ -458,8 +501,9 @@ class MuseMegakernel(torch.nn.Module):
                 f"SGLANG_TPU_MUSE_MK_PREFILL: the Muse prefill program runs at TP "
                 f"{PREFILL_TP}, got {parallel.tp_size}"
             )
+        sptp = prefill and not ep and tpu_envs.SGLANG_TPU_MUSE_MK_PREFILL_SPTP.get()
         if prefill:
-            _check_prefill_setup()
+            _check_prefill_setup(SPTP_ROW_ALIGN if sptp else ROW_ALIGN)
         geo = _ModelSpec(model, ep_ranks=parallel.moe_ep_size if ep else 1)
         decoder = model.model
         L, H = geo.n_layers, geo.hidden
@@ -467,6 +511,8 @@ class MuseMegakernel(torch.nn.Module):
         device = decoder.norm.weight.device
         qkvg, wo, wpool, wunpool, wrouter, smalls = [], [], [], [], [], []
         wo_full: list[torch.Tensor] = []  # EP only: the whole wo prefill/spep reads
+        # prefill/sptp only: replicated wo / pool / unpool and the smalls with their scales
+        sptp_w: dict[str, list[torch.Tensor]] = {n: [] for n in SPTP_WEIGHT_NAMES}
         experts, kinds = [], []
         qblock = tpu_envs.SGLANG_TPU_MUSE_MK_QBLOCK.get()
         if qblock:
@@ -543,6 +589,8 @@ class MuseMegakernel(torch.nn.Module):
                     mats[-1], scale = _fp8_channelwise(mats[-1])
                 sm[S[name + "_s"], : scale.numel()] = scale
             smalls.append(sm)
+            if sptp:
+                _append_sptp_weights(sptp_w, sm, attn.o_proj.weight, moe)
             kind = _expert_kind(moe.experts)
             kinds.append(kind)
             if ep:
@@ -582,6 +630,8 @@ class MuseMegakernel(torch.nn.Module):
         }
         if wo_full:
             weights["wo_full"] = _stack(wo_full)
+        if sptp:
+            weights.update({f"sptp_{n}": _stack(ts) for n, ts in sptp_w.items()})
         extra = sum(t.numel() * t.element_size() for t in weights.values())
         logger.info(
             "Muse megakernel prepared: %d layers, experts %s, %.2f GiB of K-major copies per device",
@@ -601,7 +651,10 @@ class MuseMegakernel(torch.nn.Module):
             expert_groups=expert_groups,
             moe_mode=moe_mode,
             prefill=prefill,
-            prefill_fp8_gather=tpu_envs.SGLANG_TPU_MUSE_MK_PREFILL_FP8_GATHER.get(),
+            # prefill/sptp gathers in e4m3 itself; the knob is prefill/tp's
+            prefill_fp8_gather=not sptp
+            and tpu_envs.SGLANG_TPU_MUSE_MK_PREFILL_FP8_GATHER.get(),
+            prefill_sptp=sptp,
             # under EP no native MoE runs (the experts hold the EP layout)
             w4a16_layers=() if ep else w4a16_layers_of(tuple(kinds), qblock),
         )
@@ -1036,6 +1089,7 @@ class MuseMegakernel(torch.nn.Module):
             sp=sp,
             expert_kinds=tuple(self.kinds) if sp else (),
             sp_ep_layout=sp and tpu_envs.SGLANG_TPU_MUSE_MK_SP_EP_LAYOUT.get(),
+            sptp=self.prefill_sptp,
         ).validate()
 
     def prefill_callable_for(self, cfg: PFConfig):
@@ -1050,10 +1104,19 @@ class MuseMegakernel(torch.nn.Module):
             return step_rows(num_tokens, self.tp_size, self.moe_mode) <= self.max_rows
         if self.prefill and mode.is_extend():
             # token buckets (tpu_compile_tokens) must tile the prefill kernels
-            if num_tokens % ROW_ALIGN:
+            align = SPTP_ROW_ALIGN if self.prefill_sptp else ROW_ALIGN
+            if num_tokens % align:
                 raise ValueError(
                     f"{num_tokens}-token extend step: the Muse prefill program needs "
-                    f"multiples of {ROW_ALIGN} tokens (tpu_compile_tokens)"
+                    f"multiples of {align} tokens (tpu_compile_tokens)"
+                )
+            # prefill/sptp's RPA runs no DECODE pass (distribution[0] == 0)
+            if self.prefill_sptp and (
+                mode.is_mixed() or forward_batch.mix_verify_width > 1
+            ):
+                raise NotImplementedError(
+                    f"prefill/sptp runs pure extend batches, got {mode} "
+                    f"(mix_verify_width {forward_batch.mix_verify_width})"
                 )
             return True
         return False
@@ -1149,6 +1212,8 @@ class MuseMegakernel(torch.nn.Module):
         weights = [
             self.w_wo_full
             if n == "wo" and self.prefill_whole_wo
+            else getattr(self, f"w_sptp_{n}")
+            if self.prefill_sptp and n in SPTP_WEIGHT_NAMES
             else getattr(self, f"w_{n}")
             for n in WEIGHT_NAMES
         ]
@@ -1437,7 +1502,7 @@ def _export_program(
     return callable_
 
 
-def _check_prefill_setup() -> None:
+def _check_prefill_setup(align: int) -> None:
     """Refuses at load time what the prefill program would only reject on its first extend
     step (the pool dtype is still checked per step, where the pool is known)."""
     from sglang.srt.runtime_context import get_exec
@@ -1454,11 +1519,11 @@ def _check_prefill_setup() -> None:
             "SGLANG_TPU_MUSE_MK_PREFILL: the prefill program reads SEQ_ALONG_LANE pools "
             "(SGLANG_TPU_USE_SEQ_ALONG_LANE_KV=1)"
         )
-    bad = [t for t in get_exec().graph.tpu_compile_tokens or () if t % ROW_ALIGN]
+    bad = [t for t in get_exec().graph.tpu_compile_tokens or () if t % align]
     if bad:
         raise NotImplementedError(
             f"SGLANG_TPU_MUSE_MK_PREFILL: tpu_compile_tokens must be multiples of "
-            f"{ROW_ALIGN}, got {bad}"
+            f"{align}, got {bad}"
         )
 
 
@@ -1508,19 +1573,23 @@ def _build_prefill_callable(cfg: PFConfig):
     """The prefill program (prefill.build_forward) over the TP mesh; batched RPA updates the
     pools in place."""
     L = cfg.n_layers
+    prog = PF_SPTP if cfg.sptp else PF_SP if cfg.sp else PF
     n_experts = PF_SP.n_expert_refs(cfg) if cfg.sp else n_expert_refs(cfg)
     n_args = PF.N_STEP_ARGS + len(WEIGHT_NAMES) + n_experts + L
+    kind = "_sptp" if cfg.sptp else "_sp" if cfg.sp else ""
     callable_ = _export_program(
-        (PF_SP.build_forward if cfg.sp else PF.build_forward)(cfg),
+        prog.build_forward(cfg),
         tp=cfg.tp,
         n_args=n_args,
         kv0=n_args - L,
         n_out=2 + L,
-        tag=f"muse_prefill{'_sp' if cfg.sp else ''}_r{cfg.rows}_c{len(cfg.capture_layers)}",
+        tag=f"muse_prefill{kind}_r{cfg.rows}_c{len(cfg.capture_layers)}",
     )
     logger.info(
-        "Muse prefill program built: sp=%s rows=%d capture=%s fp8_gather=%s w4a16_layers=%d",
+        "Muse prefill program built: sp=%s sptp=%s rows=%d capture=%s fp8_gather=%s "
+        "w4a16_layers=%d",
         cfg.sp,
+        cfg.sptp,
         cfg.rows,
         cfg.capture_layers,
         cfg.fp8_gather,

@@ -22,6 +22,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.muse_megakernel_v2.common.consts import LANE
+from sglang_tpu.muse_megakernel_v2.common.trace import _scope
 
 _FP8_MAX = 448.0
 
@@ -695,7 +696,9 @@ def run_pipeline(stages: tuple, nt: int, gap: int = 0) -> None:
 
             @pl.when(jnp.logical_and(j >= 0, j < nt))
             def _(st=spaced[k], j=j):
-                st(j)
+                name = st.__name__ if st.__name__ != "<lambda>" else f"relay{k}"
+                with _scope(f"pf_{name}"):
+                    st(j)
 
         return carry
 

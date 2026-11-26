@@ -31,6 +31,61 @@ def _layer_experts(c: PFConfig) -> list:
     return out
 
 
+def fused_rs_moe(
+    c: PFConfig,
+    layer_experts: list,
+    l: int,
+    xe,
+    ids,
+    tw,
+    experts,
+    group_offset,
+    smalls_l,
+    axis: str = "model",
+    skip_routing_psum: bool | None = None,
+    group_sizes=None,
+):
+    """The expert-TP fused-RS MoE of layer l: xe [T, He] bf16 and routing of every row ->
+    y [T / tp, He] bf16 of this rank's token block (post-expert norm and top-k sum applied)."""
+    from sglang_tpu.moe.pallas.fused_rs.fused_moe import moe_gmm_local_rs_nodedup
+
+    u, in_group = layer_experts[l]
+    w13, s13, w2, s2 = experts[4 * u : 4 * u + 4]
+    go = (
+        group_offset
+        if in_group is None
+        else jnp.stack([group_offset[0], jnp.int32(in_group)])
+    )
+    He = c.expert_hidden
+    return moe_gmm_local_rs_nodedup(
+        xe,
+        w13,
+        s13,
+        None,
+        w2,
+        s2,
+        None,
+        None,
+        None,
+        go,
+        tw[:, : c.top_k].astype(jnp.bfloat16),
+        ids[:, : c.top_k],
+        # fused-RS applies (w + 1): hand it the zero-centered weight
+        (smalls_l[SMALL["post_expert_w"], :He] - 1.0).astype(jnp.bfloat16),
+        activation="silu",
+        topk=c.top_k,
+        ep_size=c.tp,
+        ep_axis_name=axis,
+        has_post_norm=True,
+        # the output stays token-sharded
+        sp_enabled=False,
+        expert_tp=True,
+        fp4_w4a16=l in c.w4a16_layers,
+        skip_routing_psum=skip_routing_psum,
+        group_sizes=group_sizes,
+    )
+
+
 def build_forward(c: PFConfig, axis: str = "model"):
     """(meta, pos, kv_lens, cu_q, dist, pf, psw, emb, *weights in kernel.WEIGHT_NAMES order,
     *experts, *kv) -> (hidden, aux, *kv). meta is [live rows, TP rank]; smalls rows hold the
@@ -39,11 +94,10 @@ def build_forward(c: PFConfig, axis: str = "model"):
     from sglang_tpu.attention.pallas.batched_rpa.wrapper import (
         ragged_paged_attention,
     )
-    from sglang_tpu.moe.pallas.fused_rs.fused_moe import moe_gmm_local_rs_nodedup
 
     c.validate()
     L, T, hd = c.n_layers, c.rows, c.head_dim
-    qd, kvd, He = c.q_dim, c.kv_dim, c.expert_hidden
+    qd, kvd = c.q_dim, c.kv_dim
     ne = n_expert_refs(c)
     layer_experts = _layer_experts(c)
     attn_out = attn_out_call(c, ATTN_OUT_TILE, axis)
@@ -71,40 +125,6 @@ def build_forward(c: PFConfig, axis: str = "model"):
             # old batched RPA: the default reads SGLANG_TPU_RPA_OUT_HEAD_NORM_EPS; the program
             # normalizes each head itself, so never double-normalize inside RPA.
             out_head_norm_eps=None,
-        )
-
-    def moe(l, xe, ids, tw, experts, group_offset, smalls_l):
-        u, in_group = layer_experts[l]
-        w13, s13, w2, s2 = experts[4 * u : 4 * u + 4]
-        go = (
-            group_offset
-            if in_group is None
-            else jnp.stack([group_offset[0], jnp.int32(in_group)])
-        )
-        return moe_gmm_local_rs_nodedup(
-            xe,
-            w13,
-            s13,
-            None,
-            w2,
-            s2,
-            None,
-            None,
-            None,
-            go,
-            tw[:, : c.top_k].astype(jnp.bfloat16),
-            ids[:, : c.top_k],
-            # fused-RS applies (w + 1): hand it the zero-centered weight
-            (smalls_l[SMALL["post_expert_w"], :He] - 1.0).astype(jnp.bfloat16),
-            activation="silu",
-            topk=c.top_k,
-            ep_size=c.tp,
-            ep_axis_name=axis,
-            has_post_norm=True,
-            # the output stays token-sharded: post_moe gathers it
-            sp_enabled=False,
-            expert_tp=True,
-            fp4_w4a16=l in c.w4a16_layers,
         )
 
     def forward(
@@ -142,7 +162,9 @@ def build_forward(c: PFConfig, axis: str = "model"):
             x, xe, ids, tw = attn_out(
                 lyr, o.reshape(T, qd), gate, x, wo, wrouter, wpool, smalls
             )
-            y = moe(l, xe, ids, tw, experts, group_offset, smalls[l])
+            y = fused_rs_moe(
+                c, layer_experts, l, xe, ids, tw, experts, group_offset, smalls[l], axis
+            )
             nxt = c.use_rope(l + 1) if l + 1 < L else None
             x, q, kvs, gate = post_moe[nxt](
                 lyr, y, x, rope_rows, wunpool, smalls, wqkvg

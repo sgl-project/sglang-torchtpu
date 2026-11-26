@@ -30,6 +30,7 @@ from jax.sharding import PartitionSpec as P
 
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
+    PairFp8Out,
     _select_fused_rs_block_sizes,
 )
 from sglang_tpu.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
@@ -87,7 +88,21 @@ def _assert_fused_rs_smem_safe(size_m: int) -> None:
 # ============================================================================
 
 
-def _compute_rs_routing(topk_indices, *, num_experts, topk):
+def _stable_argsort_ids(ids: jax.Array, num_ids: int) -> jax.Array:
+    """jnp.argsort(ids) (stable) of non-negative ids < num_ids; SGLANG_TPU_FUSED_RS_KEY_SORT packs
+    (id, index) into one int32 key so the sort carries no second operand."""
+    n = ids.shape[0]
+    bits = max(1, (n - 1).bit_length())
+    if (
+        not tpu_envs.SGLANG_TPU_FUSED_RS_KEY_SORT.get()
+        or (num_ids - 1).bit_length() + bits > 31
+    ):
+        return jnp.argsort(ids)
+    key = (ids.astype(jnp.int32) << bits) | jnp.arange(n, dtype=jnp.int32)
+    return jnp.sort(key) & ((1 << bits) - 1)
+
+
+def _compute_rs_routing(topk_indices, *, num_experts, topk, group_sizes=None):
     """Inline routing for the RS path.
 
     Computes:
@@ -109,12 +124,13 @@ def _compute_rs_routing(topk_indices, *, num_experts, topk):
     integers for scalar prefetch refs (``tpu.memref_slice`` constraint).
     """
     topk_indices_flat = topk_indices.flatten()
-    topk_argsort_indices = jnp.argsort(topk_indices_flat)
-    expert_ids = jnp.arange(num_experts, dtype=jnp.int32)
-    group_sizes = jnp.sum(
-        (topk_indices_flat[:, None] == expert_ids[None, :]).astype(jnp.int32),
-        axis=0,
-    )
+    topk_argsort_indices = _stable_argsort_ids(topk_indices_flat, num_experts)
+    if group_sizes is None:
+        expert_ids = jnp.arange(num_experts, dtype=jnp.int32)
+        group_sizes = jnp.sum(
+            (topk_indices_flat[:, None] == expert_ids[None, :]).astype(jnp.int32),
+            axis=0,
+        )
     lhs_indices = topk_argsort_indices // topk
     topk_slot_indices = topk_argsort_indices % topk
     output_indices = lhs_indices
@@ -122,7 +138,12 @@ def _compute_rs_routing(topk_indices, *, num_experts, topk):
 
 
 def _compute_expert_tp_routing(
-    topk_indices: jax.Array, *, num_experts: int, topk: int, ep_size: int
+    topk_indices: jax.Array,
+    *,
+    num_experts: int,
+    topk: int,
+    ep_size: int,
+    group_sizes: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Expert-TP routing over virtual experts ``shard * E + expert``.
 
@@ -133,7 +154,7 @@ def _compute_expert_tp_routing(
     rows over ``ep_size`` times as many experts.
     """
     lhs_real, group_sizes_real, _, slot_real = _compute_rs_routing(
-        topk_indices, num_experts=num_experts, topk=topk
+        topk_indices, num_experts=num_experts, topk=topk, group_sizes=group_sizes
     )
     real_order = lhs_real * topk + slot_real  # flat (token, slot), expert-sorted
     shards = jnp.arange(ep_size, dtype=jnp.int32)
@@ -146,7 +167,8 @@ def _compute_expert_tp_routing(
 
 
 def _pair_post_combine(
-    recv: jax.Array,  # [blocks * chunk * topk, ...] receive blocks, rows in owned-row rank order
+    recv: jax.Array
+    | PairFp8Out,  # [blocks * chunk * topk, ...] receive blocks, owned-row rank order
     topk_indices: jax.Array,  # [num_tokens, topk], replicated
     topk_weights: jax.Array,  # [chunk, topk], this rank's tokens
     post_expert_norm_weight: jax.Array | None,
@@ -169,7 +191,7 @@ def _pair_post_combine(
         local_topk = jax.lax.dynamic_slice_in_dim(
             topk_indices, my_id * chunk_size, chunk_size, axis=0
         )
-        local_flat = jnp.argsort(local_topk.reshape(-1))
+        local_flat = _stable_argsort_ids(local_topk.reshape(-1), 1 << 15)
         token = local_flat // topk
         weight = topk_weights.astype(jnp.float32)[token, local_flat % topk]
     else:
@@ -178,18 +200,20 @@ def _pair_post_combine(
         flat = flat_sorted[jnp.nonzero(owned, size=rows)[0]]
         token = flat // topk - my_id * chunk_size
         weight = topk_weights.astype(jnp.float32)[token, flat % topk]
-    out_dtype = jnp.result_type(recv.dtype, topk_weights.dtype)
+    q8 = isinstance(recv, PairFp8Out)
+    recv_bf16 = recv.bf16_blocks if q8 else recv
+    out_dtype = jnp.result_type(recv_bf16.dtype, topk_weights.dtype)
     if (
         fused_scatter
         and post_expert_norm_weight is not None
-        and recv.ndim == 3
+        and recv_bf16.ndim == 3
         and rows % 8 == 0
         and chunk_size >= 8
         and chunk_size % 8 == 0
         and chunk_size <= 1024
     ):
         return pair_post_combine_scatter(
-            recv,
+            recv_bf16,
             post_expert_norm_weight,
             weight,
             token,
@@ -197,10 +221,20 @@ def _pair_post_combine(
             chunk_size=chunk_size,
             eps=1e-8,
             out_dtype=out_dtype,
+            recv_q8=recv.q8_blocks if q8 else None,
+            recv_q8_scale=recv.q8_scales if q8 else None,
         )
-    if post_expert_norm_weight is not None and recv.ndim == 3:
+    if q8 and post_expert_norm_weight is None:
+        raise ValueError("e4m3 pair sums need the post-expert norm combine")
+    if post_expert_norm_weight is not None and recv_bf16.ndim == 3:
         weighted = pair_post_combine(
-            recv, post_expert_norm_weight, weight, rows=rows, eps=1e-8
+            recv_bf16,
+            post_expert_norm_weight,
+            weight,
+            rows=rows,
+            eps=1e-8,
+            recv_q8=recv.q8_blocks if q8 else None,
+            recv_q8_scale=recv.q8_scales if q8 else None,
         ).reshape(rows, hidden_size)
     else:
         y = jnp.sum(recv.reshape(-1, rows, hidden_size).astype(jnp.float32), axis=0)
@@ -251,6 +285,8 @@ def moe_gmm_local_rs_nodedup(
     fp8_direct_write: bool = False,
     expert_tp: bool = False,
     fp4_w4a16: bool = False,
+    skip_routing_psum: bool | None = None,
+    group_sizes: jax.Array | None = None,
 ) -> jax.Array:
     """Per-chip MoE using the nodedup gmm_fused_rs kernel.
 
@@ -289,7 +325,12 @@ def moe_gmm_local_rs_nodedup(
     # it: the JAX prefill program computes the same routing on every rank from
     # the replicated stream, so the output is bit-identical, and it ran without
     # a halt. Re-check in the serving graph before adopting it there.
-    skip_psum = os.environ.get("MUSE_PF_SKIP_ROUTING_PSUM", "0") != "0"
+    # skip_routing_psum: the caller's routing is identical on every rank by construction
+    skip_psum = (
+        os.environ.get("MUSE_PF_SKIP_ROUTING_PSUM", "0") != "0"
+        if skip_routing_psum is None
+        else skip_routing_psum
+    )
     if not sp_enabled and not skip_psum:
         route_source = my_id == 0
         routing = jnp.stack(
@@ -338,6 +379,9 @@ def moe_gmm_local_rs_nodedup(
                 num_experts=num_local_experts,
                 topk=topk,
                 ep_size=ep_size,
+                # the caller's per-expert counts of topk_indices (sequence-parallel callers
+                # count their own rows and all-gather the counts)
+                group_sizes=group_sizes,
             )
         )
     else:
@@ -415,15 +459,49 @@ def moe_gmm_local_rs_nodedup(
         dtype=jnp.int32,
     )
 
-    # Below 4096 tokens per call the extra sibling stage costs more than it saves (bench).
+    # Below PAIR_MIN_TOKENS every row goes to its owner as its own DMA.
     pair_exchange = (
         expert_tp
-        and num_tokens >= 4096
+        and num_tokens >= tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_MIN_TOKENS.get()
         and local_rows
         and ep_size % 2 == 0
         and ep_size >= 4
         and not fp8_direct_write
         and tpu_envs.SGLANG_TPU_FUSED_RS_ETP_PAIR_EXCHANGE.get()
+    )
+    w4a8_rows = fp4_w4a16 and tpu_envs.SGLANG_TPU_FUSED_RS_W4A8_ROWS.get()
+    for old, new in (
+        ("SGLANG_TPU_FUSED_RS_GMM1_FOLD", "SGLANG_TPU_FUSED_RS_GMM1_DEQUANT_WEIGHTS"),
+        ("SGLANG_TPU_FUSED_RS_GMM2_FOLD", "SGLANG_TPU_FUSED_RS_GMM2_DEQUANT_WEIGHTS"),
+    ):
+        # renamed prototype switches: a stale setting must not run with the feature off
+        if old in os.environ:
+            raise ValueError(f"{old} was renamed to {new}")
+    gmm2_dequant_weights = (
+        fp4_w4a16 and tpu_envs.SGLANG_TPU_FUSED_RS_GMM2_DEQUANT_WEIGHTS.get()
+    )
+    gmm1_dequant_weights = (
+        fp4_w4a16 and tpu_envs.SGLANG_TPU_FUSED_RS_GMM1_DEQUANT_WEIGHTS.get()
+    )
+    pair_fp8_rows = pair_exchange and tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_FP8_ROWS.get()
+    pair_sum_bf16 = pair_exchange and tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_SUM_BF16.get()
+    lean_epilogue = pair_fp8_rows and tpu_envs.SGLANG_TPU_FUSED_RS_LEAN_EPILOGUE.get()
+    q8_in_gmm1 = tpu_envs.SGLANG_TPU_FUSED_RS_Q8_IN_GMM1.get() if pair_fp8_rows else 0
+    q8_tree = bool(q8_in_gmm1) and tpu_envs.SGLANG_TPU_FUSED_RS_Q8_TREE.get()
+    pair_mask_offsets = (
+        bool(q8_in_gmm1) and tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_MASK_OFFSETS.get()
+    )
+    pair_send_bucket = (
+        bool(q8_in_gmm1) and tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_SEND_BUCKET.get()
+    )
+    pair_src_table = (
+        bool(q8_in_gmm1) and tpu_envs.SGLANG_TPU_FUSED_RS_PAIR_SRC_TABLE.get()
+    )
+    gather_in_gmm1 = (
+        tpu_envs.SGLANG_TPU_FUSED_RS_GATHER_IN_GMM1.get() if expert_tp else 0
+    )
+    qblock_small_m = (
+        tpu_envs.SGLANG_TPU_FUSED_RS_QBLOCK_SMALL_M.get() if fp4_w4a16 else 0
     )
     out_buf = gmm_v2_fused_rs_nodedup(
         hidden_states_local,
@@ -458,6 +536,19 @@ def moe_gmm_local_rs_nodedup(
         and tpu_envs.SGLANG_TPU_FUSED_RS_ETP_SKIP_OUT_ZERO.get(),
         staging_slots=tpu_envs.SGLANG_TPU_FUSED_RS_STAGING_SLOTS.get(),
         pair_exchange=pair_exchange,
+        pair_fp8_rows=pair_fp8_rows,
+        w4a8_rows=w4a8_rows,
+        gmm2_dequant_weights=gmm2_dequant_weights,
+        gmm1_dequant_weights=gmm1_dequant_weights,
+        pair_sum_bf16=pair_sum_bf16,
+        lean_epilogue=lean_epilogue,
+        q8_in_gmm1=q8_in_gmm1,
+        q8_tree=q8_tree,
+        pair_mask_offsets=pair_mask_offsets,
+        pair_send_bucket=pair_send_bucket,
+        pair_src_table=pair_src_table,
+        gather_in_gmm1=gather_in_gmm1,
+        qblock_small_m=qblock_small_m,
     )
 
     # Post-kernel: apply topk weights and reduce over top_k. Stay in bf16
