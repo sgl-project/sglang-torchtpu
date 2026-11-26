@@ -223,6 +223,28 @@ class TpuEnvs:
     # selecting their probabilities after exp2: exp2(-inf) is the select's +0, so
     # the same bits, without a select per score between the EUP and the sums.
     SGLANG_TPU_OPT_H3_MEGAKERNEL_MASK_SCORES = EnvBool(False)
+    # SUM_VOUCH (with SGLANG_TPU_OPT_H3_MEGAKERNEL_VOUCH): the vouched op
+    # certifies each head it tries at a fixed max by that head's own softmax
+    # row sums, exp2(s - 17) summed over the keys, each real row's in
+    # [2^-60, 2^104] (no weight can overflow; weights that flush to zero move a
+    # row by under 2^-50 of its sum), instead of by its q/k norm peaks, and
+    # tries next the heads whose sums stay 2^8 inside that; phase A then
+    # computes no peaks. Heads the norm bound leaves out (layer 49's) can run
+    # at a fixed max: rounding moves with them (a failed step still recomputes
+    # with the proven layers only).
+    SGLANG_TPU_OPT_H3_MEGAKERNEL_SUM_VOUCH = EnvBool(False)
+    # CAST_FIRST: phase B's item epilogue rounds each output tile to bf16 before
+    # transposing it (half the bytes through the transposes): the same bits.
+    SGLANG_TPU_OPT_H3_MEGAKERNEL_CAST_FIRST = EnvBool(False)
+    # STEP_TABLES: phase A takes each step's row tile, head group and staging
+    # slot, and each head's owner, from SMEM tables filled once a call instead
+    # of integer divisions every step (scalar chains the MXUs wait out): the
+    # same bits.
+    SGLANG_TPU_OPT_H3_MEGAKERNEL_STEP_TABLES = EnvBool(False)
+    # SLAB_MODULATE (with UNIFORM_ADALN): phase C's uniform row tiles modulate
+    # the MLP input a row's rms factor then 256-lane slabs at a time (as phase
+    # A's modulate pieces do) instead of whole rows a chunk: the same bits.
+    SGLANG_TPU_OPT_H3_MEGAKERNEL_SLAB_MODULATE = EnvBool(False)
     # H3 megakernel tiling of the static-structure calls (an A/B knob, with
     # SGLANG_TPU_OPT_H3_MEGAKERNEL_STATIC_STRUCTURE): Tiling bounds over each
     # call's own tiling (h3_megakernel/op.py structured_tiling), name=value

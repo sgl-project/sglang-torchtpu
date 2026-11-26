@@ -108,6 +108,10 @@ def _levers() -> frozenset[str]:
         "uniform_adaln": envs.SGLANG_TPU_OPT_H3_MEGAKERNEL_UNIFORM_ADALN,
         "zero_ahead": envs.SGLANG_TPU_OPT_H3_MEGAKERNEL_ZERO_AHEAD,
         "mask_scores": envs.SGLANG_TPU_OPT_H3_MEGAKERNEL_MASK_SCORES,
+        "sum_vouch": envs.SGLANG_TPU_OPT_H3_MEGAKERNEL_SUM_VOUCH,
+        "cast_first": envs.SGLANG_TPU_OPT_H3_MEGAKERNEL_CAST_FIRST,
+        "step_tables": envs.SGLANG_TPU_OPT_H3_MEGAKERNEL_STEP_TABLES,
+        "slab_modulate": envs.SGLANG_TPU_OPT_H3_MEGAKERNEL_SLAB_MODULATE,
     }
     return frozenset(name for name, flag in flags.items() if flag.get())
 
@@ -1094,14 +1098,25 @@ def enable(model) -> bool:
     proven = proven_layers(weights["q_norm"], weights["k_norm"], config)
     online = [layer for layer in range(config.layers) if layer not in proven]
     rows = envs.SGLANG_TPU_OPT_H3_MEGAKERNEL_ROWS.get()
-    vouched = (
-        ""
-        if margin is None
-        else "; from each request's second step, also at a fixed max the online "
-        "layers' heads the request's previous step's q/k peaks bound within it by "
-        f"margin {margin:g}, checked on each step's own peaks (the step recomputed "
-        "with the proven layers when one is out)"
-    )
+    if margin is None:
+        vouched = ""
+    elif "sum_vouch" in levers:
+        from sglang_tpu.multimodal_gen.h3_megakernel import op as stack_op
+
+        vouched = (
+            "; from each request's second step, also at a fixed max the online "
+            "layers' heads whose softmax row sums at a fixed max stayed "
+            f"2^{stack_op.SUM_VOUCH_MARGIN:g} inside [2^-60, 2^104] in the request's "
+            "previous step, checked on each step's own row sums (the step "
+            "recomputed with the proven layers when one is out; structured calls)"
+        )
+    else:
+        vouched = (
+            "; from each request's second step, also at a fixed max the online "
+            "layers' heads the request's previous step's q/k peaks bound within it "
+            f"by margin {margin:g}, checked on each step's own peaks (the step "
+            "recomputed with the proven layers when one is out)"
+        )
     logger.info(
         "MiniMax H3 megakernel on: %d blocks, Ulysses %d, %.2f GiB packed bf16 "
         "weights a device, rows a device %s; fixed-max softmax on the layers the "

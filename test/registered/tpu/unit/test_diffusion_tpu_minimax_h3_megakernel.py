@@ -1767,8 +1767,9 @@ class TestKernelLevers(CustomTestCase):
     """The kernel lever flags (SGLANG_TPU_OPT_H3_MEGAKERNEL_LEAN_CUT,
     _SPLIT_ITEMS, _EPILOGUE_CHUNKS, _WIDE_KV, _WIDE_KV_ONLINE,
     _MODULATE_PIECES, _PREFETCH_DOWN, _UNIFORM_ADALN, _ZERO_AHEAD,
-    _MASK_SCORES): the structured calls at op.LEVER_SHAPES' row counts take
-    them, every other call is unchanged."""
+    _MASK_SCORES, _SUM_VOUCH, _CAST_FIRST, _STEP_TABLES, _SLAB_MODULATE): the
+    structured calls at op.LEVER_SHAPES' row counts take them, every other call
+    is unchanged."""
 
     _ENVS = {
         "lean_cut": tpu_envs.SGLANG_TPU_OPT_H3_MEGAKERNEL_LEAN_CUT,
@@ -1781,6 +1782,10 @@ class TestKernelLevers(CustomTestCase):
         "uniform_adaln": tpu_envs.SGLANG_TPU_OPT_H3_MEGAKERNEL_UNIFORM_ADALN,
         "zero_ahead": tpu_envs.SGLANG_TPU_OPT_H3_MEGAKERNEL_ZERO_AHEAD,
         "mask_scores": tpu_envs.SGLANG_TPU_OPT_H3_MEGAKERNEL_MASK_SCORES,
+        "sum_vouch": tpu_envs.SGLANG_TPU_OPT_H3_MEGAKERNEL_SUM_VOUCH,
+        "cast_first": tpu_envs.SGLANG_TPU_OPT_H3_MEGAKERNEL_CAST_FIRST,
+        "step_tables": tpu_envs.SGLANG_TPU_OPT_H3_MEGAKERNEL_STEP_TABLES,
+        "slab_modulate": tpu_envs.SGLANG_TPU_OPT_H3_MEGAKERNEL_SLAB_MODULATE,
     }
 
     @classmethod
@@ -1809,6 +1814,10 @@ class TestKernelLevers(CustomTestCase):
                 "uniform_adaln": True,
                 "zero_ahead": True,
                 "mask_scores": True,
+                "sum_bounds": True,
+                "cast_first": True,
+                "step_tables": True,
+                "slab_modulate": True,
             },
             # prefetch_down: back on at 4 devices (stack_kwargs' default off);
             # wide_kv_online groups the online key steps only.
@@ -1821,6 +1830,10 @@ class TestKernelLevers(CustomTestCase):
                 "uniform_adaln": True,
                 "zero_ahead": True,
                 "mask_scores": True,
+                "sum_bounds": True,
+                "cast_first": True,
+                "step_tables": True,
+                "slab_modulate": True,
             },
             (2, 19456): {
                 "cut_kv_compute": 256,
@@ -1831,6 +1844,10 @@ class TestKernelLevers(CustomTestCase):
                 "uniform_adaln": True,
                 "zero_ahead": True,
                 "mask_scores": True,
+                "sum_bounds": True,
+                "cast_first": True,
+                "step_tables": True,
+                "slab_modulate": True,
             },
             # 640-row phase tiles: no epilogue chunks.
             (2, 19200): {
@@ -1841,6 +1858,10 @@ class TestKernelLevers(CustomTestCase):
                 "uniform_adaln": True,
                 "zero_ahead": True,
                 "mask_scores": True,
+                "sum_bounds": True,
+                "cast_first": True,
+                "step_tables": True,
+                "slab_modulate": True,
             },
             # 4 x 9,600's attention tiles take its levers; 480-row phase A
             # tiles take 64-row epilogue chunks.
@@ -1852,6 +1873,10 @@ class TestKernelLevers(CustomTestCase):
                 "uniform_adaln": True,
                 "zero_ahead": True,
                 "mask_scores": True,
+                "sum_bounds": True,
+                "cast_first": True,
+                "step_tables": True,
+                "slab_modulate": True,
             },
         }
         for devices, rows, _ in _STRUCTURED:
@@ -1875,6 +1900,40 @@ class TestKernelLevers(CustomTestCase):
                 tiling=dataclasses.replace(op.STACK_TILING, chunk_rows=160),
             )["modulate_pieces"],
             4,
+        )
+        # epilogue_chunks follows the call's own epilogue_chunk bound.
+        self.assertEqual(
+            op.stack_kwargs(
+                8,
+                37_633,
+                rows=4864,
+                levers={"epilogue_chunks"},
+                tiling=dataclasses.replace(op.STACK_TILING, epilogue_chunk=128),
+            )["epilogue_chunk"],
+            128,
+        )
+        # The peaks layers' epilogue chunk follows the call's own bound, with
+        # or without the epilogue_chunks lever; 0 passes nothing.
+        for levers in ({"epilogue_chunks"}, frozenset()):
+            self.assertEqual(
+                op.stack_kwargs(
+                    8,
+                    37_633,
+                    rows=4864,
+                    levers=levers,
+                    tiling=dataclasses.replace(
+                        op.STACK_TILING, epilogue_chunk_peaks=192
+                    ),
+                )["epilogue_chunk_peaks"],
+                192,
+            )
+        self.assertNotIn(
+            "epilogue_chunk_peaks",
+            op.stack_kwargs(8, 37_633, rows=4864, levers={"epilogue_chunks"}),
+        )
+        self.assertEqual(
+            op.parse_tiling("epilogue_chunk_peaks=192"),
+            (("epilogue_chunk_peaks", 192),),
         )
         # wide_kv_online alone groups the online softmax's key tiles only.
         online = op.stack_kwargs(2, 37_633, rows=19200, levers={"wide_kv_online"})
@@ -2107,8 +2166,9 @@ class TestKernelLevers(CustomTestCase):
                     self.assertTrue(
                         captured["name"].endswith(
                             "_epilogue_chunks_lean_cut_mask_scores"
-                            "_modulate_pieces_prefetch_down_split_items"
-                            "_uniform_adaln_wide_kv_wide_kv_online_zero_ahead"
+                            "_modulate_pieces_prefetch_down_slab_modulate"
+                            "_split_items_step_tables_sum_vouch_uniform_adaln"
+                            "_wide_kv_wide_kv_online_zero_ahead"
                         )
                     )
                     (kwargs,) = _kernel_calls(
@@ -2125,6 +2185,10 @@ class TestKernelLevers(CustomTestCase):
                         "uniform_adaln",
                         "zero_ahead",
                         "mask_scores",
+                        "sum_bounds",
+                        "cast_first",
+                        "step_tables",
+                        "slab_modulate",
                     ):
                         self.assertEqual(kwargs.get(name), want.get(name), name)
                     self.assertTrue(kwargs["split_items"])
