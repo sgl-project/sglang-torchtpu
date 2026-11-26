@@ -3994,6 +3994,7 @@ class MuseSparkDecoderLayer(nn.Module):
         next_input_layernorm: Optional[MuseSparkRMSNorm],
         next_layer_attn: Optional[MuseSparkAttention],
         final_layernorm: Optional[MuseSparkRMSNorm],
+        pending_step_c_kv_writes: Optional[list] = None,
     ):
         """Run fused Step (c) [+RPAd], Step (b) [b1+MoE+b2], or Step (a) [b1+MoE] (``L61``)."""
         if not self._can_run_b1_moe_superkernel(n_tok, tp=tp, is_dec_step=is_dec_step):
@@ -4163,6 +4164,7 @@ class MuseSparkDecoderLayer(nn.Module):
                     pages_per_seq = int(page_indices.shape[0]) // max(
                         1, int(kv_lens.shape[0])
                     )
+                    has_shared_prefix = int(distribution.shape[0]) > 3
                     cfg_rpa, _, _, _, step_c_rpa_ok = resolve_step_c_rpa_plan(
                         rpa_mode_str,
                         sliding_window=sw,
@@ -4172,6 +4174,7 @@ class MuseSparkDecoderLayer(nn.Module):
                         kv_pack_bd4=bd4,
                         b_tokens=n_tok,
                         max_num_seqs=int(kv_lens.shape[0]),
+                        has_shared_prefix=has_shared_prefix,
                     )
                     if step_c_rpa_ok and (tp != 16 or cfg_rpa.num_slots <= 4):
                         op_c = get_b1_moe_b2_rpad_chip_sharded_op(
@@ -4245,16 +4248,66 @@ class MuseSparkDecoderLayer(nn.Module):
                             float(getattr(next_layer_attn.attn, "v_scale_float", None) or 1.0),
                             float(next_layer_attn.norm_eps),
                         )
-                        get_step_c_kv_write_op(kv_pack_dense2=dense2, kv_pack_bd4=bd4)(
-                            kv_merged_c,
-                            kv_cache,
-                            kv_lens,
-                            page_indices,
-                            cu_q_lens,
-                            cu_kv_lens,
-                            distribution,
-                            kv_layer_idx,
-                        )
+                        if pending_step_c_kv_writes is not None:
+                            swa_groups = getattr(backend, "_swa_layer_groups", None)
+                            if (
+                                sw is not None
+                                and getattr(md, "swa_page_indices", None) is not None
+                            ):
+                                g_id = (
+                                    int(
+                                        swa_groups.get(
+                                            next_layer_attn.attn.layer_id, 0
+                                        )
+                                    )
+                                    if swa_groups is not None
+                                    else 0
+                                )
+                                swa_grp = (
+                                    0
+                                    if (
+                                        g_id == 0
+                                        or getattr(md, "swa_group_page_indices", None)
+                                        is None
+                                    )
+                                    else g_id
+                                )
+                            else:
+                                swa_grp = -1
+                            grp_key = (
+                                kv_layer_idx is not None,
+                                sw is not None,
+                                swa_grp,
+                                bool(dense2),
+                                bool(bd4),
+                            )
+                            pending_step_c_kv_writes.append(
+                                (
+                                    kv_cache,
+                                    kv_lens,
+                                    page_indices,
+                                    cu_q_lens,
+                                    cu_kv_lens,
+                                    distribution,
+                                    kv_layer_idx,
+                                    kv_merged_c,
+                                    dense2,
+                                    bd4,
+                                    grp_key,
+                                    int(next_layer_attn.attn.layer_id),
+                                )
+                            )
+                        else:
+                            get_step_c_kv_write_op(kv_pack_dense2=dense2, kv_pack_bd4=bd4)(
+                                kv_merged_c,
+                                kv_cache,
+                                kv_lens,
+                                page_indices,
+                                cu_q_lens,
+                                cu_kv_lens,
+                                distribution,
+                                kv_layer_idx,
+                            )
                         return next_stream_c, next_gated_c, None, None, None
 
             op_b2 = get_b1_moe_b2_chip_sharded_op(
@@ -4437,6 +4490,7 @@ class MuseSparkDecoderLayer(nn.Module):
         final_layernorm: Optional[MuseSparkRMSNorm] = None,
         tok_sharded_stream: bool = False,
         chip_sharded_stream: bool = False,
+        pending_step_c_kv_writes: Optional[list] = None,
     ) -> (
         torch.Tensor
         | Tuple[torch.Tensor]
@@ -4534,6 +4588,7 @@ class MuseSparkDecoderLayer(nn.Module):
                             next_input_layernorm=next_input_layernorm,
                             next_layer_attn=next_layer_attn,
                             final_layernorm=final_layernorm,
+                            pending_step_c_kv_writes=pending_step_c_kv_writes,
                         )
                         if sk_out is not None:
                             return sk_out
@@ -6065,6 +6120,7 @@ class MuseSparkTextModel(nn.Module):
             if m2m_hidden is not None:
                 return m2m_hidden
         layer_idx = self.start_layer
+        pending_step_c_kv_writes: list = []
         while layer_idx < self.end_layer:
             if kernels is not None and layer_idx == kernels.start:
                 stream = kernels(
@@ -6132,6 +6188,7 @@ class MuseSparkTextModel(nn.Module):
                         relay_kw["final_layernorm"] = self.norm
                     if use_chip_sharded_relay:
                         relay_kw["chip_sharded_stream"] = True
+                        relay_kw["pending_step_c_kv_writes"] = pending_step_c_kv_writes
                     elif use_tok_sharded_relay:
                         relay_kw["tok_sharded_stream"] = True
                 layer_out = self.layers[layer_idx](
@@ -6191,6 +6248,13 @@ class MuseSparkTextModel(nn.Module):
                 for slot in slots:
                     captured_by_slot[slot] = snap
             layer_idx += 1
+
+        if pending_step_c_kv_writes:
+            from sglang_tpu.muse_megakernel.decode.b1_moe_ops import (
+                flush_pending_step_c_kv_writes,
+            )
+
+            flush_pending_step_c_kv_writes(pending_step_c_kv_writes)
 
         if not self.pp_group.is_last_rank:
             proxy = {

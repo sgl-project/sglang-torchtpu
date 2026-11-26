@@ -395,7 +395,7 @@ class TpuEnvs:
     SGLANG_TPU_MUSE_KERNEL_EXPERT_PLACEMENT = EnvStr("")
     # Prefill EPLB modes: "", "perm", "stripe", "home", "q_block", "dyn_holder", "dyn_split".
     SGLANG_TPU_MUSE_KERNEL_PREFILL_EPLB_MODE = EnvStr("")
-    # Replicated hot experts per EP rank for PREFILL_EPLB_MODE in {"stripe", "home", "q_block", "dyn_holder", "dyn_split"} (0..8).
+    # Replicated hot experts per EP rank for PREFILL_EPLB_MODE in {"stripe", "home", "q_block", "dyn_holder", "dyn_split"} (0..16).
     SGLANG_TPU_MUSE_KERNEL_PREFILL_EPLB_REPLICAS = EnvInt(0)
     # Muse prefill §4.5b cross-chip preloaded hot-expert replica slots per rank (0 = off; 1, 2, or 4).
     SGLANG_TPU_MUSE_KERNEL_PREFILL_REPLICA_SLOTS = EnvInt(0)
@@ -549,7 +549,8 @@ class TpuEnvs:
     # Muse decode Wave-7: fast B=64 sparse decode execution mode inside fused_decode_sparse
     # (0 = stock; 1 = single-chunk 64x256 VPU routing + unrolled prologue/RS + m=8 fast bucket
     # + loop-free <=8-row gather/scatter; 2 = 1 + contiguous w1_2x_w2_1x + spec_prime;
-    # 3 = dense-rows B=64 mode eliminating token pack/gather/switch/scatter).
+    # 3 = dense-rows B=64 mode eliminating token pack/gather/switch/scatter;
+    # 4 = Wave-10 Pareto preset (nc_split512 + m_buckets=(16,32) + cur1 epi + route_fast + fast_plan=2)).
     SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_B64 = EnvInt(0)
     # Muse decode Wave-7: L0/L61 FP8 sparse decode streaming variant ("" = stream3_half,
     # "w1_k2_w2_1x" = 3x16 MiB contiguous K-half streaming, "w1_k2_w8a8" = contiguous K-half + W8A8).
@@ -1135,6 +1136,8 @@ class TpuEnvs:
     # writes unpacked bf16[T, 1024] directly from its epilogue (16 MiB vs 32 MiB), dropping
     # prepare_outputs copy, KV_PACK pair-sum, and A3 attn_ref relayout copy. Exact.
     SGLANG_TPU_RPA_V3_PREFILL_A3_LAYOUT = EnvBool(False)
+    # Unlock mk128 on TP=16 SWA Stationary-Q RPAm instead of vreg_acc (default False).
+    SGLANG_TPU_RPA_V3_TP16_SWA_MK128 = EnvBool(False)
     # Opt-in 2-kernel LC Full prefill top-k slice pruning (default 0 = disabled).
     # When > 0 (multiple of 4, < half-slices per bkv block), keeps the top-k
     # 128-key half-slices per prefix bkv block while keeping sink (bkv=0) and
@@ -1587,8 +1590,9 @@ class TpuEnvs:
     # Wave-16 opt-in double-buffered stream HBM->VMEM prefetch + direct (bm, 32, 128) FP8 store
     # inside pallas_fused_b1_b2_wpool_quant (-0.73..-0.96 ms/61L on 4c Ghostfish, 0-ULP bit-exact).
     SGLANG_TPU_MUSE_KERNEL_B2_DBL_STREAM = EnvBool(False)
-    # Wave-18 opt-in multi-chunk pow2 B1+B2 + cat_sc pipeline ("auto" -> (512,1024,1024,512) at
-    # t_local=3072, (512,512,512) at t_local=1536; or explicit CSV) overlapping SparseCore AG_i8.
+    # Wave-18 opt-in multi-chunk pow2 B1+B2 + cat_sc pipeline ("auto" -> (512,512) at 1024,
+    # (512,512,512) at 1536, (512,512,512,512) at 2048, (512,1024,...,512) at >=2560%512;
+    # or explicit CSV) overlapping SparseCore AG_i8.
     SGLANG_TPU_MUSE_KERNEL_B2_PIPE_CHUNKS = EnvStr("")
 
     @classmethod

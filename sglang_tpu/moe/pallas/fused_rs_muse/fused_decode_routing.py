@@ -2042,7 +2042,7 @@ def build_dense_exec_plan_smem(
 ) -> jax.Array:
     """Build compact active-expert list in SMEM for dense-rows mode."""
     first = my_owner * e_per_owner
-    if fast_plan and e_per_owner <= 64 and num_replicas <= 8:
+    if fast_plan and e_per_owner <= 64 and num_replicas <= 16:
         if spec_slot is not None:
             use_sp = (spec_slot >= 0) & (spec_slot < e_per_owner)
             safe_sp = jnp.where(use_sp, spec_slot, jnp.int32(0))
@@ -2279,7 +2279,7 @@ def build_exec_plan_from_masks_smem(
     """Build unified active-expert plan in ONLY ``e_per_owner + R`` (<= 36) steps!"""
     del num_experts
     first = my_owner * e_per_owner
-    if fast_plan and e_per_owner <= 64 and num_replicas <= 8:
+    if fast_plan and e_per_owner <= 64 and num_replicas <= 16:
         if spec_slot is not None:
             use_sp = (spec_slot >= 0) & (spec_slot < e_per_owner)
             safe_sp = jnp.where(use_sp, spec_slot, jnp.int32(0))

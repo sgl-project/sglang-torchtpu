@@ -126,22 +126,23 @@ def register_ep16_tuned_block_sizes() -> None:
                     tp2_entry[f"{m}_silu"] = (
                         tuned_ep_tp2_256 if m >= 131072 else tuned_ep_tp2_128
                     )
-        for g in range(33, 41):
-            for bs_sfx in all_fp4_bs:
-                src_key = (
-                    f"k-4096_n-8192_g-32_lhs_quant_rhs_bs-{bs_sfx}+"
-                    f"k-4096_n-4096_g-32_lhs_quant_rhs_bs-{bs_sfx}"
+        for base_g, rng_g in ((16, range(17, 32)), (32, range(33, 49))):
+            for g in rng_g:
+                for bs_sfx in all_fp4_bs:
+                    src_key = (
+                        f"k-4096_n-8192_g-{base_g}_lhs_quant_rhs_bs-{bs_sfx}+"
+                        f"k-4096_n-4096_g-{base_g}_lhs_quant_rhs_bs-{bs_sfx}"
+                    )
+                    if src_key in tpu_dict:
+                        dst_key = src_key.replace(f"_g-{base_g}_", f"_g-{g}_")
+                        tpu_dict[dst_key] = dict(tpu_dict[src_key])
+                joint_key_16 = (
+                    f"k-4096_n-8192_g-{g}_lhs_quant_rhs_bs-16+"
+                    f"k-4096_n-4096_g-{g}_lhs_quant_rhs_bs-16"
                 )
-                if src_key in tpu_dict:
-                    dst_key = src_key.replace("_g-32_", f"_g-{g}_")
-                    tpu_dict[dst_key] = dict(tpu_dict[src_key])
-            joint_key_16 = (
-                f"k-4096_n-8192_g-{g}_lhs_quant_rhs_bs-16+"
-                f"k-4096_n-4096_g-{g}_lhs_quant_rhs_bs-16"
-            )
-            entry_g = tpu_dict.setdefault(joint_key_16, {})
-            for m in finer_ms:
-                entry_g[f"{m}_silu"] = tuned_256 if m >= 131072 else tuned_128
+                entry_g = tpu_dict.setdefault(joint_key_16, {})
+                for m in finer_ms:
+                    entry_g[f"{m}_silu"] = tuned_256 if m >= 131072 else tuned_128
     fp8_dict = tpu_root.setdefault("lhs_bfloat16_rhs_float8_e4m3fn", {})
     for g in (16, 32):
         fp8_key = (
@@ -151,25 +152,33 @@ def register_ep16_tuned_block_sizes() -> None:
         fp8_entry = fp8_dict.setdefault(fp8_key, {})
         for m in finer_ms:
             fp8_entry[f"{m}_silu"] = tuned_fp8_256 if m >= 131072 else tuned_128
-    for g in range(33, 41):
-        for bs_sfx in ("256", "512", "2048", "4096"):
-            src_fp8_key = (
-                f"k-4096_n-8192_g-32_lhs_quant_rhs_bs-{bs_sfx}+"
-                f"k-4096_n-4096_g-32_lhs_quant_rhs_bs-{bs_sfx}"
+    for base_g, rng_g in ((16, range(17, 32)), (32, range(33, 49))):
+        for g in rng_g:
+            for bs_sfx in ("256", "512", "2048", "4096"):
+                src_fp8_key = (
+                    f"k-4096_n-8192_g-{base_g}_lhs_quant_rhs_bs-{bs_sfx}+"
+                    f"k-4096_n-4096_g-{base_g}_lhs_quant_rhs_bs-{bs_sfx}"
+                )
+                dst_fp8_key = src_fp8_key.replace(f"_g-{base_g}_", f"_g-{g}_")
+                if src_fp8_key in fp8_dict:
+                    copied_fp8 = dict(fp8_dict[src_fp8_key])
+                    for m in finer_ms:
+                        if m >= 131072:
+                            copied_fp8[f"{m}_silu"] = tuned_fp8_256
+                    fp8_dict[dst_fp8_key] = copied_fp8
+                elif bs_sfx == "4096":
+                    fp8_entry_g = fp8_dict.setdefault(dst_fp8_key, {})
+                    for m in finer_ms:
+                        fp8_entry_g[f"{m}_silu"] = (
+                            tuned_fp8_256 if m >= 131072 else tuned_128
+                        )
+            src_none_key = (
+                f"k-4096_n-8192_g-{base_g}_lhs_quant+"
+                f"k-4096_n-4096_g-{base_g}_lhs_quant"
             )
-            dst_fp8_key = src_fp8_key.replace("_g-32_", f"_g-{g}_")
-            if src_fp8_key in fp8_dict:
-                copied_fp8 = dict(fp8_dict[src_fp8_key])
-                for m in finer_ms:
-                    if m >= 131072:
-                        copied_fp8[f"{m}_silu"] = tuned_fp8_256
-                fp8_dict[dst_fp8_key] = copied_fp8
-            elif bs_sfx == "4096":
-                fp8_entry_g = fp8_dict.setdefault(dst_fp8_key, {})
-                for m in finer_ms:
-                    fp8_entry_g[f"{m}_silu"] = (
-                        tuned_fp8_256 if m >= 131072 else tuned_128
-                    )
+            if src_none_key in fp8_dict:
+                dst_none_key = src_none_key.replace(f"_g-{base_g}_", f"_g-{g}_")
+                fp8_dict[dst_none_key] = dict(fp8_dict[src_none_key])
 
 
 register_ep16_tuned_block_sizes()
@@ -1650,10 +1659,16 @@ def _resolve_b2_pipe_chunks(spec: str, t_local: int) -> tuple[int, ...] | None:
     if not clean:
         return None
     if clean.lower() == "auto":
-        if t_local == 3072:
-            return (512, 1024, 1024, 512)
+        if t_local == 1024:
+            return (512, 512)
         if t_local == 1536:
             return (512, 512, 512)
+        if t_local == 2048:
+            return (512, 512, 512, 512)
+        if t_local >= 2560 and t_local % 512 == 0:
+            rem = t_local - 1024
+            mid = (1024,) * (rem // 1024) + ((512,) if (rem % 1024) else ())
+            return (512, *mid, 512)
         return None
     parts = [p.strip() for p in clean.split(",") if p.strip()]
     if len(parts) < 2:

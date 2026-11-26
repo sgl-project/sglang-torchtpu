@@ -676,7 +676,10 @@ def _invoke_v3_kernel(
                 if (
                     "sw_mk128" in raw_all_toks
                     or (
-                        not (allow_tp16_sq and is_tp16_sq_shape)
+                        (
+                            not (allow_tp16_sq and is_tp16_sq_shape)
+                            or envs.SGLANG_TPU_RPA_V3_TP16_SWA_MK128.get()
+                        )
                         and "nosw_mk128" not in raw_all_toks
                         and "nomk128" not in raw_all_toks
                     )

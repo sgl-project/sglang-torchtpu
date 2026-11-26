@@ -611,7 +611,8 @@ def pallas_qblock_remap_virtual_ids(
     total_elems = t_global * topk
     n_blocks, q_eff = resolve_qblock_params(total_elems, ep_size, quantum)
     blk_elems = total_elems // n_blocks
-    assert ep_size in (8, 16) and num_base_local in (16, 32) and 1 <= num_replicas <= 8
+    assert ep_size in (8, 16) and num_base_local in (16, 32) and 1 <= num_replicas <= 16
+    assert n_blocks <= 128 or num_replicas <= 12
     assert total_elems % (n_blocks * 512) == 0
     base_shift = num_base_local.bit_length() - 1
     base_mask = num_base_local - 1

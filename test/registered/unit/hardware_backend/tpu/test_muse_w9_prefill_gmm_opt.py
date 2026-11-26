@@ -1268,7 +1268,7 @@ def test_gmm_static_fp8_lhs_skip_scale_and_gs_fold_interpret() -> None:
             meta = MetadataRef(gm_id_to_group_id=m_gid, gm_id_to_m_offset=m_off)
             pq_fp8_r[:, :] = x_r[:, :]
             pq_sc_r[:, :, :] = sc_init_r[:, :, :]
-            _g2_slot = None if fa_mode == "3" else 1
+            _g2_slot = 1
             inner_kernel(
                 None,
                 WeightsRef(weight=w1_r, scale=s1_r, bias=None),
@@ -1333,9 +1333,7 @@ def test_gmm_static_fp8_lhs_skip_scale_and_gs_fold_interpret() -> None:
                     "SGLANG_TPU_MUSE_KERNEL_FP4_LHS_QBS": "512",
                     "SGLANG_TPU_MUSE_KERNEL_FP4_ACC_MODE": fa_mode,
                     "SGLANG_TPU_MUSE_KERNEL_PREFILL_STRIP_N": "256",
-                    "SGLANG_TPU_MUSE_KERNEL_GMM_FLQ_ZERO_RMW": (
-                        "0" if fa_mode == "3" else "3"
-                    ),
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_FLQ_ZERO_RMW": "3",
                 },
             ),
         ):
@@ -1471,6 +1469,7 @@ def test_pql6_and_inter32_tm128_tpu7x_aot_imem_budget() -> None:
         with_ext_sc: bool,
         *,
         prefill_tiles: str = base_env["SGLANG_TPU_MUSE_KERNEL_PREFILL_GMM_TILES"],
+        fa_mode: str = "1",
     ) -> tuple[int, str]:
         topo = topologies.get_topology_desc(platform="tpu", topology_name=topo_name)
         mesh = Mesh(np.array(topo.devices), ("model",))
@@ -1478,6 +1477,7 @@ def test_pql6_and_inter32_tm128_tpu7x_aot_imem_budget() -> None:
         n_slots = e_local + (num_tok * 8 + caller_tm - 1) // caller_tm
         env_map = {
             **base_env,
+            "SGLANG_TPU_MUSE_KERNEL_FP4_ACC_MODE": fa_mode,
             "SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8": pq_mode,
             "SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_LHS": static_lhs_s,
             "SGLANG_TPU_MUSE_KERNEL_PREFILL_GMM_TILES": prefill_tiles,
@@ -1591,9 +1591,16 @@ def test_pql6_and_inter32_tm128_tpu7x_aot_imem_budget() -> None:
             assert 0 < code_tm128 <= 3_385_344
 
             code_ep16, hlo_ep16 = _compile(
-                "tpu7x=2x2x2", 16, 18, 24576, 256, "6", "0", False
+                "tpu7x=2x2x2", 16, 28, 24576, 256, "6", "0", False, fa_mode="3"
             )
             assert "-pql6-slh8" in hlo_ep16 and "-i32_12" in hlo_ep16
-            assert 0 < code_ep16 <= 4 * 1024 * 1024
+            assert "-fa3" in hlo_ep16 and "-E_28-" in hlo_ep16
+            assert 0 < code_ep16 <= 3_385_344
+
+            code_fa3, hlo_fa3 = _compile(
+                "tpu7x=2x2x1", 8, 36, 24576, 256, "6", "0", False, fa_mode="3"
+            )
+            assert "-fa3" in hlo_fa3 and "-pql6-slh8" in hlo_fa3
+            assert 0 < code_fa3 <= 3_385_344
         finally:
             jax.clear_caches()

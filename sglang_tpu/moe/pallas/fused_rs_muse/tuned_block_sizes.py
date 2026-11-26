@@ -104,8 +104,8 @@ def get_fused_rs_tuned_block_sizes(
     except KeyError:
         base_groups = (
             16
-            if 17 <= num_current_groups <= 24
-            else (32 if 33 <= num_current_groups <= 41 else None)
+            if 17 <= num_current_groups <= 31
+            else (32 if 33 <= num_current_groups <= 48 else None)
         )
         fallback_joint_key = (
             f"{_model_key(k1, n1, base_groups, lhs_quantized=lhs_quantized, rhs_quant_block_size=block_size)}"

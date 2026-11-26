@@ -243,10 +243,12 @@ class TestPrefillEplbAndBsMeta(CustomTestCase):
         self.assertEqual(resolve_prefill_eplb_config("stripe", 4), ("stripe", 4))
         self.assertEqual(resolve_prefill_eplb_config("home", 4), ("home", 4))
         self.assertEqual(resolve_prefill_eplb_config("q_block", 0), ("q_block", 4))
+        self.assertEqual(resolve_prefill_eplb_config("q_block", 12), ("q_block", 12))
+        self.assertEqual(resolve_prefill_eplb_config("q_block", 16), ("q_block", 16))
         with self.assertRaises(ValueError):
             resolve_prefill_eplb_config("perm", 4)
         with self.assertRaises(ValueError):
-            resolve_prefill_eplb_config("q_block", 12)
+            resolve_prefill_eplb_config("q_block", 17)
         with self.assertRaises(ValueError):
             resolve_prefill_eplb_config("unknown_mode", 4)
 
@@ -254,12 +256,15 @@ class TestPrefillEplbAndBsMeta(CustomTestCase):
         register_ep16_tuned_block_sizes()
         fp4_tbl = FUSED_RS_TUNED_BLOCK_SIZES["TPU7x"]["lhs_bfloat16_rhs_float4_e2m1fn"]
         fp8_tbl = FUSED_RS_TUNED_BLOCK_SIZES["TPU7x"]["lhs_bfloat16_rhs_float8_e4m3fn"]
-        for g in (32, 34, 36, 40):
+        for g in (16, 22, 24, 28, 32, 34, 36, 40, 44, 48):
             key = f"k-4096_n-8192_g-{g}_lhs_quant_rhs_bs-16+k-4096_n-4096_g-{g}_lhs_quant_rhs_bs-16"
             self.assertIn(key, fp4_tbl)
             self.assertEqual(fp4_tbl[key]["65536_silu"][0], 128)
             self.assertEqual(fp4_tbl[key]["131072_silu"][0], 256)
-            if g > 32:
+            if g == 32:
+                self.assertEqual(fp4_tbl[key]["2048_silu"], (128, 4096, 4096, 4096, 4096, 1, 1))
+                self.assertEqual(fp4_tbl[key]["4096_silu"], (128, 4096, 4096, 4096, 4096, 1, 1))
+            if g not in (16, 32):
                 self.assertEqual(fp4_tbl[key]["49152_silu"][0], 128)
                 self.assertEqual(fp4_tbl[key]["16384_silu"][0], 128)
                 for bs_sfx in ("2048", "4096"):
@@ -269,6 +274,22 @@ class TestPrefillEplbAndBsMeta(CustomTestCase):
                     )
                     self.assertIn(fp8_key, fp8_tbl)
                     self.assertEqual(fp8_tbl[fp8_key]["131072_silu"][0], 256)
+
+    def test_ep16_high_replica_bijection(self):
+        rng = np.random.default_rng(1234)
+        counts = rng.integers(10, 500, size=(256,), dtype=np.int64)
+        counts[[3, 19, 44, 71, 88, 102, 130, 155, 177, 199, 211, 244]] = np.arange(
+            12000, 24000, 1000
+        )
+        for rep in (10, 12, 16):
+            r2g, col_perm = compute_zeroglue_eplb_perm(
+                counts, ep_size=16, num_local_base=16, num_replicas=rep, tile_m=256
+            )
+            self.assertEqual(sorted(col_perm.tolist()), list(range(256)))
+            self.assertEqual(r2g.shape, (16, 16 + rep))
+            for r in range(16):
+                np.testing.assert_array_equal(r2g[r, :16], col_perm[r * 16 : (r + 1) * 16])
+                np.testing.assert_array_equal(r2g[r, 16:], col_perm[:rep])
 
     def test_perm_bijection_and_balance(self):
         rng = np.random.default_rng(42)
