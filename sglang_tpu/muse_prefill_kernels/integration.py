@@ -4793,6 +4793,12 @@ class MusePrefillKernels(torch.nn.Module):
                 if tpu_envs.SGLANG_TPU_MUSE_KERNEL_PALLAS_CHIPMATE_ROUTE.get()
                 else ""
             )
+            + (
+                "_f8ni"
+                if self.a1_variant in ("v6", "v10_sp")
+                and tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_OPT.get() > 0
+                else ""
+            )
         )
         fp8_tiles_tag = (
             tpu_envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_FP8_GMM_TILES.get().replace(
@@ -4814,6 +4820,7 @@ class MusePrefillKernels(torch.nn.Module):
             router_hilo_pre=router_hilo_pre,
             d_tok_tile=d_tok_tile,
             axis_name=_AXIS,
+            next_in_gather_static_fp8=(self.a1_variant in ("v6", "v10_sp")),
             causal_chunk_stream=self.causal_chunk_stream,
             causal_chunk_spec=self.causal_chunk_spec,
         )

@@ -1249,6 +1249,125 @@ def test_v10_sp_w20_16k_2chunk_default_static_fp8_next_in_and_aot():
     )
 
 
+def test_v10_sp_w21_eplb_static_fp8_next_in_and_op_tag():
+    """Verify `_init_eplb` passes `next_in_gather_static_fp8=True` and `_f8ni` for `v10_sp`/`v6`,
+    and keeps `False` + no `_f8ni` for `v1` across both `eplb_moe_op` and `eplb_moe_fp8_op`.
+    """
+    jax = pytest.importorskip("jax")
+    torch = pytest.importorskip("torch")
+    from jax.experimental import topologies
+    from jax.sharding import Mesh
+
+    if len(jax.devices("cpu")) < _TP:
+        pytest.skip(f"Need {_TP} CPU devices (got {len(jax.devices('cpu'))})")
+
+    from types import SimpleNamespace
+    from sglang_tpu.muse_prefill_kernels.integration import MusePrefillKernels
+    from sglang_tpu.pallas_jax_op import _jax_placeholders
+
+    topo = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x=2x2x2")
+    mesh = Mesh(np.array(topo.devices).reshape(_TP), (_AXIS,))
+
+    seen_calls = []
+
+    def _fake_moe_bridge(*xs, **kwargs):
+        import jax.numpy as jnp
+
+        seen_calls.append(kwargs.get("next_in_gather_static_fp8"))
+        out_dt = (
+            jnp.float8_e4m3fn if kwargs.get("next_in_gather_static_fp8") else jnp.bfloat16
+        )
+        return (
+            jnp.zeros_like(xs[1], dtype=jnp.float32),
+            jnp.zeros_like(xs[0], dtype=out_dt),
+            jnp.zeros((xs[0].shape[0], 8), dtype=jnp.int32),
+            None,
+        )
+
+    decoder = SimpleNamespace(
+        config=SimpleNamespace(num_local_experts=256),
+        layers=[],
+    )
+    attn = SimpleNamespace(num_heads=8, num_kv_heads=1)
+    stream_t = torch.empty((1024, 8192), dtype=torch.float32, device="meta")
+    attn_t = torch.empty((1024, 8192), dtype=torch.bfloat16, device="meta")
+    fake_moe_args = [attn_t, stream_t] + [stream_t] * 20
+
+    with (
+        mock.patch("sglang_tpu.moe.pallas.fused_moe_rs_op._get_mesh", return_value=mesh),
+        mock.patch(
+            "sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.pipeline.fused_moe_full_bridge_and_ffn",
+            side_effect=_fake_moe_bridge,
+        ),
+        mock.patch(
+            "sglang_tpu.muse_prefill_kernels.eplb.PrefillEplbManager",
+            return_value=SimpleNamespace(num_experts=256, num_base_local=16),
+        ),
+        mock.patch(
+            "sglang_tpu.muse_prefill_kernels.eplb.load_eplb_stats_file",
+            return_value=None,
+        ),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_OPT, "get", return_value=4),
+        mock.patch.object(
+            tpu_envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_EPLB_MODE, "get", return_value="dyn_holder"
+        ),
+        mock.patch.object(
+            tpu_envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_EPLB_REPLICAS, "get", return_value=4
+        ),
+        mock.patch.object(
+            tpu_envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_EPLB_CALIB_FORWARDS, "get", return_value=0
+        ),
+        mock.patch.object(
+            tpu_envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_EPLB_STATS_PATH, "get", return_value=""
+        ),
+        mock.patch.object(
+            tpu_envs.SGLANG_TPU_MUSE_KERNEL_SKIP_PAD_MOE_TOKENS, "get", return_value=False
+        ),
+    ):
+        for variant, expected_flag in (("v10_sp", True), ("v6", True), ("v1", False)):
+            seen_calls.clear()
+            pk = MusePrefillKernels.__new__(MusePrefillKernels)
+            torch.nn.Module.__init__(pk)
+            pk.ep_tp2_mode = False
+            pk.fused_glue = True
+            pk.a1_variant = variant
+            pk.a1_ag_under_d = False
+            pk.causal_chunk_stream = variant == "v10_sp"
+            pk.causal_chunk_spec = "256,512" if variant == "v10_sp" else ""
+            pk.a1_parts = ()
+            pk.a1_chunks = ""
+            pk.a1_1way = False
+            pk.a1_rpa_layout = variant == "v10_sp"
+            pk.fp8_layers = {0}
+            pk.start = 0
+            pk.end = 1
+            pk.weights = []
+            pk._gather = lambda t: t
+            pk.tp_size = _TP
+            pk.tp_rank = 0
+            pk._init_eplb(decoder, attn, torch.device("meta"))
+
+            for op_attr in ("eplb_moe_op", "eplb_moe_fp8_op"):
+                op = getattr(pk, op_attr)
+                assert op is not None
+                assert ("_f8ni" in op._init_fn.name) is expected_flag, (
+                    variant,
+                    op_attr,
+                    op._init_fn.name,
+                )
+            for is_fp8 in (False, True):
+                moe_fn = pk._moe_op(is_fp8_expert=is_fp8, gather_next=False)._init_fn
+                j_args = _jax_placeholders(
+                    fake_moe_args, mesh=moe_fn.mesh, partition_specs=moe_fn.input_partition_specs
+                )
+                with (
+                    tpu_info_for_cpu_export(),
+                    jax._src.config.export_ignore_forward_compatibility(True),
+                ):
+                    moe_fn.jit_fn.trace(*j_args)
+            assert seen_calls == [expected_flag, expected_flag], (variant, seen_calls)
+
+
 def test_v10_sp_code_hygiene_ast_and_defaults():
     """Verify default flags stay unchanged, AST parses cleanly, and 0 raw os.environ.get."""
     assert tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_VARIANT.get() == "v1"
