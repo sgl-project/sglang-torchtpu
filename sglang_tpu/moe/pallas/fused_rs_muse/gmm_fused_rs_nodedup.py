@@ -5078,7 +5078,7 @@ def gmm_v2_fused_rs(
                             and int(
                                 envs.SGLANG_TPU_MUSE_KERNEL_GMM_DIRECT_SILU.get() or 0
                             )
-                            == 0
+                            in (0, 1)
                         )
                         else 0
                     ),

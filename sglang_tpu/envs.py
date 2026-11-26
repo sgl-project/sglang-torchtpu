@@ -724,7 +724,7 @@ class TpuEnvs:
     # (0 = off; 1 = XOR send order; 2 = XOR send order + within-expert rotated chip order).
     SGLANG_TPU_MUSE_KERNEL_GMM_ROTATE_RS = EnvInt(0)
     # Muse prefill Wave-8 gmm_v2_fused_rs direct SiLU epilogue without VMEM/bf16 round-trip
-    # (0 = off; 1 = single-pass FP32 gate*up; 2 = fast BF16 sigmoid epilogue).
+    # (0 = off; 1 = single-pass FP32 gate*up with fused GMM2 amax reduction; 2 = fast BF16 sigmoid).
     SGLANG_TPU_MUSE_KERNEL_GMM_DIRECT_SILU = EnvInt(0)
     # Muse prefill Wave-8 quantize MoE hidden states to FP8 once before/at AG instead of 8x in GMM1
     # (0 = off; 1 = FP8 hidden states + per-token f32 scale passed into gmm_v2_fused_rs).
@@ -1442,7 +1442,8 @@ class TpuEnvs:
     # Wave-8 prefill gmm_v2_gather_scatter inner_kernel scoped W4A8 VMEM slice & zero-spill sub-tile:
     # 0 = off; 1 = slice [rk0:rk1, start_n:end_n] directly from VMEM + explicit fp8 cast (avoids
     # monolithic 8 MiB uint32 SSA load); 2 = 1 + m_sub=128 sub-tiling at tile_m>=256;
-    # 3 = 2 + mh_outer<=48-VREG zero-spill tiling + 32-row K-half flq LHS quant (0 FP8 VMEM RMW).
+    # 3 = 2 + mh_outer<=48-VREG zero-spill tiling + 32-row K-half flq LHS quant (0 FP8 VMEM RMW);
+    # 8 = 1 + hoist_rhs_scale=True + K-half quantize_3d_lhs_tile_to_fp8 (m_step=256, smaller IMEM).
     SGLANG_TPU_MUSE_KERNEL_GMM_SCOPED_W4A8 = EnvInt(0)
     # Wave-8 prefill gmm_v2_fused_rs expert-outer Scaled-FP8 expansion:
     # 0 = off; 1 = per-strip FP4->Scaled-FP8 VMEM expansion + zero-spill k_chunk=256 FP8 MXU dot
