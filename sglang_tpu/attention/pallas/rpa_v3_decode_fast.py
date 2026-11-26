@@ -64,6 +64,30 @@ class DecodeFastConfig:
     fold_128: bool = False
     fold_col: bool = False
     no_mask0: bool = False
+    swabatch_group_size: int = 1
+
+
+def _uses_swabatch_group(
+    cfg: DecodeFastConfig,
+    *,
+    one_block_per_seq: bool,
+    decode_query_size: int,
+    kv_pack_dense2: bool,
+    probe: str | None,
+    b_tokens: int,
+    max_num_seqs: int,
+) -> bool:
+    return (
+        cfg.swabatch_group_size > 1
+        and cfg.loop_kind == "swabatch"
+        and one_block_per_seq
+        and decode_query_size == 1
+        and not kv_pack_dense2
+        and not cfg.fp8_dots
+        and probe is None
+        and b_tokens % cfg.swabatch_group_size == 0
+        and max_num_seqs == b_tokens
+    )
 
 
 def get_shared_group_size(mode_str: str) -> int:
@@ -311,6 +335,11 @@ def parse_decode_fast_config(
     fold_col = ("foldcol" in toks_cfg or gear_4k) and not no_fold
     fold_128 = ("fold128" in toks_cfg or fold_col) and not no_fold
     no_mask0 = "nomask0" in toks_cfg or gear_4k
+    swabatch_group_size = (
+        1
+        if "nobatch4" in toks_cfg
+        else (4 if ("batch4" in toks_cfg or "b4" in toks_cfg) else (2 if ("batch2" in toks_cfg or "b2" in toks_cfg) else 1))
+    )
     fine_gears = (
         decode_query_size == 1
         and sliding_window is None
@@ -405,6 +434,11 @@ def parse_decode_fast_config(
                 "dyn2ku",
                 "u4flat",
                 "ring8k",
+                "batch4",
+                "b4",
+                "batch2",
+                "b2",
+                "nobatch4",
             ):
                 continue
             if tok.startswith("s") and tok[1:].isdigit():
@@ -504,6 +538,11 @@ def parse_decode_fast_config(
 
     num_slots = max(2, num_slots)
     eff_shared_group = shared_group if (sliding_window is None and loop_kind.startswith("shared")) else 0
+    eff_swabatch_grp = (
+        swabatch_group_size
+        if (loop_kind == "swabatch" and decode_query_size == 1 and not kv_pack_dense2 and not fp8_dots)
+        else 1
+    )
 
     if sliding_window is not None:
         if loop_kind in ("stream0b", "swabatch", "swafast", "swafast2", "stream2h", "stream1p", "stream2ld", "clean1p"):
@@ -565,6 +604,7 @@ def parse_decode_fast_config(
         fold_128=fold_128,
         fold_col=fold_col,
         no_mask0=no_mask0,
+        swabatch_group_size=eff_swabatch_grp,
     )
 
 
@@ -1031,54 +1071,88 @@ def _dispatch_swabatch_w_pg(
     run_fn,
 ):
     """Dispatches active-window page count gears consistently across pre-DMA & compute."""
-    if max_ring_pages > cdiv(1024, page_size):
-        @pl.when(max_re_b <= 256)
-        def _b_256():
-            run_fn(cdiv(256, page_size))
-
-        @pl.when((max_re_b > 256) & (max_re_b <= 512))
-        def _b_512():
-            run_fn(cdiv(512, page_size))
-
-        @pl.when((max_re_b > 512) & (max_re_b <= 1024))
-        def _b_1024():
-            run_fn(cdiv(1024, page_size))
-
-        if max_ring_pages > cdiv(1536, page_size):
-            @pl.when((max_re_b > 1024) & (max_re_b <= 1536))
-            def _b_1536():
-                run_fn(cdiv(1536, page_size))
-
-            if max_ring_pages > cdiv(2048, page_size):
-                @pl.when((max_re_b > 1536) & (max_re_b <= 2048))
-                def _b_2048():
-                    run_fn(cdiv(2048, page_size))
-
-                @pl.when(max_re_b > 2048)
-                def _b_full():
-                    run_fn(max_ring_pages)
-            else:
-                @pl.when(max_re_b > 1536)
-                def _b_full():
-                    run_fn(max_ring_pages)
-        else:
-            @pl.when(max_re_b > 1024)
-            def _b_full():
-                run_fn(max_ring_pages)
-    elif max_ring_pages > cdiv(512, page_size):
-        @pl.when(max_re_b <= 256)
-        def _b_s256():
-            run_fn(cdiv(256, page_size))
-
-        @pl.when((max_re_b > 256) & (max_re_b <= 512))
-        def _b_s512():
-            run_fn(cdiv(512, page_size))
-
-        @pl.when(max_re_b > 512)
-        def _b_sfull():
-            run_fn(max_ring_pages)
-    else:
+    gears: list[tuple[int, int]] = []
+    seen_pg: set[int] = set()
+    for thresh in (256, 512, 1024, 1536, 2048):
+        pg = cdiv(thresh, page_size)
+        if pg >= max_ring_pages:
+            break
+        if gears and gears[-1][1] == pg:
+            gears[-1] = (thresh, pg)
+        elif pg not in seen_pg:
+            gears.append((thresh, pg))
+            seen_pg.add(pg)
+    if not gears:
         run_fn(max_ring_pages)
+        return
+    prev = 0
+    for idx, (thresh, pg) in enumerate(gears):
+        cond = (
+            (max_re_b <= thresh)
+            if idx == 0
+            else ((max_re_b > prev) & (max_re_b <= thresh))
+        )
+
+        @pl.when(cond)
+        def _b_gear(p=pg):
+            run_fn(p)
+
+        prev = thresh
+
+    @pl.when(max_re_b > prev)
+    def _b_full():
+        run_fn(max_ring_pages)
+
+
+def _start_swabatch_group_dmas(
+    g_idx,
+    slot,
+    w_pg: int,
+    *,
+    group_sz: int,
+    n_active,
+    kv_cache_hbm_ref,
+    bkv_vmem_ref,
+    bkv_sems,
+    kv_lens_ref,
+    page_indices_ref,
+    cu_q_lens_ref,
+    cu_kv_lens_ref,
+    num_page_indices: int,
+    page_size: int,
+    sliding_window: int | None,
+):
+    """Starts fixed-byte (group_sz * w_pg) HBM->VMEM page DMAs for one swabatch group."""
+    sem = bkv_sems.at[slot]
+    n_phys_pages = kv_cache_hbm_ref.shape[0]
+    for sub in range(group_sz):
+        seq = group_sz * g_idx + sub
+        _, act, _, _, _, npg, pb = _rpad_seq_info(
+            seq,
+            kv_lens_ref=kv_lens_ref,
+            page_indices_ref=page_indices_ref,
+            cu_q_lens_ref=cu_q_lens_ref,
+            cu_kv_lens_ref=cu_kv_lens_ref,
+            num_page_indices=num_page_indices,
+            page_size=page_size,
+            sliding_window=sliding_window,
+            dq=1,
+        )
+        act_seq = (seq < n_active) & act
+        pb_safe = jnp.where(act_seq, jnp.clip(pb, 0, num_page_indices - 1), jnp.int32(0))
+        pg0 = jnp.clip(page_indices_ref[pb_safe], 0, n_phys_pages - 1)
+        for p_i in range(w_pg):
+            pg_idx = jnp.clip(pb_safe + p_i, 0, num_page_indices - 1)
+            pg = jnp.where(
+                act_seq & (p_i < npg),
+                jnp.clip(page_indices_ref[pg_idx], 0, n_phys_pages - 1),
+                pg0,
+            )
+            pltpu.make_async_copy(
+                kv_cache_hbm_ref.at[pl.ds(pg, 1)],
+                bkv_vmem_ref.at[slot, pl.ds(sub * w_pg + p_i, 1)],
+                sem,
+            ).start()
 
 
 def prepare_and_start_rpad_dmas(
@@ -1172,27 +1246,64 @@ def prepare_and_start_rpad_dmas(
         )
 
         def _prep_swa(w_pg: int):
-            if not cfg.lazy_slot_zero:
-                @pl.when(min_pg_b < w_pg)
-                def _zero_prefix():
-                    for s_z in range(cfg.num_slots):
-                        _zero_bkv_pages_u32(
-                            bkv_vmem_ref,
-                            s_z,
-                            0,
-                            w_pg,
-                            max_ring_pages=cfg.max_ring_pages,
-                            phys_page_rows=phys_page_rows,
-                            kv_pack_dense2=kv_pack_dense2,
-                            interpret_mode=interpret_mode,
-                        )
+            grp_sz = cfg.swabatch_group_size
+            can_grp_pre = (
+                grp_sz > 1
+                and not kv_pack_dense2
+                and not cfg.fp8_dots
+                and probe is None
+                and max_num_seqs % grp_sz == 0
+                and bkv_vmem_ref.shape[1] >= grp_sz * cfg.max_ring_pages
+            )
 
-            num_ahead_b = cfg.num_slots - 1
-            for s_init in range(num_ahead_b):
-                @pl.when(s_init < n_active)
-                def _(si=s_init):
-                    _, _, _, _, _, n_pg, pg_base = _seq_info(si)
-                    _start_fetch(pg_base, n_pg, si)
+            def _prep_single():
+                if not cfg.lazy_slot_zero:
+                    @pl.when(min_pg_b < w_pg)
+                    def _zero_prefix():
+                        bkv_slot_pages = bkv_vmem_ref.shape[1]
+                        for s_z in range(cfg.num_slots):
+                            _zero_bkv_pages_u32(
+                                bkv_vmem_ref,
+                                s_z,
+                                0,
+                                w_pg,
+                                max_ring_pages=bkv_slot_pages,
+                                phys_page_rows=phys_page_rows,
+                                kv_pack_dense2=kv_pack_dense2,
+                                interpret_mode=interpret_mode,
+                            )
+
+                num_ahead_b = cfg.num_slots - 1
+                for s_init in range(num_ahead_b):
+                    @pl.when(s_init < n_active)
+                    def _(si=s_init):
+                        _, _, _, _, _, n_pg, pg_base = _seq_info(si)
+                        _start_fetch(pg_base, n_pg, si)
+
+            if can_grp_pre:
+                n_grp = (n_active + grp_sz - 1) // grp_sz
+                for g_init in range(cfg.num_slots - 1):
+                    @pl.when(g_init < n_grp)
+                    def _(gi=g_init):
+                        _start_swabatch_group_dmas(
+                            gi,
+                            gi,
+                            w_pg,
+                            group_sz=grp_sz,
+                            n_active=n_active,
+                            kv_cache_hbm_ref=kv_cache_hbm_ref,
+                            bkv_vmem_ref=bkv_vmem_ref,
+                            bkv_sems=bkv_sems,
+                            kv_lens_ref=kv_lens_ref,
+                            page_indices_ref=page_indices_ref,
+                            cu_q_lens_ref=cu_q_lens_ref,
+                            cu_kv_lens_ref=cu_kv_lens_ref,
+                            num_page_indices=num_page_indices,
+                            page_size=page_size,
+                            sliding_window=sliding_window,
+                        )
+            else:
+                _prep_single()
 
         _dispatch_swabatch_w_pg(
             max_re_b,
@@ -1263,8 +1374,6 @@ def _run_rpad_vmem_core(
     prestarted_bkv_state: tuple[jax.Array, ...] | None = None,
 ):
     """Executes VMEM-resident decode RPA core (reusable in fused superkernels)."""
-    use_hoist_kv = cfg.hoist_new_kv and decode_query_size == 1
-
     max_num_tokens = q_vmem_ref.shape[0]
     max_num_seqs = kv_lens_ref.shape[0]
     phys_page_rows = kv_cache_hbm_ref.shape[1]
@@ -1272,8 +1381,23 @@ def _run_rpad_vmem_core(
     num_page_indices = page_indices_ref.shape[0]
     num_slots = cfg.num_slots
     max_ring_pages = cfg.max_ring_pages
+    bkv_slot_pages = bkv_vmem_ref.shape[1]
     max_ring_rows = max_ring_pages * page_size
     use_branchless_sanitize = cfg.loop_kind in ("stream0b", "swabatch", "swafast")
+    can_grp_vec = (
+        _uses_swabatch_group(
+            cfg,
+            one_block_per_seq=one_block_per_seq,
+            decode_query_size=decode_query_size,
+            kv_pack_dense2=kv_pack_dense2,
+            probe=probe,
+            b_tokens=max_num_tokens,
+            max_num_seqs=max_num_seqs,
+        )
+        and bkv_slot_pages >= cfg.swabatch_group_size * max_ring_pages
+        and init_sv_vmem_ref is not None
+    )
+    use_hoist_kv = (cfg.hoist_new_kv or can_grp_vec) and decode_query_size == 1
 
     s_scale = float(sm_scale * (k_scale if k_scale is not None else 1.0))
     exp2_scale = float(s_scale * _LOG2_E)
@@ -1580,7 +1704,7 @@ def _run_rpad_vmem_core(
         u32_ref = (
             bkv_vmem_ref.bitcast(jnp.uint32)
             .at[slot]
-            .reshape(max_ring_pages, phys_page_rows, 128)
+            .reshape(bkv_slot_pages, phys_page_rows, 128)
         )
         return u32_ref[pg_idx]
 
@@ -1604,7 +1728,7 @@ def _run_rpad_vmem_core(
         u32_ref = (
             bkv_vmem_ref.bitcast(jnp.uint32)
             .at[slot]
-            .reshape(max_ring_pages, phys_page_rows, 128)
+            .reshape(bkv_slot_pages, phys_page_rows, 128)
         )
         u32_ref[pg_idx] = val_u32
 
@@ -1639,7 +1763,7 @@ def _run_rpad_vmem_core(
         u32_flat = (
             bkv_vmem_ref.bitcast(jnp.uint32)
             .at[slot]
-            .reshape(max_ring_pages * phys_page_rows, 128)
+            .reshape(bkv_slot_pages * phys_page_rows, 128)
         )
         base_r = pg_idx * phys_page_rows
         n_subs = phys_page_rows // 128
@@ -1677,7 +1801,7 @@ def _run_rpad_vmem_core(
             slot,
             start_pg,
             end_pg,
-            max_ring_pages=max_ring_pages,
+            max_ring_pages=bkv_slot_pages,
             phys_page_rows=phys_page_rows,
             kv_pack_dense2=kv_pack_dense2,
             interpret_mode=interpret_mode,
@@ -1687,7 +1811,7 @@ def _run_rpad_vmem_core(
         _zero_all_bkv_slots_u32(
             bkv_vmem_ref,
             num_slots=num_slots,
-            max_ring_pages=max_ring_pages,
+            max_ring_pages=bkv_slot_pages,
             phys_page_rows=phys_page_rows,
             interpret_mode=interpret_mode,
         )
@@ -3771,48 +3895,261 @@ def _run_rpad_vmem_core(
                             o_vmem_ref[q_r] = jnp.zeros((q_rows, 128), jnp.bfloat16)
 
                 return
-            if not bkv_prestarted:
-                if probe != "nocompute" and not cfg.lazy_slot_zero:
-                    @pl.when(min_pg_b < w_pg)
-                    def _zero_active_prefix():
-                        for s_z in range(num_slots):
-                            _zero_pages_u32(s_z, 0, w_pg)
+            def _run_swa_single():
+                if not bkv_prestarted:
+                    if probe != "nocompute" and not cfg.lazy_slot_zero:
+                        @pl.when(min_pg_b < w_pg)
+                        def _zero_active_prefix():
+                            for s_z in range(num_slots):
+                                _zero_pages_u32(s_z, 0, w_pg)
 
-            num_ahead_b = num_slots - 1
-            if not bkv_prestarted:
-                for s_init in range(num_ahead_b):
+                num_ahead_b = num_slots - 1
+                if not bkv_prestarted:
+                    for s_init in range(num_ahead_b):
 
-                    @pl.when(s_init < n_active)
-                    def _(si=s_init):
-                        _, _, _, _, _, n_pg, pg_base = seq_info(si)
-                        start_fetch_pages(pg_base, n_pg, si)
-            if use_hoist_kv:
+                        @pl.when(s_init < n_active)
+                        def _(si=s_init):
+                            _, _, _, _, _, n_pg, pg_base = seq_info(si)
+                            start_fetch_pages(pg_base, n_pg, si)
+                if use_hoist_kv:
+                    precompute_hoisted_new_kv()
+
+                @pl.loop(0, n_active)
+                def _seq_step_b(seq):
+                    slot = seq % num_slots
+                    fut_seq = seq + num_ahead_b
+                    fut_slot = (slot + num_ahead_b) % num_slots
+
+                    @pl.when(fut_seq < n_active)
+                    def _():
+                        _, _, _, _, _, n_pg_f, pg_base_f = seq_info(fut_seq)
+                        start_fetch_pages(pg_base_f, n_pg_f, fut_slot)
+
+                    q_r, act, kvl, rf, re, n_pg, _ = seq_info(seq)
+                    wait_fetch_pages(n_pg, slot)
+                    enqueue_kv_write(seq, q_r, act, kvl, slot, re - 1)
+
+                    @pl.when(act)
+                    def _():
+                        o_vmem_ref[q_r] = compute_stream1p(
+                            slot, q_vmem_ref[q_r], q_r, rf, re, w_pg
+                        )
+
+                    @pl.when(~act)
+                    def _():
+                        o_vmem_ref[q_r] = jnp.zeros((q_rows, 128), jnp.bfloat16)
+
+            def _run_swa_grp_vec():
+                grp_sz = cfg.swabatch_group_size
+                n_grp = (n_active + grp_sz - 1) // grp_sz
+                w_tok = w_pg * page_size
+                ahead_g = num_slots - 1
+                if not bkv_prestarted:
+                    for g_init in range(ahead_g):
+                        @pl.when(g_init < n_grp)
+                        def _(gi=g_init):
+                            _start_swabatch_group_dmas(
+                                gi,
+                                gi,
+                                w_pg,
+                                group_sz=grp_sz,
+                                n_active=n_active,
+                                kv_cache_hbm_ref=kv_cache_hbm_ref,
+                                bkv_vmem_ref=bkv_vmem_ref,
+                                bkv_sems=bkv_sems,
+                                kv_lens_ref=kv_lens_ref,
+                                page_indices_ref=page_indices_ref,
+                                cu_q_lens_ref=cu_q_lens_ref,
+                                cu_kv_lens_ref=cu_kv_lens_ref,
+                                num_page_indices=num_page_indices,
+                                page_size=page_size,
+                                sliding_window=sliding_window,
+                            )
                 precompute_hoisted_new_kv()
 
-            @pl.loop(0, n_active)
-            def _seq_step_b(seq):
-                slot = seq % num_slots
-                fut_seq = seq + num_ahead_b
-                fut_slot = (slot + num_ahead_b) % num_slots
-
-                @pl.when(fut_seq < n_active)
-                def _():
-                    _, _, _, _, _, n_pg_f, pg_base_f = seq_info(fut_seq)
-                    start_fetch_pages(pg_base_f, n_pg_f, fut_slot)
-
-                q_r, act, kvl, rf, re, n_pg, _ = seq_info(seq)
-                wait_fetch_pages(n_pg, slot)
-                enqueue_kv_write(seq, q_r, act, kvl, slot, re - 1)
-
-                @pl.when(act)
-                def _():
-                    o_vmem_ref[q_r] = compute_stream1p(
-                        slot, q_vmem_ref[q_r], q_r, rf, re, w_pg
+                col_sub = lax.broadcasted_iota(jnp.int32, (q_rows, w_tok), 1)
+                z_out_sub = jnp.zeros((q_rows, 128), jnp.bfloat16)
+                fast_u32_san = (not interpret_mode) and (phys_page_rows > 128)
+                if fast_u32_san:
+                    iota_128 = lax.broadcasted_iota(jnp.int32, (128, 128), 0)
+                    z_128 = jnp.zeros((128, 128), jnp.uint32)
+                    flat_u32 = bkv_vmem_ref.bitcast(jnp.uint32).reshape(
+                        num_slots * bkv_slot_pages * phys_page_rows, 128
                     )
+                    n_san_subs = phys_page_rows // 128
 
-                @pl.when(~act)
-                def _():
-                    o_vmem_ref[q_r] = jnp.zeros((q_rows, 128), jnp.bfloat16)
+                    def _san_grp_pg(sl, pg_idx_sl, lo, hi):
+                        br = (sl * bkv_slot_pages + pg_idx_sl) * phys_page_rows
+                        for si_sub in range(n_san_subs):
+                            ro = si_sub * 128
+                            so = pl.multiple_of(br + ro, 128)
+                            blk = flat_u32[pl.ds(so, 128)]
+                            cond = (iota_128 >= (lo - ro)) & (iota_128 < (hi - ro))
+                            flat_u32[pl.ds(so, 128)] = jnp.where(cond, blk, z_128)
+
+                    def _zero_grp_pg(sl, pg_idx_sl):
+                        br = (sl * bkv_slot_pages + pg_idx_sl) * phys_page_rows
+                        for si_sub in range(n_san_subs):
+                            flat_u32[pl.ds(pl.multiple_of(br + si_sub * 128, 128), 128)] = z_128
+                else:
+                    def _san_grp_pg(sl, pg_idx_sl, lo, hi):
+                        _sanitize_page_u32(sl, pg_idx_sl, lo, hi)
+
+                    def _zero_grp_pg(sl, pg_idx_sl):
+                        _zero_pages_u32(sl, pg_idx_sl, pg_idx_sl + 1)
+
+                def _grp_body(g_i, wr_cnt):
+                    sl = g_i % num_slots
+                    fut_g = g_i + ahead_g
+                    @pl.when(fut_g < n_grp)
+                    def _pf_grp():
+                        _start_swabatch_group_dmas(
+                            fut_g,
+                            fut_g % num_slots,
+                            w_pg,
+                            group_sz=grp_sz,
+                            n_active=n_active,
+                            kv_cache_hbm_ref=kv_cache_hbm_ref,
+                            bkv_vmem_ref=bkv_vmem_ref,
+                            bkv_sems=bkv_sems,
+                            kv_lens_ref=kv_lens_ref,
+                            page_indices_ref=page_indices_ref,
+                            cu_q_lens_ref=cu_q_lens_ref,
+                            cu_kv_lens_ref=cu_kv_lens_ref,
+                            num_page_indices=num_page_indices,
+                            page_size=page_size,
+                            sliding_window=sliding_window,
+                        )
+
+                    dst = bkv_vmem_ref.at[sl, pl.ds(0, grp_sz * w_pg)]
+                    pltpu.make_async_copy(dst, dst, bkv_sems.at[sl]).wait()
+
+                    rf_list, re_list, act_list = [], [], []
+                    for sub in range(grp_sz):
+                        seq = grp_sz * g_i + sub
+                        q_r, act_raw, kvl, rf, re_raw, npg_raw, _ = seq_info(seq)
+                        act = (seq < n_active) & act_raw
+                        re = jnp.where(act, re_raw, jnp.int32(0))
+                        npg = jnp.where(act, npg_raw, jnp.int32(0))
+                        rf_seq = jnp.where(act, rf, jnp.int32(0))
+                        rf_list.append(rf_seq)
+                        re_list.append(re)
+                        act_list.append(act)
+                        wr_cnt = wr_cnt + jnp.where(act, jnp.int32(1), jnp.int32(0))
+                        @pl.when(act)
+                        def _(s=seq, qr=q_r, kv=kvl):
+                            sb = cdiv(cu_kv_lens_ref[s], page_size)
+                            pos = kv - 1
+                            dp = page_indices_ref[jnp.minimum(sb + (pos // page_size), num_page_indices - 1)]
+                            pltpu.make_async_copy(
+                                kv_merged_vmem_ref.at[pl.ds(qr, 1)],
+                                updated_kv_cache_hbm_ref.at[dp, pl.ds(pos % page_size, 1)],
+                                cache_write_sem.at[0],
+                            ).start()
+
+                        pg_base_sl = sub * w_pg
+                        if w_pg <= 2:
+                            for p_i in range(w_pg):
+                                _san_grp_pg(
+                                    sl,
+                                    pg_base_sl + p_i,
+                                    jnp.maximum(rf_seq - p_i * page_size, 0),
+                                    jnp.clip(re - p_i * page_size, 0, page_size),
+                                )
+                        else:
+                            _san_grp_pg(sl, pg_base_sl, rf_seq, re)
+                            last_p = jnp.clip(npg - 1, 0, w_pg - 1)
+                            @pl.when(last_p > 0)
+                            def _slp(lp=last_p, re_v=re, pbs=pg_base_sl):
+                                _san_grp_pg(
+                                    sl, pbs + lp, 0, jnp.clip(re_v - lp * page_size, 0, page_size)
+                                )
+                            for p_i in range(1, w_pg):
+                                @pl.when(p_i >= npg)
+                                def _zpi(pi_=p_i, pbs=pg_base_sl):
+                                    _zero_grp_pg(sl, pbs + pi_)
+
+                    k_all = _bkv_fp8_chunk(sl, 0, grp_sz * w_tok, kind="k")
+                    q_g = q_vmem_ref[pl.ds(grp_sz * g_i, grp_sz)]
+                    s_list = []
+                    for sub in range(grp_sz):
+                        sc_s = jnp.matmul(
+                            q_g[sub],
+                            k_all[sub * w_tok : (sub + 1) * w_tok].T,
+                            preferred_element_type=jnp.float32,
+                        )
+                        if sliding_window is not None:
+                            sc_s = jnp.where(
+                                (col_sub >= rf_list[sub]) & (col_sub < re_list[sub]),
+                                sc_s,
+                                _MASK_LOGIT,
+                            )
+                        else:
+                            sc_s = jnp.where(col_sub < re_list[sub], sc_s, _MASK_LOGIT)
+                        s_list.append(sc_s)
+                    s_flat = jnp.concatenate(s_list, axis=0)
+                    s_new_g = jnp.concatenate(
+                        [init_sv_vmem_ref[0, grp_sz * g_i + sub] for sub in range(grp_sz)],
+                        axis=0,
+                    )
+                    acc0_g = jnp.concatenate(
+                        [init_sv_vmem_ref[1, grp_sz * g_i + sub] for sub in range(grp_sz)],
+                        axis=0,
+                    )
+                    m_flat = jnp.maximum(
+                        s_new_g,
+                        _broadcast_minor_128(
+                            jnp.max(_fold128_op(s_flat, jnp.maximum), axis=1, keepdims=True)
+                        ),
+                    )
+                    if cfg.fold_col:
+                        px_flat, l_flat = _exp2_fold_col(s_flat, m_flat, exp2_scale)
+                    elif cfg.fold_128:
+                        px_flat = jnp.exp2((s_flat - m_flat[:, :1]) * exp2_scale)
+                        l_flat = _fold128_op(px_flat, jnp.add)
+                    else:
+                        m_w = _broadcast_minor_128_any(m_flat, w_tok)
+                        px_flat = jnp.exp2((s_flat - m_w) * exp2_scale)
+                        l_flat = jnp.sum(
+                            px_flat.reshape(grp_sz * q_rows, w_tok // 128, 128), axis=1
+                        )
+                    px_dot = px_flat.astype(jnp.bfloat16) if cfg.pv_bf16 else px_flat
+                    v_all = _bkv_fp8_chunk(sl, 0, grp_sz * w_tok, kind="v")
+                    pv_g = jnp.concatenate(
+                        [
+                            jnp.matmul(
+                                px_dot[sub * q_rows : (sub + 1) * q_rows],
+                                v_all[sub * w_tok : (sub + 1) * w_tok],
+                                preferred_element_type=jnp.float32,
+                            )
+                            for sub in range(grp_sz)
+                        ],
+                        axis=0,
+                    )
+                    if v_scale is not None and v_scale_val != 1.0:
+                        pv_g = pv_g * v_scale_val
+                    p_new = jnp.exp2((s_new_g - m_flat) * exp2_scale)
+                    acc_g = pv_g + p_new * acc0_g
+                    lt_g = _broadcast_minor_128(jnp.sum(l_flat, axis=1, keepdims=True)) + p_new
+                    out_2d = (
+                        (acc_g / lt_g).astype(jnp.bfloat16)
+                        if interpret_mode
+                        else (acc_g * pltpu.reciprocal(lt_g, approx=True)).astype(jnp.bfloat16)
+                    )
+                    for sub in range(grp_sz):
+                        o_vmem_ref[grp_sz * g_i + sub] = jnp.where(
+                            act_list[sub],
+                            out_2d[sub * q_rows : (sub + 1) * q_rows],
+                            z_out_sub,
+                        )
+                    return wr_cnt
+
+                written_cnt_smem_ref[0] = lax.fori_loop(0, n_grp, _grp_body, jnp.int32(0))
+
+            if can_grp_vec:
+                _run_swa_grp_vec()
+            else:
+                _run_swa_single()
 
         _dispatch_swabatch_w_pg(
             max_re_b,
@@ -4033,7 +4370,18 @@ def _decode_fast_kernel(
         idx_r += 1
     else:
         kv_write_vmem_ref = None
-    use_hoist_kv = cfg.hoist_new_kv and decode_query_size == 1
+    use_hoist_kv = (
+        cfg.hoist_new_kv
+        or _uses_swabatch_group(
+            cfg,
+            one_block_per_seq=one_block_per_seq,
+            decode_query_size=decode_query_size,
+            kv_pack_dense2=kv_pack_dense2,
+            probe=probe,
+            b_tokens=q_vmem_ref.shape[0],
+            max_num_seqs=kv_lens_ref.shape[0],
+        )
+    ) and decode_query_size == 1
     if use_hoist_kv:
         init_sv_vmem_ref = body_refs[idx_r]
         idx_r += 1
@@ -4225,6 +4573,17 @@ def run_decode_fast_rpa(
             scope_name += "-shfp8pv"
         if run_cfg.batch_full:
             scope_name += "-batchfull"
+        use_grp_bkv = _uses_swabatch_group(
+            run_cfg,
+            one_block_per_seq=run_one_block,
+            decode_query_size=decode_query_size,
+            kv_pack_dense2=kv_pack_dense2,
+            probe=probe,
+            b_tokens=b_tokens,
+            max_num_seqs=max_num_seqs,
+        )
+        if use_grp_bkv:
+            scope_name += f"-b{run_cfg.swabatch_group_size}"
         if run_cfg.hoist_new_kv and decode_query_size == 1:
             scope_name += "-hkv"
         if run_cfg.fine_gears and decode_query_size == 1:
@@ -4294,7 +4653,15 @@ def run_decode_fast_rpa(
         ]
         scratch_shapes = [
             pltpu.VMEM(
-                (run_cfg.num_slots, run_cfg.max_ring_pages, phys_page_rows, 1, 4, 128),
+                (
+                    run_cfg.num_slots,
+                    (run_cfg.swabatch_group_size if use_grp_bkv else 1)
+                    * run_cfg.max_ring_pages,
+                    phys_page_rows,
+                    1,
+                    4,
+                    128,
+                ),
                 kv_cache_fused.dtype,
             ),
             pltpu.VMEM(
@@ -4317,7 +4684,7 @@ def run_decode_fast_rpa(
             scratch_shapes.append(
                 pltpu.VMEM((max_pair_writes, 8, 1, 4, 128), kv_cache_fused.dtype)
             )
-        if run_cfg.hoist_new_kv and decode_query_size == 1:
+        if (run_cfg.hoist_new_kv or use_grp_bkv) and decode_query_size == 1:
             scratch_shapes.append(pltpu.VMEM((2, b_pad32, q_3d.shape[1], 128), jnp.float32))
         max_blks_4k = (
             cdiv(max(pages_per_seq, 1), run_cfg.max_ring_pages)
@@ -4445,10 +4812,16 @@ def run_decode_fast_rpa(
             return jnp.concatenate([g0, g1], axis=-1), updated_cache
         raise ValueError(f"Unsupported fused_out_pack={fused_out_pack}")
 
-    if use_adaptive_c1024 and not (
-        cfg.loop_kind in ("stream0b", "swafast2")
-        and cfg.max_ring_pages <= (1024 // page_size)
-        and one_block_per_seq
+    # Group-vectorized swabatch already dispatches w_pg dynamically in-kernel;
+    # wrapping it in an outer lax.switch adds ~5.5-6.5 us/occ XLA overhead.
+    if (
+        use_adaptive_c1024
+        and not (cfg.loop_kind == "swabatch" and cfg.swabatch_group_size > 1)
+        and not (
+            cfg.loop_kind in ("stream0b", "swafast2")
+            and cfg.max_ring_pages <= (1024 // page_size)
+            and one_block_per_seq
+        )
     ):
         short_loop = (
             "swabatch"
