@@ -582,9 +582,10 @@ def b1_moe_b2_replicated_b16_jax(
     _, qkv_cols = next_w_qkv_w8k.shape
     _, gate_cols = next_w_gate_w8k.shape
     expected_chunk = hidden // world_size
+    valid_rows = (8, 16) if world_size == 8 else (16,)
     if (
-        rows != 16
-        or s_rows != 16
+        rows not in valid_rows
+        or s_rows != rows
         or hidden != 8192
         or world_size * pre_cols != _H
         or world_size * post_cols != hidden
@@ -593,7 +594,7 @@ def b1_moe_b2_replicated_b16_jax(
         or o_in != expected_chunk
     ):
         raise ValueError(
-            f"Unsupported replicated B=16 shapes world_size={world_size}, stream={stream.shape}, "
+            f"Unsupported replicated B=8/16 shapes world_size={world_size}, stream={stream.shape}, "
             f"gated={gated_attn.shape}, w_pre={w_pre_w8k.shape}, w_post={w_post_w8k.shape}"
         )
 
@@ -624,6 +625,8 @@ def b1_moe_b2_replicated_b16_jax(
     else:
         if world_size == 16 and (config.pair_rs or config.bridge_ag):
             config = dataclasses.replace(config, pair_rs=False, bridge_ag=False)
+    if rows == 8 and config.row_mode != "sparse":
+        raise ValueError("b1_moe_b2_replicated_b16_jax with B=8 requires config.row_mode='sparse'")
 
     half = hidden // 2
     n_chips = world_size // 2
@@ -815,7 +818,7 @@ def b1_moe_b2_replicated_b16_jax(
         ),
         interpret=interpret_arg,
         name=(
-            f"muse_w9_b1_moe_b2_rep_b16_tp{world_size}_k{scale_block}"
+            f"muse_w9_b1_moe_b2_rep_b{rows}_tp{world_size}_k{scale_block}"
             f"_r{num_replicas}_{'r16' if is_r16 else 'r32'}"
             f"{'_dfp' if has_free_params_arg else ''}"
             f"_{'rope' if has_rope else 'nope'}"

@@ -4994,9 +4994,10 @@ def decode_vocab_embed_chip_sharded_jax(
 
     rows = input_ids.shape[0]
     v_shard, hidden = embed_weight_shard.shape
+    valid_rows = (32, 64, 128, 256, 384) if world_size == 8 else (64, 128, 256, 384)
     if (
-        world_size != 8
-        or rows not in (32, 64, 128, 256, 384)
+        world_size not in SUPPORTED_WORLD_SIZES
+        or rows not in valid_rows
         or v_shard < 16
         or v_shard % 8 != 0
         or hidden % 1024 != 0
@@ -8418,8 +8419,10 @@ def get_moe_post_tok_sharded_final_norm_op(
 
 
 def get_decode_vocab_embed_chip_sharded_op(world_size: int) -> Callable:
-    if world_size != 8:
-        raise ValueError(f"Chip-sharded embed entry requires world_size=8, got {world_size}")
+    if world_size not in SUPPORTED_WORLD_SIZES:
+        raise ValueError(
+            f"Chip-sharded embed entry requires world_size in {SUPPORTED_WORLD_SIZES}, got {world_size}"
+        )
     op = _EMBED_CHIP_SHARDED_OPS.get(world_size)
     if op is not None:
         return op
@@ -8982,7 +8985,7 @@ def prewarm_w8_decode_bridge_ops(
                     )
     if chip_sharded and world_size in SUPPORTED_WORLD_SIZES:
         get_ag_chip_sharded_capture_op(world_size)
-        if pallas_embed and world_size == 8:
+        if pallas_embed:
             get_decode_vocab_embed_chip_sharded_op(world_size)
         if mode in (1, 3, 4):
             for r16 in (False, True):

@@ -3760,7 +3760,11 @@ class MuseSparkDecoderLayer(nn.Module):
         if not bool(self.__dict__.get("_w9_b1_moe_b2_superkernel", False)) or not is_dec_step:
             return False
         mlp = self.mlp
-        valid_b = (16,) if replicated else ((32, 64, 128) if tp == 8 else (64, 128, 256))
+        valid_b = (
+            (8, 16)
+            if (replicated and tp == 8)
+            else ((16,) if replicated else ((32, 64, 128) if tp == 8 else (64, 128, 256)))
+        )
         pre_buf_key = "_w7_wpre_w8k" if replicated else "_w8_wpre_pair_w8k"
         if (
             n_tok not in valid_b
@@ -4533,7 +4537,11 @@ class MuseSparkDecoderLayer(nn.Module):
                         )
                         if sk_out is not None:
                             return sk_out
-                    elif not tok_sharded_stream and n_tok == 16 and b2_kind == 3:
+                    elif (
+                        not tok_sharded_stream
+                        and (n_tok == 16 or (tp == 8 and n_tok == 8))
+                        and b2_kind == 3
+                    ):
                         sk16_out = self._try_b1_moe_replicated_b16_superkernel(
                             positions=positions,
                             stream=stream,
@@ -5836,9 +5844,9 @@ class MuseSparkTextModel(nn.Module):
             elif (
                 use_chip_sharded_relay
                 and can_pallas_embed
-                and pallas_emb_tp == 8
-                and chip_sh_tp == 8
-                and n_tok_in >= 32
+                and pallas_emb_tp == chip_sh_tp
+                and chip_sh_tp in (8, 16)
+                and n_tok_in >= (32 if chip_sh_tp == 8 else 64)
             ):
                 from sglang_tpu.kernels.decode_collective_bridges_w8 import (
                     get_decode_vocab_embed_chip_sharded_op,
@@ -5847,7 +5855,9 @@ class MuseSparkTextModel(nn.Module):
                 l0_ln = self.layers[self.start_layer].input_layernorm
                 l0_gain = l0_ln.gain()
                 assert l0_gain is not None
-                stream, carried_attn_input = get_decode_vocab_embed_chip_sharded_op(8)(
+                stream, carried_attn_input = get_decode_vocab_embed_chip_sharded_op(
+                    chip_sh_tp
+                )(
                     input_ids.to(torch.int32),
                     self.embed_tokens.weight,
                     l0_gain,

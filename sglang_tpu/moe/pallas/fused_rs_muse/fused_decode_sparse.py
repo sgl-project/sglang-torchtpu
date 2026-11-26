@@ -4172,10 +4172,11 @@ def run_muse_sparse_experts_and_rs_from_vmem(
         ).wait()
 
         if write_output_ref and output_ref is not None:
-            for r0 in range(0, batch_size, 16):
-                output_ref[pl.ds(r0, 16), :] = fan_3d_buf[
-                    pl.ds(r0, 16), :, :
-                ].reshape(16, _H)
+            out_rc = min(batch_size, 16)
+            for r0 in range(0, batch_size, out_rc):
+                output_ref[pl.ds(r0, out_rc), :] = fan_3d_buf[
+                    pl.ds(r0, out_rc), :, :
+                ].reshape(out_rc, _H)
 
         mate_op.wait_send()
         for c, op in s1_ops:
@@ -4217,10 +4218,11 @@ def run_muse_sparse_experts_and_rs_from_vmem(
         ).wait()
 
         if write_output_ref and output_ref is not None:
-            for r0 in range(0, batch_size, 16):
-                output_ref[pl.ds(r0, 16), :] = fan_3d_buf[
-                    pl.ds(r0, 16), :, :
-                ].reshape(16, _H)
+            out_rc = min(batch_size, 16)
+            for r0 in range(0, batch_size, out_rc):
+                output_ref[pl.ds(r0, out_rc), :] = fan_3d_buf[
+                    pl.ds(r0, out_rc), :, :
+                ].reshape(out_rc, _H)
 
         for dest, fan_op in fan_copies:
 
@@ -5931,7 +5933,7 @@ def _sparse_fp8_decode_kernel(
 
         lax.fori_loop(0, io_rows_alloc // 8, _zero_io_chunk, jnp.int32(0))
 
-        x_rc = 16
+        x_rc = min(batch_size, 16)
 
         def _reshape_x_chunk(ci, _):
             r0 = pl.multiple_of(ci * x_rc, x_rc)
@@ -7133,10 +7135,11 @@ def _sparse_fp8_decode_kernel(
             fan_s2_recv_sem,
         ).wait()
 
-        for r0 in range(0, batch_size, 16):
-            output_ref[pl.ds(r0, 16), :] = fan_3d_buf[
-                pl.ds(r0, 16), :, :
-            ].reshape(16, _H)
+        out_rc = min(batch_size, 16)
+        for r0 in range(0, batch_size, out_rc):
+            output_ref[pl.ds(r0, out_rc), :] = fan_3d_buf[
+                pl.ds(r0, out_rc), :, :
+            ].reshape(out_rc, _H)
 
         mate_op.wait_send()
         for c, op in s1_ops:
@@ -7176,10 +7179,11 @@ def _sparse_fp8_decode_kernel(
             fan_recv_sem,
         ).wait()
 
-        for r0 in range(0, batch_size, 16):
-            output_ref[pl.ds(r0, 16), :] = fan_3d_buf[
-                pl.ds(r0, 16), :, :
-            ].reshape(16, _H)
+        out_rc = min(batch_size, 16)
+        for r0 in range(0, batch_size, out_rc):
+            output_ref[pl.ds(r0, out_rc), :] = fan_3d_buf[
+                pl.ds(r0, out_rc), :, :
+            ].reshape(out_rc, _H)
 
         for dest, fan_op in fan_copies:
 
