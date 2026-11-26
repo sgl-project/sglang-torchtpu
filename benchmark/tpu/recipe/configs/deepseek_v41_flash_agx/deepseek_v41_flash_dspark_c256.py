@@ -108,6 +108,14 @@ CONFIG["server_args"]["max_prefill_tokens"] = 16384
 CONFIG["server_args"]["prefill_decode_interval"] = 16
 CONFIG["runtime_env"]["SGLANG_DP_ATTN_WORK_CAP"] = "800000000"
 CONFIG["runtime_env"]["SGLANG_PREFILL_SPF"] = "1"
+# Shortest-prefill-first aging, a starvation guard for SPF: each prefill token a
+# request waits lowers its rank by one token, so a 100-200K-uncached prompt waits
+# about 1-1.5 min of its rank's prefill. AgentX c256 real-draft, tree 9e490d50b8
+# (pdi 16), only this differs, cross-slot (j-85b986ba-01e3-41fd-b0b0 vs arm a of
+# j-38e8579f-5c9e-4815-b1ac): tok/s/chip 105,046 -> 120,713, paired p90
+# interactivity 1.015 (95% CI 1.012-1.018), median 0.994; product 1.17. Worst TTFT
+# 33.4 -> 5.4 min, >=32K-uncached p99 21.1 -> 3.3 min; <20K TTFT p50 3.2 -> 6.3 s.
+CONFIG["server_args"]["shortest_prefill_aging_factor"] = 1.0
 # Fused attention output projection (wo_a requantized to per-channel FP8), all
 # layers. AgentX c256 real-draft, only this differs (j-5fa78565-fffd-4f9f-99ed vs
 # j-9bcca990-173d-45cb-9ae1): paired p90 interactivity ratio 1.022 (95% CI
