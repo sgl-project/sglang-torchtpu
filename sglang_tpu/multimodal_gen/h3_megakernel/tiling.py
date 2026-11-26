@@ -49,8 +49,7 @@ class Tiling:
         takes a key tile that does not divide the rows (its q, k, v buffer
         pads to whole key tiles); other walks need one that does.
       block_kv_compute: Key rows per unrolled compute step within one.
-      block_kv_compute_online: The same for online-softmax layers (1024 is
-        3% faster at 74k rows, 5% slower at 32k).
+      block_kv_compute_online: The same for online-softmax layers.
       sub_rows: Rows per MXU call inside a tile.
       n_chunk: Output columns per MXU call.
       chunk_rows: Rows per pass of the norm, SwiGLU and residual loops.
@@ -105,10 +104,11 @@ class Tiling:
             or config.rope_dims > config.head_dim
         ):
             raise ValueError(
-                f"MiniMax H3 megakernel takes a multiple of 128 rows a device and"
-                f" hidden and ffn widths, 128 head dims, heads that split"
-                f" {devices} ways and a key tile of 16-row multiples; got {rows}"
-                f" rows, key tile {self.key_tile} and {config}"
+                f"MiniMax H3 megakernel takes a multiple of 128 rows a device"
+                f" (of 16 with split_q_tiles), hidden and ffn widths of 128-lane"
+                f" multiples, 128 head dims, heads that split {devices} ways and"
+                f" a key tile of 16-row multiples; got {rows} rows, key tile"
+                f" {self.key_tile} and {config}"
             )
         qkv = divisor(rows, self.qkv_rows, 16)
         mlp = divisor(rows, self.mlp_rows, 16)
@@ -157,8 +157,7 @@ def kv_divisor(size: int, cap: int) -> int:
     ``cap`` that divides ``size`` if that is at least half as large.
 
     A key tile off the MXU's 256 leaves part of a pass empty in every PV
-    matmul: at 76,800 rows 2560-row tiles beat 1920-row ones by 4% of the
-    step, and at 33,792 rows 1536 beat 2112 by 2%.
+    matmul.
     """
     rows = divisor(size, cap, 16)
     if size % 256 or cap < 256:

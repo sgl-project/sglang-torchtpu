@@ -96,16 +96,8 @@ if _HAS_JAX:
 # few layers, while a swapped weight or a stale buffer is ~10x more.
 _L2, _MAX = 5e-3, 2e-2
 # What the sglang hook passes besides the operands: the kernel derives the
-# fixed-max layers from the norm weights (nothing vouched), no peaks, bf16, no
-# sparse, windowed or cached attention.
-_LOSSLESS = dict(
-    fixed=None,
-    fixed_heads=None,
-    return_peaks=False,
-    fp8=False,
-    scaled_v=False,
-    fast_phase_c=False,
-)
+# fixed-max layers from the norm weights (nothing vouched), no peaks.
+_LOSSLESS = dict(fixed=None, fixed_heads=None, return_peaks=False)
 # The released FL2VA transformer/config.json.
 _RELEASED = {
     "hidden_size": 5376,
@@ -590,6 +582,33 @@ class TestStackInterpret(CustomTestCase):
         self.assertTrue(_same_bits(traced[:219], static[:219]))
         self.assertTrue(_same_bits(traced, flagged))
 
+    def test_one_row_tile_a_device(self):
+        # 128 rows a device in one phase A and one phase C row tile: no copy of
+        # a next row tile is built (its rows would be past the device's). The
+        # generic walk, and a static structure with the phase A and C levers.
+        tiling = dataclasses.replace(_TILING, qkv_rows=128, mlp_rows=128)
+        levers = dict(
+            static_structure=100,
+            narrow_tail=True,
+            modulate_pieces=2,
+            step_tables=True,
+            uniform_adaln=True,
+            slab_modulate=True,
+            zero_ahead=True,
+        )
+        for name, kwargs in (("generic", {}), ("levers", levers)):
+            with self.subTest(name):
+                got, want, raced = _run(
+                    rows=128,
+                    used=100,
+                    races=True,
+                    norm_scale=(0.3, 1.5),
+                    tiling=tiling,
+                    **kwargs,
+                )
+                self.assertFalse(raced)
+                self.assert_close(_errors(got, want))
+
 
 @unittest.skipUnless(_HAS_JAX, _SKIP)
 class TestStackInterpretMultiDevice(CustomTestCase):
@@ -611,6 +630,18 @@ class TestStackInterpretMultiDevice(CustomTestCase):
         # device 1, whose last query tile is all padding.
         code = """
             kw = dict(used=400, norm_scale=(0.3, 1.5))
+            got, want, raced = t._run(2, races=True, **kw)
+            static, _, _ = t._run(2, traced=False, static_items=False, **kw)
+            print(json.dumps([[*t._errors(got, want), t._same_bits(got, static) and not raced]]))
+        """
+        self.assert_runs(_in_fresh_process(2, code, timeout=1800), 1)
+
+    def test_two_devices_one_row_tile_each(self):
+        # 128 rows a device, each one phase A and one phase C row tile.
+        code = """
+            import dataclasses
+            tiling = dataclasses.replace(t._TILING, qkv_rows=128, mlp_rows=128)
+            kw = dict(rows=128, used=200, norm_scale=(0.3, 1.5), tiling=tiling)
             got, want, raced = t._run(2, races=True, **kw)
             static, _, _ = t._run(2, traced=False, static_items=False, **kw)
             print(json.dumps([[*t._errors(got, want), t._same_bits(got, static) and not raced]]))
@@ -1037,7 +1068,7 @@ class TestKernelLevers(CustomTestCase):
         # Phase C's 64-row tiles at 512 rows: tiles 0, 1 and 3 read one AdaLN
         # row each (uniform: the MLP input's shift and scale from one lookup),
         # the others a row a lookup; layer 0 proven, layer 1 online. Every
-        # row bit for bit; the race detector on. Not with fast_phase_c.
+        # row bit for bit; the race detector on.
         fixture = _request(dataclasses.replace(_CONFIG, layers=2), 512)
         uniform = np.asarray(mk.uniform_row_tiles(fixture["onehot"], _TILING.mlp_rows))
         self.assertTrue(uniform.any() and not uniform.all())
@@ -1049,8 +1080,6 @@ class TestKernelLevers(CustomTestCase):
         got, _, raced = _run(races=True, uniform_adaln=True, **case)
         self.assertFalse(raced)
         self.assertTrue(_same_bits(got, base))
-        with self.assertRaisesRegex(ValueError, "uniform_adaln"):
-            _run(rows=512, uniform_adaln=True, fast_phase_c=True)
 
     def test_cast_first_step_tables_and_slab_modulate_change_no_bit(self):
         # cast_first: the item epilogue rounds to bf16 before its transpose;

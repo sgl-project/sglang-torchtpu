@@ -35,8 +35,6 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
-import ml_dtypes
-import numpy as np
 from jax import lax
 
 _F32 = jnp.float32
@@ -288,51 +286,6 @@ def dense_attention(
     return (out / jnp.moveaxis(probs.sum(axis=-1), 0, 1)[..., None]).astype(_BF16)
 
 
-FP8 = jnp.float8_e4m3fn
-FP8_MAX = 448.0
-# pack_weights's GEMMs that run in fp8 under quantize_fp8: the down
-# projection stays bf16 (its SwiGLU inputs carry the outliers).
-FP8_WEIGHTS = ("wqkv", "wo", "w13")
-
-
-def quantize_fp8(weights: Mapping[str, Any]) -> dict[str, Any]:
-    """``pack_weights`` arrays with ``FP8_WEIGHTS`` in e4m3 and, per weight,
-    ``<name>_scale``: its per-output-column scales, ``[L, tiles, 1, cols]`` f32
-    (``W ~ q * scale``). Host numpy stays numpy, so a whole checkpoint can be
-    quantized before it reaches a device.
-    """
-
-    def one(w, xp):
-        w = xp.asarray(w, dtype=np.float32)
-        scale = xp.max(xp.abs(w), axis=-2, keepdims=True) / FP8_MAX
-        scale = xp.where(scale > 0, scale, 1.0)
-        # The f32 -> e4m3 cast does not saturate (overflow is NaN): clip first.
-        q = xp.clip(w / scale, -FP8_MAX, FP8_MAX)
-        return q.astype(ml_dtypes.float8_e4m3fn if xp is np else FP8), scale.astype(
-            np.float32
-        )
-
-    out = dict(weights)
-    for name in FP8_WEIGHTS:
-        w = weights[name]
-        if isinstance(w, np.ndarray):  # a layer at a time: bounded host memory
-            parts = [one(layer, np) for layer in w]
-            out[name] = np.stack([q for q, _ in parts])
-            out[name + "_scale"] = np.stack([s for _, s in parts])
-        else:
-            out[name], out[name + "_scale"] = one(w, jnp)
-    return out
-
-
-def quantize_rows(x: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """Per-row e4m3 quantization of ``[..., K]`` f32: ``(q, scale [..., 1])``,
-    ``x ~ q * scale``, as the kernel quantizes activations."""
-    amax = jnp.max(jnp.abs(x), axis=-1, keepdims=True)
-    inv = FP8_MAX / jnp.maximum(amax, 1e-30)
-    q = jnp.clip(x * inv, -FP8_MAX, FP8_MAX).astype(FP8)
-    return q, amax / FP8_MAX
-
-
 def reference_layer(
     x: jax.Array,
     layer: Mapping[str, jax.Array],
@@ -372,22 +325,13 @@ def reference_layer(
     params = [tables[k][row].astype(_F32) for k in range(NUM_TABLES)]
     shift1, scale1, gate1, shift2, scale2, gate2 = params
 
-    fp8 = "wqkv_scale" in layer
-
     def modulate(value, weight, shift, scale):
         normed = rms(value.astype(_F32), config.eps) * weight.astype(_F32)
-        out = normed * (1.0 + scale) + shift
-        return out if fp8 else out.astype(_BF16)
+        return (normed * (1.0 + scale) + shift).astype(_BF16)
 
     def project(lhs, name, spec):
-        """``lhs`` x weight ``name``; under fp8 both e4m3 (lhs per row, weight
-        per output column), the product rescaled in f32."""
-        if not fp8:
-            return jnp.einsum(spec, lhs, layer[name], preferred_element_type=_F32)
-        q, row_scale = quantize_rows(lhs.astype(_F32))
-        out = jnp.einsum(spec, q, layer[name], preferred_element_type=_F32)
-        col_scale = layer[name + "_scale"][:, 0]  # [tiles, cols]
-        return out * row_scale[..., None] * col_scale
+        """``lhs`` x weight ``name``."""
+        return jnp.einsum(spec, lhs, layer[name], preferred_element_type=_F32)
 
     h = modulate(x, layer["norm1"], shift1, scale1)
     # [T, H] x [heads/g, H, g 3D] -> [T, heads/g, g 3D] -> [T, heads, 3D]:

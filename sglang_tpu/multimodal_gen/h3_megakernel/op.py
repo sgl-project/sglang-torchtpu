@@ -23,6 +23,7 @@ kernel call takes the structured op's options (``stack_kwargs``).
 
 import dataclasses
 import functools
+import inspect
 import re
 
 import jax
@@ -35,145 +36,76 @@ from sglang_tpu.multimodal_gen.h3_megakernel import tiling as tl
 
 AXIS = "sp"
 # The kernel's tiling bounds for padding: padded_rows picks the packed row
-# count from these (4,992 rows a device at 8 devices for the 1344x768x124
-# request).
+# count from these.
 ROWS_TILING = tl.Tiling(sub_rows=640, stage_slots=24, block_kv_compute_online=1024)
-# What the kernel runs with: those bounds plus the tuned MLP tiling (mlp_rows
-# 640, chunk_rows 80); stack() cuts them down to divide each row count
-# (Tiling.fit). qkv_rows 704: with 24 staging slots a 768-row phase-A tile
-# needs ~69 MiB of the 63.94 MiB of VMEM (a 10 s video at 9,216 rows a
-# device does not compile), 704 fits. The 1344x768x124 row counts (4,992,
-# 4,864, 9,600, 18,944, 19,456 a device) fit the same tiles either way.
+# What the kernel runs with: those bounds plus the MLP tiling (mlp_rows 640,
+# chunk_rows 80); stack() cuts them down to divide each row count
+# (Tiling.fit). qkv_rows 704: with 24 staging slots a 768-row phase A tile
+# does not fit VMEM.
 STACK_TILING = dataclasses.replace(
     ROWS_TILING, qkv_rows=704, mlp_rows=640, chunk_rows=80
 )
-# The call's softmax and precision options, pinned. With fixed and
-# fixed_heads None the kernel runs a fixed-max softmax on exactly the layers
-# its own fixed_max_layers proves from the packed q/k norm weights (a bound
-# that holds for every input) and the online softmax elsewhere: nothing is
-# vouched by measured activations, flags files or calibration. bf16 weights
-# (no fp8), no sparse, windowed or far-cache attention, no peaks, the
-# default fixed max of 17 (the one the norm bound vouches for).
+# The call's softmax options, pinned. With fixed and fixed_heads None the
+# kernel runs a fixed-max softmax on exactly the layers its own
+# fixed_max_layers proves from the packed q/k norm weights (a bound that holds
+# for every input) and the online softmax elsewhere: nothing is vouched by
+# measured activations, flags files or calibration. No peaks, the default
+# fixed max of 17 (the one the norm bound vouches for).
 STACK_KWARGS = {
     "fixed": None,
     "fixed_heads": None,
-    "head_perm": None,
     "return_peaks": False,
-    "fp8": False,
-    "sparse": None,
-    "window": None,
-    "far": None,
-    "far_mode": None,
-    "tile_masks": None,
-    "listed": None,
     "narrow_tail": False,
-    "scaled_v": False,
-    "fast_phase_c": False,
     "fixed_max": 17.0,
 }
 # The static-structure option (SGLANG_TPU_OPT_H3_MEGAKERNEL_STATIC_STRUCTURE)
-# runs a static structure at these (devices, rows a device), the 1344x768x124
-# request's row counts it was AOT-checked at (VMEM, loop sizes), and the
-# generic walk at any other.
+# runs a static structure at these (devices, rows a device), the row counts it
+# was AOT-checked at (VMEM, loop sizes), and the generic walk at any other.
 STRUCTURED_SHAPES = frozenset(
     {(8, 4992), (8, 4864), (8, 4800), (4, 9600), (2, 19456), (2, 19200)}
 )
-# And it pads to 19,456 rows a device at 2 devices where padded_rows gives
-# 18,944 (the 1344x768x124 request): 2,432-row query tiles, the per-device tiles
-# of 8 x 4,864, instead of 512-row ones.
+# Row counts the static-structure option pads to in place of padded_rows':
+# 19,456 rows at 2 devices take 2,432-row query tiles, not 512-row ones.
 STRUCTURED_ROWS = {(2, 18944): 19456}
-# A structured call's own tiling at some (devices, rows a device), others
-# STACK_TILING. 2 x 19,200 rows (SGLANG_TPU_OPT_H3_MEGAKERNEL_ROWS=19200 at
-# 2 devices: 650 rows of padding where 19,456 carry 1,162) run the 4 x 9,600
-# tiles (3,200-row query tiles, 640-row phase tiles) with 19,456's 2,048-key
-# tiles (key_tile; 38,400 rows hold 18.75 of them): each real row adds
-# 19,456's key sub-blocks in its order. Rounding-level against 19,456 rows
-# on v7x: the compiler splits the P V sum of a query tile's last 128 lanes
-# over both MXUs, and those lanes are other rows at 3,200-row tiles.
+# A structured call's own tiling at some shapes (others STACK_TILING): 2 x
+# 19,200 rows run 4 x 9,600's 3,200-row query tiles and 640-row phase tiles
+# with 2,048-key tiles.
 STRUCTURED_TILINGS = {
     (2, 19200): dataclasses.replace(STACK_TILING, block_q=3200, key_tile=2048)
 }
-# Every call's tiling at some (devices, rows a device) STACK_TILING does not
-# cut. 8 x 4,800 rows (SGLANG_TPU_OPT_H3_MEGAKERNEL_ROWS=4800 at 8 devices:
-# 650 rows of padding where 4,864 carry 1,162) run 4 x 9,600's attention
-# tiles: 3,200-row query tiles that cross a
-# device boundary at their middle (split_q_tiles; no 128-row tile divides
-# 4,800) and 2,560-key tiles of 1,280- and 640-key sub-blocks, with 480-row
-# phase tiles. Rounding-level against 4,864 rows.
+# Every call's tiling at shapes STACK_TILING does not cut: 8 x 4,800 rows take
+# 3,200-row query tiles that cross a device boundary at their middle.
 SHAPE_TILINGS = {(8, 4800): dataclasses.replace(STACK_TILING, split_q_tiles=True)}
-# Kernel levers of the structured op's calls, each behind its own flag
-# (hook._levers), at the (devices, rows a device) it was AOT-checked at; other
-# calls run without it (lean_cut and split_items shape only a static
-# structure's loops, so its generic-walk calls run without them too).
-#   lean_cut: kernel.stack cut_kv_compute (the fixed-max cut tile's last
-#     real sub-block halved; bitwise), at the 2,048-key sub-blocks of 8 x
-#     4,864, 2 x 19,456 and 2 x 19,200 rows (one 1,024-key sub-block for the
-#     1344x768x124 structure) and the 1,280-key ones of 4 x 9,600 and 8 x 4,800
-#     (640 keys of the cut tile's second).
-#   split_items: split_items (one item loop per query width; bitwise).
-#   epilogue_chunks: epilogue_chunk 64 at the 608- and 480-row phase A
-#     tiles, whose epilogue rows (a divisor of the tile) are 32 and 48.
-#   wide_kv: kv_group 2 (each key DMA and key step two 2,048-key tiles, run
-#     as their 2,048- and 1,024-key sub-blocks; bitwise) at 38,912 rows: 18
-#     key steps an item become 9. 9,600 rows' 2,560-key tiles would make an
-#     online key step of eight 640-key sub-blocks; they keep their program.
-#   wide_kv_online: the same for the online softmax only, kv_group (1, 2)
-#     (at 3,200-row query tiles the grouped fixed-max step ran slower on
-#     v7x, the online one faster); also at 4 x 9,600 rows, whose online key
-#     step becomes eight 640-key sub-blocks of two 2,560-key tiles (the same
-#     bits on TPU7x, and faster per online head). With 2,560-key tiles the
-#     grouped fixed-max step (wide_kv) does change bits on TPU7x.
-#   modulate_pieces: kernel.stack modulate_pieces, a piece a chunk
-#     (``modulate_pieces``): the next row tile's modulate one chunk a phase A
-#     step (19 steps of 32 rows at 608-row tiles, 8 of 80 at 640, 6 of 80 at
-#     480) instead of one or two steps whose modulate outlasts their matmul
-#     (bitwise).
-#   prefetch_down: prefetch_down at 4 x 9,600 rows, where stack_kwargs turns it
-#     off: the down projection's first weight tile loads during the up
-#     projection (63.45 of the 63.94 MiB of VMEM there; the same bits).
-#   uniform_adaln: uniform_adaln (phase C's uniform row tiles modulate the MLP
-#     input with one lookup of its shift and scale, no one-hot matmul per
-#     chunk; bitwise), at every structured shape.
-#   zero_ahead: zero_ahead (each phase B item's running state zeroed in the
-#     item before's epilogue block; bitwise), at every structured shape.
-#   mask_scores: mask_scores (a masked sub-block subtracts a per-key column,
-#     +inf at the keys past the live length, instead of selecting its
-#     probabilities: exp2(-inf) is the select's +0; bitwise), at every
-#     structured shape.
-#   cast_first: cast_first (phase B's item epilogue rounds o / l to bf16 before
-#     the transpose into the output tile; bitwise), at every structured shape.
-#   step_tables: step_tables (phase A's per-step scalars from SMEM tables
-#     filled once a call, not integer divisions every step; bitwise), at every
-#     structured shape.
-#   slab_modulate: slab_modulate (phase C's uniform tiles modulate the MLP
-#     input as modulate_slabs, not whole rows a chunk; bitwise), at every
-#     structured shape (with uniform_adaln).
-#   sum_vouch: sum_bounds (the vouched op certifies each tried head by its
-#     softmax's own row sums, kernel.sum_safe_heads, instead of its q/k norm
-#     peaks, and phase A computes no peaks): heads whose scores the norms do
-#     not bound, such as layer 49's, can then run at a fixed max; rounding
-#     moves with the heads tried. At every structured shape; vouched op only.
+# The kernel levers (hook._levers, one flag each) and the shapes each was
+# AOT-checked at; the structured calls at those shapes take it, every other call
+# runs without it. Each maps to kernel.stack's option of the same idea (see its
+# docstring): lean_cut cut_kv_compute, split_items, epilogue_chunks
+# epilogue_chunk, wide_kv kv_group 2, wide_kv_online kv_group (1, 2) (the two
+# are exclusive), modulate_pieces, prefetch_down (back on at 4 x 9,600, where
+# stack_kwargs turns it off), uniform_adaln, zero_ahead, mask_scores,
+# cast_first, step_tables, slab_modulate; sum_vouch: sum_bounds, the vouched op
+# only. All but sum_vouch keep the bits.
+_ALL = frozenset({(8, 4864), (8, 4800), (4, 9600), (2, 19456), (2, 19200)})
 LEVER_SHAPES = {
-    "lean_cut": frozenset({(8, 4864), (8, 4800), (4, 9600), (2, 19456), (2, 19200)}),
-    "split_items": frozenset({(8, 4864), (8, 4800), (4, 9600), (2, 19456), (2, 19200)}),
+    **{
+        lever: _ALL
+        for lever in (
+            "lean_cut",
+            "split_items",
+            "modulate_pieces",
+            "uniform_adaln",
+            "zero_ahead",
+            "mask_scores",
+            "sum_vouch",
+            "cast_first",
+            "step_tables",
+            "slab_modulate",
+        )
+    },
     "epilogue_chunks": frozenset({(8, 4864), (8, 4800), (2, 19456)}),
     "wide_kv": frozenset({(8, 4864), (2, 19456), (2, 19200)}),
     "wide_kv_online": frozenset({(8, 4864), (4, 9600), (2, 19456), (2, 19200)}),
-    "modulate_pieces": frozenset(
-        {(8, 4864), (8, 4800), (4, 9600), (2, 19456), (2, 19200)}
-    ),
     "prefetch_down": frozenset({(4, 9600)}),
-    "uniform_adaln": frozenset(
-        {(8, 4864), (8, 4800), (4, 9600), (2, 19456), (2, 19200)}
-    ),
-    "zero_ahead": frozenset({(8, 4864), (8, 4800), (4, 9600), (2, 19456), (2, 19200)}),
-    "mask_scores": frozenset({(8, 4864), (8, 4800), (4, 9600), (2, 19456), (2, 19200)}),
-    "sum_vouch": frozenset({(8, 4864), (8, 4800), (4, 9600), (2, 19456), (2, 19200)}),
-    "cast_first": frozenset({(8, 4864), (8, 4800), (4, 9600), (2, 19456), (2, 19200)}),
-    "step_tables": frozenset({(8, 4864), (8, 4800), (4, 9600), (2, 19456), (2, 19200)}),
-    "slab_modulate": frozenset(
-        {(8, 4864), (8, 4800), (4, 9600), (2, 19456), (2, 19200)}
-    ),
 }
 # sum_vouch: the margin (log2 units) inside kernel.sum_safe_heads' window a
 # head's sums need to be tried at a fixed max the next step.
@@ -265,6 +197,21 @@ def modulate_pieces(
     return max(p for p in range(1, min(chunks, groups) + 1) if chunks % p == 0)
 
 
+def check_levers(levers) -> None:
+    """Refuses lever sets no call takes: wide_kv and wide_kv_online are
+    exclusive (each sets the call's key groups).
+
+    Raises:
+      ValueError: If ``levers`` holds both.
+    """
+    if {"wide_kv", "wide_kv_online"} <= set(levers):
+        raise ValueError(
+            "MiniMax H3 megakernel levers wide_kv and wide_kv_online are"
+            " exclusive: set SGLANG_TPU_OPT_H3_MEGAKERNEL_WIDE_KV or"
+            " SGLANG_TPU_OPT_H3_MEGAKERNEL_WIDE_KV_ONLINE, not both"
+        )
+
+
 def stack_kwargs(
     devices: int,
     structure: int | None = None,
@@ -277,10 +224,11 @@ def stack_kwargs(
     option: the static live length whose loop structure the loops take (0:
     none, the generic walk). That option also passes narrow_tail, which only
     a static structure shapes, and at 4 devices turns off the phase C
-    down-weight prefetch: at 9,600 rows a device the prefetch leaves 0.49 MiB
-    of the 63.94 MiB of VMEM, 2.36 MiB without it (the same bits). And each
-    of ``levers`` (``LEVER_SHAPES``' names) that covers ``rows`` a device;
-    ``tiling`` and ``config``: the call's (``modulate_pieces``)."""
+    down-weight prefetch (VMEM headroom at 9,600 rows a device; the same
+    bits). And each of ``levers`` (``LEVER_SHAPES``' names) that covers
+    ``rows`` a device; ``tiling`` and ``config``: the call's
+    (``modulate_pieces``)."""
+    check_levers(levers)
     if structure is None:
         return STACK_KWARGS
     kwargs = dict(STACK_KWARGS, narrow_tail=True, static_structure=structure or None)
@@ -569,6 +517,88 @@ def traced(options: dict, trace: int = 0) -> dict:
     return dict(options, trace=trace) if trace else options
 
 
+def call_tiling(
+    devices: int, rows: int, structure: int | None, tiling=STACK_TILING, overrides=()
+):
+    """The tiling of one call at ``rows`` a device: a structured call's
+    (``structured_tiling``, with the TILING overrides), else ``shape_tiling``'s.
+    The overrides tune the structured shapes they were measured at; the
+    generic walk (structure 0 or None) keeps the default tiling."""
+    if structure:
+        return structured_tiling(devices, rows, tiling, overrides)
+    return shape_tiling(devices, rows, tiling)
+
+
+# The op's tensor arguments, in order; the vouched op takes the tried heads and
+# the tally after the live length; a structured op takes the static structure
+# (an int, one program per value) last.
+_TENSORS = ("x", "onehot", "cos", "sin", "tables", "used")
+_VOUCH_TENSORS = ("vouch", "tally")
+
+
+def _op_signature(vouched: bool, structured: bool) -> inspect.Signature:
+    """The exported function's signature: cpu_export_jax_op tells tensors from
+    static arguments by its annotations."""
+    names = _TENSORS + (_VOUCH_TENSORS if vouched else ()) + pack.WEIGHT_ORDER
+    params = [
+        inspect.Parameter(
+            name, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=jax.Array
+        )
+        for name in names
+    ]
+    if structured:
+        params.append(
+            inspect.Parameter(
+                "structure", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=int
+            )
+        )
+    returns = tuple[jax.Array, jax.Array, jax.Array] if vouched else jax.Array
+    return inspect.Signature(params, return_annotation=returns)
+
+
+def stack_function(
+    mesh,
+    config: ref.Config,
+    devices: int,
+    tiling: tl.Tiling = STACK_TILING,
+    margin: float | None = None,
+    structured: bool = False,
+    levers=frozenset(),
+    overrides=(),
+    trace: int = 0,
+):
+    """The op's JAX function over ``mesh``: one ``sharded_stack`` program (or
+    ``sharded_vouched_stack`` with ``margin``) per row count, and with
+    ``structured`` per static structure (its last, static argument); each
+    call's tiling from ``call_tiling`` and its options from ``stack_kwargs``."""
+
+    @functools.lru_cache(maxsize=None)
+    def program(structure, rows):
+        tiling_ = call_tiling(devices, rows, structure, tiling, overrides)
+        options = traced(
+            stack_kwargs(
+                devices,
+                structure,
+                rows=rows,
+                levers=levers,
+                tiling=tiling_,
+                config=config,
+            ),
+            trace,
+        )
+        if margin is None:
+            return sharded_stack(mesh, config, tiling_, options=options)
+        return sharded_vouched_stack(mesh, config, tiling_, margin, options=options)
+
+    def stack(*args):
+        structure = args[-1] if structured else None
+        tensors = args[:-1] if structured else args
+        return program(structure, tensors[0].shape[0] // devices)(*tensors)
+
+    stack.__signature__ = _op_signature(margin is not None, structured)
+    return stack
+
+
 def build_stack_op(
     config: ref.Config,
     devices: int,
@@ -587,14 +617,14 @@ def build_stack_op(
     static structure as a last, static int argument (``stack_kwargs``), one
     program per value. With ``vouch_margin`` the op is the vouched variant
     (``local_vouched_stack``): it takes the heads to try and the tally after
-    the live length and returns the rows, the vouched heads and the tally;
-    with ``structured`` too it also takes the static structure last and its
-    kernel call takes the structured op's options. ``levers``: the kernel
-    levers of the structured calls (``LEVER_SHAPES``' names);
-    ``tiling_overrides``: their tiling bounds (``parse_tiling``). ``trace``:
-    the kernel's xprof trace regions (``kernel.stack``'s ``trace``; profiling
-    only, SGLANG_TPU_MK_TRACE_REGIONS).
+    the live length and returns the rows, the vouched heads and the tally.
+    ``levers``: the kernel levers of the structured calls (``LEVER_SHAPES``'
+    names); ``tiling_overrides``: their tiling bounds (``parse_tiling``).
+    ``trace``: the kernel's xprof trace regions (``kernel.stack``'s
+    ``trace``; profiling only, SGLANG_TPU_MK_TRACE_REGIONS).
     """
+    # At registration (server start), before any call is traced.
+    check_levers(levers)
     from sglang_tpu.pallas_jax_op import cpu_export_jax_op
 
     if mesh is None:
@@ -603,272 +633,31 @@ def build_stack_op(
         mesh = get_pallas_mesh((AXIS,), (devices,))
     levers = frozenset(levers) if structured else frozenset()
     overrides = tuple(tiling_overrides) if structured else ()
-    if vouch_margin is not None:
-        return _build_vouched_op(
+    vouched = vouch_margin is not None
+    in_specs, out_specs = vouched_partition_specs() if vouched else partition_specs()
+    return cpu_export_jax_op(
+        op_name(
+            config,
+            devices,
+            structured=structured,
+            vouched=vouched,
+            levers=levers,
+            tiled=bool(overrides),
+            trace=trace,
+        ),
+        stack_function(
+            mesh,
             config,
             devices,
             tiling,
-            mesh,
             vouch_margin,
             structured=structured,
             levers=levers,
             overrides=overrides,
             trace=trace,
-        )
-    if structured:
-        in_specs, out_spec = partition_specs()
-        return cpu_export_jax_op(
-            op_name(
-                config,
-                devices,
-                structured=True,
-                levers=levers,
-                tiled=bool(overrides),
-                trace=trace,
-            ),
-            _structured_stack(
-                mesh, config, devices, tiling, levers, overrides, trace=trace
-            ),
-            mesh=mesh,
-            # The static structure is a static argument: no partition.
-            input_partition_specs=(*in_specs, None),
-            output_partition_specs=(out_spec,),
-        )
-    # One program a row count: each with its shape_tiling.
-    sharded = functools.lru_cache(maxsize=None)(
-        lambda rows: sharded_stack(
-            mesh,
-            config,
-            shape_tiling(devices, rows, tiling),
-            options=traced(STACK_KWARGS, trace),
-        )
-    )
-
-    def stack(
-        x: jax.Array,
-        onehot: jax.Array,
-        cos: jax.Array,
-        sin: jax.Array,
-        tables: jax.Array,
-        used: jax.Array,
-        norm1: jax.Array,
-        norm2: jax.Array,
-        q_norm: jax.Array,
-        k_norm: jax.Array,
-        wqkv: jax.Array,
-        wo: jax.Array,
-        w13: jax.Array,
-        w2: jax.Array,
-    ) -> jax.Array:
-        weights = (norm1, norm2, q_norm, k_norm, wqkv, wo, w13, w2)
-        program = sharded(x.shape[0] // devices)
-        return program(x, onehot, cos, sin, tables, used, *weights)
-
-    in_specs, out_spec = partition_specs()
-    return cpu_export_jax_op(
-        op_name(config, devices, trace=trace),
-        stack,
+        ),
         mesh=mesh,
-        input_partition_specs=in_specs,
-        output_partition_specs=(out_spec,),
+        # The static structure is a static argument: no partition.
+        input_partition_specs=(*in_specs, None) if structured else in_specs,
+        output_partition_specs=out_specs if vouched else (out_specs,),
     )
-
-
-def _structured_stack(
-    mesh,
-    config: ref.Config,
-    devices: int,
-    tiling: tl.Tiling,
-    levers=frozenset(),
-    overrides=(),
-    trace: int = 0,
-):
-    """The structured op's function: ``build_stack_op``'s plus the static
-    structure, a static int (one ``local_stack`` program per value and row
-    count)."""
-    sharded = functools.lru_cache(maxsize=None)(
-        lambda structure, rows: sharded_stack(
-            mesh,
-            config,
-            (
-                structured_tiling(devices, rows, tiling, overrides)
-                if structure
-                else shape_tiling(devices, rows, tiling)
-            ),
-            options=traced(
-                stack_kwargs(
-                    devices,
-                    structure,
-                    rows=rows,
-                    levers=levers,
-                    tiling=structured_tiling(devices, rows, tiling, overrides),
-                    config=config,
-                ),
-                trace,
-            ),
-        )
-    )
-
-    def stack(
-        x: jax.Array,
-        onehot: jax.Array,
-        cos: jax.Array,
-        sin: jax.Array,
-        tables: jax.Array,
-        used: jax.Array,
-        norm1: jax.Array,
-        norm2: jax.Array,
-        q_norm: jax.Array,
-        k_norm: jax.Array,
-        wqkv: jax.Array,
-        wo: jax.Array,
-        w13: jax.Array,
-        w2: jax.Array,
-        structure: int,
-    ) -> jax.Array:
-        weights = (norm1, norm2, q_norm, k_norm, wqkv, wo, w13, w2)
-        program = sharded(structure, x.shape[0] // devices)
-        return program(x, onehot, cos, sin, tables, used, *weights)
-
-    return stack
-
-
-def _build_vouched_op(
-    config: ref.Config,
-    devices: int,
-    tiling,
-    mesh,
-    margin: float,
-    structured: bool = False,
-    levers=frozenset(),
-    overrides=(),
-    trace: int = 0,
-):
-    """``build_stack_op``'s vouched variant; ``structured``: plus the static
-    structure, last, as the structured op takes it."""
-    from sglang_tpu.pallas_jax_op import cpu_export_jax_op
-
-    in_specs, out_specs = vouched_partition_specs()
-    if structured:
-        return cpu_export_jax_op(
-            op_name(
-                config,
-                devices,
-                structured=True,
-                vouched=True,
-                levers=levers,
-                tiled=bool(overrides),
-                trace=trace,
-            ),
-            _structured_vouched_stack(
-                mesh, config, devices, tiling, margin, levers, overrides, trace=trace
-            ),
-            mesh=mesh,
-            # The static structure is a static argument: no partition.
-            input_partition_specs=(*in_specs, None),
-            output_partition_specs=out_specs,
-        )
-    # One program a row count: each with its shape_tiling.
-    sharded = functools.lru_cache(maxsize=None)(
-        lambda rows: sharded_vouched_stack(
-            mesh,
-            config,
-            shape_tiling(devices, rows, tiling),
-            margin,
-            options=traced(STACK_KWARGS, trace),
-        )
-    )
-
-    def stack(
-        x: jax.Array,
-        onehot: jax.Array,
-        cos: jax.Array,
-        sin: jax.Array,
-        tables: jax.Array,
-        used: jax.Array,
-        vouch: jax.Array,
-        tally: jax.Array,
-        norm1: jax.Array,
-        norm2: jax.Array,
-        q_norm: jax.Array,
-        k_norm: jax.Array,
-        wqkv: jax.Array,
-        wo: jax.Array,
-        w13: jax.Array,
-        w2: jax.Array,
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        weights = (norm1, norm2, q_norm, k_norm, wqkv, wo, w13, w2)
-        program = sharded(x.shape[0] // devices)
-        return program(x, onehot, cos, sin, tables, used, vouch, tally, *weights)
-
-    return cpu_export_jax_op(
-        op_name(config, devices, vouched=True, trace=trace),
-        stack,
-        mesh=mesh,
-        input_partition_specs=in_specs,
-        output_partition_specs=out_specs,
-    )
-
-
-def _structured_vouched_stack(
-    mesh,
-    config: ref.Config,
-    devices: int,
-    tiling: tl.Tiling,
-    margin: float,
-    levers=frozenset(),
-    overrides=(),
-    trace: int = 0,
-):
-    """The vouched op's function under the static-structure option: plus the
-    static structure, a static int (one ``local_vouched_stack`` program per
-    value and row count), whose kernel call takes the structured op's
-    options (``stack_kwargs``) besides the tried heads and the peaks."""
-    sharded = functools.lru_cache(maxsize=None)(
-        lambda structure, rows: sharded_vouched_stack(
-            mesh,
-            config,
-            (
-                structured_tiling(devices, rows, tiling, overrides)
-                if structure
-                else shape_tiling(devices, rows, tiling)
-            ),
-            margin,
-            options=traced(
-                stack_kwargs(
-                    devices,
-                    structure,
-                    rows=rows,
-                    levers=levers,
-                    tiling=structured_tiling(devices, rows, tiling, overrides),
-                    config=config,
-                ),
-                trace,
-            ),
-        )
-    )
-
-    def stack(
-        x: jax.Array,
-        onehot: jax.Array,
-        cos: jax.Array,
-        sin: jax.Array,
-        tables: jax.Array,
-        used: jax.Array,
-        vouch: jax.Array,
-        tally: jax.Array,
-        norm1: jax.Array,
-        norm2: jax.Array,
-        q_norm: jax.Array,
-        k_norm: jax.Array,
-        wqkv: jax.Array,
-        wo: jax.Array,
-        w13: jax.Array,
-        w2: jax.Array,
-        structure: int,
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        weights = (norm1, norm2, q_norm, k_norm, wqkv, wo, w13, w2)
-        program = sharded(structure, x.shape[0] // devices)
-        return program(x, onehot, cos, sin, tables, used, vouch, tally, *weights)
-
-    return stack
