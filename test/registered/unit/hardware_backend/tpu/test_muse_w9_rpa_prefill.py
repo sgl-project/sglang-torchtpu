@@ -2088,13 +2088,15 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
                 )
             return captured
 
-        self.assertIn("sw_unalign_fuse", _capture_swa("", qh=8, sw=2048)["_prefill_opts"])
-        self.assertIn("sw_unalign_fuse", _capture_swa("", qh=8, sw=2049)["_prefill_opts"])
-        self.assertNotIn("sw_unalign_fuse", _capture_swa("nosw_unalign_fuse", qh=8, sw=2048)["_prefill_opts"])
-        self.assertNotIn("sw_unalign_fuse", _capture_swa("nosw2048_fuse", qh=8, sw=2048)["_prefill_opts"])
-        self.assertNotIn("sw_unalign_fuse", _capture_swa("nosw_mk128", qh=8, sw=2048)["_prefill_opts"])
-        self.assertNotIn("sw_unalign_fuse", _capture_swa("", qh=4, sw=2048)["_prefill_opts"])
-        self.assertNotIn("sw_unalign_fuse", _capture_swa("", qh=8, sw=None)["_prefill_opts"])
+        self.assertNotIn("sw_unalign_fuse", _capture_swa("", qh=8, sw=2048)["_prefill_opts"])
+        self.assertNotIn("sw_unalign_fuse", _capture_swa("", qh=8, sw=2049)["_prefill_opts"])
+        self.assertIn("sw_unalign_fuse", _capture_swa("sw_unalign_fuse", qh=8, sw=2048)["_prefill_opts"])
+        self.assertIn("sw_unalign_fuse", _capture_swa("sw_unalign_fuse", qh=8, sw=2049)["_prefill_opts"])
+        self.assertNotIn("sw_unalign_fuse", _capture_swa("sw_unalign_fuse,nosw_unalign_fuse", qh=8, sw=2048)["_prefill_opts"])
+        self.assertNotIn("sw_unalign_fuse", _capture_swa("sw_unalign_fuse,nosw2048_fuse", qh=8, sw=2048)["_prefill_opts"])
+        self.assertNotIn("sw_unalign_fuse", _capture_swa("sw_unalign_fuse,nosw_mk128", qh=8, sw=2048)["_prefill_opts"])
+        self.assertNotIn("sw_unalign_fuse", _capture_swa("sw_unalign_fuse", qh=4, sw=2048)["_prefill_opts"])
+        self.assertNotIn("sw_unalign_fuse", _capture_swa("sw_unalign_fuse", qh=8, sw=None)["_prefill_opts"])
 
         rng = np.random.default_rng(1414)
         page_size = 512
@@ -2255,13 +2257,16 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
                 )
             return captured
 
-        self.assertIn("sw_tail_clamp", _capture_swa("", qh=8, sw=2048)["_prefill_opts"])
-        self.assertIn("sw_tail_clamp", _capture_swa("", qh=8, sw=2049)["_prefill_opts"])
-        self.assertNotIn("sw_tail_clamp", _capture_swa("nosw_tail_clamp", qh=8, sw=2048)["_prefill_opts"])
-        self.assertNotIn("sw_tail_clamp", _capture_swa("nosw2048_fuse", qh=8, sw=2048)["_prefill_opts"])
-        self.assertNotIn("sw_tail_clamp", _capture_swa("nosw_mk128", qh=8, sw=2048)["_prefill_opts"])
-        self.assertNotIn("sw_tail_clamp", _capture_swa("", qh=4, sw=2048)["_prefill_opts"])
-        self.assertNotIn("sw_tail_clamp", _capture_swa("", qh=8, sw=None)["_prefill_opts"])
+        self.assertNotIn("sw_tail_clamp", _capture_swa("", qh=8, sw=2048)["_prefill_opts"])
+        self.assertNotIn("sw_tail_clamp", _capture_swa("", qh=8, sw=2049)["_prefill_opts"])
+        self.assertIn("sw_tail_clamp", _capture_swa("sw_tail_clamp", qh=8, sw=2048)["_prefill_opts"])
+        self.assertIn("sw_tail_clamp", _capture_swa("sw_tail_clamp", qh=8, sw=2049)["_prefill_opts"])
+        self.assertNotIn("sw_tail_clamp", _capture_swa("sw_tail_clamp,nosw_tail_clamp", qh=8, sw=2048)["_prefill_opts"])
+        self.assertNotIn("sw_tail_clamp", _capture_swa("sw_tail_clamp,nosw_unalign_fuse", qh=8, sw=2048)["_prefill_opts"])
+        self.assertNotIn("sw_tail_clamp", _capture_swa("sw_tail_clamp,nosw2048_fuse", qh=8, sw=2048)["_prefill_opts"])
+        self.assertNotIn("sw_tail_clamp", _capture_swa("sw_tail_clamp,nosw_mk128", qh=8, sw=2048)["_prefill_opts"])
+        self.assertNotIn("sw_tail_clamp", _capture_swa("sw_tail_clamp", qh=4, sw=2048)["_prefill_opts"])
+        self.assertNotIn("sw_tail_clamp", _capture_swa("sw_tail_clamp", qh=8, sw=None)["_prefill_opts"])
 
         rng = np.random.default_rng(1515)
         page_size = 512
