@@ -190,8 +190,16 @@ class ImageEncodingStage(PipelineStage):
 
         return postprocess_funcs[0](outputs, image_inputs)
 
+    def _text_encoder_position_ids(self, inputs, server_args, device):
+        """The pipeline's text encoder positions from the processor's host
+        tensors (before ``BatchFeature.to`` moves them in place), or None."""
+        position_ids = server_args.pipeline_config.get_text_encoder_position_ids(
+            inputs, 0, self.text_encoder
+        )
+        return None if position_ids is None else position_ids.to(device)
+
     @staticmethod
-    def _prepare_text_encoder_inputs(image_inputs) -> dict[str, Any]:
+    def _prepare_text_encoder_inputs(image_inputs, position_ids=None) -> dict[str, Any]:
         inputs = {
             "input_ids": image_inputs.input_ids,
             "attention_mask": image_inputs.attention_mask,
@@ -200,6 +208,8 @@ class ImageEncodingStage(PipelineStage):
             "output_hidden_states": True,
             "use_cache": False,
         }
+        if position_ids is not None:
+            inputs["position_ids"] = position_ids
         if "mm_token_type_ids" in image_inputs:
             inputs["mm_token_type_ids"] = image_inputs["mm_token_type_ids"]
         return inputs
@@ -278,7 +288,11 @@ class ImageEncodingStage(PipelineStage):
 
             image_inputs = self.image_processor(
                 images=prompt_images, return_tensors="pt", **cur_kwargs
-            ).to(cuda_device)
+            )
+            position_ids = self._text_encoder_position_ids(
+                image_inputs, server_args, cuda_device
+            )
+            image_inputs = image_inputs.to(cuda_device)
 
             if self.image_encoder:
                 # if an image encoder is provided
@@ -322,7 +336,11 @@ class ImageEncodingStage(PipelineStage):
                         images=prompt_images,
                         return_tensors="pt",
                         **neg_image_processor_kwargs,
-                    ).to(cuda_device)
+                    )
+                    neg_position_ids = self._text_encoder_position_ids(
+                        neg_image_inputs, server_args, cuda_device
+                    )
+                    neg_image_inputs = neg_image_inputs.to(cuda_device)
 
                 with self.use_declared_component(
                     component_name="text_encoder",
@@ -350,11 +368,15 @@ class ImageEncodingStage(PipelineStage):
                         )
                     with set_forward_context(current_timestep=0, attn_metadata=None):
                         outputs = self.text_encoder(
-                            **self._prepare_text_encoder_inputs(image_inputs)
+                            **self._prepare_text_encoder_inputs(
+                                image_inputs, position_ids
+                            )
                         )
                         if batch.do_classifier_free_guidance:
                             neg_outputs = self.text_encoder(
-                                **self._prepare_text_encoder_inputs(neg_image_inputs)
+                                **self._prepare_text_encoder_inputs(
+                                    neg_image_inputs, neg_position_ids
+                                )
                             )
 
                 prompt_embeds, prompt_embeds_mask, prompt_seq_lens = (
