@@ -111,6 +111,9 @@ class InputConfigs:
     num_quant_blocks: int = 1
     # lhs only: one quant scale per row over the whole tile K (EP gmm_v2 style).
     row_scale: bool = False
+    # rhs only, fp4 with the block scale applied after each block's dot: the fp4 codes go
+    # to the MXU as e4m3 (exact) instead of bf16, half the weight pushes.
+    e4m3_codes: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -522,6 +525,15 @@ def inner_kernel(
                             scaled_rhs_slices.append(scaled_rhs_slice)
                             rhs_k_start = rhs_k_end
                         block_rhs_for_quant = jnp.concatenate(scaled_rhs_slices, axis=0)
+                elif cfgs.rhs_cfgs.e4m3_codes:
+                    if (
+                        not apply_rhs_scale_after_matmul
+                        or block_rhs.dtype != jnp.float4_e2m1fn
+                    ):
+                        raise ValueError(
+                            "e4m3_codes needs fp4 weights with the scale applied after the dot"
+                        )
+                    block_rhs_for_quant = block_rhs.astype(jnp.float8_e4m3fn)
                 else:
                     block_rhs_for_quant = _to_bf16(block_rhs)
 

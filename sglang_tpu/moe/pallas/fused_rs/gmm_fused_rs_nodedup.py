@@ -563,6 +563,7 @@ def kernel_main_fused_rs(
     pair_send_bucket: bool = False,  # sibling send: one bucket-sized DMA from GMM2
     pair_src_table: bool = False,  # run start rows from a metadata table
     gather_in_gmm1: int = 0,  # first rows of tile g + 1's gather issued inside GMM1(g)
+    qblock_small_m: int = 0,  # buckets of <= this many rows: e4m3 codes, scale after each dot
 ):
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write kernel.
 
@@ -1014,15 +1015,28 @@ def kernel_main_fused_rs(
         and tile_n2 % (_sls_out * num_lanes) == 0
     )
 
+    def _bucket_cfgs(cfgs, m_rows):
+        # Few rows: a 256-K dot per scale block with e4m3 codes pushes half the weight vregs;
+        # the per-block f32 rescale grows with rows, so large buckets keep cfgs.
+        tiles = dataclasses.replace(cfgs.tiles, tile_m=m_rows)
+        if m_rows > qblock_small_m:
+            return dataclasses.replace(cfgs, tiles=tiles)
+        return dataclasses.replace(
+            cfgs,
+            tiles=tiles,
+            lhs_cfgs=dataclasses.replace(
+                cfgs.lhs_cfgs, quant_block_size=cfgs.rhs_cfgs.quant_block_size
+            ),
+            rhs_cfgs=dataclasses.replace(cfgs.rhs_cfgs, e4m3_codes=True),
+        )
+
     # --- GMM compute helpers ---
     @jax.named_scope("compute_gmm1_tile")
     def compute_gmm1_tile(buf_id, n_id, k_id, gm_id, m_rows):
         if _ablate & {"nocompute", "nogmm1"}:
             return
         sem_id = gm_id % 2
-        _cfgs1 = dataclasses.replace(
-            cfgs1, tiles=dataclasses.replace(cfgs1.tiles, tile_m=m_rows)
-        )
+        _cfgs1 = _bucket_cfgs(cfgs1, m_rows)
         k_cols = tile_k1 // num_lanes
         k_offset = k_id * k_cols
         lhs_data = gathered_lhs_2x_ref[
@@ -1079,9 +1093,7 @@ def kernel_main_fused_rs(
         if _ablate & {"nocompute", "nogmm2"}:
             return
         sem_id = gm_id % 2
-        _cfgs2 = dataclasses.replace(
-            cfgs2, tiles=dataclasses.replace(cfgs2.tiles, tile_m=m_rows)
-        )
+        _cfgs2 = _bucket_cfgs(cfgs2, m_rows)
         lhs_data = intermediate_ref[
             pl.ds(0, m_rows // dims.size_lhs_sublane),
             :,
@@ -2758,6 +2770,7 @@ def _pair_exchange_metadata(
         "pair_send_bucket",
         "pair_src_table",
         "gather_in_gmm1",
+        "qblock_small_m",
     ],
 )
 def gmm_v2_fused_rs(
@@ -2806,6 +2819,7 @@ def gmm_v2_fused_rs(
     pair_mask_offsets: bool = False,
     pair_send_bucket: bool = False,
     pair_src_table: bool = False,
+    qblock_small_m: int = 0,
 ) -> jax.Array | PairFp8Out:
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write.
 
@@ -3506,6 +3520,10 @@ def gmm_v2_fused_rs(
         # rows past a tile land in the buffer's slack: at most tile_m - 16 (fp8 layers' tiles
         # are smaller than the fp4 ones)
         kernel_kwargs["gather_in_gmm1"] = max(0, min(gather_in_gmm1, tile_m - 16))
+    if qblock_small_m:
+        if not fp4_w4a16 or w4a8_rows:
+            raise ValueError("qblock_small_m modifies the bf16-lhs fp4_w4a16 path")
+        kernel_kwargs["qblock_small_m"] = qblock_small_m
     in_specs = [
         pl.BlockSpec(memory_space=pltpu.HBM),  # hidden_states_3d
         pl.BlockSpec(memory_space=pltpu.HBM),  # w1

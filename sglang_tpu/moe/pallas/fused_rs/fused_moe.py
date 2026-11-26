@@ -500,6 +500,9 @@ def moe_gmm_local_rs_nodedup(
     gather_in_gmm1 = (
         tpu_envs.SGLANG_TPU_FUSED_RS_GATHER_IN_GMM1.get() if expert_tp else 0
     )
+    qblock_small_m = (
+        tpu_envs.SGLANG_TPU_FUSED_RS_QBLOCK_SMALL_M.get() if fp4_w4a16 else 0
+    )
     out_buf = gmm_v2_fused_rs_nodedup(
         hidden_states_local,
         w1,
@@ -545,6 +548,7 @@ def moe_gmm_local_rs_nodedup(
         pair_send_bucket=pair_send_bucket,
         pair_src_table=pair_src_table,
         gather_in_gmm1=gather_in_gmm1,
+        qblock_small_m=qblock_small_m,
     )
 
     # Post-kernel: apply topk weights and reduce over top_k. Stay in bf16
