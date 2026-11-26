@@ -1145,6 +1145,8 @@ class TpuEnvs:
     SGLANG_TPU_RPA_V3_PREFILL_TOPK_SLICES = EnvInt(0)
     # Query pooling stride for Stage-1 All-QK scoring (2 = pair-averaged Q, 1 = full Q).
     SGLANG_TPU_RPA_V3_PREFILL_TOPK_QSTRIDE = EnvInt(2)
+    # Use Stage-1 GQA-batched paired-K scorer + in-kernel exact top-k/bitpack (eliminates XLA sort).
+    SGLANG_TPU_RPA_V3_PREFILL_TOPK_FAST = EnvBool(False)
     # Muse prefill kernel path with SGLANG_TPU_KV_PACK_HEADS: A1 (two-half bf16 variants)
     # writes q and kv in RPA v3's packed layout, dropping the XLA expand/repack glue.
     SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT = EnvBool(False)
