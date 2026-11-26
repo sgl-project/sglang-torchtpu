@@ -469,6 +469,31 @@ class TestKernelInterpret(CustomTestCase):
                     got = _interpret(case, dataclasses.replace(base, **opts))
                     np.testing.assert_array_equal(got, want)
 
+    def test_up_chunks(self):
+        """Tiling.up_chunks runs each MLP up-projection step's matmul and GELU by
+        row chunks (with pipelined_epilogues): the same output as the default
+        layout bit for bit, on every softmax path, in both DMA orders, with one
+        tile a stream (cols 512) and several (cols 128). Chunks of 32 rows or more
+        (128-row tiles)."""
+        cases = {
+            "fixed": _case(qk_scale=0.25),
+            "rowfix": _case(qk_scale=3.0),
+            "online rerun": _case(
+                rows=512, craft=_all_rows_far, rope=False, e_rows={ref.GATE: 50.0}
+            ),
+        }
+        for cols in (128, 512):
+            base = dataclasses.replace(_tiling(), cols=cols, pipelined_epilogues=True)
+            for name, case in cases.items():
+                want = _interpret(case, base)
+                for n, dma in ((4, "on_wait"), (2, "eager")):
+                    with self.subTest(name, cols=cols, up_chunks=n, dma=dma):
+                        got = _interpret(
+                            case, dataclasses.replace(base, up_chunks=n), dma=dma
+                        )
+                        self.assertFalse(_races_found())
+                        np.testing.assert_array_equal(got, want)
+
     def test_masked_scores_each_variant(self):
         """mask_scores with every softmax variant forced: the fixed path's masked
         tile subtracts its column, rowfix and online keep the select; each gives
@@ -922,6 +947,13 @@ class TestTiling(CustomTestCase):
                 Tiling(cross_keys=counts).check(8192, 4, 5120, 13824, 40)
         with self.assertRaises(ValueError):
             Tiling(cross_step=3).check(8192, 4, 5120, 13824, 40)
+        for n in (0, 3, 128):  # chunks of 16k rows of the 1,024-row tiles
+            with self.assertRaises(ValueError):
+                Tiling(up_chunks=n).check(8192, 4, 5120, 13824, 40)
+        up8 = Tiling(pipelined_epilogues=True, up_chunks=8)
+        self.assertEqual(up8.opt_suffix(), "_pe_up8")
+        for devices in (4, 2, 1):
+            up8.check(32768 // devices, devices, 5120, 13824, 40)
 
 
 if __name__ == "__main__":

@@ -218,6 +218,41 @@ def _stream_pipelined(tiles: int, fetch, produce, consume) -> None:
     consume(tiles - 1)
 
 
+def _stream_pipelined_chunks(tiles: int, chunks: int, fetch, produce, consume) -> None:
+    """``_stream_pipelined`` by row chunks: step ``i`` runs ``consume(i - 1, c)``
+    then ``produce(i, slot, c)`` for each chunk ``c`` in turn, so chunk ``c``'s
+    matmul runs under the previous tile's epilogue of the same rows and its own
+    result pops under chunk ``c + 1``'s matmul. A chunk's ``consume`` reads what
+    that chunk's ``produce`` then rewrites. The caller has started tile 0 into
+    slot 0."""
+    for cp in fetch(0, 0):
+        cp.wait()
+    if tiles > 1:
+        for cp in fetch(1, 1):
+            cp.start()
+    for c in range(chunks):
+        produce(0, 0, c)
+
+    def step(i, carry):
+        slot = i % 2
+        for cp in fetch(i, slot):
+            cp.wait()
+
+        @pl.when(i + 1 < tiles)
+        def _next():
+            for cp in fetch(i + 1, 1 - slot):
+                cp.start()
+
+        for c in range(chunks):
+            consume(i - 1, c)
+            produce(i, slot, c)
+        return carry
+
+    lax.fori_loop(1, tiles, step, None)
+    for c in range(chunks):
+        consume(tiles - 1, c)
+
+
 def _kernel(
     meta_ref,  # SMEM [2] int32: real rows of the whole sequence, cross-attention keys
     x_in,
@@ -1450,6 +1485,32 @@ def _kernel(
                     # The first weight tile loads during n3's wait.
                     start(w1_tile(0, 0))
                     n3_in(t).wait()
+                    if pipe and tiling.up_chunks > 1:
+                        # up_chunks: each tile's up and GELU by row chunks, the same
+                        # values a row as ``up`` and ``gelu``.
+                        ru = TC // tiling.up_chunks
+
+                        def up_rows(f, slot, c):
+                            hp = jnp.dot(
+                                n3v[pl.ds(c * ru, ru), :],
+                                ring1[slot],
+                                preferred_element_type=F32,
+                            )
+                            hs[0, pl.ds(c * ru, ru), :] = (
+                                hp + vec("b1", f * TN, TN)
+                            ).astype(BF16)
+
+                        def gelu_rows(f, c):
+                            hp = hs[0, pl.ds(c * ru, ru), :]
+                            hfull[
+                                pl.ds(c * ru, ru), pl.ds(pl.multiple_of(f * TN, TN), TN)
+                            ] = ref.gelu_tanh(hp.astype(F32)).astype(BF16)
+
+                        with scope("C2.up", 2):
+                            _stream_pipelined_chunks(
+                                nf, tiling.up_chunks, w1_tile, up_rows, gelu_rows
+                            )
+                        return
                     if pipe:
 
                         def up_out(f, slot):

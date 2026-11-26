@@ -76,6 +76,13 @@ class Tiling:
     # start ahead of its first key tile (the first item's before the item loop).
     # The fixed path then starts from the same zero state: the same bits.
     zero_ahead: bool = False
+    # With pipelined_epilogues, phase C2's MLP up-projection steps run their
+    # matmul as this many row chunks: chunk c's result pops under chunk c + 1's
+    # matmul, and the previous tile's GELU runs in chunks between them, instead
+    # of after the step's whole MXU stream. Each row is the same dot (each MXU
+    # still runs a 256-column half over the whole K), bias, rounding and GELU:
+    # the same bits.
+    up_chunks: int = 1
     vmem_limit_bytes: int = 64 * 1024 * 1024
 
     def opt_suffix(self) -> str:
@@ -86,6 +93,7 @@ class Tiling:
             + ("" if self.semaphore_checks else "_ns")
             + ("_ms" if self.mask_scores else "")
             + ("_za" if self.zero_ahead else "")
+            + (f"_up{self.up_chunks}" if self.up_chunks > 1 else "")
         )
 
     def row_unit(self) -> int:
@@ -140,6 +148,10 @@ class Tiling:
             "cross_keys must be ascending multiples of 16 (bf16 K/V row tiles)",
         )
         need(self.cross_step in (1, 2, 4, 8), "cross_step must be 1, 2, 4 or 8")
+        need(
+            self.up_chunks >= 1 and self.mlp_rows % (16 * self.up_chunks) == 0,
+            "up_chunks must cut mlp_rows into chunks of 16k rows",
+        )
         # Phase B holds the most VMEM: the f32 [sub_kv, block_q] score block, the
         # query, output and staging buffers a query row, the key/value tiles and
         # small vectors (matches Mosaic's count on v7x to ~0.1 MiB, e.g. 69.4 MiB
