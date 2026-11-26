@@ -2711,16 +2711,62 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
             (1, False, False, 2),
         ):
             qh_blk = 4 * sq_kv_heads
-            q_np = rng.normal(0.0, 0.25, (1, t_buf, qh_blk, 2, 128)).astype(np.float32)
-            # Plant a strong sink in page 0 and needles in prefix block 2 (tokens 2048..3071) for seq 0 & 1.
-            q_jax = jnp.asarray(q_np, dtype=jnp.bfloat16)
+            # Construct realistic-logit Q and KV with sink in bkv=0 (page 0) and a sharp planted
+            # needle in half-slice 7 (tokens 2960..2963 of block 2, outside [0..3]) for seq 0
+            # (valid_bq_rows=129, partial Q-group with unwritten trailing VMEM stages).
+            q_raw = rng.normal(0.0, 0.25, (t_buf, sq_kv_heads, 8, 64)).astype(np.float32)
+            q_raw[:, :, :, :8] += 1.6
+            k_raw = rng.normal(0.0, 0.14, (cur_p * page_size, sq_kv_heads, 64)).astype(np.float32)
+            v_raw = rng.normal(0.0, 0.12, (cur_p * page_size, sq_kv_heads, 64)).astype(np.float32)
+            k_raw[:16, :, :8] += 6.5
+            v_raw[:16, :, :] += 0.9
+            needle_pos = 2960  # page 5 (block 2, half-slice 7 in normal; slices 6+7 in dense2)
+            needle_q_row = 50
+            for kvh_i in range(sq_kv_heads):
+                k_raw[needle_pos : needle_pos + 4, kvh_i, :] = q_raw[needle_q_row, kvh_i, 0, :] * 3.8
+                v_raw[needle_pos : needle_pos + 4, kvh_i, :] = 3.0 if kvh_i == 0 else -3.0
+
+            q_packed = np.zeros((1, t_buf, qh_blk, 2, 128), dtype=np.float32)
+            for kvh_i in range(sq_kv_heads):
+                c0 = 0 if kvh_i == 0 else 64
+                for p_i in range(4):
+                    q_packed[0, :, kvh_i * 4 + p_i, 0, c0 : c0 + 64] = q_raw[:, kvh_i, 2 * p_i, :]
+                    q_packed[0, :, kvh_i * 4 + p_i, 1, c0 : c0 + 64] = q_raw[:, kvh_i, 2 * p_i + 1, :]
+            q_jax = jnp.asarray(q_packed, dtype=jnp.bfloat16)
             kv_jax = jnp.asarray(rng.normal(0.0, 0.20, (t_buf, 1, 4, 128)), dtype=jnp.float8_e4m3fn)
+
+            ku8 = np.asarray(jax.lax.bitcast_convert_type(jnp.asarray(k_raw, dtype=jnp.float8_e4m3fn), jnp.uint8))
+            vu8 = np.asarray(jax.lax.bitcast_convert_type(jnp.asarray(v_raw, dtype=jnp.float8_e4m3fn), jnp.uint8))
             phys_pg = page_size // 2 if use_d2 else page_size
             cache_u8 = np.full((cur_p + 2, phys_pg, 1, 4, 128), 0x7F, dtype=np.uint8)
-            for pg_i in range(cur_p):
-                cache_u8[pg_i, :, 0, :4, :] = rng.integers(
-                    0x2A, 0x36, size=(phys_pg, 4, 128), dtype=np.uint8
-                )
+            k_pg = ku8.reshape(cur_p, page_size, sq_kv_heads, 64)
+            v_pg = vu8.reshape(cur_p, page_size, sq_kv_heads, 64)
+            cache_u8[:cur_p, :, 0, :, :] = 0
+            if use_d2:
+                cache_u8[:cur_p, :, 0, 0, :64] = k_pg[:, 0::2, 0, :]
+                cache_u8[:cur_p, :, 0, 1, :64] = v_pg[:, 0::2, 0, :]
+                cache_u8[:cur_p, :, 0, 2, :64] = k_pg[:, 1::2, 0, :]
+                cache_u8[:cur_p, :, 0, 3, :64] = v_pg[:, 1::2, 0, :]
+                if sq_kv_heads > 1:
+                    cache_u8[:cur_p, :, 0, 0, 64:] = k_pg[:, 0::2, 1, :]
+                    cache_u8[:cur_p, :, 0, 1, 64:] = v_pg[:, 0::2, 1, :]
+                    cache_u8[:cur_p, :, 0, 2, 64:] = k_pg[:, 1::2, 1, :]
+                    cache_u8[:cur_p, :, 0, 3, 64:] = v_pg[:, 1::2, 1, :]
+            else:
+                cache_u8[:cur_p, :, 0, 0, :64] = k_pg[:, :, 0, :]
+                cache_u8[:cur_p, :, 0, 1, :64] = v_pg[:, :, 0, :]
+                if sq_kv_heads > 1:
+                    cache_u8[:cur_p, :, 0, 0, 64:] = k_pg[:, :, 1, :]
+                    cache_u8[:cur_p, :, 0, 1, 64:] = v_pg[:, :, 1, :]
+            # Preserve 0x7F (NaN) poison in out-of-bounds tail rows of each sequence's final page.
+            pg_off = 0
+            for kvl in seq_kv:
+                n_pg = (kvl + page_size - 1) // page_size
+                tail_tok = kvl % page_size
+                if tail_tok:
+                    tail_row = (tail_tok + 1) // 2 if use_d2 else tail_tok
+                    cache_u8[pg_off + n_pg - 1, tail_row:, 0, :, :] = 0x7F
+                pg_off += n_pg
             kv_cache = _u8_to_fp8(cache_u8)
             opts_run = (base_lc | {"gqa8"}) if use_gqa8 else (base_lc | {"tp16_sq"})
             with self.subTest(sq_kv_heads=sq_kv_heads, gqa8=use_gqa8, dense2=use_d2, qstride=qs):
@@ -2749,7 +2795,11 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
                 b = np.asarray(out_tk[:tot_q], dtype=np.float32)
                 self.assertTrue(np.all(np.isfinite(b)), "Non-finite output in w18b top-k Interpret test")
                 cos = float(np.dot(a.ravel(), b.ravel()) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
-                self.assertGreaterEqual(cos, 0.99)
+                cos_s0 = float(np.dot(a[:129].ravel(), b[:129].ravel()) / (np.linalg.norm(a[:129]) * np.linalg.norm(b[:129]) + 1e-12))
+                cos_nd = float(np.dot(a[needle_q_row, :64], b[needle_q_row, :64]) / (np.linalg.norm(a[needle_q_row, :64]) * np.linalg.norm(b[needle_q_row, :64]) + 1e-12))
+                self.assertGreaterEqual(cos, 0.999)
+                self.assertGreaterEqual(cos_s0, 0.999)
+                self.assertGreaterEqual(cos_nd, 0.999)
 
         # TPU v7 AOT export verification for TP=8 (bq=4096, bkv=16384) and TP=16 (bq=8192, bkv=16384).
         try:

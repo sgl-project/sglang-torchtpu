@@ -3751,6 +3751,7 @@ def _prefix_score_kernel(
     r_256_io = lax.broadcasted_iota(jnp.int32, (256, 128), 0)
     q_h_iota = lax.broadcasted_iota(jnp.int32, (8, 128), 0)
     col_iota_8w = lax.broadcasted_iota(jnp.int32, (8, w_q), 1)
+    col_iota_64w = lax.broadcasted_iota(jnp.int32, (64, w_q), 1)
 
     @pl.loop(start_seq_idx, end_seq_idx)
     def _k1_seq(seq_idx):
@@ -3903,12 +3904,18 @@ def _prefix_score_kernel(
 
                     @pl.loop(0, valid_qgrps, unroll=False)
                     def _k1_quant_grp(g_idx):
+                        valid_g_rows = jnp.clip(
+                            valid_bq_rows - g_idx * q_grp_sz, 0, q_grp_sz
+                        )
+                        valid_cols = cdiv(valid_g_rows, qstride)
+                        col_ok_64w = col_iota_64w < valid_cols
                         for kv_h in range(sq_kv_heads):
 
                             def _quant_qh(q_h, sc_acc):
                                 qf = q_k1_bf16_ref[g_idx, kv_h * 8 + q_h].astype(
                                     jnp.float32
                                 )
+                                qf = jnp.where(col_ok_64w, qf, jnp.float32(0.0))
                                 amax = _tile_amax_f32(qf)
                                 q_inv = jnp.where(
                                     amax == 0.0,
@@ -8483,6 +8490,7 @@ def ragged_paged_attention(
             and eff_bq_topk >= 256
             and eff_bq_topk % 256 == 0
             and bkv_sz >= 1024
+            and num_h_per_bkv <= 128
             and (pages_per_seq * page_size) > bkv_sz
             and _prefill_topk_slices > 0
             and _prefill_topk_slices < num_h_per_bkv
