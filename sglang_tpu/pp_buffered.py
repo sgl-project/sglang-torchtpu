@@ -188,20 +188,32 @@ def hbm_reserve_bytes(
     aux_dtype: torch.dtype,
     depth: int,
     zero_residual_rows: int,
+    receives: bool = True,
+    sends: bool = True,
 ) -> int:
     """An upper bound on the device memory a stage's buffered hand-off holds
-    beyond the model and the KV cache. Landing: up to _MAX_RECEIVES posted
-    receives. Outgoing: up to ``depth`` transfers queued for sending plus the
-    one end_iteration builds while it waits for room. Each is one transfer
-    of every carried tensor at ``max_rows`` rows. Zero residuals: one per
-    padded row count, ``zero_residual_rows`` rows in all. The first stage
-    posts no receives and the last sends nothing, so they hold less; the KV
-    capacity is the minimum over stages, so the bound is the same for all."""
+    beyond the model and the KV cache. Each term counts transfers of every
+    carried tensor at ``max_rows`` rows.
+
+    Landing: up to _MAX_RECEIVES receives. A receive keeps its flag until
+    the fence after its forward passes, so the landing buffers of forwards
+    launched but not yet run count against the same _MAX_RECEIVES.
+    Layout copies: each of those forwards also holds the copy _from_wire makes
+    of its input until it runs, so up to _MAX_RECEIVES more transfers.
+    Outgoing: up to ``depth`` transfers queued for sending plus the one
+    end_iteration builds, which it holds both as the merged sum and as its
+    wire copy while _to_wire makes the copy.
+    Zero residuals: one per padded row count, ``zero_residual_rows`` rows in
+    all.
+
+    The first stage receives nothing, so it holds no landing buffers, layout
+    copies or zero residuals. The last stage sends nothing (end_iteration
+    returns before it builds a transfer), so it holds no outgoing buffers."""
     transfer = max_rows * hidden * (dtype.itemsize + num_aux * aux_dtype.itemsize)
-    landing = _MAX_RECEIVES * transfer
-    outgoing = (depth + 1) * transfer
-    zero = zero_residual_rows * hidden * dtype.itemsize
-    return landing + outgoing + zero
+    received = 2 * _MAX_RECEIVES * transfer if receives else 0
+    outgoing = (depth + 2) * transfer if sends else 0
+    zero = zero_residual_rows * hidden * dtype.itemsize if receives else 0
+    return received + outgoing + zero
 
 
 class PPBufferedHandoff:
@@ -510,6 +522,9 @@ class PPBufferedHandoff:
         self._received_this_iteration = True
 
         def wait() -> dict[str, torch.Tensor]:
+            # The scheduler keeps this callable until its next receive; drop the
+            # landing buffers here so only the receive flags bound them.
+            nonlocal landing
             started = time.perf_counter()
             with torch.profiler.record_function("pp_buffered_wait_posted"):
                 error = landing.exception()
@@ -520,6 +535,7 @@ class PPBufferedHandoff:
                     f"{transfer} failed"
                 ) from error
             received = landing.result()
+            landing = None
             for x in received:
                 self._transport.wait_landed(x)
             return self.unpack(
@@ -581,6 +597,8 @@ class PPBufferedHandoff:
             with self._post_cv:
                 self._posting = False
             landing.set_result(received)
+            # Waiting for the next post must not keep this one's buffers alive.
+            del landing, received
 
     def unpack(
         self, received: tuple[torch.Tensor, ...], rows: int
@@ -718,8 +736,10 @@ class PPBufferedHandoff:
                     self._sends.clear()
                     self._cv.notify_all()
                     return
-                # Releases the tensors: the copies are done.
+                # Releases the tensors: the copies are done. Drop this thread's
+                # reference too, or the buffer outlives the slot it frees.
                 self._sends.popleft()
+                del outgoing
                 self.sent += 1
                 self._cv.notify_all()
 
@@ -752,6 +772,8 @@ class PPBufferedHandoff:
             aux_dtype=self.aux_dtype,
             depth=self.depth,
             zero_residual_rows=zero_residual_rows,
+            receives=self.rank > 0,
+            sends=self.rank != self.last,
         )
 
     def check_hbm(self, zero_residual_rows: int) -> int:
@@ -760,13 +782,18 @@ class PPBufferedHandoff:
         shortfall fails here rather than as an out-of-memory error under load.
         Returns the bytes checked."""
         nbytes = self.reserve_bytes(zero_residual_rows)
+        parts = []
+        if self.rank > 0:
+            parts.append(f"{_MAX_RECEIVES} receives and their layout copies")
+        if self.rank != self.last:
+            parts.append(f"{self.depth + 2} sends")
         try:
             self._transport.check_free(nbytes, self.device)
         except Exception as exc:
             raise RuntimeError(
                 f"buffered hand-off stage {self.rank}: the device cannot hold the "
                 f"hand-off's worst case of {nbytes / (1 << 30):.2f} GiB "
-                f"({_MAX_RECEIVES} receives and {self.depth + 1} sends of "
+                f"({' and '.join(parts)} of "
                 f"{self.max_rows} rows) next to the KV cache. Lower "
                 "--mem-fraction-static or --max-total-tokens, or "
                 "SGLANG_TPU_PP_BUFFERED_SEND_DEPTH."

@@ -98,7 +98,7 @@ from sglang_tpu.hooks.pipeline_parallel import (
     check_pipeline_parallel_compat,
     skip_spec_op_precompile_without_draft,
 )
-from sglang_tpu.hooks.pp_buffered_kv_budget import reserve_pp_buffered_handoff
+from sglang_tpu.hooks.pp_buffered_kv_budget import pp_stage_kv_budget
 from sglang_tpu.hooks.row_select import concat_rows as concat_merged_rows
 from sglang_tpu.hooks.row_select import select_rows as select_kept_rows
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
@@ -401,7 +401,7 @@ HOOKS: list[tuple] = [
     ),
     (
         "sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._profile_available_bytes",
-        reserve_pp_buffered_handoff,
+        pp_stage_kv_budget,
         HookType.AROUND,
     ),
     (
