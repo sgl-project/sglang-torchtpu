@@ -1699,9 +1699,10 @@ class MuseSparkMoE(nn.Module):
         """Validate and attach §4.5b preloaded hot-expert replica buffers to this MoE layer."""
         ex = self.experts
         num_replicas = int(rep_w1.shape[0])
-        if num_replicas not in (1, 2, 4, 6, 8):
+        if num_replicas not in (1, 2, 4, 6, 8, 12, 16):
             raise ValueError(
-                f"Preloaded replica slots must be in (1, 2, 4, 6, 8), got {num_replicas}"
+                "Preloaded replica slots must be in (1, 2, 4, 6, 8, 12, 16), "
+                f"got {num_replicas}"
             )
         for name, rep, base in (
             ("rep_w1", rep_w1, ex.w13_weight),
@@ -1881,7 +1882,7 @@ class MuseSparkMoE(nn.Module):
                 "full_stage_b",
             )
             or world not in (8, 16)
-            or num_replicas not in (0, 1, 2, 4, 6, 8)
+            or num_replicas not in (0, 1, 2, 4, 6, 8, 12, 16)
             or replica_cost_mode not in ("active", "tiles", "weighted")
             or graph.tpu_compile_tracer != "dynamo"
             or graph.use_spmd_compile
@@ -6498,10 +6499,10 @@ class MuseSparkForConditionalGeneration(nn.Module):
                     "SGLANG_TPU_MUSE_KERNEL_DECODE_FULL_MOE requires pure EP8/EP16 "
                     "and cannot be combined with DECODE_EP_TP2 or DECODE_CHIPMATE_REBALANCE"
                 )
-        if decode_replicas not in (0, 1, 2, 4, 6, 8):
+        if decode_replicas not in (0, 1, 2, 4, 6, 8, 12, 16):
             raise ValueError(
                 "SGLANG_TPU_MUSE_KERNEL_DECODE_REPLICA_SLOTS must be one of "
-                f"(0, 1, 2, 4, 6, 8), got {decode_replicas}"
+                f"(0, 1, 2, 4, 6, 8, 12, 16), got {decode_replicas}"
             )
         prefill_eplb_mode = str(
             _env_get("SGLANG_TPU_MUSE_KERNEL_PREFILL_EPLB_MODE", "")
@@ -7776,6 +7777,11 @@ class MuseSparkForConditionalGeneration(nn.Module):
                 "SGLANG_TPU_MUSE_KERNEL_DECODE_REPLICA_SELECTION_MODE", "global_top"
             )
         )
+        rep_obj = str(
+            _env_get(
+                "SGLANG_TPU_MUSE_KERNEL_DECODE_REPLICA_OBJECTIVE", "decode_active"
+            )
+        )
         allow_boundary_rep = bool(
             _env_get("SGLANG_TPU_MUSE_KERNEL_DECODE_FP8_FUSE_ALL", False)
             or _env_get("SGLANG_TPU_MUSE_KERNEL_DECODE_SPARSE_FP8", False)
@@ -7803,6 +7809,7 @@ class MuseSparkForConditionalGeneration(nn.Module):
                     num_replicas_per_owner=num_replicas,
                     placement=placement,
                     owner_to_chip=owner_to_chip,
+                    objective=rep_obj,
                     selection_mode=sel_mode,
                 )
                 validate_replica_plan(plan)

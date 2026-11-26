@@ -33,7 +33,9 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.moe.pallas.fused_rs_muse.decode_hbm_breakers import (
+    parse_free_rank_cap_spec,
     resolve_free_and_min_p_for_batch,
+    scale_free_rank_cap_for_batch,
 )
 from sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_routing import (
     DenseRoutingScratch,
@@ -102,6 +104,9 @@ class SparseDecodeConfig:
     free_max_rows: int = 0  # Wave-8: batch-coupled free-expert tail pruning max rows
     free_max_w: float = 0.06
     free_min_slot: int = 5
+    free_rank_cap: int = 0  # Wave-9.18b: rank-capped FREE active threshold (0 = off)
+    free_tail_rows: int = 0
+    free_tail_w: float = 0.0
     debug_stop_after: str = ""  # "", "route", "plan", "pack", "experts", "rs"
 
 
@@ -381,6 +386,11 @@ def default_sparse_decode_config(
             parse_free_spec_fn=parse_free_expert_rows_spec,
         )
     )
+    raw_rc, raw_tr, raw_tw = parse_free_rank_cap_spec()
+    rc_eff, tr_eff = scale_free_rank_cap_for_batch(
+        raw_rc, raw_tr, batch_size, e_per_owner=_E_TOTAL // ep
+    )
+    tw_eff = raw_tw if (rc_eff > 0 and tr_eff > 0) else 0.0
     fast_gs = _read_fast_gs_knob()
     use_verify_lhs_fp8, use_verify_tm128 = _read_verify_w4a8_knobs()
     route_kw = dict(
@@ -397,6 +407,9 @@ def default_sparse_decode_config(
         free_max_rows=free_rows_eff,
         free_max_w=free_max_w_eff,
         free_min_slot=free_min_slot_eff,
+        free_rank_cap=rc_eff,
+        free_tail_rows=tr_eff,
+        free_tail_w=tw_eff,
     )
     if scale_block == 16:
         tile_m = (
@@ -1919,6 +1932,9 @@ def plan_and_prime_muse_sparse_from_vmem(
             route_rb16_mode=getattr(cfg, "route_rb16_mode", None),
             route_fast=getattr(cfg, "route_fast", None),
             free_params_ref=free_params_ref,
+            free_rank_cap=cfg.free_rank_cap,
+            free_tail_rows=cfg.free_tail_rows,
+            free_tail_w=cfg.free_tail_w,
         )
         counts_smem = r_scratch.counts_smem
 
@@ -5051,6 +5067,7 @@ def fused_decode_sparse_from_logits(
         f"{f'_fp{config.fast_plan}' if config.fast_plan else ''}"
         f"{'_us1' if config.unroll_strips else ''}"
         f"{'_fgs1' if config.fast_gs else ''}"
+        f"{f'_rc{config.free_rank_cap}' if config.free_rank_cap else ''}"
         f"{'_dfp' if has_free_params_arg else ''}"
     )
     return pl.pallas_call(
@@ -7237,7 +7254,7 @@ def fused_decode_sparse_fp8_from_logits(
             )
         num_replicas = int(rep_w1.shape[0])
         if (
-            num_replicas not in (1, 2, 4, 6, 8)
+            num_replicas not in (1, 2, 4, 6, 8, 12, 16)
             or rep_w1.shape != (num_replicas, _H, _N1)
             or rep_w2.shape != (num_replicas, _I, _H)
             or rep_w1.dtype != jnp.float8_e4m3fn

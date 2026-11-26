@@ -223,6 +223,52 @@ def read_d1_large_batch_free() -> bool:
     return bool(_env_raw("SGLANG_TPU_MUSE_DECODE_D1_LARGE_BATCH_FREE", False)) and _is_d1_non_speculative()
 
 
+def parse_free_rank_cap_spec(spec: str | None = None) -> tuple[int, int, float]:
+    """Parse ``SGLANG_TPU_MUSE_DECODE_FREE_RANK_CAP`` -> ``(rank_cap, tail_rows, tail_w)``.
+
+    Format:
+      - ``""`` / ``"0"`` / ``"off"`` -> ``(0, 0, 0.0)`` (disabled)
+      - ``"<cap>"`` -> ``(cap, 2, 0.31)``
+      - ``"<cap>:<tail_rows>"`` -> ``(cap, tail_rows, 0.31)``
+      - ``"<cap>:<tail_rows>:<tail_w>"`` -> ``(cap, tail_rows, tail_w)``
+    """
+    raw = (
+        str(_env_raw("SGLANG_TPU_MUSE_DECODE_FREE_RANK_CAP", ""))
+        if spec is None
+        else str(spec)
+    ).strip().lower()
+    if not raw or raw in ("0", "false", "no", "off", "none"):
+        return 0, 0, 0.0
+    parts = [p.strip() for p in raw.split(":") if p.strip()]
+    cap = max(0, int(parts[0]))
+    if cap <= 0:
+        return 0, 0, 0.0
+    tail_rows = max(1, int(parts[1])) if len(parts) >= 2 else 2
+    tail_w = float(parts[2]) if len(parts) >= 3 else 0.31
+    return cap, tail_rows, max(0.0, tail_w)
+
+
+def scale_free_rank_cap_for_batch(
+    rank_cap: int,
+    tail_rows: int,
+    batch_size: int,
+    *,
+    e_per_owner: int = 32,
+    d1_large_batch: bool | None = None,
+) -> tuple[int, int]:
+    """Scale ``(rank_cap, tail_rows)`` cleanly by batch size (disabled at ``B < 32``)."""
+    if rank_cap <= 0 or tail_rows <= 0 or batch_size < 32:
+        return 0, 0
+    eff_d1 = read_d1_large_batch_free() if d1_large_batch is None else bool(d1_large_batch)
+    if batch_size >= 128 and not eff_d1:
+        return 0, 0
+    scaled_rows = max(1, int(round(tail_rows * batch_size / 64.0)))
+    if batch_size <= 64:
+        return min(e_per_owner, rank_cap), scaled_rows
+    scaled_cap = int(round(rank_cap * (1.0 + 0.5 * (batch_size / 64.0 - 1.0))))
+    return min(e_per_owner, max(rank_cap, scaled_cap)), scaled_rows
+
+
 def scale_free_expert_for_batch(
     free_rows: int,
     free_min_slot: int,

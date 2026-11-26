@@ -133,8 +133,8 @@ class TestMuseW7DecodeMoE(CustomTestCase):
         self.assertIs(
             tpu_envs.SGLANG_TPU_MUSE_KERNEL_DECODE_SYNC_PREFILL_EPLB.get(), False
         )
-        self.assertEqual(SUPPORTED_REPLICA_SLOTS, (0, 1, 2, 4, 6, 8))
-        for r in (6, 8):
+        self.assertEqual(SUPPORTED_REPLICA_SLOTS, (0, 1, 2, 4, 6, 8, 12, 16))
+        for r in (6, 8, 12, 16):
             self.assertEqual(
                 muse_fuse_all_decode_op_name(
                     mode="sparse", ep=8, tp=1, block=256, num_replicas=r
@@ -162,6 +162,54 @@ class TestMuseW7DecodeMoE(CustomTestCase):
             for node in ast.walk(tree):
                 if isinstance(node, ast.ImportFrom) and node.module == "__future__":
                     self.fail(f"PEP 563 __future__ import forbidden in {rel}")
+
+        for r in (12, 16):
+            moe, parallel, graph = _make_stub_fp8_moe()
+            moe.attach_preloaded_replicas(
+                rep_w1=torch.empty((r, 4096, 8192), dtype=torch.float8_e4m3fn, device="meta"),
+                rep_s1=torch.ones((r, 1, 1, 8192), dtype=torch.float32),
+                rep_w2=torch.empty((r, 4096, 4096), dtype=torch.float8_e4m3fn, device="meta"),
+                rep_s2=torch.ones((r, 1, 1, 4096), dtype=torch.float32),
+                replica_meta=torch.zeros((4, 8 * r), dtype=torch.int32),
+            )
+            fake_op = Mock()
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "WORLD_SIZE": "8",
+                        "SGLANG_TPU_MUSE_KERNEL_DECODE_FP8_FUSE_ALL": "1",
+                    },
+                    clear=False,
+                ),
+                patch("torch.distributed.is_initialized", return_value=True),
+                patch("torch.distributed.get_rank", return_value=0),
+                patch(
+                    "sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_op.get_muse_fuse_all_decode_op",
+                    side_effect=lambda **kw: (
+                        muse_fuse_all_decode_op_name(
+                            mode=kw["mode"],
+                            ep=kw["ep"],
+                            tp=kw["tp"],
+                            block=kw["block"],
+                            num_replicas=kw["num_replicas"],
+                            replica_cost_mode=kw["replica_cost_mode"],
+                        ),
+                        fake_op,
+                    )[1],
+                ),
+            ):
+                moe._prepare_fuse_all_decode(
+                    mode="sparse",
+                    parallel=parallel,
+                    graph=graph,
+                    ex=moe.experts,
+                    num_replicas=r,
+                    replica_cost_mode="tiles",
+                    chipmate_xor=None,
+                )
+            self.assertEqual(moe._fused_decode_num_replicas, r)
+            self.assertIs(moe._fused_decode_op, fake_op)
 
     def test_fp8_to_nvfp4_quant_accuracy_and_modes(self):
         g = torch.Generator().manual_seed(42)

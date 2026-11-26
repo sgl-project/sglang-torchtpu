@@ -492,6 +492,8 @@ class TpuEnvs:
     SGLANG_TPU_MUSE_KERNEL_DECODE_REPLICA_COST_MODE = EnvStr("tiles")
     # Offline §4.5b replica candidate selection ("global_top" or "bottleneck_owner").
     SGLANG_TPU_MUSE_KERNEL_DECODE_REPLICA_SELECTION_MODE = EnvStr("global_top")
+    # Offline §4.5b calibration weight objective ("decode_active", "decode_hybrid", "prefill_rows").
+    SGLANG_TPU_MUSE_KERNEL_DECODE_REPLICA_OBJECTIVE = EnvStr("decode_active")
     # Muse decode §4.3 pure-EP dynamic intra-chip chipmate weight redistribution
     # (requires DECODE_FUSE_ALL=1 on pure EP8/EP16).
     SGLANG_TPU_MUSE_KERNEL_DECODE_CHIPMATE_REBALANCE = EnvBool(False)
@@ -600,6 +602,8 @@ class TpuEnvs:
     SGLANG_TPU_MUSE_DECODE_VERIFY_MIN_P_TOPK = EnvFloat(-1.0)
     # Opt-in d=1 scaled FREE/MIN_P at B >= 128 (e.g. c256 concurrency when speculative_algorithm is None).
     SGLANG_TPU_MUSE_DECODE_D1_LARGE_BATCH_FREE = EnvBool(False)
+    # Opt-in load-aware rank-capped FREE tail shedding ("<cap>:<tail_rows>:<tail_w>", e.g. "11:2:0.32").
+    SGLANG_TPU_MUSE_DECODE_FREE_RANK_CAP = EnvStr("")
     SGLANG_TPU_MUSE_KERNEL_DECODE_TILE_M128 = EnvBool(False)
     # Muse Wave-7B: allow DECODE_REPLICA_SLOTS > 0 alongside PREFILL_EPLB_STATS_PATH when
     # PrefillEplbManager._refresh_decode_replicas keeps _fused_decode_rep_* synchronized.
