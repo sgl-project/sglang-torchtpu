@@ -621,20 +621,6 @@ def _invoke_v3_kernel(
                     )
                 ):
                     prefill_opts.add("mk128")
-                if (
-                    sliding_window in (2048, 2049)
-                    and "mk128" in prefill_opts
-                    and "nosw2048_fuse" not in raw_all_toks
-                    and "nosw_unalign_fuse" not in raw_all_toks
-                ):
-                    prefill_opts.add("sw_unalign_fuse")
-                if (
-                    sliding_window in (2048, 2049)
-                    and "mk128" in prefill_opts
-                    and "nosw2048_fuse" not in raw_all_toks
-                    and "nosw_tail_clamp" not in raw_all_toks
-                ):
-                    prefill_opts.add("sw_tail_clamp")
             else:
                 if "nomk128" not in raw_all_toks:
                     prefill_opts.add("mk128")
@@ -666,8 +652,6 @@ def _invoke_v3_kernel(
             "la2",
             "unroll_up",
             "sw_short_v2",
-            "sw_unalign_fuse",
-            "sw_tail_clamp",
             "tp16_sq",
             "sw_short_fuse",
             "tq_unroll",
@@ -683,6 +667,26 @@ def _invoke_v3_kernel(
                 prefill_opts.add(w7_opt)
             if sliding_window is None and f"full_{w7_opt}" in all_prefill_toks:
                 prefill_opts.add(w7_opt)
+        # Keep unaligned-SWA fusion opt-in to avoid 62-layer cold-IMEM bloat.
+        if (
+            sliding_window in (2048, 2049)
+            and "mk128" in prefill_opts
+            and "nosw2048_fuse" not in raw_all_toks
+            and "nosw_unalign_fuse" not in raw_all_toks
+        ):
+            if (
+                "sw_unalign_fuse" in all_prefill_toks
+                or "sw_sw_unalign_fuse" in all_prefill_toks
+            ):
+                prefill_opts.add("sw_unalign_fuse")
+            if (
+                (
+                    "sw_tail_clamp" in all_prefill_toks
+                    or "sw_sw_tail_clamp" in all_prefill_toks
+                )
+                and "nosw_tail_clamp" not in raw_all_toks
+            ):
+                prefill_opts.add("sw_tail_clamp")
         if "mk128" in prefill_opts:
             prefill_opts.difference_update(("vreg_acc", "vreg_acc1", "mrb1"))
         if (

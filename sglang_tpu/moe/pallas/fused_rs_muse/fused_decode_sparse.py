@@ -449,14 +449,14 @@ def default_sparse_decode_config(
             **route_kw,
         )
     if batch_size <= 64:
-        is_b16 = batch_size == 16
+        is_b16 = batch_size <= 16
         w_m = (
             "w1_2x_w2_1x"
             if (fast_b64 == 2 and not is_b16)
             else ("stream3_k2" if (contig_parts and scale_block <= 256) else "stream3")
         )
         m_bkts = (
-            (8, 16)
+            ((8,) if batch_size <= 8 else (8, 16))
             if is_b16
             else (
                 (8, 16, 32)
@@ -477,7 +477,7 @@ def default_sparse_decode_config(
             pair_rs=use_pair_rs,
             bridge_ag=use_ep16_bridge_ag or (False if is_b16 else use_br64),
             norm_f32_stage=True,
-            route_chunk_rows=16 if is_b16 else (batch_size if fast_b64 >= 1 else 32),
+            route_chunk_rows=min(batch_size, 16) if is_b16 else (batch_size if fast_b64 >= 1 else 32),
             static_holder_mask=static_mask,
             spec_prime_parts=spec_eff,
             fast_b64_epi_pro=(fast_b64 >= 1),

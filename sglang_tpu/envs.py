@@ -728,7 +728,7 @@ class TpuEnvs:
     # (0 = off; 1 = XOR send order; 2 = XOR send order + within-expert rotated chip order).
     SGLANG_TPU_MUSE_KERNEL_GMM_ROTATE_RS = EnvInt(0)
     # Muse prefill Wave-8 gmm_v2_fused_rs direct SiLU epilogue without VMEM/bf16 round-trip
-    # (0 = off; 1 = single-pass FP32 gate*up; 2 = fast BF16 sigmoid epilogue).
+    # (0 = off; 1 = single-pass FP32 gate*up with fused GMM2 amax reduction; 2 = fast BF16 sigmoid).
     SGLANG_TPU_MUSE_KERNEL_GMM_DIRECT_SILU = EnvInt(0)
     # Muse prefill Wave-8 quantize MoE hidden states to FP8 once before/at AG instead of 8x in GMM1
     # (0 = off; 1 = FP8 hidden states + per-token f32 scale passed into gmm_v2_fused_rs).
@@ -1446,7 +1446,8 @@ class TpuEnvs:
     # Wave-8 prefill gmm_v2_gather_scatter inner_kernel scoped W4A8 VMEM slice & zero-spill sub-tile:
     # 0 = off; 1 = slice [rk0:rk1, start_n:end_n] directly from VMEM + explicit fp8 cast (avoids
     # monolithic 8 MiB uint32 SSA load); 2 = 1 + m_sub=128 sub-tiling at tile_m>=256;
-    # 3 = 2 + mh_outer<=48-VREG zero-spill tiling + 32-row K-half flq LHS quant (0 FP8 VMEM RMW).
+    # 3 = 2 + mh_outer<=48-VREG zero-spill tiling + 32-row K-half flq LHS quant (0 FP8 VMEM RMW);
+    # 8 = 1 + hoist_rhs_scale=True + K-half quantize_3d_lhs_tile_to_fp8 (m_step=256, smaller IMEM).
     SGLANG_TPU_MUSE_KERNEL_GMM_SCOPED_W4A8 = EnvInt(0)
     # Wave-8 prefill gmm_v2_fused_rs expert-outer Scaled-FP8 expansion:
     # 0 = off; 1 = per-strip FP4->Scaled-FP8 VMEM expansion + zero-spill k_chunk=256 FP8 MXU dot
@@ -1498,6 +1499,10 @@ class TpuEnvs:
     # and Entry on BOTH TP=8 (B=32..384) and TP=16 (B=64..384), eliminating intra-chip stream
     # split/re-gather D2D barriers and concat loops.
     SGLANG_TPU_MUSE_DECODE_CHIP_SHARDED_BRIDGES = EnvBool(False)
+    # Opt-in parallel orthogonal 3-slab XYZ reduce-scatter in TP=16 B=64 chip-sharded Bridge 1b.
+    SGLANG_TPU_MUSE_DECODE_TP16_PARALLEL_RS = EnvBool(False)
+    # Opt-in Bug C (4 KiB sq_pair swap, -50% VPU) + half-col 1-shot ag_exp + d2d2 at r_pair=8.
+    SGLANG_TPU_MUSE_DECODE_BUG_C_ONESHOT = EnvBool(False)
     # Wave-9 opt-in TP_chip=2 W_post [4096, 4096] in chip-sharded Bridge 2b & L61 Final Norm on TP=8,
     # eliminating both tok_s2 and post_ici inter-chip ICI collectives (+0.97 GiB/rank HBM).
     SGLANG_TPU_MUSE_DECODE_CHIP_B2_TP2_WPOST = EnvBool(False)
@@ -1535,6 +1540,13 @@ class TpuEnvs:
     # page-aligned chunk cuts; 2 = exact token compute charge + exact unaligned cuts;
     # >=64 = exact token compute charge + chunk cuts aligned to the token multiple (e.g. 4096).
     SGLANG_TPU_EXACT_CHUNK_FILL = EnvInt(0)
+    # Wave-16 opt-in asymmetric power-of-2 B1+B2 chunk split (e.g. 512+1024 on TP=16,
+    # 1024+2048 on TP=8 for 24K buckets) under GMM_PREQUANT_LHS_FP8=5 so every B2
+    # all_gather is a power-of-2 size without non-pow2 SparseCore AG cliffs.
+    SGLANG_TPU_MUSE_KERNEL_B2_POW2_CHUNKS = EnvBool(False)
+    # Wave-16 opt-in double-buffered stream HBM->VMEM prefetch + direct (bm, 32, 128) FP8 store
+    # inside pallas_fused_b1_b2_wpool_quant (-0.73..-0.96 ms/61L on 4c Ghostfish, 0-ULP bit-exact).
+    SGLANG_TPU_MUSE_KERNEL_B2_DBL_STREAM = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:

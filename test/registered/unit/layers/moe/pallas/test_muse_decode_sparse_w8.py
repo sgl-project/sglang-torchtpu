@@ -3246,6 +3246,11 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
             self.assertEqual(cfg_b16.tile_m, 16)
             self.assertEqual(cfg_b16.m_buckets, (8, 16))
             self.assertEqual(cfg_b16.route_chunk_rows, 16)
+            cfg_b8 = v1_mod.default_sparse_decode_config(8, 8, 512)
+            self.assertEqual(cfg_b8.row_mode, "sparse")
+            self.assertEqual(cfg_b8.tile_m, 16)
+            self.assertEqual(cfg_b8.m_buckets, (8,))
+            self.assertEqual(cfg_b8.route_chunk_rows, 8)
         finally:
             if prev_b16 is None:
                 os.environ.pop("SGLANG_TPU_MUSE_KERNEL_DECODE_B16_SPARSE", None)
@@ -3546,6 +3551,125 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
                 self.assertGreater(
                     comp.memory_analysis().generated_code_size_in_bytes, 0
                 )
+
+    def test_w9_pareto_nonuniform_free_and_dual_scale_placement(self):
+        breakers_mod = _load_pkg_module(
+            "decode_hbm_breakers", _MUSE_DIR / "decode_hbm_breakers.py"
+        )
+        v1_mod = _load_pkg_module(
+            "fused_decode_sparse", _MUSE_DIR / "fused_decode_sparse.py"
+        )
+        planner_mod = _load_pkg_module(
+            "moe_imbalance_planner", _MUSE_DIR / "moe_imbalance_planner.py"
+        )
+
+        # 1. Verify Pareto 2-tier presets preserve tuple return type and layer splits.
+        for name, expected_mid in (
+            ("pareto_f4w22p88", (0.88, 4, 0.22, 2)),
+            ("pareto_f6w24p84", (0.84, 6, 0.24, 1)),
+            ("pareto_f4w24p86", (0.86, 4, 0.24, 2)),
+            ("pareto_f3w28p88", (0.88, 3, 0.28, 2)),
+        ):
+            parsed = breakers_mod.parse_nonuniform_free_spec(name)
+            self.assertIsInstance(parsed, tuple)
+            self.assertEqual(
+                breakers_mod.resolve_nonuniform_free_for_layer(
+                    30, 62, 64,
+                    min_p_topk=0.86, free_rows=8, free_max_w=0.18, free_min_slot=2,
+                    parse_free_spec_fn=v1_mod.parse_free_expert_rows_spec,
+                    spec=name,
+                ),
+                expected_mid,
+            )
+
+        # 2. Verify 3-tier entropy presets & explicit multi-rule per-layer syntax.
+        for spec_name, mid_exp in (
+            ("pareto_3tier_safe", (0.86, 4, 0.24, 2)),
+            ("pareto_3tier_fast", (0.88, 3, 0.28, 2)),
+        ):
+            parsed_d = breakers_mod.parse_nonuniform_free_spec(spec_name)
+            self.assertIsInstance(parsed_d, dict)
+            # Boundary layer (L1) vs skewed layer (L26) vs broad middle layer (L30).
+            self.assertEqual(
+                breakers_mod.resolve_nonuniform_free_for_layer(
+                    1, 62, 64,
+                    min_p_topk=0.86, free_rows=8, free_max_w=0.18, free_min_slot=2,
+                    parse_free_spec_fn=v1_mod.parse_free_expert_rows_spec,
+                    spec=spec_name,
+                ),
+                (0.88, 6, 0.18, 2),
+            )
+            self.assertEqual(
+                breakers_mod.resolve_nonuniform_free_for_layer(
+                    26, 62, 64,
+                    min_p_topk=0.86, free_rows=8, free_max_w=0.18, free_min_slot=2,
+                    parse_free_spec_fn=v1_mod.parse_free_expert_rows_spec,
+                    spec=spec_name,
+                ),
+                (0.88, 4, 0.22, 2),
+            )
+            self.assertEqual(
+                breakers_mod.resolve_nonuniform_free_for_layer(
+                    30, 62, 64,
+                    min_p_topk=0.86, free_rows=8, free_max_w=0.18, free_min_slot=2,
+                    parse_free_spec_fn=v1_mod.parse_free_expert_rows_spec,
+                    spec=spec_name,
+                ),
+                mid_exp,
+            )
+
+        custom = "default=6:0.18:2:0.88;10-12,26=4:0.24:2:0.86"
+        self.assertEqual(
+            breakers_mod.resolve_nonuniform_free_for_layer(
+                11, 62, 64,
+                min_p_topk=0.86, free_rows=8, free_max_w=0.18, free_min_slot=2,
+                parse_free_spec_fn=v1_mod.parse_free_expert_rows_spec,
+                spec=custom,
+            ),
+            (0.86, 4, 0.24, 2),
+        )
+        with self.assertRaises(ValueError):
+            breakers_mod.parse_nonuniform_free_spec("10-12=4:0.24:2:0.86")
+
+        # 3. Dual-scale placement (`sub_owners=16` paired into `num_owners=8`) avoids
+        #    EP=16 even-vs-odd rank hot/cold skew while balancing both EP=8 and EP=16.
+        rng = np.random.default_rng(17)
+        ranks = np.arange(1, 257, dtype=np.float64)
+        rng.shuffle(ranks)
+        skew_counts = 1.0 / np.power(ranks, 1.1)
+        skew_counts = (skew_counts / skew_counts.sum()) * 100000.0
+        chip_map = np.array([r >> 1 for r in range(8)], dtype=np.int32)
+
+        ep8_only = planner_mod.build_static_placement(
+            skew_counts, num_owners=8, owner_to_chip=chip_map,
+            objective="decode_active", min_gain=0.0, hot_slot0_order=True,
+        )
+        dual_scale = planner_mod.build_static_placement(
+            skew_counts, num_owners=8, owner_to_chip=chip_map,
+            objective="decode_active", min_gain=0.0, hot_slot0_order=True,
+            sub_owners=16,
+        )
+        self.assertEqual(
+            sorted(dual_scale.tolist()), list(range(256))
+        )
+        w = planner_mod._decode_objective_weights(
+            skew_counts, objective="decode_active", calib_batch=64
+        )
+        ep8_loads_16 = w[ep8_only].reshape(16, 16).sum(axis=1)
+        dual_loads_16 = w[dual_scale].reshape(16, 16).sum(axis=1)
+        dual_loads_8 = w[dual_scale].reshape(8, 32).sum(axis=1)
+        self.assertLess(
+            dual_loads_16.max() / dual_loads_16.mean(),
+            ep8_loads_16.max() / ep8_loads_16.mean(),
+        )
+        self.assertLess(dual_loads_16.max() / dual_loads_16.mean(), 1.03)
+        self.assertLess(dual_loads_8.max() / dual_loads_8.mean(), 1.02)
+        # Slot 0 of every EP=16 sub-owner holds that sub-owner's hottest expert.
+        for s in range(16):
+            sub_slice = dual_scale[s * 16 : (s + 1) * 16]
+            self.assertEqual(
+                skew_counts[sub_slice[0]], skew_counts[sub_slice].max()
+            )
 
 
 if __name__ == "__main__":

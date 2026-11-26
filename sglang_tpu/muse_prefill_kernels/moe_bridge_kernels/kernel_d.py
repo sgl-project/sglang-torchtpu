@@ -138,7 +138,10 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
         zero_spill
         or envs.SGLANG_TPU_MUSE_KERNEL_D_ZERO_SPILL.get()
         or tok_tile_eff > 64
+        or (tok_tile_eff >= 32 and chunk_size <= 32)
     ) and not (emit_fp8_attn_in or use_blk_fp8_unpool)
+    if chunk_size <= 32 and not use_zero_spill and chunk_size % 16 == 0:
+        tok_tile_eff = min(tok_tile_eff, 16)
 
     num_rows = chunk_size - row_start if num_rows is None else num_rows
     assert row_start % tok_tile_eff == 0 and num_rows % tok_tile_eff == 0, (
@@ -219,6 +222,17 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                 u_scratch_ref[r0 : r0 + r_step, c0 * lanes : (c0 + c_step) * lanes] = (
                     jnp.concatenate(parts, axis=0)
                 )
+
+    def _load_mxu_tile_128x1024(buf_2x_ref, slot, m0, m1, c0, c1, c_grp):
+        vals_raw = buf_2x_ref[slot, m0:m1, c0:c1, :]
+        if in_buf_is_fp8:
+            vals_raw = vals_raw.astype(jnp.bfloat16)
+        # Scrub NaN/Inf (e.g. unwritten 0x7F fp8 out_buf padding rows) before the 16x128 MXU dot
+        # so off-diagonal 0.0 weights cannot propagate 0.0 * NaN/Inf = NaN within a 16-row block.
+        vals_raw = jnp.where(
+            jnp.isfinite(vals_raw.astype(jnp.float32)), vals_raw, jnp.bfloat16(0.0)
+        )
+        return vals_raw.reshape(16 * topk, c_grp * lanes)
 
     if use_zero_spill:
         t_sub = min(32, tok_tile_eff)
@@ -350,11 +364,8 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                     for c_blk in range(n2_cols // c_grp_zs):
                         c0, c1 = c_blk * c_grp_zs, (c_blk + 1) * c_grp_zs
                         u0, u1 = c0 * lanes, c1 * lanes
-                        vals_raw = buf_2x_ref[slot, m0:m1, c0:c1, :]
-                        if in_buf_is_fp8:
-                            vals_raw = vals_raw.astype(jnp.bfloat16)
-                        vals_128x1024 = vals_raw.reshape(
-                            16 * topk, c_grp_zs * lanes
+                        vals_128x1024 = _load_mxu_tile_128x1024(
+                            buf_2x_ref, slot, m0, m1, c0, c1, c_grp_zs
                         )
                         u_sub_bf16 = jnp.dot(
                             w_16x128,
@@ -802,11 +813,8 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                 for c_blk in range(n2_cols // c_grp):
                     c0, c1 = c_blk * c_grp, (c_blk + 1) * c_grp
                     u0, u1 = c0 * lanes, c1 * lanes
-                    vals_raw = buf_2x_ref[slot, m0:m1, c0:c1, :]
-                    if in_buf_is_fp8:
-                        vals_raw = vals_raw.astype(jnp.bfloat16)
-                    vals_128x1024 = vals_raw.reshape(
-                        16 * topk, c_grp * lanes
+                    vals_128x1024 = _load_mxu_tile_128x1024(
+                        buf_2x_ref, slot, m0, m1, c0, c1, c_grp
                     )
                     u_sub_bf16 = jnp.dot(
                         w_16x128,
@@ -1156,7 +1164,7 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
         ),
         compiler_params=pltpu.CompilerParams(
             disable_bounds_checks=True,
-            vmem_limit_bytes=62 * 1024 * 1024,
+            vmem_limit_bytes=63 * 1024 * 1024,
         ),
         name=(
             f"pallas_d_combine_unpool_4slab_t{tok_tile_eff}"
