@@ -71,12 +71,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.models.dits import minimax_h3 as dit
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3 import (
-    packed_sequence,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
-    MiniMaxH3DenoisingStage,
-)
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     ensure_distributed_env_defaults,
 )
@@ -297,11 +291,7 @@ class _RecordingOp:
 
 @contextlib.contextmanager
 def _padding_restored():
-    with patch.object(
-        packed_sequence,
-        "minimax_h3_padded_seq_len",
-        packed_sequence.minimax_h3_padded_seq_len,
-    ):
+    with patch.object(hook, "_kernel_padding", None):
         yield
 
 
@@ -1399,37 +1389,13 @@ def _case_loop(rank, world, layers, shard: bool):
         enable_cache_dit=None,
         quality="lossless",
     )
-    cls = dit.MiniMaxH3DiTModel
-    names = (
-        "post_load_weights",
-        "forward",
-        "validate_weight_update_source",
-        "validate_lora_layers",
-    )
-    from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
-        LoRAPipeline,
-    )
-
-    with (
-        patch.multiple(cls, **{name: getattr(cls, name) for name in names}),
-        patch.object(MiniMaxH3DenoisingStage, "_run_full_loop", loop),
-        patch.object(
-            LoRAPipeline,
-            "_reject_lora_on_packed_weights",
-            LoRAPipeline._reject_lora_on_packed_weights,
-        ),
-        _recorded_gathers(gathers),
-    ):
-        hook.install()
-        try:
-            run = MiniMaxH3DenoisingStage._run_full_loop
-            for rid, warmup in (("warm", True), ("measured", False)):
-                batch = SimpleNamespace(
-                    request_id=rid, is_warmup=warmup, sampling_params=params
-                )
-                run(stage, batch, None)
-        finally:
-            del cls._tpu_h3_megakernel_installed
+    with _recorded_gathers(gathers):
+        for rid, warmup in (("warm", True), ("measured", False)):
+            batch = SimpleNamespace(
+                request_id=rid, is_warmup=warmup, sampling_params=params
+            )
+            # The hook around MiniMaxH3DenoisingStage._run_full_loop.
+            hook.run_request(loop, stage, batch, None)
     return SimpleNamespace(op=op, gathers=gathers)
 
 

@@ -30,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -134,6 +135,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     MiniMaxH3DenoisingStage,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms.plugins import HookRegistry
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     ensure_distributed_env_defaults,
 )
@@ -157,6 +159,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.append(_REPO_ROOT)
 
 from sglang_tpu.envs import envs as tpu_envs  # noqa: E402
+from sglang_tpu.multimodal_gen import hooks  # noqa: E402
 from sglang_tpu.multimodal_gen.h3_megakernel import hook, pack  # noqa: E402
 
 _HAS_JAX = importlib.util.find_spec("jax") is not None
@@ -353,12 +356,9 @@ def _kernel_config(arch, layers: int):
 
 @contextlib.contextmanager
 def _padding_restored():
-    """Restore the packed builders' padding function after a test."""
-    with patch.object(
-        packed_sequence,
-        "minimax_h3_padded_seq_len",
-        packed_sequence.minimax_h3_padded_seq_len,
-    ):
+    """The packed builders' padding hook applied, and the padding restored
+    after a test."""
+    with _hooked():
         yield
 
 
@@ -465,12 +465,11 @@ class TestMegakernelPadding(CustomTestCase):
 
     def test_padding_unchanged_unless_packed(self):
         # Off, refused or dump-only, the builders keep their own padding.
-        original = packed_sequence.minimax_h3_padded_seq_len
         with _padding_restored():
             model = _bare_model()
             with patch.object(hook, "_ranks_agree", lambda reason: reason):
                 self.assertFalse(hook.enable(model))
-            self.assertIs(packed_sequence.minimax_h3_padded_seq_len, original)
+            self.assertIsNone(hook._kernel_padding)
             self.assertEqual(_packed_t2va(60)["seq_len"], 128)
 
 
@@ -593,8 +592,9 @@ def _kernel_rope(x, cos, sin, rope_dims):
 
 
 @contextlib.contextmanager
-def _installed(run_full_loop=None):
-    """``hook.install`` with every patched class attribute restored after;
+def _hooked(run_full_loop=None):
+    """The hooks as the plugin entry point registers them and the HookRegistry
+    applies them, every target, the registry and the padding restored after;
     ``run_full_loop`` stands in for the stage's denoise loop."""
     cls = dit.MiniMaxH3DiTModel
     names = (
@@ -611,13 +611,20 @@ def _installed(run_full_loop=None):
             "_reject_lora_on_packed_weights",
             LoRAPipeline._reject_lora_on_packed_weights,
         ),
+        patch.object(
+            packed_sequence,
+            "minimax_h3_padded_seq_len",
+            packed_sequence.minimax_h3_padded_seq_len,
+        ),
+        patch.object(hook, "_kernel_padding", None),
+        patch.object(HookRegistry, "_hooks", defaultdict(list)),
+        patch.object(HookRegistry, "_patched", set()),
     ):
-        hook.install()
-        hook.install()  # idempotent
-        try:
-            yield cls
-        finally:
-            del cls._tpu_h3_megakernel_installed
+        with tpu_envs.SGLANG_TPU_ENABLE_H3_MEGAKERNEL.override(True):
+            hooks.register()
+        HookRegistry.apply_hooks()
+        hooks.require_h3_megakernel_hooks()
+        yield cls
 
 
 def _tiny_model(arch=None, device=None):
@@ -1005,7 +1012,7 @@ class TestMegakernelHook(CustomTestCase):
                     originals, request, packed_reference, calls
                 ),
             )
-            padding = packed_sequence.minimax_h3_padded_seq_len
+            padding = hook._kernel_padding
         self.assertEqual(padding.func, hook.padded_seq_len)
         self.assertEqual(padding.keywords["devices"], 2)
         (stack,) = model.blocks
@@ -1098,7 +1105,7 @@ class TestMegakernelHook(CustomTestCase):
         self.assertEqual(stack.op.call_count, 1)
 
     def test_packed_model_refuses_lora_and_weight_updates(self):
-        with _installed() as cls:
+        with _hooked() as cls:
             packed, plain = _bare_model(cls, packed=True), _bare_model(cls)
             with self.assertRaisesRegex(ValueError, "LoRA"):
                 packed.validate_lora_layers(["blocks.0.attn.qkv_proj"])
@@ -1141,7 +1148,7 @@ class TestMegakernelHook(CustomTestCase):
                 sampling_params=SimpleNamespace(**params),
             )
 
-        with _installed(run_full_loop=loop_mock):
+        with _hooked(run_full_loop=loop_mock):
             run = MiniMaxH3DenoisingStage._run_full_loop
             with self.assertLogs(hook.logger, logging.INFO) as logs:
                 run(stage, batch("r1"), None)
@@ -1202,22 +1209,66 @@ class TestMegakernelHook(CustomTestCase):
             files["/sys/fs/cgroup/memory.max"] = "max"
             self.assertEqual(hook._host_available(), 1 << 40)
 
-    def test_worker_installs_the_h3_hook_when_enabled(self):
+    def test_plugin_registers_the_hooks_when_enabled(self):
+        # The sglang.multimodal_gen.plugins entry point registers nothing
+        # without the option. With it, registering and applying the hooks
+        # (every target resolves) imports no megakernel module: a hook does,
+        # when it first runs.
+        import tomllib
+
+        with open(os.path.join(_REPO_ROOT, "pyproject.toml"), "rb") as f:
+            entry_points = tomllib.load(f)["project"]["entry-points"]
+        self.assertEqual(
+            entry_points["sglang.multimodal_gen.plugins"],
+            {"tpu_oot_hooks": "sglang_tpu.multimodal_gen.hooks:register"},
+        )
+        with (
+            patch.object(HookRegistry, "_hooks", defaultdict(list)),
+            tpu_envs.SGLANG_TPU_ENABLE_H3_MEGAKERNEL.override(False),
+        ):
+            hooks.register()
+            self.assertEqual(dict(HookRegistry._hooks), {})
+        megakernel = ("sglang_tpu.multimodal_gen.h3_megakernel", hook.__name__)
+        with patch.dict(sys.modules, dict.fromkeys(megakernel)), _hooked():
+            pass
+        for _, name, _ in hooks.H3_MEGAKERNEL_HOOKS:
+            self.assertTrue(callable(getattr(hook, name)), name)
+        # AFTER post_load_weights: the kernel takes the blocks only when enabled.
+        model = _bare_model()
+        with (
+            patch.object(dit.MiniMaxH3DiTModel, "post_load_weights", lambda self: None),
+            _hooked(),
+            patch.object(hook, "enable") as enable,
+        ):
+            for h3_on in (False, True):
+                with tpu_envs.SGLANG_TPU_ENABLE_H3_MEGAKERNEL.override(h3_on):
+                    self.assertIsNone(model.post_load_weights())
+        enable.assert_called_once_with(model)
+
+    def test_worker_requires_the_h3_hooks_when_enabled(self):
         from sglang_tpu import patches
         from sglang_tpu.multimodal_gen import minimax_h3, rope, worker
 
-        for h3_on in (False, True):
+        def install(h3_on: bool) -> None:
             with (
                 patch.object(patches, "_register_aten_fallbacks"),
                 patch.object(rope, "install"),
                 patch.object(minimax_h3, "install") as minimax_h3_install,
-                patch.object(hook, "install") as h3_install,
                 tpu_envs.SGLANG_TPU_ENABLE_H3_MEGAKERNEL.override(h3_on),
                 patch.object(torch, "set_float32_matmul_precision"),
             ):
                 worker.install_runtime_patches()
             minimax_h3_install.assert_called_once_with()
-            self.assertEqual(h3_install.call_count, int(h3_on))
+
+        install(False)
+        # Enabled without the plugin's hooks: no silent fallback to torch.
+        with (
+            patch.object(HookRegistry, "_patched", set()),
+            self.assertRaisesRegex(RuntimeError, "tpu_oot_hooks"),
+        ):
+            install(True)
+        with _hooked():
+            install(True)
 
 
 # ------------------------------------------------------------ vouched heads
@@ -1440,7 +1491,7 @@ class TestVouchedHeads(CustomTestCase):
                 ),
             )
 
-        with _installed(run_full_loop=MagicMock(side_effect=loop)):
+        with _hooked(run_full_loop=MagicMock(side_effect=loop)):
             run = MiniMaxH3DenoisingStage._run_full_loop
             with self.assertLogs(hook.logger, logging.INFO) as logs:
                 run(stage, batch("warm", warmup=True), None)
@@ -1688,7 +1739,7 @@ class TestStaticStructureOption(CustomTestCase):
             self.assertLogs(hook.logger, logging.INFO) as logs,
         ):
             self.assertTrue(hook.enable(model))
-            padding = packed_sequence.minimax_h3_padded_seq_len
+            padding = hook._kernel_padding
         self.assertEqual(op_for.call_args.args[1:], (2, True))
         (stack,) = model.blocks
         self.assertTrue(stack.structured)

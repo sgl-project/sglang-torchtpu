@@ -6,9 +6,12 @@ Runtime patch, tracked debt:
   programs with Ulysses all-to-alls between them; the Pallas megakernel
   (``kernel.stack``) runs every block of a step in one call, with the
   Ulysses exchange inside it.
-- How: with ``SGLANG_TPU_ENABLE_H3_MEGAKERNEL=1``, :func:`install` wraps
-  ``MiniMaxH3DiTModel.post_load_weights`` to decide, identically on every
-  rank, whether the kernel can run (:func:`unsupported_reason`). If it can,
+- How: with ``SGLANG_TPU_ENABLE_H3_MEGAKERNEL=1``, the
+  ``sglang.multimodal_gen.plugins`` entry point
+  (``sglang_tpu.multimodal_gen.hooks``) registers this module's hooks with
+  the HookRegistry. AFTER ``MiniMaxH3DiTModel.post_load_weights``,
+  :func:`pack_after_load` decides, identically on every rank, whether the
+  kernel can run (:func:`unsupported_reason`). If it can,
   the op is registered, the blocks' projections are packed into the kernel's
   layout (originals freed, staged through host memory) and ``model.blocks``
   becomes ``ModuleList([H3MegakernelStack])``, the seam Cache-DiT also uses:
@@ -17,14 +20,18 @@ Runtime patch, tracked debt:
   resident ``adaln_proj`` on every call, the one-hot and RoPE tables from
   sglang's indices and RoPE cache, and passes the live length from
   ``cu_seqlens`` on device (one program for every prompt length of a padded
-  row count). ``packed_sequence.minimax_h3_padded_seq_len`` pads the packed
-  sequence to a row count the kernel tiles well (``tiling.padded_rows``).
+  row count). AROUND ``packed_sequence.minimax_h3_padded_seq_len``,
+  :func:`pad_to_kernel_rows` pads the packed sequence to a row count the
+  kernel tiles well (``tiling.padded_rows``).
   With ``SGLANG_TPU_OPT_H3_MEGAKERNEL_STATIC_STRUCTURE=1`` the host bounds
   also pick a static loop structure (``kernel.stack``'s
   ``static_structure``): one program per padded row count and loop
   structure, the generic walk at other row counts.
   Otherwise sglang's blocks run unchanged. Packed models refuse weight
-  updates, LoRA, Cache-DiT, Spectrum and TeaCache. With
+  updates and LoRA (BEFORE ``validate_weight_update_source``,
+  ``validate_lora_layers`` and ``LoRAPipeline._reject_lora_on_packed_weights``)
+  and Cache-DiT, Spectrum and TeaCache (AROUND
+  ``MiniMaxH3DenoisingStage._run_full_loop``, :func:`run_request`). With
   ``SGLANG_TPU_OPT_H3_MEGAKERNEL_VOUCH=1`` the op is the vouched variant
   (``op.local_vouched_stack``): each step after a request's first also
   tries at a fixed max the heads the request's previous step's peaks vouch
@@ -43,9 +50,19 @@ Runtime patch, tracked debt:
   (SGLANG_TPU_OPT_H3_MEGAKERNEL_LEAN_CUT, _SPLIT_ITEMS, _EPILOGUE_CHUNKS,
   _WIDE_KV, _WIDE_KV_ONLINE) shape the structured calls at
   ``op.LEVER_SHAPES``' row counts.
-- Upstream PR or issue: none.
-- Remove when: the torch_tpu block path reaches the kernel's speed, or core
-  grows a platform hook for the DiT block stack.
+- Upstream PR or issue: the target seam is a shared DiT megakernel
+  (block-stack) integration seam in multimodal_gen, mirroring srt's
+  ``plugin_kernels`` spec and ``kernel_plugins`` binding. A kernel declares
+  its requirements and the features it accepts, and every other feature
+  (FSDP, offload, torch.compile, Cache-DiT, step caching, LoRA, weight
+  updates, sparse attention) is refused; one binding validates at startup,
+  agrees across ranks, replaces the blocks after load and dispatches with
+  fallback, with seams for platform-provided sequence padding and
+  per-request denoise hooks (``begin_request`` / ``end_request``). These
+  hooks move onto it.
+  TODO: link the tracking issue.
+- Remove when: the torch_tpu block path reaches the kernel's speed, or that
+  seam lands.
 """
 
 from __future__ import annotations
@@ -82,6 +99,8 @@ _SHARD_VOTE = (
 # step tries at a fixed max (SGLANG_TPU_OPT_H3_MEGAKERNEL_VOUCH). Any value
 # >= 0 keeps every step exact; a lower one only adds recomputed steps.
 VOUCH_MARGIN = 1.1
+# The packed builders' padding once a DiT is packed (pad_to_kernel_rows).
+_kernel_padding = None
 
 
 def requested() -> bool:
@@ -502,11 +521,8 @@ def padded_seq_len(
 
 def _use_kernel_padding(devices: int, config) -> None:
     """Point the packed builders' padding at the kernel's row count."""
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3 import (
-        packed_sequence,
-    )
-
-    packed_sequence.minimax_h3_padded_seq_len = functools.partial(
+    global _kernel_padding
+    _kernel_padding = functools.partial(
         padded_seq_len,
         devices=devices,
         config=config,
@@ -1234,87 +1250,75 @@ def _packed_error(what: str) -> ValueError:
     )
 
 
-def _refuse_when_packed(method, what: str):
-    @functools.wraps(method)
-    def wrapped(self, *args, **kwargs):
-        if is_packed(self):
+def _refuse_when_packed(what: str):
+    def refuse(model, *args, **kwargs) -> None:
+        if is_packed(model):
             raise _packed_error(what)
-        return method(self, *args, **kwargs)
 
-    return wrapped
+    return refuse
 
 
-def install() -> None:
-    """Route ``MiniMaxH3DiTModel``'s block stack through the kernel when every
-    rank can run it (decided after the weights load)."""
-    from sglang.multimodal_gen.runtime.models.dits import minimax_h3 as dit
-    from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
-        LoRAPipeline,
-    )
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
-        MiniMaxH3DenoisingStage,
-    )
+# The hooks; sglang_tpu.multimodal_gen.hooks registers them.
 
-    cls = dit.MiniMaxH3DiTModel
-    if getattr(cls, "_tpu_h3_megakernel_installed", False):
-        return
-    post_load_weights = cls.post_load_weights
-    reject_lora = LoRAPipeline._reject_lora_on_packed_weights
-    run_full_loop = MiniMaxH3DenoisingStage._run_full_loop
 
-    @functools.wraps(post_load_weights)
-    def _post_load_weights(self) -> None:
-        post_load_weights(self)
-        if envs.SGLANG_TPU_ENABLE_H3_MEGAKERNEL.get():
-            enable(self)
+def pack_after_load(result, model) -> None:
+    """AFTER ``MiniMaxH3DiTModel.post_load_weights``: route the block stack
+    through the kernel when every rank can run it."""
+    if requested():
+        enable(model)
 
-    @functools.wraps(reject_lora)
-    def _reject_lora_on_packed_weights(self) -> None:
-        # set_lora and convert_to_lora_layers check here before any layer is
-        # replaced.
-        for name in ("transformer", "transformer_2"):
-            module = self.modules.get(name)
-            if module is not None and _packed_dit(module) is not None:
-                raise _packed_error("LoRA")
-        reject_lora(self)
 
-    @functools.wraps(run_full_loop)
-    def _run_full_loop(self, batch, server_args) -> None:
-        model = _packed_dit(self.transformer)
-        if model is None:
-            return run_full_loop(self, batch, server_args)
-        # Before the loop: Cache-DiT would mount on the blocks first thing.
-        refusal = request_refusal(self, batch)
-        if refusal is not None:
-            raise ValueError(
-                f"MiniMax H3 megakernel: a request with {refusal} cannot run "
-                "on the packed DiT blocks; send it without, or restart without "
-                "SGLANG_TPU_ENABLE_H3_MEGAKERNEL"
-            )
-        stack = model.__dict__[_STATE]
-        start = stack.calls
-        # The vouched heads live from here to the end of this request's loop.
-        stack.begin_request(_request_id(batch))
-        try:
-            return run_full_loop(self, batch, server_args)
-        finally:
-            # After the loop: the one host read of the tally comes just before
-            # the stage's own output check waits for the device. The tally
-            # follows the "(warmup)" mark, which log readers match.
-            tally = stack.end_request()
-            logger.info(
-                "MiniMax H3 megakernel: request %s ran the block-stack op %d times%s%s",
-                _request_id(batch),
-                stack.calls - start,
-                " (warmup)" if getattr(batch, "is_warmup", False) else "",
-                _vouch_summary(tally, stack.calls - start),
-            )
+# BEFORE MiniMaxH3DiTModel.validate_weight_update_source and validate_lora_layers.
+refuse_weight_updates = _refuse_when_packed("weight updates")
+refuse_lora_layers = _refuse_when_packed("LoRA")
 
-    cls.post_load_weights = _post_load_weights
-    cls.validate_weight_update_source = _refuse_when_packed(
-        cls.validate_weight_update_source, "weight updates"
-    )
-    cls.validate_lora_layers = _refuse_when_packed(cls.validate_lora_layers, "LoRA")
-    LoRAPipeline._reject_lora_on_packed_weights = _reject_lora_on_packed_weights
-    MiniMaxH3DenoisingStage._run_full_loop = _run_full_loop
-    cls._tpu_h3_megakernel_installed = True
+
+def refuse_lora_on_packed_dit(pipeline) -> None:
+    """BEFORE ``LoRAPipeline._reject_lora_on_packed_weights``, where set_lora
+    and convert_to_lora_layers check before any layer is replaced."""
+    for name in ("transformer", "transformer_2"):
+        module = pipeline.modules.get(name)
+        if module is not None and _packed_dit(module) is not None:
+            raise _packed_error("LoRA")
+
+
+def run_request(run_full_loop, stage, batch, server_args) -> None:
+    """AROUND ``MiniMaxH3DenoisingStage._run_full_loop``: a packed DiT's
+    request refusals, vouched heads and log line."""
+    model = _packed_dit(stage.transformer)
+    if model is None:
+        return run_full_loop(stage, batch, server_args)
+    # Before the loop: Cache-DiT would mount on the blocks first thing.
+    refusal = request_refusal(stage, batch)
+    if refusal is not None:
+        raise ValueError(
+            f"MiniMax H3 megakernel: a request with {refusal} cannot run "
+            "on the packed DiT blocks; send it without, or restart without "
+            "SGLANG_TPU_ENABLE_H3_MEGAKERNEL"
+        )
+    stack = model.__dict__[_STATE]
+    start = stack.calls
+    # The vouched heads live from here to the end of this request's loop.
+    stack.begin_request(_request_id(batch))
+    try:
+        return run_full_loop(stage, batch, server_args)
+    finally:
+        # After the loop: the one host read of the tally comes just before
+        # the stage's own output check waits for the device. The tally
+        # follows the "(warmup)" mark, which log readers match.
+        tally = stack.end_request()
+        logger.info(
+            "MiniMax H3 megakernel: request %s ran the block-stack op %d times%s%s",
+            _request_id(batch),
+            stack.calls - start,
+            " (warmup)" if getattr(batch, "is_warmup", False) else "",
+            _vouch_summary(tally, stack.calls - start),
+        )
+
+
+def pad_to_kernel_rows(minimax_h3_padded_seq_len, used: int) -> int:
+    """AROUND ``packed_sequence.minimax_h3_padded_seq_len``, every packed
+    builder's padding: the kernel's row count once a DiT is packed."""
+    if _kernel_padding is None:
+        return minimax_h3_padded_seq_len(used)
+    return _kernel_padding(used)

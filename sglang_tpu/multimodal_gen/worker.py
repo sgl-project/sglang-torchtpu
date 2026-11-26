@@ -20,11 +20,12 @@ def install_runtime_patches() -> None:
 
     from sglang_tpu.envs import envs
 
-    # Only a worker with the kernel enabled imports the megakernel package.
+    # The kernel's hooks come from the sglang.multimodal_gen.plugins entry
+    # point; a worker that enables it without them refuses to start.
     if envs.SGLANG_TPU_ENABLE_H3_MEGAKERNEL.get():
-        from sglang_tpu.multimodal_gen.h3_megakernel import hook as h3_megakernel
+        from sglang_tpu.multimodal_gen import hooks
 
-        h3_megakernel.install()
+        hooks.require_h3_megakernel_hooks()
 
 
 def configure_compile_cache() -> None:
