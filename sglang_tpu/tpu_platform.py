@@ -1165,6 +1165,7 @@ class TpuSRTPlatform(SRTPlatform):
         )
         from sglang_tpu.hooks.dsv4 import register_tpu_dsv4_resolution_hooks
         from sglang_tpu.kimi_k3 import static_fp8_parts
+        from sglang_tpu.moe.fused_ep import check_fused_ep_env
         from sglang_tpu.patches import _prepare_tpu_env
 
         register_tpu_dsv4_resolution_hooks()
@@ -1172,6 +1173,7 @@ class TpuSRTPlatform(SRTPlatform):
         # Fail on a mistyped SGLANG_TPU_K3_STATIC_FP8 now, not after the
         # weights have loaded (its binder runs post-load).
         _pin_moe_gather_permute_for_static_fp8(static_fp8_parts())
+        check_fused_ep_env()
         cfg = resolving_view(server_args)
         if cfg.enable_page_major_kv_layout:
             raise ValueError(

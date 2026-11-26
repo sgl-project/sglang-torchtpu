@@ -667,6 +667,20 @@ class TpuEnvs:
     # per global layer. 0 (default): one shared loop with tree-walk KV refill, which keeps
     # the loops in IMEM overlays (q8 32k: TP -3 to -6.5%); 64 restores the previous hoisting.
     SGLANG_TPU_MUSE_MK_ATTN_HOIST_MAX_ROWS = EnvInt(0)
+    # Fused expert-parallel MoE (sglang_tpu/moe/fused_ep.py) for the MoE layers a
+    # model provider admits (attention DP == EP == world): unset keeps every layer
+    # on its --moe-runner-backend; v2 runs fused_ep_moe_v2 with all-gather
+    # dispatch; push runs it with dispatch="push". Needs SGLANG_SHARED_EXPERT_TP1=1
+    # (checked at startup). push also needs two XLA flags in LIBTPU_INIT_ARGS:
+    # --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=0 and
+    # --xla_mosaic_unsafe_allow_multicore_remote_dma=true (push_fused_moe).
+    # Read when the plugin hooks are built.
+    SGLANG_TPU_MOE_FUSED_EP_KERNEL_IMPL = EnvStr(None)
+    # Push-dispatch knobs (fused_ep.PUSH_OPTIONS), forwarded only under
+    # SGLANG_TPU_MOE_FUSED_EP_KERNEL_IMPL=push. Unset keeps the kernel default
+    # (fused_ep_moe_push: sc_prepush=2, tc_exchange=False).
+    SGLANG_TPU_MOE_FUSED_EP_PUSH_SC_PREPUSH = EnvInt(None)
+    SGLANG_TPU_MOE_FUSED_EP_PUSH_TC_EXCHANGE = EnvBool(None)
 
     @classmethod
     def names(cls) -> list[str]:

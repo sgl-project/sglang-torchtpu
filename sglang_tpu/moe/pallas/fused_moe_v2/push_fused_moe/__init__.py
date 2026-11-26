@@ -21,6 +21,13 @@ the first visit positions before the TensorCore kernel starts, and the
 TensorCore kernel pushes the rest with in-kernel remote DMAs. See layer.py.
 Callers go through `fused_ep_moe_v2`; `fused_ep_moe_push` is exported for the
 package's own tests.
+
+Required XLA flags: the SparseCore pre-push and the in-kernel remote DMAs need
+both of these in LIBTPU_INIT_ARGS when libtpu starts, i.e. before the JAX
+client is created (test_fused_ep_moe_push.py sets the same):
+
+    --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=0
+    --xla_mosaic_unsafe_allow_multicore_remote_dma=true
 """
 
 from sglang_tpu.moe.pallas.fused_moe_v2.push_fused_moe.layer import fused_ep_moe_push

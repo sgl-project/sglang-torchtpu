@@ -85,6 +85,7 @@ from sglang_tpu.hooks.mhc import (
     register_mhc_ops,
     wire_hc_ffn_post_pre,
 )
+from sglang_tpu.hooks.moe_fused_ep import hook_specs as moe_fused_ep_hooks
 from sglang_tpu.hooks.moe_topk import (
     biased_grouped_topk,
     biased_topk,
@@ -493,6 +494,8 @@ if envs.SGLANG_TPU_ENABLE_TRUE_ON_POLICY.get():
 
 # After dsv4_hooks: the V4.1 pool hooks must be the outer wrapper.
 HOOKS.extend(dsv41_hooks())
+
+HOOKS.extend(moe_fused_ep_hooks())
 
 _registered = False
 
