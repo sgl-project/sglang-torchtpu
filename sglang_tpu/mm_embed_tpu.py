@@ -175,8 +175,9 @@ def _place_mm_rows(
 
     Args:
         masks: Per-modality host bool masks of shape [rows, 1]; None to skip.
-        embeddings: Per-modality host embeddings, row-aligned in order to their
-            mask's set positions; None to skip.
+        embeddings: Per-modality embeddings, row-aligned in order to their
+            mask's set positions; None to skip. Rows on the device are copied
+            to the host first.
         rows: Padded token count of the batch.
         hidden: Width of the destination.
         dtype: Destination dtype.
@@ -195,6 +196,9 @@ def _place_mm_rows(
             continue
         if isinstance(embedding, PaddedEmbedding):
             embedding = embedding.to_host()
+        elif embedding.device.type != "cpu":
+            # Encoders may keep their output on the device; the buffer is host memory.
+            embedding = embedding.cpu()
         indices = mask.reshape(-1).nonzero(as_tuple=True)[0]
         if indices.numel() != embedding.shape[0]:
             raise ValueError(
