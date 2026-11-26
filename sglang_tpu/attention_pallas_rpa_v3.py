@@ -543,6 +543,13 @@ def _invoke_v3_kernel(
                 eff_lc_toks.add("prefix_fast")
             if "nostaged_qo" not in eff_lc_toks:
                 eff_lc_toks.add("staged_qo")
+            if (
+                not is_tp16_sq_target
+                and not use_dense2
+                and "nogqa8" not in eff_lc_toks
+                and "nogqa8" not in raw_all_toks
+            ):
+                eff_lc_toks.add("gqa8")
         if stationary_q_blocks:
             bq_sz = stationary_q_blocks[0]
             extra["m_block_sizes"] = stationary_q_blocks
@@ -621,6 +628,8 @@ def _invoke_v3_kernel(
                 bkv_sz = 2048
             bkv_csz = max(256, logical_page_size)
             bkv_sz = max(bkv_sz, bkv_csz)
+            if use_dense2:
+                bkv_sz = min(bkv_sz, max(8192, bkv_csz))
             if is_lc_full and not is_tp16_sq_target and bq_sz >= 8192 and bkv_sz >= 8192:
                 raise ValueError(
                     f"TP=8 LC RPAm (bq_sz={bq_sz}, bkv_sz={bkv_sz}) exceeds 64 MiB VMEM; "
@@ -643,6 +652,8 @@ def _invoke_v3_kernel(
             or (bq_sz >= 4096 and "nostaged_qo" not in eff_lc_toks)
         ):
             prefill_opts.add("staged_qo")
+        if is_lc_full and "gqa8" in eff_lc_toks:
+            prefill_opts.add("gqa8")
         if use_w7_preset and sliding_window is not None:
             prefill_opts.update(("fp8_qk", "mrb3"))
         if use_w8_preset and sliding_window is not None:
@@ -739,6 +750,8 @@ def _invoke_v3_kernel(
                 prefill_opts.add("sw_tail_clamp")
         if "mk128" in prefill_opts:
             prefill_opts.difference_update(("vreg_acc", "vreg_acc1", "mrb1"))
+        if "nogqa8" in all_prefill_toks:
+            prefill_opts.discard("gqa8")
         if (
             not (allow_tp16_sq and is_tp16_sq_shape)
             and envs.SGLANG_TPU_RPA_V3_TP16_NATIVE_PREFILL.get()
