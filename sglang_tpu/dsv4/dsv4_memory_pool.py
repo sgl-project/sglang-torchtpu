@@ -67,6 +67,10 @@ def get_or_build_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor:
     """Convert complex64 ``freqs_cis`` ``[max_pos, rope_head_dim // 2]`` into the
     contiguous ``float32`` ``[max_pos, rope_head_dim]`` ``[cos, sin]`` table
     consumed by the TPU Pallas compressor and RoPE kernels."""
+    # The RoPE kernels read a 128-wide table as lane-packed
+    # (get_or_build_rope_lane_table); a plain one that wide would misrotate.
+    if 2 * freqs_cis.shape[-1] == ROPE_LANES:
+        raise ValueError("rope_head_dim 128 has no plain cos/sin table layout")
     key = (id(freqs_cis), freqs_cis.device)
     cached = _COS_SIN_CACHE.get(key)
     if cached is not None:
@@ -79,6 +83,50 @@ def get_or_build_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor:
     )
     _COS_SIN_CACHE[key] = cos_sin
     return cos_sin
+
+
+# Lane-packed RoPE tables, keyed like `_COS_SIN_CACHE`.
+_ROPE_LANE_TABLE: Dict[Tuple[int, torch.device], torch.Tensor] = {}
+ROPE_LANES = 128
+# DeepSeek-V4 rope_head_dim: two positions per lane row.
+ROPE_DIM = ROPE_LANES // 2
+
+
+def get_or_build_rope_lane_table(freqs_cis: torch.Tensor) -> torch.Tensor:
+    """The ``get_or_build_cos_sin_cache`` table packed two positions per row:
+    ``[ceil(max_pos / 2), 128]`` float32, row ``r`` = positions ``2r, 2r + 1``.
+
+    torch_tpu stores the ``[max_pos, 64]`` table dim-0-minor, so a Pallas call
+    that takes it whole relayouts all of it first; a 128-lane row stays
+    row-major, and the RoPE kernels get only the batch's rows
+    (``rope.cos_sin_rows``). For an odd ``max_pos`` the extra slot repeats
+    position ``max_pos - 1``, so a position clipped to the packed length reads
+    what one clipped to ``max_pos`` reads.
+
+    Built on the host and uploaded as its own buffer: a device-side reshape and
+    clone stays a strided view in torch_tpu that re-runs the relayout per use.
+    """
+    key = (id(freqs_cis), freqs_cis.device)
+    cached = _ROPE_LANE_TABLE.get(key)
+    if cached is not None:
+        return cached
+    real_imag = torch.view_as_real(freqs_cis.detach().cpu()).to(torch.float32)
+    assert 2 * real_imag.shape[-2] == ROPE_DIM, tuple(freqs_cis.shape)
+    cos_sin = torch.cat([real_imag[..., 0], real_imag[..., 1]], dim=-1)
+    if cos_sin.shape[0] % 2:
+        cos_sin = torch.cat([cos_sin, cos_sin[-1:]])
+    table = cos_sin.reshape(-1, ROPE_LANES).clone().to(freqs_cis.device)
+    _ROPE_LANE_TABLE[key] = table
+    return table
+
+
+def lookup_cos_sin(table: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    """``[T, 64]`` ``[cos, sin]`` rows of a lane-packed or plain table."""
+    positions = positions.long()
+    if table.shape[-1] != ROPE_LANES:
+        return table[positions]
+    rows = table[positions // 2].view(-1, 2, ROPE_DIM)
+    return rows[torch.arange(rows.shape[0], device=rows.device), positions % 2]
 
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
