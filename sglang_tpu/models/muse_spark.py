@@ -4094,13 +4094,22 @@ class MuseSparkDecoderLayer(nn.Module):
                 backend = _resolve_decode_attn_backend(forward_batch)
                 md = getattr(backend, "forward_metadata", None) if backend is not None else None
                 rpa_mode_str = str(tpu_envs.SGLANG_TPU_RPA_V3_DECODE_FAST.get()).strip()
+                sw = getattr(next_layer_attn.attn, "sliding_window_size", None)
+                if sw is not None and sw <= 0:
+                    sw = None
+                elif sw is not None:
+                    sw = int(sw) + 1
+                lc_swa_step_c = bool(tpu_envs.SGLANG_TPU_MUSE_MK_STEP_C_LC_SWA.get())
                 if (
                     rpa_mode_str
                     and backend is not None
                     and md is not None
                     and getattr(backend, "_decode_prepared_gated_op", None) is not None
                     and getattr(md, "decode_query_size", 0) == 1
-                    and getattr(md, "decode_shared_prefix_pages", None) is None
+                    and (
+                        (lc_swa_step_c and sw is not None)
+                        or getattr(md, "decode_shared_prefix_pages", None) is None
+                    )
                     and backend.can_forward_decode_prepared(
                         next_layer_attn.attn, forward_batch
                     )
@@ -4108,11 +4117,6 @@ class MuseSparkDecoderLayer(nn.Module):
                     kv_cache, kv_layer_idx = _fused_kv_operands(
                         backend.token_to_kv_pool, next_layer_attn.attn.layer_id
                     )
-                    sw = getattr(next_layer_attn.attn, "sliding_window_size", None)
-                    if sw is not None and sw <= 0:
-                        sw = None
-                    elif sw is not None:
-                        sw = int(sw) + 1
                     kv_lens = backend._kv_lens(forward_batch)
                     page_indices = backend._layer_page_indices(
                         next_layer_attn.attn.layer_id, is_swa_layer=(sw is not None)

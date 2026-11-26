@@ -2154,15 +2154,15 @@ def test_step_c_rpa_plan_group_sizing_and_fallback():
     assert (one_blk, slot_pg, use_grp, is_ok) == (True, 20, True, True)
     assert cfg_4.swabatch_group_size == 4
 
-    # 2. Graceful 4 -> 2 fallback when batch tokens only divisible by 2.
+    # 2. Graceful 4 -> 2 fallback when batch tokens only divisible by 2 (B >= 32).
     cfg_2, one_blk_2, slot_pg_2, use_grp_2, is_ok_2 = resolve_step_c_rpa_plan(
         "w8,s4,batchfull,g4k,foldcol,batch4",
         sliding_window=2049,
         pages_per_seq=4,
         phys_page_rows=512,
         kv_pack_dense2=False,
-        b_tokens=6,
-        max_num_seqs=6,
+        b_tokens=34,
+        max_num_seqs=34,
     )
     assert (one_blk_2, slot_pg_2, use_grp_2, is_ok_2) == (True, 10, True, True)
     assert cfg_2.swabatch_group_size == 2
