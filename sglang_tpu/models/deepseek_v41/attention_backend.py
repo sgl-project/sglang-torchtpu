@@ -2295,7 +2295,10 @@ class DSV41TPUAttnBackend(AttentionBackend):
             history = swa.reshape(-1, kv.shape[1])[plan.history_src]
             kv = torch.cat((kv, history, kv[plan.commit_token]))
             records = torch.cat((records, plan.history_dst, plan.commit_dst))
-        swa.copy_(self._publish_swa(metadata, swa, records, kv))
+            updated = self.csa2_ops.publish_window_scatter(swa, records, kv)
+        else:
+            updated = self._publish_swa(metadata, swa, records, kv)
+        swa.copy_(updated)
 
         if attn_sink is None:
             sink = torch.zeros(q.shape[1], dtype=torch.float32, device=q.device)

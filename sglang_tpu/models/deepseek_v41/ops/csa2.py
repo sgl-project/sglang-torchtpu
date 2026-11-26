@@ -109,6 +109,19 @@ def _publish_swa(pages: jax.Array, records: jax.Array, kv: jax.Array) -> jax.Arr
     return write_swa_pages(pages, records, kv)
 
 
+def _publish_window_scatter(
+    pages: jax.Array, records: jax.Array, values: jax.Array
+) -> jax.Array:
+    """Write unique valid workspace/ring records in the single-bank window pool."""
+    owner = pages.reshape(-1, HEAD_DIM)
+    capacity = owner.shape[0]
+    # Negative scatter indices wrap in JAX. Drop null, padding and oversized rows.
+    dst = jnp.where(
+        (records >= SWA_PAGE_SIZE) & (records < capacity), records, capacity
+    )
+    return owner.at[dst].set(values, mode="drop").reshape(pages.shape)
+
+
 def _swa_plan(
     pages: jax.Array, records: jax.Array
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
@@ -457,6 +470,7 @@ _DEFINITIONS = {
     "swa_metadata": (_swa_metadata, _fake_swa_metadata, ()),
     "swa_metadata_non_causal": (_swa_metadata_non_causal, _fake_swa_metadata, ()),
     "publish_swa": (_publish_swa, _fake_publish_swa, (0,)),
+    "publish_window_scatter": (_publish_window_scatter, _fake_publish_swa, (0,)),
     "swa_plan": (_swa_plan, _fake_swa_plan, ()),
     "publish_swa_planned": (_publish_swa_planned, _fake_publish_swa_planned, (0,)),
     "publish_main": (_publish_main, _fake_publish_main, (0, 1)),
@@ -536,6 +550,12 @@ def publish_swa(
     unique. Returns the new ``pages``; the caller does ``pages.copy_(...)``.
     """
     return _op("publish_swa")(pages, _i32(records), kv.reshape(-1, HEAD_DIM))
+
+
+def publish_window_scatter(
+    pages: torch.Tensor, records: torch.Tensor, kv: torch.Tensor
+) -> torch.Tensor:
+    return _op("publish_window_scatter")(pages, _i32(records), kv.reshape(-1, HEAD_DIM))
 
 
 def swa_plan(pages: torch.Tensor, records: torch.Tensor) -> tuple[torch.Tensor, ...]:

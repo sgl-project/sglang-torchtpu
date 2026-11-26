@@ -384,5 +384,40 @@ def test_compiled_step_updates_caller_pools(tpu_ops, ratio):
     _check(case, inputs, out, swa_records)
 
 
+@requires_tpu
+def test_window_scatter_preserves_old_ring_and_untouched_rows(tpu_ops):
+    rng = torch.Generator().manual_seed(19)
+    host = torch.randn(3, 64, 512, generator=rng).bfloat16()
+    values = torch.randn(9, 512, generator=rng).bfloat16()
+    # Workspace rows 128/129 share a word. Commit overwrites row 64
+    # after that row's old contents have been staged into row 130.
+    records = torch.tensor([128, 129, -1, -2, 0, 63, 192, 193, 191], dtype=torch.int32)
+    history_src = torch.tensor([64, 65], dtype=torch.int32)
+    history_dst = torch.tensor([130, 131], dtype=torch.int32)
+    commit_token = torch.tensor([0, 1], dtype=torch.int32)
+    commit_dst = torch.tensor([64, 67], dtype=torch.int32)
+
+    @functools.partial(torch.compile, backend="tpu", fullgraph=True, dynamic=False)
+    def step(owner, kv, dst, hs, hd, ct, cd):
+        staged = torch.cat((kv, owner.reshape(-1, 512)[hs], kv[ct]))
+        owner.copy_(
+            tpu_ops.publish_window_scatter(owner, torch.cat((dst, hd, cd)), staged)
+        )
+        return owner
+
+    args = tuple(
+        t.to("tpu")
+        for t in (values, records, history_src, history_dst, commit_token, commit_dst)
+    )
+    owner = host.to("tpu")
+    for _ in range(2):
+        rows = host.view(-1, 512)
+        rows[history_dst.long()] = rows[history_src.long()]
+        rows[[128, 129, 191]] = values[[0, 1, 8]]
+        rows[commit_dst.long()] = values[commit_token.long()]
+        owner = step(owner, *args)
+        torch.testing.assert_close(owner.cpu(), host, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-p", "no:cacheprovider"]))

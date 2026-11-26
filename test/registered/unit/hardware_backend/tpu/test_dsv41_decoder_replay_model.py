@@ -109,6 +109,8 @@ class RefCsa2:
         flat[records[ok].long()] = kv.reshape(-1, out.shape[-1])[ok].to(out.dtype)
         return out
 
+    publish_window_scatter = publish_swa
+
     @staticmethod
     def publish_main(words, scales, records, latent):
         q, scale = _fp8_rows(latent)
