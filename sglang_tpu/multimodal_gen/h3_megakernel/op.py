@@ -140,6 +140,19 @@ SHAPE_TILINGS = {(8, 4800): dataclasses.replace(STACK_TILING, split_q_tiles=True
 #     +inf at the keys past the live length, instead of selecting its
 #     probabilities: exp2(-inf) is the select's +0; bitwise), at every
 #     structured shape.
+#   cast_first: cast_first (phase B's item epilogue rounds o / l to bf16 before
+#     the transpose into the output tile; bitwise), at every structured shape.
+#   step_tables: step_tables (phase A's per-step scalars from SMEM tables
+#     filled once a call, not integer divisions every step; bitwise), at every
+#     structured shape.
+#   slab_modulate: slab_modulate (phase C's uniform tiles modulate the MLP
+#     input as modulate_slabs, not whole rows a chunk; bitwise), at every
+#     structured shape (with uniform_adaln).
+#   sum_vouch: sum_bounds (the vouched op certifies each tried head by its
+#     softmax's own row sums, kernel.sum_safe_heads, instead of its q/k norm
+#     peaks, and phase A computes no peaks): heads whose scores the norms do
+#     not bound, such as layer 49's, can then run at a fixed max; rounding
+#     moves with the heads tried. At every structured shape; vouched op only.
 LEVER_SHAPES = {
     "lean_cut": frozenset({(8, 4864), (8, 4800), (4, 9600), (2, 19456), (2, 19200)}),
     "split_items": frozenset({(8, 4864), (8, 4800), (4, 9600), (2, 19456), (2, 19200)}),
@@ -155,7 +168,16 @@ LEVER_SHAPES = {
     ),
     "zero_ahead": frozenset({(8, 4864), (8, 4800), (4, 9600), (2, 19456), (2, 19200)}),
     "mask_scores": frozenset({(8, 4864), (8, 4800), (4, 9600), (2, 19456), (2, 19200)}),
+    "sum_vouch": frozenset({(8, 4864), (8, 4800), (4, 9600), (2, 19456), (2, 19200)}),
+    "cast_first": frozenset({(8, 4864), (8, 4800), (4, 9600), (2, 19456), (2, 19200)}),
+    "step_tables": frozenset({(8, 4864), (8, 4800), (4, 9600), (2, 19456), (2, 19200)}),
+    "slab_modulate": frozenset(
+        {(8, 4864), (8, 4800), (4, 9600), (2, 19456), (2, 19200)}
+    ),
 }
+# sum_vouch: the margin (log2 units) inside kernel.sum_safe_heads' window a
+# head's sums need to be tried at a fixed max the next step.
+SUM_VOUCH_MARGIN = 8.0
 # lean_cut's smallest sub-block: whole 256-key MXU passes.
 CUT_KV_COMPUTE = 256
 EPILOGUE_CHUNK = 64
@@ -176,6 +198,8 @@ TILING_FIELDS = frozenset(
         "sub_rows",
         "chunk_rows",
         "epilogue_rows",
+        "epilogue_chunk",
+        "epilogue_chunk_peaks",
         "stage_slots",
     }
 )
@@ -273,11 +297,17 @@ def stack_kwargs(
     if "split_items" in on:
         kwargs["split_items"] = True
     if "epilogue_chunks" in on:
-        kwargs["epilogue_chunk"] = EPILOGUE_CHUNK
+        # A tiling's own epilogue_chunk bound (SGLANG_TPU_OPT_H3_MEGAKERNEL_TILING)
+        # in place of the default; any chunk computes the same per-row values.
+        kwargs["epilogue_chunk"] = (tiling and tiling.epilogue_chunk) or EPILOGUE_CHUNK
     if "wide_kv" in on:
         kwargs["kv_group"] = KV_GROUP
     elif "wide_kv_online" in on:
         kwargs["kv_group"] = (1, KV_GROUP)
+    if structure and tiling and tiling.epilogue_chunk_peaks:
+        # The TILING knob's chunk for the peaks layers' epilogue (any chunk
+        # computes the same per-row values and the same peaks).
+        kwargs["epilogue_chunk_peaks"] = tiling.epilogue_chunk_peaks
     if "modulate_pieces" in on:
         kwargs["modulate_pieces"] = modulate_pieces(devices, rows, tiling, config)
     if "prefetch_down" in on:
@@ -288,6 +318,14 @@ def stack_kwargs(
         kwargs["zero_ahead"] = True
     if "mask_scores" in on:
         kwargs["mask_scores"] = True
+    if "sum_vouch" in on:
+        kwargs["sum_bounds"] = True
+    if "cast_first" in on:
+        kwargs["cast_first"] = True
+    if "step_tables" in on:
+        kwargs["step_tables"] = True
+    if "slab_modulate" in on:
+        kwargs["slab_modulate"] = True
     return kwargs
 
 
@@ -385,6 +423,15 @@ def local_vouched_stack(
         tried = lax.pmin(tried, axis)
     tried = tried != 0
     options = dict(options, return_peaks=True)
+    # sum_vouch (options' sum_bounds): the peaks are the heads' fixed-max row
+    # sums; a head is inside while they stay in kernel.sum_safe_heads' window,
+    # and tried next while they stay SUM_VOUCH_MARGIN inside it.
+    sums = bool(options.get("sum_bounds"))
+
+    def safe(peaks, next_step=False):
+        if sums:
+            return kernel.sum_safe_heads(peaks, SUM_VOUCH_MARGIN if next_step else 0.0)
+        return kernel.safe_heads(peaks, margin if next_step else 1.0)
 
     def attempt(carry):
         index = carry[0]
@@ -408,7 +455,7 @@ def local_vouched_stack(
         peaks = peaks[:, :, :1]
         if axis is not None:
             peaks = lax.pmax(peaks, axis)
-        inside = kernel.safe_heads(peaks)[:, : config.heads]
+        inside = safe(peaks)[:, : config.heads]
         return index + 1, out, peaks, jnp.all(inside | ~fixed)
 
     layers = tables.shape[0]
@@ -420,7 +467,7 @@ def local_vouched_stack(
     )
     attempts, out, peaks, _ = lax.while_loop(lambda c: ~c[3], attempt, start)
     redone = attempts - 1
-    vouched = kernel.safe_heads(peaks, margin)[:, : config.heads] & unproven
+    vouched = safe(peaks, next_step=True)[:, : config.heads] & unproven
     ran = jnp.where(redone == 0, tried.sum(dtype=jnp.int32), 0)
     step = jnp.stack((redone, ran)).astype(jnp.int32)
     return out, vouched.astype(jnp.int32), tally + step

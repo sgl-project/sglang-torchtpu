@@ -617,6 +617,23 @@ class TestStackInterpretMultiDevice(CustomTestCase):
         """
         self.assert_runs(_in_fresh_process(2, code, timeout=1800), 1)
 
+    def test_four_devices_new_levers_change_no_bit(self):
+        # step_tables (phase A's step scalars, the head groups rotated per
+        # device and each head's owner from SMEM tables) and cast_first
+        # together, on four devices with three heads a device (the
+        # bulk exchange's sends and kept rows) and two layers (fixed max, then
+        # online): every row bit for bit against the plain call; the race
+        # detector on.
+        code = """
+            kw = dict(rows=128, heads=12, used=350, norm_scale=(0.3, 1.5))
+            base, want, _ = t._run(4, **kw)
+            got, _, raced = t._run(4, races=True, step_tables=True,
+                                   cast_first=True, **kw)
+            print(json.dumps([[*t._errors(got, want),
+                               t._same_bits(got, base) and not raced]]))
+        """
+        self.assert_runs(_in_fresh_process(4, code, timeout=3600), 1, slack=2)
+
     def test_four_devices_bulk_exchange(self):
         # Three heads a device (bulk_exchange streams the second and third
         # during phase B), 128 rows each, 350 real (the padding starts on
@@ -932,6 +949,37 @@ class TestKernelLevers(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "modulate_pieces"):
                     _run(rows=512, heads=heads, modulate_pieces=pieces)
 
+    def test_epilogue_chunk_changes_no_bit(self):
+        # Phase A's pipelined epilogue over 128-row tiles in chunks of 64, 96
+        # (and a shorter last one of 32) and 128 rows instead of the tiling's
+        # 32, and the peaks layers' epilogue alone in other chunks; layer 0
+        # proven, layer 1 takes the peaks. Every row bit for bit; the race
+        # detector on. (Chunks under 32 rows change XLA:CPU's own row-sum
+        # order in the interpreter, hence none here.)
+        case = dict(
+            rows=512,
+            heads=8,
+            norm_scale=(0.3, 1.5),
+            tiling=dataclasses.replace(_TILING, qkv_rows=128),
+        )
+        base, want, _ = _run(**case)
+        l2, worst = _errors(base, want)
+        self.assertLess(l2, _L2)
+        self.assertLess(worst, _MAX)
+        for chunks in (
+            dict(epilogue_chunk=64),
+            dict(epilogue_chunk=96),
+            dict(epilogue_chunk=128),
+            dict(epilogue_chunk_peaks=96),
+            dict(epilogue_chunk=64, epilogue_chunk_peaks=128),
+        ):
+            with self.subTest(**chunks):
+                got, _, raced = _run(races=True, **chunks, **case)
+                self.assertFalse(raced)
+                self.assertTrue(_same_bits(got, base))
+        with self.assertRaisesRegex(ValueError, "epilogue_chunk_peaks"):
+            _run(epilogue_chunk_peaks=40, **case)
+
     def test_zero_ahead_changes_no_bit(self):
         # The dense walk of 280 live rows of 512 (the last query tile
         # narrowed to its real rows: its padding sums one), with and without
@@ -1003,6 +1051,30 @@ class TestKernelLevers(CustomTestCase):
         self.assertTrue(_same_bits(got, base))
         with self.assertRaisesRegex(ValueError, "uniform_adaln"):
             _run(rows=512, uniform_adaln=True, fast_phase_c=True)
+
+    def test_cast_first_step_tables_and_slab_modulate_change_no_bit(self):
+        # cast_first: the item epilogue rounds to bf16 before its transpose;
+        # step_tables: phase A's step scalars from SMEM tables. 512 rows of
+        # 64-row phase A tiles, four head groups (rotated by device on two),
+        # layer 0 proven and layer 1 with the peaks. Every row bit for bit;
+        # the race detector on.
+        case = dict(rows=512, heads=8, norm_scale=(0.3, 1.5))
+        base, want, _ = _run(**case)
+        l2, worst = _errors(base, want)
+        self.assertLess(l2, _L2)
+        self.assertLess(worst, _MAX)
+        for option in ("cast_first", "step_tables"):
+            with self.subTest(option=option):
+                got, _, raced = _run(races=True, **{option: True}, **case)
+                self.assertFalse(raced)
+                self.assertTrue(_same_bits(got, base))
+        # slab_modulate: phase C's uniform tiles (tiles 0, 1 and 3 of the
+        # kernel tests' 512-row fixture) modulate by modulate_slabs.
+        adaln, _, _ = _run(uniform_adaln=True, **case)
+        got, _, raced = _run(races=True, uniform_adaln=True, slab_modulate=True, **case)
+        self.assertFalse(raced)
+        self.assertTrue(_same_bits(got, adaln))
+        self.assertTrue(_same_bits(adaln, base))
 
     def test_key_groups_change_no_bit(self):
         # 256-key tiles of four fixed-max and eight online sub-blocks, walked

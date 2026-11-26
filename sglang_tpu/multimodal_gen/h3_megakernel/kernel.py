@@ -81,6 +81,14 @@ _FIXED_BOUND, _FIXED_M = 109.0, 17.0
 # 2^-8) three times, the normed product, RoPE's bf16 tables and the output,
 # which grows |q| |k| by at most (1 + 2^-8)^6 < 1.024.
 _BOUND_SLACK = 1.025
+# sum_bounds: a fixed-max softmax is the softmax up to rounding when each real
+# row's sum of weights exp2(s - _FIXED_M) lies in [2^_SUM_LO, 2^_SUM_HI]. No
+# weight then exceeds 2^_SUM_HI (each is at most its row's sum), so with
+# values under 2^20 (as the norm-proven layers assume) neither the sum nor any
+# partial P V sum passes 2^124; and the weights under 2^-126 that may flush to
+# zero, at most 2^15.2 of them, move a row's sum and output by under
+# 2^-110.8 / 2^_SUM_LO = 2^-50.8 of the row's sum, far below f32 rounding.
+_SUM_LO, _SUM_HI = -60.0, 104.0
 # The six AdaLN tables of a block, in the checkpoint's chunk order.
 _SHIFT_MSA, _SCALE_MSA, _GATE_MSA, _SHIFT_MLP, _SCALE_MLP, _GATE_MLP = range(6)
 _CONTRACT_LAST = (((1,), (1,)), ((), ()))  # a @ b.T
@@ -393,10 +401,15 @@ def _kernel(
     cut_keys: int = 0,
     split_items: bool = False,
     epilogue_chunk: int = 0,
+    epilogue_chunk_peaks: int = 0,
     modulate_pieces: int = 0,
     uniform_adaln: bool = False,
     zero_ahead: bool = False,
     mask_scores: bool = False,
+    sum_bounds: bool = False,
+    cast_first: bool = False,
+    step_tables: bool = False,
+    slab_modulate: bool = False,
     kv_group: tuple[int, int] = (1, 1),
     online_ahead: bool = False,
     fixed_ahead: bool = False,
@@ -499,6 +512,14 @@ def _kernel(
 
         return start, wait
 
+    def owner_local(spot):
+        """``(spot // local_heads, spot % local_heads)``: the device that computes
+        head spot ``spot`` and its local head there (step_tables: a table load)."""
+        if step_tables and "heads" in tables_at:
+            word = tables_at["heads"][spot]
+            return word & 0xFF, (word >> 8) & 0xFF
+        return spot // local_heads, spot % local_heads
+
     def bulk_transfer(src, parity, spot, row, count, local_sem, send_sem):
         """bulk_exchange's ``transfer`` of my rows ``[row, row + count)`` of a
         head's q, k, v (``src``): ``(start, wait)``. ``spot``: its owner and
@@ -509,7 +530,7 @@ def _kernel(
         the owner's receive semaphore of that head); else into ``kv_mine``
         (local), which phase B sends on.
         """
-        owner, local = spot // local_heads, spot % local_heads
+        owner, local = owner_local(spot)
         rs = pl.ds(me * rows + row, count)
         mine = copy(src, kv_ref.at[parity, local, :, rs], local_sem)
         later = copy(src, kv_mine_ref.at[owner, local, :, pl.ds(row, count)], local_sem)
@@ -710,6 +731,52 @@ def _kernel(
             return norms.at[parity], qk_norms.at[parity]
         return norms, qk_norms
 
+    # step_tables: SMEM tables of phase A's step scalars, filled once a call
+    # (``with_step_tables``): per step its row tile, its (rotated and raw) head
+    # group and its staging slot; per head its owner and local index there.
+    tables_at: dict[str, Any] = {}
+
+    def with_step_tables(body):
+        """``body()`` with phase A's step tables in SMEM (step_tables), else
+        ``body()``."""
+        if not step_tables:
+            body()
+            return
+        tile, slots = tiling.qkv_rows, tiling.stage_slots
+        groups = heads // group
+        steps = rows // tile * groups
+        offset = me * groups // devices
+
+        def scoped(step_ref, head_ref):
+            def fill(step, carry):
+                raw = step % groups
+                step_ref[step] = (
+                    step // groups
+                    | ((raw + offset) % groups) << 8
+                    | raw << 16
+                    | (step % slots) << 24
+                )
+                return carry
+
+            lax.fori_loop(0, steps, fill, None)
+            for head in range(heads):
+                head_ref[head] = head // local_heads | (head % local_heads) << 8
+            tables_at["steps"], tables_at["heads"], tables_at["n"] = (
+                step_ref,
+                head_ref,
+                steps,
+            )
+            body()
+
+        pl.run_scoped(
+            scoped, pltpu.SMEM((steps,), jnp.int32), pltpu.SMEM((heads,), jnp.int32)
+        )
+
+    def step_word(step):
+        """step_tables: the word of ``step`` (clamped into the table: a guarded
+        step outside it reads its neighbour, never used)."""
+        return tables_at["steps"][jnp.clip(step, 0, tables_at["n"] - 1)]
+
     # ------------------------------------------------------------ phase A
     def phase_a(layer: jax.Array, parity: jax.Array, with_peaks: bool) -> None:
         tile, slots = tiling.qkv_rows, tiling.stage_slots
@@ -749,8 +816,23 @@ def _kernel(
             factors = extra[len(quant) + 1] if ahead else None
 
             def place(step):
-                """Step's row tile and head group."""
+                """Step's row tile and head group (a static step: static)."""
+                if step_tables and not isinstance(step, numbers.Integral):
+                    word = step_word(step)
+                    return word & 0xFF, (word >> 8) & 0xFF
                 return step // groups, (step % groups + offset) % groups
+
+            def raw_group(step):
+                """``step % groups`` (its unrotated head group)."""
+                if step_tables and not isinstance(step, numbers.Integral):
+                    return (step_word(step) >> 16) & 0xFF
+                return step % groups
+
+            def stage_slot(step):
+                """``step % slots``."""
+                if step_tables and not isinstance(step, numbers.Integral):
+                    return (step_word(step) >> 24) & 0xFF
+                return step % slots
 
             def x_copy(index):
                 rs = pl.ds(index * tile, tile)
@@ -760,7 +842,7 @@ def _kernel(
                 """Head j of step's group: q, k, v -> its owner (``head_spot``), at
                 my rows."""
                 index, first_head = place(step)
-                head, slot = first_head * group + j, step % slots
+                head, slot = first_head * group + j, stage_slot(step)
                 spot = head_spot(layer, head)
                 if bulk_exchange:
                     return bulk_transfer(
@@ -773,13 +855,14 @@ def _kernel(
                         kv_send.at[slot * group + j],
                     )
                 rs = pl.ds(me * rows + index * tile, tile)
+                owner, local = owner_local(spot)
                 return transfer(
                     stage.at[slot, j],
-                    kv_ref.at[parity, spot % local_heads, :, rs],
+                    kv_ref.at[parity, local, :, rs],
                     sems.at[5 + slot * group + j],
                     kv_send.at[slot * group + j],
                     kv_recv.at[parity],
-                    spot // local_heads,
+                    owner,
                 )
 
             def side_copies(index, side):
@@ -813,7 +896,7 @@ def _kernel(
                 tile's cos and sin start in (its one-hot in ``next_rows``)."""
                 index, _ = place(step)
 
-                @pl.when((step % groups == 0) & (index + 1 < tiles))
+                @pl.when((raw_group(step) == 0) & (index + 1 < tiles))
                 def _prefetch():
                     for one in side_copies(index + 1, (index + 1) % 2)[:2]:
                         one.start()
@@ -948,7 +1031,7 @@ def _kernel(
                 pl.when(index + 1 < tiles)(next_onehot().start)
 
             def rows_when(step, modulated=False):
-                @pl.when(step % groups == 0)
+                @pl.when(raw_group(step) == 0)
                 def _next_rows():
                     with scope("A.rows", 2):
                         next_rows(step, modulated)
@@ -973,7 +1056,7 @@ def _kernel(
                     return
                 index = place(step)[0]
                 nxt = index + 1
-                part = step % groups - ahead_at
+                part = raw_group(step) - ahead_at
                 now = (part >= 0) & (part < parts) & (nxt < tiles)
                 if isinstance(now, bool) and not now:  # a static step elsewhere
                     main()
@@ -1032,7 +1115,7 @@ def _kernel(
                         acc.at[0],
                         cos.at[side],
                         sin.at[side],
-                        step % slots,
+                        stage_slot(step),
                         place(step)[1],
                         index % 2,
                         slot,
@@ -1048,13 +1131,17 @@ def _kernel(
                 overlaps the next step's matmul). epilogue_chunk: in chunks of that
                 many rows and a shorter last one."""
                 index, first_head = place(step)
-                epi = epilogue_chunk or tiling.epilogue_rows
+                epi = (
+                    (epilogue_chunk_peaks if with_peaks else 0)
+                    or epilogue_chunk
+                    or tiling.epilogue_rows
+                )
                 for at in range(0, tile, epi):
                     epilogue(
                         acc.at[step % 2],
                         cos.at[index % 2],
                         sin.at[index % 2],
-                        step % slots,
+                        stage_slot(step),
                         first_head,
                         index % 2,
                         step % 2,
@@ -1216,6 +1303,8 @@ def _kernel(
     ) -> None:
         """Items ``[item_lo, item_hi)`` (in ``head_order``) at one softmax; the
         ``final`` call also waits for every peer's output tiles."""
+        # sum_bounds: the norm weights bound this layer (no sums recorded).
+        proven = (meta_ref[1 + layer] & 32) != 0
         # kv_group (the dense walk only; fixed-max, online): each DMA and key
         # step moves that many of the tiling's key tiles, run as the same
         # sub-blocks.
@@ -1299,7 +1388,10 @@ def _kernel(
         # pylint: disable-next=too-many-statements
         def scoped(q, k, v, m_run, l_run, o_run, stage, sems, *extra):
             # far_cache: a query tile's far output (bf16), max and sum, and sems;
-            # tile_masks: my heads' masks, two items' tile lists and counts, a sem.
+            # tile_masks: my heads' masks, two items' tile lists and counts, a sem;
+            # sum_bounds (last): a copy of an item's final sum and max rows.
+            if sum_bounds:
+                *extra, sums_copy = extra
             cache, lists = extra[: 3 * far_cache], extra[3 * far_cache :]
             if tile_masks:
                 masks, tile_list, counts, mask_sem = lists
@@ -2015,11 +2107,45 @@ def _kernel(
                     stage[at % 2] = (
                         o_run[...] / (l_run[0:1] * (2.0**-_FIXED_M))
                     ).T.astype(_BF16)
+                elif cast_first:  # the same bf16 values, transposed packed
+                    stage[at % 2] = (o_run[...] / l_run[0:1]).astype(_BF16).T
                 else:
                     stage[at % 2] = (o_run[...] / l_run[0:1]).T.astype(_BF16)
+                if sum_bounds:
+                    # A copy of the final sum (and max) rows in this block, before
+                    # ``then`` (zero_ahead) clears them; the recording branches
+                    # off after the transfer starts, so the block stays whole.
+                    sums_copy[0:1, :] = l_run[0:1, :]
+                    if not fixed:
+                        sums_copy[1:2, :] = m_run[0:1, :]
                 if then is not None:
                     then()
                 placed_transfer(at)[0]()
+                if sum_bounds:
+                    pl.when(~proven)(functools.partial(record_sums, item_of(at)))
+
+            def record_sums(item):
+                """sum_bounds: the largest and the largest reciprocal of item's
+                real rows' fixed-max sums (``l``; online ``l * 2^(m - fixed_max)``,
+                the sum a fixed max would take) into ``peaks`` [0] and [1], row 0,
+                at its head's lane: maxed over the head's items (zeroed each
+                layer). A sum that is not finite reads +inf (its reciprocal 0),
+                a zero sum's reciprocal +inf."""
+                head = head_order[item // q_tiles]
+                lanes = lax.broadcasted_iota(jnp.int32, (1, block_q), 1)
+                real = lanes + q_tile_of(item) * block_q < used
+                sums = sums_copy[0:1, :]
+                if not fixed:
+                    sums = sums * jnp.exp2(sums_copy[1:2, :] - fixed_max)
+                sums = jnp.where(jnp.abs(sums) < jnp.inf, sums, jnp.inf)
+                top = jnp.max(jnp.where(real, sums, 0.0), axis=1, keepdims=True)
+                inv = jnp.max(jnp.where(real, 1.0 / sums, 0.0), axis=1, keepdims=True)
+                lane = lax.broadcasted_iota(jnp.int32, (1, TABLE_LANES), 1)
+                hit = lane == computed_head(layer, head)
+                for k, value in ((0, top), (1, inv)):
+                    peaks[k, 0:1, :] = jnp.maximum(
+                        peaks[k, 0:1, :], jnp.where(hit, value, 0.0)
+                    )
 
             def static_item(
                 at: jax.Array, base: jax.Array, width: int = 0
@@ -2191,6 +2317,7 @@ def _kernel(
                 if tile_masks
                 else ()
             ),
+            *((pltpu.VMEM((8, block_q), _F32),) if sum_bounds else ()),
         )
 
     # ------------------------------------------------------------ phase C
@@ -2445,6 +2572,11 @@ def _kernel(
                     # the column scales and their semaphores; fast_phase_c: then
                     # fill's shift and scale.
                     quant = scratch[: 3 * fp8]
+                    # slab_modulate (uniform tiles): the rms factors' scratch, last.
+                    slabs = slab_modulate and not fp8 and bool(first_rows(2))
+                    factors = scratch[-1] if slabs else None
+                    if slabs:
+                        scratch = scratch[:-1]
                     firsts = None if not first_rows(2) else scratch[-1]
 
                     def prologue():
@@ -2453,7 +2585,26 @@ def _kernel(
                         if firsts is not None:  # under the first weight tile's load
                             prepare(firsts, tables, (0, 1))
                         rows = None if firsts is None else (firsts.at[0], firsts.at[1])
-                        if fp8:
+                        if slabs:
+                            # A uniform tile: modulate_slabs' values (each row's rms
+                            # factor, then 256-lane slabs), no whole rows held.
+                            pl.when(uniform)(
+                                functools.partial(
+                                    modulate_slabs,
+                                    x,
+                                    h,
+                                    norm_ref.at[1],
+                                    rows,
+                                    factors,
+                                    tile,
+                                )
+                            )
+                            pl.when(~uniform)(
+                                functools.partial(
+                                    modulate, x, h, onehot, tables, norm_ref.at[1], tile
+                                )
+                            )
+                        elif fp8:
                             branch(
                                 functools.partial(
                                     modulate_fp8,
@@ -2575,6 +2726,11 @@ def _kernel(
                             else []
                         ),
                         *first_rows(2),
+                        *(
+                            [pltpu.VMEM((tile, 1), _F32)]
+                            if slab_modulate and not fp8 and first_rows(2)
+                            else []
+                        ),
                     )
 
                 # Down: each column tile contracts every FFN channel in one MXU
@@ -2821,13 +2977,21 @@ def _kernel(
                         orders[owner, count] = head
                         count = count + (bit if fixed_pass else 1 - bit)
         with scope("A"):
-            pl.when(proven_layer)(functools.partial(phase_a, layer, parity, False))
-            pl.when(~proven_layer)(functools.partial(phase_a, layer, parity, True))
-        with scope("L.peaks"):
-            write = peaks_write(layer)
-            write.start()
-            if not fast_layer_edges:  # else waited before the buffer's next use
-                write.wait()
+            if sum_bounds:  # the softmax sums certify, not the q/k peaks
+                phase_a(layer, parity, False)
+            else:
+                pl.when(proven_layer)(functools.partial(phase_a, layer, parity, False))
+                pl.when(~proven_layer)(functools.partial(phase_a, layer, parity, True))
+
+        def write_peaks():
+            with scope("L.peaks"):
+                write = peaks_write(layer)
+                write.start()
+                if not fast_layer_edges:  # else waited before the buffer's next use
+                    write.wait()
+
+        if not sum_bounds:
+            write_peaks()
         flags = meta_ref[1 + layer]
         fixed, sparse = (flags & 1) != 0, (flags & 2) != 0
         record, reuse = (flags & 4) != 0, (flags & 8) != 0
@@ -2856,11 +3020,13 @@ def _kernel(
         with scope("B"):
             attend(True, jnp.int32(0), split * q_tiles, False)
             attend(False, split * q_tiles, jnp.int32(items), True)
+        if sum_bounds:  # phase B wrote them
+            write_peaks()
         with scope("C"):
             phase_c(layer, parity)
         return carry
 
-    lax.fori_loop(0, layers, layer_body, None)
+    with_step_tables(lambda: lax.fori_loop(0, layers, layer_body, None))
     if fast_layer_edges:  # the last layer's peaks are out before the end
         with scope("L.peaks"):
             peaks_write(layers - 1).wait()
@@ -3054,10 +3220,15 @@ def stack(
     cut_kv_compute: int = 0,
     split_items: bool = False,
     epilogue_chunk: int = 0,
+    epilogue_chunk_peaks: int = 0,
     modulate_pieces: int = 0,
     uniform_adaln: bool = False,
     zero_ahead: bool = False,
     mask_scores: bool = False,
+    sum_bounds: bool = False,
+    cast_first: bool = False,
+    step_tables: bool = False,
+    slab_modulate: bool = False,
     kv_group: int | tuple[int, int] = 1,
 ) -> Any:
     """Runs every block of ``weights`` on this device's rows.
@@ -3266,6 +3437,8 @@ def stack(
         staging) in chunks of this many rows and a shorter last one instead
         of ``tiling.epilogue_rows`` (a divisor of the row tile: 32 at 608-row
         tiles). 0: off.
+      epilogue_chunk_peaks: The same for the layers whose epilogue also takes
+        the q/k peaks (``with_peaks``); 0: as the others. The same bits.
       modulate_pieces: With ``modulate_ahead``, the next row tile's modulate
         in this many pieces of whole chunks (``tiling.chunk_rows``), one per
         head group step from the middle of the tile on, instead of 2 (1 at an
@@ -3295,6 +3468,29 @@ def stack(
         gets the same difference, a masked one -inf and ``exp2(-inf)`` the
         select's +0. The same probabilities and max, so the same bits, with no
         per-element select between the EUP's results and the sums.
+      sum_bounds: The peaks certify by the softmax's own row sums instead of
+        the q/k norms: phase A records no peaks, and each item of a layer the
+        norm weights leave unproven records, at its head's lane, the largest
+        fixed-max row sum of its real rows (``l``; online ``l * 2^(m -
+        fixed_max)``, the sum a fixed max would take) in row 0 of peaks[0] and
+        the largest reciprocal of one in peaks[1], maxed over the head's items
+        (``sum_safe_heads``). A fixed-max head whose sums stay in
+        [2^_SUM_LO, 2^_SUM_HI] ran the softmax up to rounding (see
+        ``_SUM_LO``), whatever its q/k norms. Only the peaks change, not the
+        rows.
+      cast_first: Phase B's item epilogue rounds o / l to bf16 before the
+        transpose into the output tile instead of after it (half the bytes
+        through the transposes): the same values, the same bits.
+      step_tables: Phase A's per-step scalars (row tile, head group, staging
+        slot) and each head's owner and local index come from SMEM tables
+        filled once a call instead of integer divisions every step, whose
+        chains lengthen the scalar blocks around each step's matmul (the
+        MXUs idle there). The same steps, the same bits.
+      slab_modulate: With uniform_adaln, phase C's uniform tiles modulate the
+        MLP input as phase A's modulate_ahead does (``modulate_slabs``: each
+        row's rms factor, then 256-lane slabs) instead of whole rows a chunk,
+        whose spills lengthen the pass the MXUs idle through between the
+        output and the up projection. The same values, the same bits.
       kv_group: With ``static_items``' dense walk, phase B moves and walks the
         keys this many of ``tiling``'s key tiles at a time: one DMA and one
         step of the key loop per group, its sub-blocks those of one key tile
@@ -3329,10 +3525,14 @@ def stack(
         raise ValueError(
             "fixed_max other than 17 does not take scaled_v or the far cache"
         )
-    if any(value < 0 or value % 16 for value in (cut_kv_compute, epilogue_chunk)):
+    if any(
+        value < 0 or value % 16
+        for value in (cut_kv_compute, epilogue_chunk, epilogue_chunk_peaks)
+    ):
         raise ValueError(
-            "cut_kv_compute and epilogue_chunk take multiples of 16 rows; got"
-            f" {cut_kv_compute} and {epilogue_chunk}"
+            "cut_kv_compute, epilogue_chunk and epilogue_chunk_peaks take"
+            f" multiples of 16 rows; got {cut_kv_compute}, {epilogue_chunk} and"
+            f" {epilogue_chunk_peaks}"
         )
     groups = (kv_group,) * 2 if isinstance(kv_group, numbers.Integral) else kv_group
     if len(groups) != 2 or any(
@@ -3594,9 +3794,14 @@ def stack(
         cut_keys=cut_keys,
         split_items=split_items,
         epilogue_chunk=epilogue_chunk,
+        epilogue_chunk_peaks=epilogue_chunk_peaks,
         modulate_pieces=modulate_pieces,
         uniform_adaln=uniform_adaln,
         zero_ahead=zero_ahead,
+        sum_bounds=sum_bounds,
+        cast_first=cast_first,
+        step_tables=step_tables,
+        slab_modulate=slab_modulate,
         mask_scores=mask_scores,
         kv_group=kv_group,
         online_ahead=online_ahead,
@@ -3741,6 +3946,15 @@ def loop_structure(
 def safe_heads(peaks: jax.Array, margin: float = 1.0) -> jax.Array:
     """``[L, heads]`` bool: ``safe_layers`` per head (lane)."""
     return layer_bounds(peaks) * margin * _BOUND_SLACK <= _FIXED_BOUND
+
+
+def sum_safe_heads(peaks: jax.Array, margin: float = 0.0) -> jax.Array:
+    """``[L, heads]`` bool from ``stack``'s ``sum_bounds`` peaks (maxed over
+    devices first): every real row's fixed-max sum of the head within
+    [2^(_SUM_LO + margin), 2^(_SUM_HI - margin)] (``margin`` in log2 units).
+    A head with no rows recorded (norm-proven layers) reads True."""
+    top, inv = peaks[..., 0, 0, :], peaks[..., 1, 0, :]
+    return (top <= 2.0 ** (_SUM_HI - margin)) & (inv <= 2.0 ** (-_SUM_LO - margin))
 
 
 def layer_bounds(peaks: jax.Array) -> jax.Array:

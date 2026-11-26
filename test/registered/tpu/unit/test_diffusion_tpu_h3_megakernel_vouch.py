@@ -139,10 +139,12 @@ def _structure(sp: int) -> int:
     return first
 
 
-def _options(sp: int, structure=None) -> dict:
+def _options(sp: int, structure=None, sums=False) -> dict:
     """The op's kernel options: the plain op's, or with ``structure`` the
-    structured op's (``op.stack_kwargs``)."""
-    return op.STACK_KWARGS if structure is None else op.stack_kwargs(sp, structure)
+    structured op's (``op.stack_kwargs``); ``sums``: with sum_bounds (the
+    sum_vouch lever's certificate)."""
+    options = op.STACK_KWARGS if structure is None else op.stack_kwargs(sp, structure)
+    return dict(options, sum_bounds=True) if sums else options
 
 
 def _heads(config, layers=()) -> np.ndarray:
@@ -153,7 +155,7 @@ def _heads(config, layers=()) -> np.ndarray:
 
 
 @functools.lru_cache(maxsize=None)
-def _vouched_fn(sp, margin, races, structure=None):
+def _vouched_fn(sp, margin, races, structure=None, sums=False):
     """The vouched op's JAX function, jitted once a configuration;
     ``structure``: with the structured op's kernel options."""
     config, mesh = _case(sp)[:2]
@@ -164,15 +166,17 @@ def _vouched_fn(sp, margin, races, structure=None):
             kt._TILING,
             margin,
             _interpret(races),
-            options=_options(sp, structure),
+            options=_options(sp, structure, sums),
         )
     )
 
 
-def _vouched(sp, vouch, tally=(0, 0), margin=_MARGIN, races=False, structure=None):
+def _vouched(
+    sp, vouch, tally=(0, 0), margin=_MARGIN, races=False, structure=None, sums=False
+):
     """The vouched op's JAX function: (rows, next heads, tally) as numpy."""
     _, _, operands, weights, _, _ = _case(sp)
-    out, heads, counts = _vouched_fn(sp, margin, races, structure)(
+    out, heads, counts = _vouched_fn(sp, margin, races, structure, sums)(
         *operands,
         jnp.asarray(vouch, jnp.int32),
         jnp.asarray(tally, jnp.int32),
@@ -182,7 +186,7 @@ def _vouched(sp, vouch, tally=(0, 0), margin=_MARGIN, races=False, structure=Non
 
 
 @functools.lru_cache(maxsize=None)
-def _plain_fn(sp, races, structure=None):
+def _plain_fn(sp, races, structure=None, sums=False):
     """The plain op's kernel call with ``fixed_heads`` as an operand (all
     false: the plain op's own call, bit for bit) and the peaks maxed over
     devices, jitted once a configuration; ``structure``: the structured
@@ -202,7 +206,7 @@ def _plain_fn(sp, races, structure=None):
             tiling=kt._TILING,
             axis="sp",
             interpret=_interpret(races),
-            **dict(_options(sp, structure), fixed_heads=fixed, return_peaks=True),
+            **dict(_options(sp, structure, sums), fixed_heads=fixed, return_peaks=True),
         )
         return out, lax.pmax(peaks, "sp")
 
@@ -218,13 +222,13 @@ def _plain_fn(sp, races, structure=None):
     )
 
 
-def _plain(sp, fixed_heads=None, races=False, structure=None):
+def _plain(sp, fixed_heads=None, races=False, structure=None, sums=False):
     """The kernel's result with ``fixed_heads`` at a fixed max besides the
     proven layers, and its peaks: (rows, peaks) as numpy."""
     config, _, operands, weights, _, _ = _case(sp)
     if fixed_heads is None:
         fixed_heads = _heads(config)
-    out, peaks = _plain_fn(sp, races, structure)(
+    out, peaks = _plain_fn(sp, races, structure, sums)(
         *operands, jnp.asarray(fixed_heads, jnp.bool_), *_weight_list(weights)
     )
     return np.asarray(out), np.asarray(peaks)
@@ -240,36 +244,42 @@ def _plain_op(sp, structure=None):
     return np.asarray(jax.jit(fn)(*operands, *_weight_list(weights)))
 
 
-def _vouched_by(sp, peaks, margin=_MARGIN) -> np.ndarray:
-    """What a step whose accepted peaks are ``peaks`` vouches for next."""
+def _vouched_by(sp, peaks, margin=_MARGIN, sums=False) -> np.ndarray:
+    """What a step whose accepted peaks are ``peaks`` vouches for next
+    (``sums``: sum_bounds peaks, op.SUM_VOUCH_MARGIN inside the window)."""
     config, _, _, weights, _, _ = _case(sp)
     unproven = ~np.asarray(mk.fixed_max_layers(weights, config))[:, None]
-    safe = np.asarray(mk.safe_heads(jnp.asarray(peaks), margin))[:, : config.heads]
+    if sums:
+        safe = mk.sum_safe_heads(jnp.asarray(peaks), op.SUM_VOUCH_MARGIN)
+    else:
+        safe = mk.safe_heads(jnp.asarray(peaks), margin)
+    safe = np.asarray(safe)[:, : config.heads]
     return (safe & unproven).astype(np.int32)
 
 
-def _vouch_checks(sp: int, races: bool, structure=None) -> dict:
+def _vouch_checks(sp: int, races: bool, structure=None, sums=False) -> dict:
     """Both branches of a step on ``sp`` devices, as JSON-able results;
-    ``structure``: both ops with the static-structure option's options."""
+    ``structure``: both ops with the static-structure option's options;
+    ``sums``: both with sum_bounds (the sum_vouch certificate)."""
     config, _, _, _, used, reference = _case(sp)
-    run = dict(races=races, structure=structure)
+    run = dict(races=races, structure=structure, sums=sums)
     proven, proven_peaks = _plain(sp, **run)
     inside, outside = _heads(config, (1,)), _heads(config, (1, 2))
     out, heads, tally = _vouched(sp, inside, **run)
     want, want_peaks = _plain(sp, inside, **run)
     redo, redo_heads, redo_tally = _vouched(sp, outside, tally=(2, 5), **run)
     return {
-        "vouched_by_proven": _vouched_by(sp, proven_peaks).tolist(),
+        "vouched_by_proven": _vouched_by(sp, proven_peaks, sums=sums).tolist(),
         "inside_same": kt._same_bits(out, want),
         "inside_differs_from_proven": not kt._same_bits(want, proven),
         "inside_next": heads.tolist(),
-        "inside_next_want": _vouched_by(sp, want_peaks).tolist(),
+        "inside_next_want": _vouched_by(sp, want_peaks, sums=sums).tolist(),
         "inside_tally": tally.tolist(),
         "inside_errors": list(kt._errors(out[:used], reference)),
         "proven_errors": list(kt._errors(proven[:used], reference)),
         "redo_same": kt._same_bits(redo, proven),
         "redo_next": redo_heads.tolist(),
-        "redo_next_want": _vouched_by(sp, proven_peaks).tolist(),
+        "redo_next_want": _vouched_by(sp, proven_peaks, sums=sums).tolist(),
         "redo_tally": redo_tally.tolist(),
         "races": kt._races_found(),
     }
@@ -509,6 +519,109 @@ class TestVouchedStepMultiDevice(CustomTestCase):
         stdout = _in_fresh_process(2, code, timeout=5400)
         self.assertNotIn("RACE DETECTED", stdout)
         _assert_checks(self, json.loads(stdout.splitlines()[-1]), _case(1)[0])
+
+
+def _reference_sums(sp: int) -> tuple[np.ndarray, np.ndarray]:
+    """Layer 1's fixed-max row sums from the reference's own bf16 q and k:
+    per head, the largest real row's sum of exp2(s - 17) over the real keys
+    and the largest reciprocal (f64; the kernel's q rounds with the softmax
+    scale folded in, so its sums agree to a fraction of a log2 unit)."""
+    config, _, operands, weights, used, _ = _case(sp)
+    x, onehot, cos, sin, tables = operands[:5]
+    layers = [{name: value[i] for name, value in weights.items()} for i in range(2)]
+    captured = {}
+
+    def capture(q, k, v):
+        captured["qk"] = (q, k)
+        return ref.dense_attention(q, k, v, used)
+
+    x = ref.reference_layer(x, layers[0], tables[0], onehot, cos, sin, used, config)
+    ref.reference_layer(
+        x, layers[1], tables[1], onehot, cos, sin, used, config, capture
+    )
+    q, k = (np.asarray(a, np.float64)[:used] for a in captured["qk"])
+    scores = np.einsum("qgd,kgd->gqk", q, k) * (config.head_dim**-0.5 / np.log(2.0))
+    sums = np.exp2(scores - 17.0).sum(axis=-1)
+    return sums.max(axis=1), (1.0 / sums).max(axis=1)
+
+
+def _sum_checks(sp: int, races: bool) -> dict:
+    """sum_bounds on ``sp`` devices: the rows of a call are its rows without
+    it, bit for bit (with and without layer 1 tried), and the sums it
+    records for layer 1's heads (online and fixed-max) against each other
+    and the reference's."""
+    config = _case(sp)[0]
+    inside = _heads(config, (1,))
+    rows = {}
+    peaks = {}
+    for name, fixed in (("online", None), ("fixed", inside)):
+        for sums in (False, True):
+            rows[name, sums], got = _plain(sp, fixed, races=races, sums=sums)
+            if sums:
+                peaks[name] = got
+    heads = config.heads
+    top, inv = _reference_sums(sp)
+    return {
+        "rows_same": [
+            kt._same_bits(rows[name, True], rows[name, False])
+            for name in ("online", "fixed")
+        ],
+        # Layer 0 is norm-proven (nothing recorded); layer 1's sums by both
+        # softmaxes; layer 2's online scores overflow a fixed max (+inf).
+        "proven_zero": float(np.abs(peaks["online"][0, :, 0, :heads]).max()),
+        "online_top": peaks["online"][1, 0, 0, :heads].tolist(),
+        "online_inv": peaks["online"][1, 1, 0, :heads].tolist(),
+        "fixed_top": peaks["fixed"][1, 0, 0, :heads].tolist(),
+        "fixed_inv": peaks["fixed"][1, 1, 0, :heads].tolist(),
+        "layer2_top": peaks["online"][2, 0, 0, :heads].tolist(),
+        "reference_top": top.tolist(),
+        "reference_inv": inv.tolist(),
+        "races": kt._races_found(),
+    }
+
+
+def _assert_sums(test, checks: dict) -> None:
+    test.assertEqual(checks["rows_same"], [True, True])
+    test.assertEqual(checks["proven_zero"], 0.0)
+    for stat in ("top", "inv"):
+        online, fixed = (
+            np.asarray(checks[f"{kind}_{stat}"]) for kind in ("online", "fixed")
+        )
+        want = np.asarray(checks[f"reference_{stat}"])
+        # Both softmaxes' sums: one quantity, f32 rounding apart.
+        np.testing.assert_allclose(online, fixed, rtol=1e-4)
+        # The reference's within its q-rounding difference (log2 units).
+        np.testing.assert_allclose(np.log2(fixed), np.log2(want), atol=1.0)
+    # Layer 2's ~170-unit scores: past the window's top on every head.
+    test.assertTrue(
+        bool((np.asarray(checks["layer2_top"]) > 2.0**mk._SUM_HI).all()),
+        checks["layer2_top"],
+    )
+    test.assertFalse(checks["races"])
+
+
+@unittest.skipUnless(_HAS_JAX, _SKIP)
+class TestSumVouchedStep(CustomTestCase):
+    """sum_vouch (sum_bounds): the vouched op certifies each tried head by
+    its softmax's row sums; each branch of a step is still a kernel call bit
+    for bit, and the sums are the fixed-max ones."""
+
+    def test_each_branch_is_a_kernel_call_bit_for_bit(self):
+        _assert_checks(self, _vouch_checks(1, False, sums=True), _case(1)[0])
+
+    def test_sums_change_no_row_and_are_the_fixed_max_sums(self):
+        _assert_sums(self, _sum_checks(1, False))
+
+    def test_two_devices(self):
+        code = """
+            print(json.dumps(t._vouch_checks(2, races=True, sums=True)))
+            print(json.dumps(t._sum_checks(2, races=True)))
+        """
+        stdout = _in_fresh_process(2, code, timeout=5400)
+        self.assertNotIn("RACE DETECTED", stdout)
+        lines = stdout.splitlines()
+        _assert_checks(self, json.loads(lines[-2]), _case(1)[0])
+        _assert_sums(self, json.loads(lines[-1]))
 
 
 _LOWER = r"""

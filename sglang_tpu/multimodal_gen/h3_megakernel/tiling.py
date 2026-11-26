@@ -55,6 +55,11 @@ class Tiling:
       n_chunk: Output columns per MXU call.
       chunk_rows: Rows per pass of the norm, SwiGLU and residual loops.
       epilogue_rows: Rows per pass of phase A's q/k norm and RoPE.
+      epilogue_chunk: Rows per pass of phase A's q/k norm and RoPE under the
+        epilogue_chunks lever (``op.stack_kwargs``), a multiple of 16 with a
+        shorter last pass; 0: ``op.EPILOGUE_CHUNK``.
+      epilogue_chunk_peaks: The same for the layers whose epilogue also takes
+        the q/k peaks (not proven by the norm weights); 0: as the others.
       stage_slots: Steps phase A's q, k, v sends may stay in flight.
       vmem_limit_bytes: Mosaic's scoped-VMEM ceiling for the call.
     """
@@ -71,6 +76,8 @@ class Tiling:
     n_chunk: int = 768
     chunk_rows: int = 128
     epilogue_rows: int = 64
+    epilogue_chunk: int = 0
+    epilogue_chunk_peaks: int = 0
     stage_slots: int = 16
     vmem_limit_bytes: int = 64 * 2**20
 
