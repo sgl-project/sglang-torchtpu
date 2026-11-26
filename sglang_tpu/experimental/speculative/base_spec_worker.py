@@ -291,7 +291,7 @@ class TpuSpecWorker(BaseSpecWorker):
         self._accept_threshold_acc = get_spec().speculative_accept_threshold_acc
         # Filled per batch bucket once the target compile policy exists.
         self._all_drafts: dict[int, torch.Tensor] = {}
-        self._idle_inputs: dict[int, _IdleStepInputs] = {}
+        self._idle_inputs: dict[tuple[int, int], _IdleStepInputs] = {}
         # Benchmark knob: force the accept length (SGLANG_SIMULATE_ACC_LEN), as core DFlash does.
         self._simulate_acc_len = SIMULATE_ACC_LEN
         if self._simulate_acc_len > 0 and SIMULATE_ACC_TOKEN_MODE not in (
@@ -1590,10 +1590,12 @@ class TpuSpecWorker(BaseSpecWorker):
     def _idle_step_inputs(self, padded_bs: int) -> _IdleStepInputs:
         if not tpu_envs.SGLANG_TPU_SPEC_IDLE_INPUT_CACHE.get():
             return self._build_idle_step_inputs(padded_bs)
-        inputs = self._idle_inputs.get(padded_bs)
+        # The verify width is part of the rows' shape (adaptive workers change it).
+        key = (padded_bs, self.num_verify_rows)
+        inputs = self._idle_inputs.get(key)
         if inputs is None:
             inputs = self._build_idle_step_inputs(padded_bs)
-            self._idle_inputs[padded_bs] = inputs
+            self._idle_inputs[key] = inputs
         return inputs
 
     def _build_idle_step_inputs(self, padded_bs: int) -> _IdleStepInputs:

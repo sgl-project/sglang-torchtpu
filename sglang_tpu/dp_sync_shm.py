@@ -17,6 +17,7 @@ which each rank does only after it finished reading step s.
 from __future__ import annotations
 
 import logging
+import os
 import platform
 import socket
 import sys
@@ -126,11 +127,23 @@ def _attach_untracked(name: str) -> shared_memory.SharedMemory:
 
 
 def _group_on_one_x86_host(group: torch.distributed.ProcessGroup) -> bool:
-    """Collective: True on every rank iff all ranks share this host and it is x86."""
-    local = (socket.gethostname(), platform.machine())
+    """Collective: True on every rank iff all ranks share one x86 host's /dev/shm."""
+    local = (socket.gethostname(), platform.machine(), _shm_mount_id())
     hosts = [None] * torch.distributed.get_world_size(group)
     torch.distributed.all_gather_object(hosts, local, group=group)
     return len(set(hosts)) == 1 and local[1] in ("x86_64", "AMD64")
+
+
+def _shm_mount_id() -> tuple:
+    """Identity of this process's /dev/shm: a hostname match alone also holds for
+    containers that share a host name but not an IPC namespace / tmpfs mount."""
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            boot_id = f.read().strip()
+        st = os.stat("/dev/shm")
+        return (boot_id, st.st_dev, st.st_ino)
+    except OSError:
+        return (None, os.getpid())  # unknown: never matches another rank
 
 
 class ShmExchangeRegistry:
@@ -139,6 +152,9 @@ class ShmExchangeRegistry:
     def __init__(self) -> None:
         self._eligible: dict[int, bool] = {}
         self._exchanges: dict[tuple, ShmRowExchange] = {}
+        # Keyed by id(group): hold each group so a collected group's id can't be
+        # reused by a new group on some ranks only (stale exchange vs gloo = hang).
+        self._groups: dict[int, torch.distributed.ProcessGroup] = {}
 
     def get(
         self, *, group: torch.distributed.ProcessGroup, local_row: torch.Tensor
@@ -151,6 +167,7 @@ class ShmExchangeRegistry:
             return None
         group_key = id(group)
         if group_key not in self._eligible:
+            self._groups[group_key] = group
             self._eligible[group_key] = _group_on_one_x86_host(group)
             if not self._eligible[group_key]:
                 logger.warning(
