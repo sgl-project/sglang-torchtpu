@@ -597,6 +597,10 @@ def _run_oproj_ar_and_post_attn_norm(
     x_scale_buf=None,
     inv_pff_buf=None,
     defer_stream_store: bool = False,
+    skip_barrier_wait: bool = False,
+    skip_stream_load: bool = False,
+    skip_stream_store: bool = False,
+    prestarted_wo_dma: bool = False,
 ) -> None:
     """Shared core: D2D-overlapped FP8 ``o_proj`` + ``XOR=1`` AR + ``pa_ln + res + pre_ffn_ln``.
 
@@ -629,13 +633,15 @@ def _run_oproj_ar_and_post_attn_norm(
     chip_c0 = pl.multiple_of(chip * chunk, 128)
 
     # Start BOTH 4 MiB Wo halves back-to-back: chipmate half [0] finishes first (2.9 us)!
-    pltpu.make_async_copy(
-        wo_hbm.at[:, pl.ds(other_c0, half)], wo_buf.at[0], wo_sem.at[0]
-    ).start()
-    pltpu.make_async_copy(
-        wo_hbm.at[:, pl.ds(own_c0, half)], wo_buf.at[1], wo_sem.at[1]
-    ).start()
-    pltpu.make_async_copy(stream_hbm, s_buf, s_in_sem.at[0]).start()
+    if not prestarted_wo_dma:
+        pltpu.make_async_copy(
+            wo_hbm.at[:, pl.ds(other_c0, half)], wo_buf.at[0], wo_sem.at[0]
+        ).start()
+        pltpu.make_async_copy(
+            wo_hbm.at[:, pl.ds(own_c0, half)], wo_buf.at[1], wo_sem.at[1]
+        ).start()
+    if not skip_stream_load:
+        pltpu.make_async_copy(stream_hbm, s_buf, s_in_sem.at[0]).start()
 
     if x_fp8_buf is not None:
         _quantize_act_fp8_per_row(gated_ref, x_fp8_buf, x_scale_buf)
@@ -655,7 +661,8 @@ def _run_oproj_ar_and_post_attn_norm(
     )
 
     # Ensure all peers are resident, then FIRE Phase-1a D2D overlapped with own-half o_proj!
-    _wait_barrier(world_size)
+    if not skip_barrier_wait:
+        _wait_barrier(world_size)
     c1a = pltpu.make_async_remote_copy(
         send_half,
         mate_recv,
@@ -782,7 +789,8 @@ def _run_oproj_ar_and_post_attn_norm(
         )
         ag1_a.start()
         ag1_b.start()
-        _dma_wait(s_buf, s_in_sem.at[0])
+        if not skip_stream_load:
+            _dma_wait(s_buf, s_in_sem.at[0])
         _prescale_s_buf_in_vmem(s_buf, pa_alpha_ref, rows=rows, hidden=hidden, bm=bm64)
         ag1_a.wait()
         ag1_b.wait()
@@ -867,7 +875,8 @@ def _run_oproj_ar_and_post_attn_norm(
             )
             op.start()
             c2a.append(op)
-        _dma_wait(s_buf, s_in_sem.at[0])
+        if not skip_stream_load:
+            _dma_wait(s_buf, s_in_sem.at[0])
         _prescale_s_buf_in_vmem(s_buf, pa_alpha_ref, rows=rows, hidden=hidden, bm=bm64)
         for op in c2a:
             op.wait()
@@ -973,7 +982,7 @@ def _run_oproj_ar_and_post_attn_norm(
         _fori_col_blocks(hidden, _pre_ffn_out)
 
     _fori_strips(rows, bm, _finish_pa_and_pre_ffn)
-    if not defer_stream_store:
+    if not defer_stream_store and not skip_stream_store:
         # Stream updated residual out to HBM in the background while MoE pre-proj runs!
         pltpu.make_async_copy(s_buf, out_stream_hbm, s_out_sem.at[0]).start()
 
@@ -1139,13 +1148,18 @@ def _norm_pre_expert_slice(
     align: int,
     pre_exp_eps: float,
     pre_exp_scale_input: bool,
+    out_expert_3d_ref=None,
 ) -> None:
-    """Zero-spill pre_expert RMSNorm using unrolled 1024-col strips."""
+    """Zero-spill pre_expert RMSNorm using unrolled 1024-col strips (2D or MoE 3D layout)."""
     import jax.numpy as jnp
     from jax import lax
     from jax.experimental import pallas as pl
 
-    bm_n = _pick_strip(n_r, 32)
+    if out_expert_3d_ref is not None and h_pre % 2048 != 0:
+        raise ValueError(
+            f"out_expert_3d_ref requires h_pre multiple of 2048 (16*128), got {h_pre}"
+        )
+    bm_n = _pick_strip(n_r, 16 if out_expert_3d_ref is not None else 32)
 
     def _strip(r_loc):
         rs_l = pl.ds(r_loc, bm_n)
@@ -1166,18 +1180,36 @@ def _norm_pre_expert_slice(
             + jnp.float32(pre_exp_eps)
         )
 
-        def _o_step(c_sl):
-            xf = src_buf[rs_l, c_sl].astype(jnp.float32)
-            g = pre_exp_gain_ref[0:1, c_sl]
-            yn = (xf * g) * inv if pre_exp_scale_input else (xf * inv) * g
-            out_expert_in_ref[rs_g, c_sl] = yn.astype(out_expert_in_ref.dtype)
+        if out_expert_in_ref is not None:
+            def _o_step(c_sl):
+                xf = src_buf[rs_l, c_sl].astype(jnp.float32)
+                g = pre_exp_gain_ref[0:1, c_sl]
+                yn = (xf * g) * inv if pre_exp_scale_input else (xf * inv) * g
+                out_expert_in_ref[rs_g, c_sl] = yn.astype(out_expert_in_ref.dtype)
 
-        _fori_col_blocks(h_pre, _o_step)
+            _fori_col_blocks(h_pre, _o_step)
+
+        if out_expert_3d_ref is not None:
+            n_2k = h_pre // 2048
+            for h_i in range(n_2k):
+                chunks = []
+                for sub in range(8):
+                    c_sl = pl.ds(
+                        pl.multiple_of(h_i * 2048 + sub * _COL_STRIP, _COL_STRIP),
+                        _COL_STRIP,
+                    )
+                    xf = src_buf[rs_l, c_sl].astype(jnp.float32)
+                    g = pre_exp_gain_ref[0:1, c_sl]
+                    yn = (xf * g) * inv if pre_exp_scale_input else (xf * inv) * g
+                    chunks.append(yn.astype(out_expert_3d_ref.dtype))
+                out_expert_3d_ref[rs_g, pl.ds(pl.multiple_of(h_i * 16, 16), 16), :] = (
+                    jnp.concatenate(chunks, axis=1).reshape(bm_n, 16, 128)
+                )
 
     _fori_strips(n_r, bm_n, _strip)
 
 
-def _attn_to_moe_bridge_kernel(
+def _run_rep_b1_vmem_core(
     stream_hbm,
     gated_ref,
     wo_hbm,
@@ -1239,12 +1271,24 @@ def _attn_to_moe_bridge_kernel(
     pre_exp_scale_input: bool,
     use_w8a8: bool,
     router_d2d_overlap: bool = False,
+    skip_barrier_signal: bool = False,
+    skip_barrier_wait: bool = False,
+    skip_stream_load: bool = False,
+    skip_stream_store: bool = False,
+    prestarted_wo_dma: bool = False,
+    prestarted_w_pre_dma: bool = False,
+    prestarted_w_router_dma: bool = False,
+    during_ag_exp_ici_fn=None,
+    out_expert_3d_ref=None,
 ) -> None:
-    """10-op zero-spill megabridge from ``RPAd_fast(onorm+gate)`` straight into ``muse_sparse``!"""
+    """Reusable VMEM-resident replicated-stream Bridge 1b core (e.g. B=16 superkernel)."""
     import jax.numpy as jnp
     from jax import lax
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
+
+    if out_expert_in_ref is None and out_expert_3d_ref is None:
+        raise ValueError("Expected at least one of out_expert_in_ref or out_expert_3d_ref")
 
     rows = gated_ref.shape[0]
     hidden = wo_hbm.shape[1]
@@ -1258,13 +1302,16 @@ def _attn_to_moe_bridge_kernel(
     tile_r32 = (not is_r16) and rows > 64
 
     me = lax.axis_index("model").astype(jnp.int32)
-    _signal_barrier(me, world_size)
+    if not skip_barrier_signal:
+        _signal_barrier(me, world_size)
 
     # Prefetch BOTH W_pre (4 MiB FP8) and W_router (4 MiB BF16 / 8 MiB FP32) from HBM
     # right underneath the 7.5 us o_proj ICI reduce-scatter + all-gather -> 0.0 us wait!
     def _prefetch_moe_weights():
-        pltpu.make_async_copy(w_pre_hbm, w_pre_buf, w_pre_sem.at[0]).start()
-        pltpu.make_async_copy(w_router_hbm, w_router_buf, w_router_sem.at[0]).start()
+        if not prestarted_w_pre_dma:
+            pltpu.make_async_copy(w_pre_hbm, w_pre_buf, w_pre_sem.at[0]).start()
+        if not prestarted_w_router_dma:
+            pltpu.make_async_copy(w_router_hbm, w_router_buf, w_router_sem.at[0]).start()
 
     r_buf_arg = None if (is_r16 or tile_r32) else router_vmem
     _run_oproj_ar_and_post_attn_norm(
@@ -1275,11 +1322,17 @@ def _attn_to_moe_bridge_kernel(
         ar_s2a_send, ar_s2a_recv, ar_s2b_send, ar_s2b_recv,
         me=me, world_size=world_size, pa_eps=pa_eps, pre_ff_eps=pre_ff_eps,
         pre_ff_scale_input=pre_ff_scale_input,
-        start_extra_prefetch_fn=_prefetch_moe_weights,
+        start_extra_prefetch_fn=(
+            None if (prestarted_w_pre_dma and prestarted_w_router_dma) else _prefetch_moe_weights
+        ),
         x_fp8_buf=x_fp8_buf if use_w8a8 else None,
         x_scale_buf=x_scale_buf if use_w8a8 else None,
         inv_pff_buf=inv_pff_buf if tile_r32 else None,
         defer_stream_store=tile_r32,
+        skip_barrier_wait=skip_barrier_wait,
+        skip_stream_load=skip_stream_load,
+        skip_stream_store=skip_stream_store,
+        prestarted_wo_dma=prestarted_wo_dma,
     )
 
     # W_pre is ALREADY resident in VMEM! Run FP8 pre_expert_proj [B, 8192] @ [8192, 512]!
@@ -1322,17 +1375,23 @@ def _attn_to_moe_bridge_kernel(
             _fori_strips(n_exp, _DOT_TN, _e_step)
 
         _fori_strips(rows, bm_g, _r_step)
-        if tile_r32:
+        if tile_r32 and not skip_stream_store:
             pltpu.make_async_copy(s_buf, out_stream_hbm, s_out_sem.at[0]).start()
 
+    def _under_ag_exp_ici():
+        _compute_router_under_ici()
+        if during_ag_exp_ici_fn is not None:
+            during_ag_exp_ici_fn()
+
     # Zero-spill pre_expert_norm overlapped behind Stage-3 D2D!
-    align = 16 if use_halfrow else 8
+    align = 16 if (use_halfrow or (out_expert_3d_ref is not None and rows >= 16)) else 8
 
     def _norm_pre_slice(src_buf, row_base, n_r):
         _norm_pre_expert_slice(
             src_buf, pre_exp_gain_ref, out_expert_in_ref,
             h_pre=h_pre, row_base=row_base, n_r=n_r, align=align,
             pre_exp_eps=pre_exp_eps, pre_exp_scale_input=pre_exp_scale_input,
+            out_expert_3d_ref=out_expert_3d_ref,
         )
 
     # Reuse dead send_half VMEM buffer when h_pre == half (saves 3 MiB @ B=384!).
@@ -1386,25 +1445,32 @@ def _attn_to_moe_bridge_kernel(
             s2_ops.append(op)
         overlap_router_d2d = bool(router_d2d_overlap) and not tile_r32
         if not overlap_router_d2d:
-            _compute_router_under_ici()
+            _under_ag_exp_ici()
         for op in s2_ops:
             op.wait()
 
-        # Normalize ONLY my_half into out_expert_in_ref[my_r0:my_r0+half_r], then Stage-3 D2D
+        # Normalize ONLY my_half into out_expert_{in,3d}_ref[my_r0:my_r0+half_r], then Stage-3 D2D
         # copies normalized bf16 straight to mate (halves pre_expert_norm VPU rows!).
         if overlap_router_d2d:
-            _compute_router_under_ici()
+            _under_ag_exp_ici()
         _norm_pre_slice(eff_pre_a, my_r0, half_r)
+        exp_dst = out_expert_3d_ref if out_expert_3d_ref is not None else out_expert_in_ref
+        s3_slice = (
+            exp_dst.at[pl.ds(my_r0, half_r), :, :]
+            if out_expert_3d_ref is not None
+            else exp_dst.at[pl.ds(my_r0, half_r), :]
+        )
         s3 = pltpu.make_async_remote_copy(
-            out_expert_in_ref.at[pl.ds(my_r0, half_r), :],
-            out_expert_in_ref.at[pl.ds(my_r0, half_r), :],
+            s3_slice,
+            s3_slice,
             ag_s3_send.at[0],
             ag_s3_recv.at[0],
             device_id=(mate,),
             device_id_type=pl.DeviceIdType.MESH,
         )
         s3.start()
-        _dma_wait(out_stream_hbm, s_out_sem.at[0])
+        if not skip_stream_store:
+            _dma_wait(out_stream_hbm, s_out_sem.at[0])
         s3.wait()
     else:
         eff_pre_b = mate_recv.at[pl.ds(0, pre_buf_rows), :] if h_pre == half else pre_half_b
@@ -1421,11 +1487,39 @@ def _attn_to_moe_bridge_kernel(
             me=me,
             world_size=world_size,
             use_halfrow=False,
-            during_ici_fn=_compute_router_under_ici,
+            during_ici_fn=_under_ag_exp_ici,
             my_half_epilogue_fn=_norm_pre_slice,
             mate_half_epilogue_fn=_norm_pre_slice,
         )
-        _dma_wait(out_stream_hbm, s_out_sem.at[0])
+        if not skip_stream_store:
+            _dma_wait(out_stream_hbm, s_out_sem.at[0])
+
+
+def _attn_to_moe_bridge_kernel(
+    *args,
+    world_size: int,
+    pa_eps: float,
+    pre_ff_eps: float,
+    pre_ff_scale_input: bool,
+    router_multiplier: float,
+    pre_exp_eps: float,
+    pre_exp_scale_input: bool,
+    use_w8a8: bool,
+    router_d2d_overlap: bool = False,
+) -> None:
+    """10-op zero-spill megabridge from ``RPAd_fast(onorm+gate)`` straight into ``muse_sparse``!"""
+    _run_rep_b1_vmem_core(
+        *args,
+        world_size=world_size,
+        pa_eps=pa_eps,
+        pre_ff_eps=pre_ff_eps,
+        pre_ff_scale_input=pre_ff_scale_input,
+        router_multiplier=router_multiplier,
+        pre_exp_eps=pre_exp_eps,
+        pre_exp_scale_input=pre_exp_scale_input,
+        use_w8a8=use_w8a8,
+        router_d2d_overlap=router_d2d_overlap,
+    )
 
 
 def attn_to_moe_bridge_jax(
@@ -2022,6 +2116,7 @@ def _gather_token_shard_xor1_and_dot_post(
     *,
     me,
     world_size: int,
+    skip_barrier_wait: bool = False,
 ) -> None:
     """Overlap ``XOR=1`` token AG (``[B//W, 4096] -> [B, 4096]``) with ``W_post`` DMA & MXU!
 
@@ -2043,7 +2138,8 @@ def _gather_token_shard_xor1_and_dot_post(
     chip = me >> jnp.int32(1)
     chip_r0 = pl.multiple_of(chip * pair_r, 16)
 
-    _wait_barrier(world_size)
+    if not skip_barrier_wait:
+        _wait_barrier(world_size)
     ts1 = pltpu.make_async_remote_copy(
         moe_shard_ref,
         mate_tok_buf,

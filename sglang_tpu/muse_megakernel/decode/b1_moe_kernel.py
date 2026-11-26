@@ -254,6 +254,7 @@ def _b1_moe_chip_sharded_kernel(
     pre_exp_scale_input: bool,
     cfg: SparseDecodeConfig,
     has_spec_slot_arg: bool,
+    has_free_params_arg: bool = False,
     interpret_mode: bool = False,
 ) -> None:
     """Fused Step (a) ``[chip_b1 + muse_sparse(fb0)]`` Pallas kernel body."""
@@ -266,6 +267,7 @@ def _b1_moe_chip_sharded_kernel(
     rank_ref = next(it)
     replica_meta_ref = next(it) if num_replicas > 0 else None
     spec_slot_ref = next(it) if has_spec_slot_arg else None
+    free_params_ref = next(it) if has_free_params_arg else None
 
     # Bridge 1b + MoE inputs.
     stream_chip_hbm = next(it)
@@ -941,6 +943,7 @@ def _b1_moe_chip_sharded_kernel(
             holder_slot_expert_smem=msc["holder_slot_expert_smem"],
             holder_cand_smem=msc["holder_cand_smem"],
             spec_slot_ref=spec_slot_ref,
+            free_params_ref=free_params_ref,
             ep=world_size,
             batch_size=rows,
             scale_block=scale_block,
@@ -1207,6 +1210,7 @@ def b1_moe_chip_sharded_jax(
     rep_s2: jax.Array | None = None,
     replica_meta: jax.Array | None = None,
     spec_home_slot: jax.Array | None = None,
+    free_params: jax.Array | None = None,
     *,
     world_size: int = 8,
     pa_eps: float = 1e-8,
@@ -1381,11 +1385,17 @@ def b1_moe_chip_sharded_jax(
     bias_2d = bias.reshape(1, _E_TOTAL)
     norm_2d = post_exp_norm.reshape(1, _H)
     has_spec_slot_arg = spec_home_slot is not None
+    has_free_params_arg = free_params is not None
     scalar_args = [jnp.atleast_1d(rank).astype(jnp.int32)]
     if has_replicas:
         scalar_args.append(replica_meta)
     if has_spec_slot_arg:
         scalar_args.append(jnp.atleast_1d(spec_home_slot).astype(jnp.int32))
+    if has_free_params_arg:
+        fp_arg = free_params.reshape(-1).astype(jnp.float32)
+        if fp_arg.shape != (4,):
+            raise ValueError(f"Expected free_params shape (4,), got {free_params.shape}")
+        scalar_args.append(fp_arg)
 
     base_in_specs = (
         h_sp,  # stream_chip
@@ -1461,6 +1471,7 @@ def b1_moe_chip_sharded_jax(
         pre_exp_scale_input=bool(pre_exp_scale_input),
         cfg=config,
         has_spec_slot_arg=has_spec_slot_arg,
+        has_free_params_arg=has_free_params_arg,
         interpret_mode=interpret_mode,
     )
 
@@ -1485,5 +1496,6 @@ def b1_moe_chip_sharded_jax(
         name=(
             f"muse_w9_b1_moe_b{rows}_tp{world_size}_k{scale_block}"
             f"_r{num_replicas}_{'r16' if is_r16 else 'r32'}"
+            f"{'_dfp' if has_free_params_arg else ''}"
         ),
     )(*call_args)

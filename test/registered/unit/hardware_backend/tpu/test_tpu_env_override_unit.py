@@ -17,6 +17,7 @@ from unittest.mock import patch
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.env_override import (
     _DECODE_CP_SPARSE_CORE_OVERRIDES,
+    _SPARSE_CORE_OFFLOAD_OVERRIDES,
     _VMEM_PREFETCH_MIN_LAYERS,
     _VMEM_PREFETCH_OVERRIDES,
     _VMEM_PREFETCH_SAFE_MIN_TOKENS,
@@ -109,6 +110,17 @@ class TestLibtpuInitArgsOverrides(CustomTestCase):
                     args = os.environ["LIBTPU_INIT_ARGS"].split()
                 for flag in _DECODE_CP_SPARSE_CORE_OVERRIDES:
                     self.assertEqual(flag in args, expected)
+
+    def test_sparse_core_compute_offload_defaults_preserve_caller_overrides(self):
+        args = self._apply(None, None).split()
+        for flag in _SPARSE_CORE_OFFLOAD_OVERRIDES:
+            self.assertIn(flag, args)
+        user_flag = "--xla_tpu_enable_sparse_core_compute_offload=true"
+        overridden = self._apply(user_flag, None).split()
+        self.assertIn(user_flag, overridden)
+        self.assertNotIn(
+            "--xla_tpu_enable_sparse_core_compute_offload=false", overridden
+        )
 
 
 if __name__ == "__main__":

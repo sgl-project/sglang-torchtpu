@@ -565,6 +565,19 @@ def resolve_qblock_params(
     eff_q = min(128, int(quantum)) if int(quantum) > 128 else max(1, int(quantum))
     if total_elems >= 64 * 1024 and total_elems % 1024 == 0:
         chunks_8row = total_elems // 1024
+        # Prefer coarse 48/64 macro-aligned blocks (e.g. T=24K: n_blocks=48, 4x32-row tiles
+        # in each 128x128 macro-tile) when blks_per_macro is a power of 2 in [2, 16]:
+        # cuts Pallas q_block steps 192->12 while improving gmm_v2 tile balance, without
+        # altering non-macro shapes such as T=36K (chunks_8row=288 -> n_blocks=96).
+        if total_elems % (LANE * LANE) == 0:
+            n_macro = total_elems // (LANE * LANE)
+            for cand in (48, 64):
+                if (
+                    chunks_8row % cand == 0
+                    and cand % n_macro == 0
+                    and (cand // n_macro) in (2, 4, 8, 16)
+                ):
+                    return cand, eff_q
         if chunks_8row <= 256:
             return chunks_8row, eff_q
         for cand in (256, 192, 128, 96, 64, 32):
@@ -587,9 +600,10 @@ def pallas_qblock_remap_virtual_ids(
 ) -> tuple[jax.Array, jax.Array]:
     """Single-op Pallas VMEM+MXU kernel for `q_block` Zero-Glue EPLB virtual-ID remapping.
 
-    Eliminates ~45 unfused XLA HLO elementwise/reduction ops (~90 us/layer at R=4) with
-    0-ULP bit-exact parity against `remap_zeroglue_virtual_ids(..., mode='q_block')`.
-    Supports `EP=8/16` (`num_base_local in {16, 32}`) and fine `8`-row blocks (`n_blocks<=256`).
+    Eliminates ~45 unfused XLA HLO elementwise/reduction ops with 0-ULP bit-exact parity
+    against `remap_zeroglue_virtual_ids(..., mode='q_block')`.
+    Supports `EP=8/16` (`num_base_local in {16, 32}`), vectorizing `(128, 128)` macro-tiles
+    (`12` steps at `T=24K` instead of `192` `8`-row steps) whenever macro-aligned.
     """
     num_replicas = num_local_experts - num_base_local
     t_global = global_topk_ids.shape[0]
@@ -611,6 +625,18 @@ def pallas_qblock_remap_virtual_ids(
     rows_per_rank = (t_local * topk) // LANE
     assert rows_per_rank % 8 == 0
 
+    use_macro_vec = (
+        total_rows % LANE == 0
+        and n_blocks <= 256
+        and n_blocks % (total_rows // LANE) == 0
+        and (n_blocks // (total_rows // LANE)) in (2, 4, 8, 16)
+    )
+    n_macro = total_rows // LANE if use_macro_vec else 0
+    blks_per_macro = (n_blocks // n_macro) if use_macro_vec else 0
+    rows_per_blk = (LANE // blks_per_macro) if use_macro_vec else 0
+    row_shift = (rows_per_blk.bit_length() - 1) if use_macro_vec else 0
+    blk_mask = (blks_per_macro - 1) if use_macro_vec else 0
+
     ids_2d = global_topk_ids.astype(jnp.int32).reshape(total_rows, LANE)
     meta_sp = jnp.asarray([my_id.reshape(-1)[0].astype(jnp.int32)], dtype=jnp.int32)
 
@@ -631,37 +657,94 @@ def pallas_qblock_remap_virtual_ids(
                 jnp.zeros((8, LANE), dtype=jnp.int32) for _ in range(num_replicas)
             )
 
-        def _pass1(st, carry):
-            base_acc = carry[0]
-            r0 = pl.multiple_of(st * rows_per_step, 8)
-            x = ids_ref[pl.ds(r0, rows_per_step), :]
-            own = lax.shift_right_logical(x, jnp.int32(base_shift))
-            is_non_rep = x >= jnp.int32(num_replicas)
-            for r in range(ep_size):
-                cnt_r = jnp.sum((is_non_rep & (own == r)).astype(jnp.int32))
-                base_acc = jnp.where(lane_8 == r, base_acc + cnt_r, base_acc)
-            if use_two_halves:
-                bcs_lo = list(carry[1 : 1 + num_replicas])
-                bcs_hi = list(carry[1 + num_replicas :])
-                for k in range(num_replicas):
-                    hk = jnp.sum((x == k).astype(jnp.int32))
-                    bcs_lo[k] = jnp.where(lane_8 == st, hk, bcs_lo[k])
-                    bcs_hi[k] = jnp.where((lane_8 + jnp.int32(128)) == st, hk, bcs_hi[k])
-                return (base_acc, *bcs_lo, *bcs_hi)
-            bcs = list(carry[1:])
-            for k in range(num_replicas):
-                mx = (x == k).astype(jnp.int32)
-                if blks_per_step == 1:
-                    hk = jnp.sum(mx)
-                    bcs[k] = jnp.where(lane_8 == st, hk, bcs[k])
-                else:
-                    hk0 = jnp.sum(jnp.where(row_8 < 4, mx, 0))
-                    hk1 = jnp.sum(jnp.where(row_8 >= 4, mx, 0))
-                    bcs[k] = jnp.where(lane_8 == (2 * st), hk0, bcs[k])
-                    bcs[k] = jnp.where(lane_8 == (2 * st + 1), hk1, bcs[k])
-            return (base_acc, *bcs)
+        if use_macro_vec:
+            p_right = (
+                lax.shift_right_logical(row_128, jnp.int32(row_shift))
+                == (lane_128 & jnp.int32(blk_mask))
+            ).astype(jnp.bfloat16)
 
-        done_carry = lax.fori_loop(0, n_steps, _pass1, init_carry)
+            def _pass1(m, carry):
+                base_acc = carry[0]
+                r0 = pl.multiple_of(m * LANE, LANE)
+                x = ids_ref[pl.ds(r0, LANE), :]
+                own = lax.shift_right_logical(x, jnp.int32(base_shift))
+                is_non_rep = x >= jnp.int32(num_replicas)
+                for r in range(ep_size):
+                    cnt_r = jnp.sum((is_non_rep & (own == r)).astype(jnp.int32))
+                    base_acc = jnp.where(lane_8 == r, base_acc + cnt_r, base_acc)
+
+                blk_base = m * jnp.int32(blks_per_macro)
+                mask_lo = (lane_8 >= blk_base) & (
+                    lane_8 < blk_base + jnp.int32(blks_per_macro)
+                )
+                if use_two_halves:
+                    bcs_lo = list(carry[1 : 1 + num_replicas])
+                    bcs_hi = list(carry[1 + num_replicas :])
+                    mask_hi = ((lane_8 + jnp.int32(128)) >= blk_base) & (
+                        (lane_8 + jnp.int32(128))
+                        < blk_base + jnp.int32(blks_per_macro)
+                    )
+                    for k in range(num_replicas):
+                        row_k = jnp.sum((x == k).astype(jnp.int32), axis=1, keepdims=True)
+                        row_t = jnp.broadcast_to(
+                            row_k.astype(jnp.bfloat16), (LANE, LANE)
+                        ).T[:8, :]
+                        cnt_8 = jnp.matmul(
+                            row_t, p_right, preferred_element_type=jnp.float32
+                        ).astype(jnp.int32)
+                        bcs_lo[k] = jnp.where(mask_lo, cnt_8, bcs_lo[k])
+                        bcs_hi[k] = jnp.where(mask_hi, cnt_8, bcs_hi[k])
+                    return (base_acc, *bcs_lo, *bcs_hi)
+
+                bcs = list(carry[1:])
+                for k in range(num_replicas):
+                    row_k = jnp.sum((x == k).astype(jnp.int32), axis=1, keepdims=True)
+                    row_t = jnp.broadcast_to(
+                        row_k.astype(jnp.bfloat16), (LANE, LANE)
+                    ).T[:8, :]
+                    cnt_8 = jnp.matmul(
+                        row_t, p_right, preferred_element_type=jnp.float32
+                    ).astype(jnp.int32)
+                    bcs[k] = jnp.where(mask_lo, cnt_8, bcs[k])
+                return (base_acc, *bcs)
+
+            done_carry = lax.fori_loop(0, n_macro, _pass1, init_carry)
+        else:
+
+            def _pass1(st, carry):
+                base_acc = carry[0]
+                r0 = pl.multiple_of(st * rows_per_step, 8)
+                x = ids_ref[pl.ds(r0, rows_per_step), :]
+                own = lax.shift_right_logical(x, jnp.int32(base_shift))
+                is_non_rep = x >= jnp.int32(num_replicas)
+                for r in range(ep_size):
+                    cnt_r = jnp.sum((is_non_rep & (own == r)).astype(jnp.int32))
+                    base_acc = jnp.where(lane_8 == r, base_acc + cnt_r, base_acc)
+                if use_two_halves:
+                    bcs_lo = list(carry[1 : 1 + num_replicas])
+                    bcs_hi = list(carry[1 + num_replicas :])
+                    for k in range(num_replicas):
+                        hk = jnp.sum((x == k).astype(jnp.int32))
+                        bcs_lo[k] = jnp.where(lane_8 == st, hk, bcs_lo[k])
+                        bcs_hi[k] = jnp.where(
+                            (lane_8 + jnp.int32(128)) == st, hk, bcs_hi[k]
+                        )
+                    return (base_acc, *bcs_lo, *bcs_hi)
+                bcs = list(carry[1:])
+                for k in range(num_replicas):
+                    mx = (x == k).astype(jnp.int32)
+                    if blks_per_step == 1:
+                        hk = jnp.sum(mx)
+                        bcs[k] = jnp.where(lane_8 == st, hk, bcs[k])
+                    else:
+                        hk0 = jnp.sum(jnp.where(row_8 < 4, mx, 0))
+                        hk1 = jnp.sum(jnp.where(row_8 >= 4, mx, 0))
+                        bcs[k] = jnp.where(lane_8 == (2 * st), hk0, bcs[k])
+                        bcs[k] = jnp.where(lane_8 == (2 * st + 1), hk1, bcs[k])
+                return (base_acc, *bcs)
+
+            done_carry = lax.fori_loop(0, n_steps, _pass1, init_carry)
+
         base_acc = done_carry[0]
 
         base_r = [
@@ -767,44 +850,85 @@ def pallas_qblock_remap_virtual_ids(
             else:
                 vk_vecs_lo.append(_route_blocks(bc_k, jnp.int32(0)))
 
-        def _pass2(st, dummy):
-            r0 = pl.multiple_of(st * rows_per_step, 8)
-            x = ids_ref[pl.ds(r0, rows_per_step), :]
-            v = lax.shift_right_logical(x, jnp.int32(base_shift)) * jnp.int32(
-                num_local_experts
-            ) + (x & jnp.int32(base_mask))
-            for k in range(num_replicas):
-                if use_two_halves:
-                    vk_b = jnp.max(
-                        jnp.sum(
-                            jnp.where(lane_8 == st, vk_vecs_lo[k], 0)
-                            + jnp.where(
-                                (lane_8 + jnp.int32(128)) == st, vk_vecs_hi[k], 0
-                            ),
-                            axis=1,
-                        )
-                    )
-                    v = jnp.where(x == k, vk_b, v)
-                elif blks_per_step == 1:
-                    vk_b = jnp.max(
-                        jnp.sum(jnp.where(lane_8 == st, vk_vecs_lo[k], 0), axis=1)
-                    )
-                    v = jnp.where(x == k, vk_b, v)
-                else:
-                    vk_b0 = jnp.max(
-                        jnp.sum(jnp.where(lane_8 == (2 * st), vk_vecs_lo[k], 0), axis=1)
-                    )
-                    vk_b1 = jnp.max(
-                        jnp.sum(
-                            jnp.where(lane_8 == (2 * st + 1), vk_vecs_lo[k], 0), axis=1
-                        )
-                    )
-                    vk_row = jnp.where(row_8 < 4, vk_b0, vk_b1)
-                    v = jnp.where(x == k, vk_row, v)
-            v_global_out_ref[pl.ds(r0, rows_per_step), :] = v
-            return dummy
+        if use_macro_vec:
+            blk_sub = lax.shift_right_logical(row_128, jnp.int32(row_shift))
 
-        lax.fori_loop(0, n_steps, _pass2, jnp.int32(0))
+            def _pass2(m, dummy):
+                r0 = pl.multiple_of(m * LANE, LANE)
+                x = ids_ref[pl.ds(r0, LANE), :]
+                v = lax.shift_right_logical(x, jnp.int32(base_shift)) * jnp.int32(
+                    num_local_experts
+                ) + (x & jnp.int32(base_mask))
+                blk_of_row = m * jnp.int32(blks_per_macro) + blk_sub
+                for k in range(num_replicas):
+                    v_lo_128 = jnp.broadcast_to(vk_vecs_lo[k][:1, :], (LANE, LANE))
+                    if use_two_halves:
+                        v_hi_128 = jnp.broadcast_to(vk_vecs_hi[k][:1, :], (LANE, LANE))
+                        sel_lo = lane_128 == blk_of_row
+                        sel_hi = (lane_128 + jnp.int32(128)) == blk_of_row
+                        vk_row = jnp.sum(
+                            jnp.where(sel_lo, v_lo_128, 0)
+                            + jnp.where(sel_hi, v_hi_128, 0),
+                            axis=1,
+                            keepdims=True,
+                        )
+                    else:
+                        vk_row = jnp.sum(
+                            jnp.where(lane_128 == blk_of_row, v_lo_128, 0),
+                            axis=1,
+                            keepdims=True,
+                        )
+                    v = jnp.where(x == k, vk_row, v)
+                v_global_out_ref[pl.ds(r0, LANE), :] = v
+                return dummy
+
+            lax.fori_loop(0, n_macro, _pass2, jnp.int32(0))
+        else:
+
+            def _pass2(st, dummy):
+                r0 = pl.multiple_of(st * rows_per_step, 8)
+                x = ids_ref[pl.ds(r0, rows_per_step), :]
+                v = lax.shift_right_logical(x, jnp.int32(base_shift)) * jnp.int32(
+                    num_local_experts
+                ) + (x & jnp.int32(base_mask))
+                for k in range(num_replicas):
+                    if use_two_halves:
+                        vk_b = jnp.max(
+                            jnp.sum(
+                                jnp.where(lane_8 == st, vk_vecs_lo[k], 0)
+                                + jnp.where(
+                                    (lane_8 + jnp.int32(128)) == st,
+                                    vk_vecs_hi[k],
+                                    0,
+                                ),
+                                axis=1,
+                            )
+                        )
+                        v = jnp.where(x == k, vk_b, v)
+                    elif blks_per_step == 1:
+                        vk_b = jnp.max(
+                            jnp.sum(jnp.where(lane_8 == st, vk_vecs_lo[k], 0), axis=1)
+                        )
+                        v = jnp.where(x == k, vk_b, v)
+                    else:
+                        vk_b0 = jnp.max(
+                            jnp.sum(
+                                jnp.where(lane_8 == (2 * st), vk_vecs_lo[k], 0), axis=1
+                            )
+                        )
+                        vk_b1 = jnp.max(
+                            jnp.sum(
+                                jnp.where(lane_8 == (2 * st + 1), vk_vecs_lo[k], 0),
+                                axis=1,
+                            )
+                        )
+                        vk_row = jnp.where(row_8 < 4, vk_b0, vk_b1)
+                        v = jnp.where(x == k, vk_row, v)
+                v_global_out_ref[pl.ds(r0, rows_per_step), :] = v
+                return dummy
+
+            lax.fori_loop(0, n_steps, _pass2, jnp.int32(0))
+
         my_r0 = pl.multiple_of(me * rows_per_rank, 8)
         v_local_out_ref[:, :] = v_global_out_ref[pl.ds(my_r0, rows_per_rank), :]
 

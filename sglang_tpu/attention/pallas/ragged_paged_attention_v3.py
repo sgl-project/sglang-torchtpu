@@ -432,6 +432,7 @@ def _stationary_q_v2_process(
     use_sw_short_v2 = "sw_short_v2" in prefill_opts
     use_sw_short_fuse = ("sw_short_fuse" in prefill_opts) or use_sw_short_v2
     use_sw_unalign_fuse = "sw_unalign_fuse" in prefill_opts
+    use_sw_tail_clamp = ("sw_tail_clamp" in prefill_opts) and use_mk128
     use_sub8_l = "sub8_l" in prefill_opts
     use_la2 = "la2" in prefill_opts
     use_unroll_up = ("unroll_up" in prefill_opts) and not (
@@ -1185,7 +1186,9 @@ def _stationary_q_v2_process(
                     out_sp.extend((bs[:, :128, :], bs[:, 128:, :]))
             return tuple(out_sp)
 
-        def _eval_mk128_head(kv_h, qt_1, qsc_1, h_base, n_slices, bias_specs):
+        def _eval_mk128_head(
+            kv_h, qt_1, qsc_1, h_base, n_slices, bias_specs, max_h_idx=None
+        ):
             n_h = 2 * n_slices
             z_acc = jnp.zeros((1, 64, tq_sz), jnp.float32)
             kv_sl = (
@@ -1195,7 +1198,12 @@ def _stationary_q_v2_process(
             )
 
             def _h_ring(h_idx):
-                return (h_idx & ring_h_mask) if ring_covers_all else h_idx
+                h_eff = (
+                    jnp.minimum(h_idx, max_h_idx)
+                    if max_h_idx is not None
+                    else h_idx
+                )
+                return (h_eff & ring_h_mask) if ring_covers_all else h_eff
 
             h_specs = _expand_mk128_specs(bias_specs)
             if use_la2 and n_h >= 2:
@@ -2129,63 +2137,121 @@ def _stationary_q_v2_process(
             and ring_covers_all
         )
 
-        def _send_fused_bo():
+        def _send_fused_bo(valid_rows=None):
             if use_a3_out:
                 g0_f = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
                 aligned_g0_f = (g0_f // 16) * 16
                 lead_f = g0_f - aligned_g0_f
-
-                @pl.when(lead_f == 0)
-                def _zero_carry_f():
-                    bo_carry_ref[...] = jnp.zeros_like(bo_carry_ref)
-
-                @pl.when(lead_f > 0)
-                def _shift_and_merge_carry_f():
+                if valid_rows is None:
+                    full_rows_f = tq_sz
                     row_iota_f = lax.broadcasted_iota(
                         jnp.int32, (tq_sz + 16, 128), 0
                     )
                     zero_tail_f = jnp.zeros((16, 128), jnp.float32)
 
-                    @pl.loop(0, sq_pairs, unroll=False)
-                    def _sh_f_pair(s_f):
-                        c_sl_f = pl.ds(pl.multiple_of(s_f * 128, 128), 128)
-                        c_f = jnp.concatenate(
-                            [
-                                bo_x2_ref[
-                                    bo_sem_idx,
-                                    :tq_sz,
-                                    c_sl_f,
-                                ].astype(jnp.float32),
-                                zero_tail_f,
-                            ],
-                            axis=0,
-                        )
-                        for sh in (1, 2, 4, 8):
-                            c_f = jnp.where(
-                                (lead_f & sh) != 0,
-                                pltpu.roll(c_f, shift=sh, axis=0),
-                                c_f,
+                    @pl.when(lead_f == 0)
+                    def _zero_carry_f():
+                        bo_carry_ref[...] = jnp.zeros_like(bo_carry_ref)
+
+                    @pl.when(lead_f > 0)
+                    def _shift_and_merge_carry_f():
+                        @pl.loop(0, sq_pairs, unroll=False)
+                        def _sh_f_pair(s_f):
+                            c_sl_f = pl.ds(pl.multiple_of(s_f * 128, 128), 128)
+                            c_f = jnp.concatenate(
+                                [
+                                    bo_x2_ref[
+                                        bo_sem_idx,
+                                        :tq_sz,
+                                        c_sl_f,
+                                    ].astype(jnp.float32),
+                                    zero_tail_f,
+                                ],
+                                axis=0,
                             )
-                        carry_f = bo_carry_ref[:, c_sl_f].astype(jnp.float32)
-                        carry_pad_f = jnp.concatenate(
+                            for sh in (1, 2, 4, 8):
+                                c_f = jnp.where(
+                                    (lead_f & sh) != 0,
+                                    pltpu.roll(c_f, shift=sh, axis=0),
+                                    c_f,
+                                )
+                            carry_f = bo_carry_ref[:, c_sl_f].astype(jnp.float32)
+                            carry_pad_f = jnp.concatenate(
+                                [
+                                    carry_f,
+                                    jnp.zeros((tq_sz, 128), jnp.float32),
+                                ],
+                                axis=0,
+                            )
+                            merged_f = jnp.where(
+                                row_iota_f < lead_f, carry_pad_f, c_f
+                            )
+                            bo_x2_ref[bo_sem_idx, :, c_sl_f] = merged_f.astype(
+                                jnp.bfloat16
+                            )
+
+                        bo_carry_ref[...] = bo_x2_ref[
+                            bo_sem_idx, pl.ds(tq_sz, 16), :
+                        ]
+
+                    start_send_bo_a3(aligned_g0_f, full_rows_f, bo_sem_idx)
+                    return
+
+                total_rows_t = lead_f + valid_rows
+                full_rows_t = (total_rows_t // 16) * 16
+                row_iota_t = lax.broadcasted_iota(
+                    jnp.int32, (tq_sz + 16, 128), 0
+                )
+                zero_tail_t = jnp.zeros((16, 128), jnp.float32)
+
+                @pl.loop(0, sq_pairs, unroll=False)
+                def _sh_t_pair(s_t):
+                    c_sl_t = pl.ds(pl.multiple_of(s_t * 128, 128), 128)
+                    c_t = jnp.concatenate(
+                        [
+                            bo_x2_ref[
+                                bo_sem_idx, :tq_sz, c_sl_t
+                            ].astype(jnp.float32),
+                            zero_tail_t,
+                        ],
+                        axis=0,
+                    )
+                    c_t = jnp.where(row_iota_t < valid_rows, c_t, 0.0)
+
+                    @pl.when(lead_f == 0)
+                    def _t_al():
+                        bo_x2_ref[bo_sem_idx, :, c_sl_t] = c_t.astype(
+                            jnp.bfloat16
+                        )
+
+                    @pl.when(lead_f > 0)
+                    def _t_sh():
+                        sh_t = c_t
+                        for sh in (1, 2, 4, 8):
+                            sh_t = jnp.where(
+                                (lead_f & sh) != 0,
+                                pltpu.roll(sh_t, shift=sh, axis=0),
+                                sh_t,
+                            )
+                        carry_t = bo_carry_ref[:, c_sl_t].astype(jnp.float32)
+                        carry_pad_t = jnp.concatenate(
                             [
-                                carry_f,
+                                carry_t,
                                 jnp.zeros((tq_sz, 128), jnp.float32),
                             ],
                             axis=0,
                         )
-                        merged_f = jnp.where(
-                            row_iota_f < lead_f, carry_pad_f, c_f
+                        merged_t = jnp.where(
+                            row_iota_t < lead_f, carry_pad_t, sh_t
                         )
-                        bo_x2_ref[bo_sem_idx, :, c_sl_f] = merged_f.astype(
+                        bo_x2_ref[bo_sem_idx, :, c_sl_t] = merged_t.astype(
                             jnp.bfloat16
                         )
 
-                    bo_carry_ref[...] = bo_x2_ref[
-                        bo_sem_idx, pl.ds(tq_sz, 16), :
-                    ]
-
-                start_send_bo_a3(aligned_g0_f, tq_sz, bo_sem_idx)
+                bo_carry_ref[...] = bo_x2_ref[
+                    bo_sem_idx, pl.ds(pl.multiple_of(full_rows_t, 16), 16), :
+                ]
+                start_send_bo_a3(aligned_g0_f, full_rows_t, bo_sem_idx)
             else:
                 start_send_bo(seq_idx, bq_idx, bo_sem_idx)
 
@@ -2215,13 +2281,22 @@ def _stationary_q_v2_process(
                 .reshape(256 * sq_pairs, 128)
             )
 
-        def _run_sw_mk128_fused(s_lo, n_slices, bias_specs):
+        def _run_sw_mk128_fused(
+            s_lo, n_slices, bias_specs, valid_rows=None, max_h_idx=None
+        ):
             q_u32_ref = _get_bq_u32_ref()
             h_base_sw = 2 * s_lo
+            q_row_ok = (
+                (lax.broadcasted_iota(jnp.int32, (tq_sz, 128), 0) < valid_rows)
+                if valid_rows is not None
+                else None
+            )
             for kv_h in range(sq_kv_heads):
                 for gp in range(4):
                     s_pair = kv_h * 4 + gp
                     u_s = _bq_pair_u32(q_u32_ref, bq_sem_idx, 0, s_pair)
+                    if q_row_ok is not None:
+                        u_s = jnp.where(q_row_ok, u_s, jnp.uint32(0))
                     pair_q_t = _decode_q_pair(u_s, kv_h * 4, is_lo_ep)
                     if use_fp8_qk_dyn:
                         q0_f8, q0_sc8 = _quant_qt_fp8(pair_q_t[:64, :])
@@ -2238,10 +2313,22 @@ def _stationary_q_v2_process(
                         )
                         qsc_pair = (None, None)
                     acc0, l0 = _eval_mk128_head(
-                        kv_h, qt_pair[0], qsc_pair[0], h_base_sw, n_slices, bias_specs
+                        kv_h,
+                        qt_pair[0],
+                        qsc_pair[0],
+                        h_base_sw,
+                        n_slices,
+                        bias_specs,
+                        max_h_idx=max_h_idx,
                     )
                     acc1, l1 = _eval_mk128_head(
-                        kv_h, qt_pair[1], qsc_pair[1], h_base_sw, n_slices, bias_specs
+                        kv_h,
+                        qt_pair[1],
+                        qsc_pair[1],
+                        h_base_sw,
+                        n_slices,
+                        bias_specs,
+                        max_h_idx=max_h_idx,
                     )
                     _write_sw9_pair_out(
                         acc0[0], acc1[0], l0[0], l1[0], s_pair, kv_h
@@ -2273,8 +2360,14 @@ def _stationary_q_v2_process(
                 lt_s9 = _pair(q_rel_w >= (k_r0 + 256), q_rel_w >= (k_r1 + 256))
             return (ut_s0, ut_s1) + ("none",) * 6 + (lt_s8, lt_s9)
 
-        def _run_sw10_fused_qe(s_lo, w_off):
-            _run_sw_mk128_fused(s_lo, 10, _sw10_unalign_bias_specs(w_off))
+        def _run_sw10_fused_qe(s_lo, w_off, valid_rows=None, max_h_idx=None):
+            _run_sw_mk128_fused(
+                s_lo,
+                10,
+                _sw10_unalign_bias_specs(w_off),
+                valid_rows=valid_rows,
+                max_h_idx=max_h_idx,
+            )
 
         def _run_sw9_fused_qe(s_lo):
             bias_specs = ("ut",) + ("none",) * 7 + ("lt",)
@@ -2585,6 +2678,20 @@ def _stationary_q_v2_process(
                     if use_sw_short_fuse
                     else jnp.bool_(False)
                 )
+                is_sw_tail_0 = (
+                    jnp.logical_and(
+                        valid_bq_rows < tq_sz,
+                        jnp.logical_and(
+                            valid_bq_rows > 0,
+                            jnp.logical_and(
+                                q_first_0 >= 2048,
+                                q_first_0 + valid_bq_rows <= kv_len,
+                            ),
+                        ),
+                    )
+                    if use_sw_tail_clamp
+                    else jnp.bool_(False)
+                )
 
                 @pl.when(is_sw9_fast_0)
                 def _do_fused_sw9():
@@ -2592,14 +2699,24 @@ def _stationary_q_v2_process(
                     _run_sw9_fused_qe(s_lo_0)
                     _send_fused_bo()
 
-                if use_sw_unalign_fuse and use_mk128:
+                if use_sw_unalign_fuse or use_sw_tail_clamp:
 
-                    @pl.when(is_sw10_fast_0)
+                    @pl.when(jnp.logical_or(is_sw10_fast_0, is_sw_tail_0))
                     def _do_fused_sw10():
                         w_off_0 = sw_left_0 & 255
                         s_lo_0 = sw_left_0 // 256
-                        _run_sw10_fused_qe(s_lo_0, w_off_0)
-                        _send_fused_bo()
+                        if use_sw_tail_clamp:
+                            max_h_0 = 2 * cdiv(effective_kv_len, 256) - 1
+                            _run_sw10_fused_qe(
+                                s_lo_0,
+                                w_off_0,
+                                valid_rows=valid_bq_rows,
+                                max_h_idx=max_h_0,
+                            )
+                            _send_fused_bo(valid_bq_rows)
+                        else:
+                            _run_sw10_fused_qe(s_lo_0, w_off_0)
+                            _send_fused_bo()
 
                 if use_sw_short_fuse:
 
@@ -2836,7 +2953,10 @@ def _stationary_q_v2_process(
                 @pl.when(
                     jnp.logical_not(
                         jnp.logical_or(
-                            jnp.logical_or(is_sw9_fast_0, is_sw10_fast_0),
+                            jnp.logical_or(
+                                is_sw9_fast_0,
+                                jnp.logical_or(is_sw10_fast_0, is_sw_tail_0),
+                            ),
                             is_sw_short_0,
                         )
                     )
@@ -7077,6 +7197,7 @@ def ragged_paged_attention(
                 "prefix_fast",
                 "staged_qo",
                 "sw_unalign_fuse",
+                "sw_tail_clamp",
                 *_STATIONARY_Q_V2_OPTS,
             }
         use_stationary_q_v2 = bool(

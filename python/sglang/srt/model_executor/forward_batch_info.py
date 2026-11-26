@@ -1226,7 +1226,26 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # Init position information
         if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
             if ret.positions is None and not ret.input_ids_from_graph:
-                ret.positions = clamp_position(batch.seq_lens)
+                if (
+                    _is_tpu
+                    and ret.spec_info is None
+                    and isinstance(batch.seq_lens_cpu, torch.Tensor)
+                    and batch.seq_lens_cpu.shape[0] == len(batch.seq_lens)
+                ):
+                    pos_cpu = torch.clamp(batch.seq_lens_cpu - 1, min=0).to(
+                        torch.int64
+                    )
+                    if not bool(
+                        getattr(
+                            getattr(model_runner, "server_args", None),
+                            "enable_torch_compile",
+                            True,
+                        )
+                    ):
+                        pos_cpu = pos_cpu.to(device, non_blocking=True)
+                    ret.positions = pos_cpu
+                else:
+                    ret.positions = clamp_position(batch.seq_lens)
         else:
             if isinstance(extend_seq_lens, list):
                 # Build from host lists; the backend may defer H2D until padding.

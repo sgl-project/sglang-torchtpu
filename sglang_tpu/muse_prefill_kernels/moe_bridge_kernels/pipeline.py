@@ -1680,6 +1680,7 @@ def _allow_pallas_sortfree_routing(
         and sortfree_prefill
         and (topk & (topk - 1)) == 0
         and (ep_size * t_local) >= 256
+        and (t_local >= 256)
         and (t_local % 128 == 0)
         and ((t_local * topk) % 128 == 0)
         and (n_loc_eff <= 120)

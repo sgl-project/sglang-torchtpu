@@ -586,6 +586,10 @@ class TpuEnvs:
     SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_PLAN = EnvInt(0)
     SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_GS = EnvBool(False)
     SGLANG_TPU_MUSE_KERNEL_DECODE_EP_TP2_PAIR_RS = EnvBool(False)
+    # Opt-in B=16 (LC 8K/1K) sparse execution (m_buckets=(8, 16) vs dense) unlocking FREE/MIN_P.
+    SGLANG_TPU_MUSE_KERNEL_DECODE_B16_SPARSE = EnvBool(False)
+    # Opt-in non-uniform per-layer FREE/MIN_P preset or spec ("" = uniform off).
+    SGLANG_TPU_MUSE_DECODE_NONUNIFORM_FREE = EnvStr("")
     # Opt-in (#3035): allow SPEC_PRIME (>0) alongside ROUTE_FAST + FAST_PLAN=2 and optional home slot hint (-1=auto).
     SGLANG_TPU_MUSE_KERNEL_DECODE_SPEC_PRIME_FAST = EnvBool(False)
     SGLANG_TPU_MUSE_KERNEL_DECODE_SPEC_HOME_SLOT = EnvInt(-1)
@@ -1501,6 +1505,10 @@ class TpuEnvs:
     # + Step (a) [chip_b1 + muse_sparse] on L61 across TP=8/16 (eliminates inter-op XLA
     # barriers and keeps residual stream live in VMEM across MoE).
     SGLANG_TPU_MUSE_DECODE_B1_MOE_B2_SUPERKERNEL = EnvBool(False)
+    # Wave-9 opt-in Step (c) [chip_b1 + muse_sparse(3d) + chip_b2 + RPAd] decode superkernel
+    # on SWA / bounded-context layers (<= 20 ring slots*pages, B <= 64, EP=8/16): fuses next
+    # layer RPAd directly behind Bridge 2b QKV/RoPE/KV epilogue and skips next self_attn.
+    SGLANG_TPU_MUSE_DECODE_STEP_C_SUPERKERNEL = EnvBool(False)
     # Wave-8 fuse decode QKV RMSNorm + RoPE + KV FP8 quant epilogue directly into Bridge 2b & L0.
     SGLANG_TPU_MUSE_DECODE_BRIDGE_QKV_EPI = EnvBool(False)
     # Wave-9 unlock fused in-VMEM QKV/RoPE/FP8-KV epilogue on TP=16 (qkv_cols=640, 8Q/1KV) across

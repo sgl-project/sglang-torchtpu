@@ -293,6 +293,105 @@ def resolve_free_and_min_p_for_batch(
     return eff_min_p, scaled_rows, eff_max_w, scaled_min_slot
 
 
+_NONUNIFORM_FREE_PRESETS: dict[str, tuple[tuple[int, float, int, float], tuple[int, float, int, float], int]] = {
+    # (boundary: rows, max_w, min_slot, min_p), (middle: rows, max_w, min_slot, min_p), boundary_n
+    "mid_f10p82": ((6, 0.18, 2, 0.88), (10, 0.22, 1, 0.82), 5),
+    "mid_f10p84": ((6, 0.18, 2, 0.88), (10, 0.22, 1, 0.84), 5),
+    "mid_f9p84": ((6, 0.18, 2, 0.88), (9, 0.20, 1, 0.84), 5),
+}
+
+
+def parse_nonuniform_free_spec(
+    spec: str,
+) -> tuple[tuple[int, float, int, float], tuple[int, float, int, float], int] | None:
+    """Parse ``SGLANG_TPU_MUSE_DECODE_NONUNIFORM_FREE`` preset or ``b|m[@bn]`` spec.
+
+    Format:
+      - ``""`` / ``"off"`` / ``"0"`` -> ``None`` (uniform fallback)
+      - Preset name in ``("mid_f10p82", "mid_f10p84", "mid_f9p84")``
+      - Explicit ``"b_rows:b_w:b_ms:b_mp|m_rows:m_w:m_ms:m_mp[@bn]"``
+    """
+    raw = str(spec or "").strip()
+    if not raw or raw.lower() in ("0", "false", "no", "off", "none"):
+        return None
+    preset = _NONUNIFORM_FREE_PRESETS.get(raw.lower())
+    if preset is not None:
+        return preset
+    body, _, bn_str = raw.partition("@")
+    boundary_n = max(1, int(bn_str)) if bn_str.strip() else 5
+    b_raw, sep, m_raw = body.partition("|")
+    if not sep:
+        raise ValueError(
+            f"Invalid SGLANG_TPU_MUSE_DECODE_NONUNIFORM_FREE={raw!r}; "
+            "expected preset or 'b_rows:b_w:b_ms:b_mp|m_rows:m_w:m_ms:m_mp[@bn]'"
+        )
+
+    def _parse4(tok: str) -> tuple[int, float, int, float]:
+        parts = [p.strip() for p in tok.split(":")]
+        if len(parts) != 4:
+            raise ValueError(f"Expected 4 colon-separated fields in {tok!r}")
+        return int(parts[0]), float(parts[1]), int(parts[2]), float(parts[3])
+
+    return _parse4(b_raw), _parse4(m_raw), boundary_n
+
+
+def resolve_nonuniform_free_for_layer(
+    layer_idx: int,
+    num_layers: int,
+    batch_size: int,
+    *,
+    min_p_topk: float,
+    free_rows: int,
+    free_max_w: float,
+    free_min_slot: int,
+    parse_free_spec_fn,
+    ep: int = 8,
+    scale_mode: str | None = None,
+    spec: str | None = None,
+) -> tuple[float, int, float, int]:
+    """Resolve ``(min_p_topk, free_rows, free_max_w, free_min_slot)`` for one MoE layer.
+
+    When ``SGLANG_TPU_MUSE_DECODE_NONUNIFORM_FREE`` is unset/empty, delegates
+    identically to ``resolve_free_and_min_p_for_batch``. Otherwise applies
+    conservative pruning on boundary layers ``[1..bn]`` and ``[N-1-bn..N-2]``
+    and stronger pruning on middle layers ``[bn+1..N-2-bn]``, with ``ep``-aware
+    clamping at ``B <= 16`` (``<= 1`` row on ``EP=16``, ``<= 2`` on ``EP=8``).
+    """
+    eff_spec = (
+        str(_env_raw("SGLANG_TPU_MUSE_DECODE_NONUNIFORM_FREE", "")).strip()
+        if spec is None
+        else str(spec).strip()
+    )
+    parsed = parse_nonuniform_free_spec(eff_spec)
+    if parsed is None:
+        return resolve_free_and_min_p_for_batch(
+            batch_size,
+            min_p_topk=min_p_topk,
+            free_rows=free_rows,
+            free_max_w=free_max_w,
+            free_min_slot=free_min_slot,
+            parse_free_spec_fn=parse_free_spec_fn,
+            scale_mode=scale_mode,
+        )
+    if batch_size >= 128:
+        return resolve_free_and_min_p_for_batch(
+            batch_size,
+            min_p_topk=min_p_topk,
+            free_rows=free_rows,
+            free_max_w=free_max_w,
+            free_min_slot=free_min_slot,
+            parse_free_spec_fn=parse_free_spec_fn,
+            scale_mode=scale_mode,
+        )
+    b_cfg, m_cfg, bn = parsed
+    is_boundary = (layer_idx <= bn) or (layer_idx >= max(bn + 1, num_layers - 1 - bn))
+    t_rows, t_w, t_ms, t_mp = b_cfg if is_boundary else m_cfg
+    s_rows, s_ms = scale_free_expert_for_batch(t_rows, t_ms, batch_size, mode=scale_mode)
+    if batch_size <= 16 and s_rows > 0:
+        s_rows = min(s_rows, 1 if ep >= 16 else 2)
+    return t_mp, s_rows, t_w, s_ms
+
+
 def read_sparse_v2_env_overrides() -> SparseV2EnvOverrides:
     """Read granular ``SparseDecodeV2Config`` overrides from environment."""
     m_bkt_str = str(_env_raw("SGLANG_TPU_MUSE_KERNEL_DECODE_M_BUCKETS", ""))

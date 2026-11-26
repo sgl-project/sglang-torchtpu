@@ -886,7 +886,7 @@ class LogitsProcessor(nn.Module):
                     return LogitsProcessorOutput(
                         next_token_logits=None,
                         next_token_global_top_k_logits=g_logits,
-                        next_token_global_top_k_token_ids=g_ids,
+                        next_token_global_top_k_token_ids=g_ids.to(torch.int64),
                         hidden_states=hidden_states_to_store,
                         mm_input_embeds=logits_metadata.mm_input_embeds,
                     )
@@ -904,7 +904,9 @@ class LogitsProcessor(nn.Module):
                 return LogitsProcessorOutput(
                     next_token_logits=None,
                     next_token_global_top_k_logits=global_top_k_logits,
-                    next_token_global_top_k_token_ids=global_top_k_token_ids,
+                    next_token_global_top_k_token_ids=global_top_k_token_ids.to(
+                        torch.int64
+                    ),
                     hidden_states=hidden_states_to_store,
                     last_hidden_states=last_hidden_states_to_store,
                     mm_input_embeds=logits_metadata.mm_input_embeds,
