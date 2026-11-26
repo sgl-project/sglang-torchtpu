@@ -1555,6 +1555,9 @@ class TpuEnvs:
     # Wave-16 opt-in double-buffered stream HBM->VMEM prefetch + direct (bm, 32, 128) FP8 store
     # inside pallas_fused_b1_b2_wpool_quant (-0.73..-0.96 ms/61L on 4c Ghostfish, 0-ULP bit-exact).
     SGLANG_TPU_MUSE_KERNEL_B2_DBL_STREAM = EnvBool(False)
+    # Wave-18 opt-in multi-chunk pow2 B1+B2 + cat_sc pipeline ("auto" -> (512,1024,1024,512) at
+    # t_local=3072, (512,512,512) at t_local=1536; or explicit CSV) overlapping SparseCore AG_i8.
+    SGLANG_TPU_MUSE_KERNEL_B2_PIPE_CHUNKS = EnvStr("")
 
     @classmethod
     def names(cls) -> list[str]:
