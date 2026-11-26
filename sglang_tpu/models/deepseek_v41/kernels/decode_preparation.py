@@ -117,10 +117,10 @@ def _half_vmem() -> pltpu.CompilerParams:
     )
 
 
-def pack_matrix(records, values, *, base, capacity, padded):
+def pack_matrix(records, values, *, base, capacity, padded, page_size=64):
     n = values.shape[0]
     local = jnp.where(
-        (max(base, 64) <= records.T) & (base + capacity > records.T),
+        (max(base, page_size) <= records.T) & (base + capacity > records.T),
         records.T - base,
         capacity,
     )
@@ -216,6 +216,7 @@ def _swa_capacities(banks):
 
 def swa_pack(banks, records, values):
     capacities, lanes_cores = _swa_capacities(banks)
+    page_size = banks[0].shape[1]
     padded = (values.shape[0] + lanes_cores - 1) // lanes_cores * lanes_cores
 
     def body(records, values):
@@ -223,7 +224,12 @@ def swa_pack(banks, records, values):
         for capacity in capacities:
             result.append(
                 pack_matrix(
-                    records, values, base=base, capacity=capacity, padded=padded
+                    records,
+                    values,
+                    base=base,
+                    capacity=capacity,
+                    padded=padded,
+                    page_size=page_size,
                 )
             )
             base += capacity

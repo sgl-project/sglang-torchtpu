@@ -72,6 +72,7 @@ from sglang_tpu.disaggregation.raiden.dram_offload_channel import DramOffloadCha
 from sglang_tpu.disaggregation.raiden.host_pool import (
     WINDOW_SLOTS_PER_FULL_SLOT,
     StagingAdmission,
+    has_heterogeneous_page_layouts,
     node_worker_rank,
     ranks_per_node,
     slot_host_bytes,
@@ -561,9 +562,11 @@ class RaidenKVManager(
                 * self._swa_max_request_blocks()
             )
         engines = [(self._kv_caches, max_blocks)]
+        engine_names = ["full"]
         if self._swa_kv_caches:
             swa_max_blocks = self._swa_max_request_blocks()
             engines.append((self._swa_kv_caches, swa_max_blocks))
+            engine_names.append("swa")
         if self._draft_kv_caches:
             draft_max_blocks = (
                 self._swa_max_request_blocks()
@@ -571,11 +574,42 @@ class RaidenKVManager(
                 else self._max_request_blocks()
             )
             engines.append((self._draft_kv_caches, draft_max_blocks))
-        layers = split_staging_layers(
-            [len(t) for t, _ in engines], self._staging_layers_total
-        )
+            engine_names.append("draft")
+        # Bounded shared-layer staging (num_staging_layers < len(tensors)) is
+        # unsafe when an engine mixes buffers with different per-page layouts
+        # (e.g. DSV4.1 full KV/scale/indexer roots), because tpu_sync strides
+        # shared host buffers by host_block_id * layer_block_byte_size across
+        # concurrent sessions. Keep full per-layer host mirrors for
+        # heterogeneous engines and split SGLANG_TPU_RAIDEN_STAGING_LAYERS only
+        # across homogeneous ones.
+        homog_indices = []
+        hetero_engines = []
+        for i, (name, (tensors, _)) in enumerate(zip(engine_names, engines)):
+            if has_heterogeneous_page_layouts(tensors):
+                hetero_engines.append((name, len(tensors)))
+            else:
+                homog_indices.append(i)
+        if self._staging_layers_total > 0 and hetero_engines:
+            desc = ", ".join(f"{name} ({n} tensors)" for name, n in hetero_engines)
+            logger.warning(
+                "RaidenKVManager rank%d keeping full per-layer host staging "
+                "mirrors for heterogeneous engine(s) [%s] despite "
+                "SGLANG_TPU_RAIDEN_STAGING_LAYERS=%d; bounded shared-layer "
+                "staging requires uniform per-page layouts.",
+                self.attn_tp_rank,
+                desc,
+                self._staging_layers_total,
+            )
+        layers = [len(tensors) for tensors, _ in engines]
+        if homog_indices:
+            homog_layers = split_staging_layers(
+                [len(engines[i][0]) for i in homog_indices],
+                self._staging_layers_total,
+            )
+            for i, n in zip(homog_indices, homog_layers):
+                layers[i] = n
         if self._state_kv_caches:
-            # GDN state engines keep every layer.
+            # GDN/DSV4 state engines keep every layer.
             state_max_blocks = self._state_max_blocks
             engines.append((list(self._state_kv_caches), state_max_blocks))
             layers.append(len(self._state_kv_caches))
@@ -710,8 +744,9 @@ class RaidenKVManager(
     ) -> List[Tuple[int, int]]:
         """Size all engine staging pools within this rank's host-memory budget.
 
-        Each engine's slot cost is its host layer buffer count multiplied by
-        max_blocks and the widest layer's bytes per page.
+        Each engine's slot cost is ``slot_host_bytes(tensors, max_blocks,
+        num_layers)``: the per-layer sum for a full mirror, or ``num_layers``
+        times the widest layer's page for shared staging buffers.
 
         Fixed-slot engines receive the same number of slots. Dynamic staging
         assigns WINDOW_SLOTS_PER_FULL_SLOT slots to each remaining engine for

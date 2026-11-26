@@ -3,33 +3,48 @@
 
 Keeps the core DeepSeekV4TokenToKVPool control plane (full and SWA allocators,
 full_to_swa_index_mapping, kv_source layer sharing, ratio-2 pair state) and swaps
-only the physical buffers for the shapes the V4.1 Pallas kernels read:
+only the physical buffers for TPU-tile-aligned 3D page roots (for Raiden P/D
+page DMA without XLA (8, 128) tile interleaving) with zero-copy kernel views:
 
-- SWA, every layer: bf16 [ceil((swa_size + 256) / 64), 64, 512]; page = swa_loc // 64.
-- Main KV, kv_source layers: FP8 latent words int32 [R, 128] + fp32 scales [R];
-  record = full_loc // r, R = ceil((full_size + 256) / 256) * (256 // r), so a main
-  page holds 256 // r records and its id is the full page id.
-- Indexer K, kv_source layers: packed FP8 int32 [P * 33, 128] with
-  PackedFP8Layout(P, page_size=128); record = full_loc // r, P = R // 128.
+- SWA, every layer: root bf16 [num_pages256, 256, 512]; 64-token kernel view
+  bf16 [num_pages256 * 4, 64, 512]; page = swa_loc // 64.
+- Main KV, kv_source layers: root FP8 latent words int32
+  [num_full_pages, 256 // r, 128] + root fp32 scales [num_full_pages, 8, 128]
+  (one whole (8, 128) tile per full page, scale_step = 1024 // (256 // r));
+  flat views int32 [R, 128] and fp32 [num_full_pages * 1024].
+- Indexer K, kv_source layers: root packed FP8 int32
+  [num_full_pages, rows_per_full, 128] with page_stride=36 (r=1, 72 rows/page)
+  or page_stride=40 (r=2, 40 rows/page); flat view int32 [P * page_stride, 128]
+  described by PackedFP8Layout(P, page_stride=page_stride, page_size=128).
+- Ratio-2 pair state, ratio-2 kv_source layers: root fp32
+  [num_req_slots + 1, ring_stride, feat_stride] (ring_stride=8, feat_stride=1024);
+  spare slot ``num_req_slots`` holds the read-only ``-1`` sentinel ``(0, -inf)``.
 
-The allocators reserve logical page 0, so SWA pages 0..3, main page 0 and the
-indexer pages of full page 0 are never written. Every buffer is a base tensor
-(`_base is None`) so torch_tpu can donate it to Pallas calls.
+The allocators reserve logical page 0, so SWA page 0 (64-token pages 0..3), main
+page 0 and the indexer pages of full page 0 are never written. Every root buffer
+is a base tensor (`_base is None`) so torch_tpu can donate it to Pallas calls
+and Raiden can register its HBM address directly.
 """
 
 from __future__ import annotations
 
 import inspect
 import logging
+import math
 from dataclasses import dataclass
 from functools import partial
-from typing import Mapping, Optional, Sequence, Tuple
+from typing import List, Mapping, Optional, Sequence, Tuple
 from unittest.mock import patch
 
+import numpy as np
 import torch
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.layers.attention.dsv4.unified_kv_gate import is_unified_kv_triton
+from sglang.srt.mem_cache.deepseek_v4_compress_state import (
+    CompressStatePool,
+    KVAndScore,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4IndexerPool,
     DeepSeekV4SingleKVPool,
@@ -37,7 +52,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 )
 from sglang.srt.mem_cache.kv.memory import request_window as core_request_window
 from sglang.srt.mem_cache.memory_pool import get_tensor_size_bytes
-from sglang.srt.runtime_context import get_exec, get_schedule
+from sglang.srt.runtime_context import get_disagg, get_exec, get_schedule
 from sglang.srt.utils import ceil_div
 from sglang_tpu.dsv4.dsv4_memory_pool import _zeros_kv_buffer
 from sglang_tpu.models.deepseek_v41.request_window import (
@@ -88,34 +103,87 @@ except ModuleNotFoundError as exc:
 logger = logging.getLogger(__name__)
 
 FULL_PAGE_TOKENS = 256
-# CSA2 accepts SWA pages of 64; the fused SWA publish runs only at 64.
+# CSA2 reads 64-token SWA views; the root buffer groups 4 views per 256-token
+# logical SWA page so Raiden page DMA moves whole TPU-tile-aligned pages.
 SWA_PAGE_TOKENS = 64
 LATENT_DIM = 512
 INDEX_HEAD_DIM = 128
 WORD_LANES = 128
+TPU_SUBLANE_ALIGN = 8
+SCALE_TILE_ROWS = TPU_SUBLANE_ALIGN
+SCALE_TILE_LANES = WORD_LANES
+SCALE_TILE_ELEMENTS = SCALE_TILE_ROWS * SCALE_TILE_LANES
 
 SWA_BYTES_PER_TOKEN = LATENT_DIM * torch.bfloat16.itemsize
-# One 512 B FP8 record (448 e4m3 + 64 e8m0) plus its fp32 scale companion.
-MAIN_BYTES_PER_RECORD = WORD_LANES * 4 + 4
-# 128 FP8 values + one fp32 scale: 33 word rows per 128-record page.
-INDEX_BYTES_PER_RECORD = PAGE_ROWS * WORD_LANES * 4 // PAGE_RECORDS
+# One 512 B FP8 record (448 e4m3 + 64 e8m0) in int32[128].
+MAIN_WORD_BYTES_PER_RECORD = WORD_LANES * 4
 
 LOW_RATIOS = (1, 2)
 SUPPORTED_RATIOS = (0, *LOW_RATIOS)
 
 
+def num_swa_pages256(swa_size: int) -> int:
+    # The SWA allocator reserves one logical 256-token page, so the top swa_loc
+    # is swa_size + 255.
+    return ceil_div(swa_size + FULL_PAGE_TOKENS, FULL_PAGE_TOKENS)
+
+
 def num_swa_pages64(swa_size: int) -> int:
-    # The SWA allocator reserves one logical page, so the top swa_loc is swa_size + 255.
-    return ceil_div(swa_size + FULL_PAGE_TOKENS, SWA_PAGE_TOKENS)
+    return num_swa_pages256(swa_size) * (FULL_PAGE_TOKENS // SWA_PAGE_TOKENS)
+
+
+def num_main_pages(full_size: int) -> int:
+    return ceil_div(full_size + FULL_PAGE_TOKENS, FULL_PAGE_TOKENS)
 
 
 def num_main_records(full_size: int, ratio: int) -> int:
-    full_pages = ceil_div(full_size + FULL_PAGE_TOKENS, FULL_PAGE_TOKENS)
-    return full_pages * (FULL_PAGE_TOKENS // ratio)
+    return num_main_pages(full_size) * (FULL_PAGE_TOKENS // ratio)
 
 
 def num_index_pages(full_size: int, ratio: int) -> int:
     return num_main_records(full_size, ratio) // PAGE_RECORDS
+
+
+def main_bytes_per_record(ratio: int) -> int:
+    """512 B FP8 latent word + share of one (8, 128) fp32 scale tile per page."""
+    records_per_page = FULL_PAGE_TOKENS // ratio
+    scale_bytes_per_page = SCALE_TILE_ELEMENTS * torch.float32.itemsize
+    assert scale_bytes_per_page % records_per_page == 0
+    return MAIN_WORD_BYTES_PER_RECORD + scale_bytes_per_page // records_per_page
+
+
+def index_page_stride(ratio: int) -> int:
+    """128-record subpage stride so each full page's rows are a multiple of 8."""
+    subpages = (FULL_PAGE_TOKENS // ratio) // PAGE_RECORDS
+    stride_align = TPU_SUBLANE_ALIGN // math.gcd(TPU_SUBLANE_ALIGN, subpages)
+    return ceil_div(PAGE_ROWS, stride_align) * stride_align
+
+
+def index_bytes_per_record(ratio: int) -> int:
+    """Packed FP8 index-K bytes per record including 8-row page alignment."""
+    return index_page_stride(ratio) * WORD_LANES * 4 // PAGE_RECORDS
+
+
+def c2_state_fixed_bytes(
+    *,
+    num_req_slots: int,
+    ring_size: int,
+    head_dim: int,
+    num_layers: int,
+) -> int:
+    """Total HBM bytes of ``TPUPairStatePool`` across ``num_layers`` ratio-2 sources."""
+    ring_stride = max(
+        TPU_SUBLANE_ALIGN,
+        ceil_div(ring_size, TPU_SUBLANE_ALIGN) * TPU_SUBLANE_ALIGN,
+    )
+    feat_stride = ceil_div(2 * head_dim, WORD_LANES) * WORD_LANES
+    return (
+        (num_req_slots + 1)
+        * ring_stride
+        * feat_stride
+        * torch.float32.itemsize
+        * num_layers
+    )
 
 
 def uses_dsv41_pool(compress_ratios: Sequence[int]) -> bool:
@@ -124,7 +192,7 @@ def uses_dsv41_pool(compress_ratios: Sequence[int]) -> bool:
 
 
 class DSV41TPUSWAKVPool(DeepSeekV4SingleKVPool):
-    """Per-layer bf16 SWA pages [num_pages, 64, 512]."""
+    """Per-layer bf16 SWA roots [num_pages256, 256, 512] with 64-token views."""
 
     def __init__(
         self,
@@ -136,7 +204,8 @@ class DSV41TPUSWAKVPool(DeepSeekV4SingleKVPool):
         qk_nope_head_dim: int,
         qk_rope_head_dim: int,
     ):
-        self.num_pages = num_swa_pages64(size)
+        self.num_pages256 = num_swa_pages256(size)
+        self.num_pages = self.num_pages256 * (FULL_PAGE_TOKENS // SWA_PAGE_TOKENS)
         super().__init__(
             size,
             SWA_PAGE_TOKENS,
@@ -151,21 +220,29 @@ class DSV41TPUSWAKVPool(DeepSeekV4SingleKVPool):
 
     def _create_buffers(self) -> None:
         self.kv_cache_total_dim = SWA_BYTES_PER_TOKEN
-        shape = (self.num_pages, self.page_size, LATENT_DIM)
-        self.kv_buffer = [
+        shape = (self.num_pages256, FULL_PAGE_TOKENS, LATENT_DIM)
+        self.k_pages = [
             _zeros_kv_buffer(shape, torch.bfloat16, self.device)
             for _ in range(self.layer_num)
+        ]
+        self.kv_buffer = [
+            p.view(self.num_pages, SWA_PAGE_TOKENS, LATENT_DIM) for p in self.k_pages
         ]
 
     def get_bytes_per_token(self) -> int:
         return SWA_BYTES_PER_TOKEN
 
     def get_kv_size_bytes(self) -> Tuple[int, int]:
-        return int(get_tensor_size_bytes(self.kv_buffer)), 0
+        return int(get_tensor_size_bytes(self.k_pages)), 0
 
 
 class DSV41TPUMainKVPool(DeepSeekV4SingleKVPool):
-    """Per kv_source layer FP8 latent records: int32 words [R, 128] + fp32 [R]."""
+    """Per kv_source layer FP8 latent records: 3D page roots + flat kernel views.
+
+    Root ``k_pages`` is ``int32 [num_pages, 256 // ratio, 128]`` and root
+    ``scale_pages`` is ``fp32 [num_pages, 8, 128]`` (one whole TPU ``(8, 128)``
+    tile per full page, ``scale_step = 1024 // (256 // ratio)``).
+    """
 
     def __init__(
         self,
@@ -179,10 +256,13 @@ class DSV41TPUMainKVPool(DeepSeekV4SingleKVPool):
         qk_rope_head_dim: int,
     ):
         self.ratio = ratio
-        self.num_records = num_main_records(full_size, ratio)
+        self.num_pages = num_main_pages(full_size)
+        self.records_per_page = FULL_PAGE_TOKENS // ratio
+        self.num_records = self.num_pages * self.records_per_page
+        self.scale_step = SCALE_TILE_ELEMENTS // self.records_per_page
         super().__init__(
             full_size // ratio,
-            FULL_PAGE_TOKENS // ratio,
+            self.records_per_page,
             torch.int32,
             qk_nope_head_dim,
             qk_rope_head_dim,
@@ -193,29 +273,46 @@ class DSV41TPUMainKVPool(DeepSeekV4SingleKVPool):
         )
 
     def _create_buffers(self) -> None:
-        self.kv_cache_total_dim = MAIN_BYTES_PER_RECORD
-        self.kv_buffer = [
-            _zeros_kv_buffer((self.num_records, WORD_LANES), torch.int32, self.device)
+        self.kv_cache_total_dim = main_bytes_per_record(self.ratio)
+        self.k_pages = [
+            _zeros_kv_buffer(
+                (self.num_pages, self.records_per_page, WORD_LANES),
+                torch.int32,
+                self.device,
+            )
             for _ in range(self.layer_num)
         ]
-        self.scale_buffer = [
-            _zeros_kv_buffer((self.num_records,), torch.float32, self.device)
+        self.scale_pages = [
+            _zeros_kv_buffer(
+                (self.num_pages, SCALE_TILE_ROWS, SCALE_TILE_LANES),
+                torch.float32,
+                self.device,
+            )
             for _ in range(self.layer_num)
+        ]
+        self.kv_buffer = [p.view(self.num_records, WORD_LANES) for p in self.k_pages]
+        self.scale_buffer = [
+            p.view(self.num_pages * SCALE_TILE_ELEMENTS) for p in self.scale_pages
         ]
 
     def get_bytes_per_token(self) -> int:
-        return MAIN_BYTES_PER_RECORD
+        return main_bytes_per_record(self.ratio)
 
     def get_kv_size_bytes(self) -> Tuple[int, int]:
         return (
-            int(get_tensor_size_bytes(self.kv_buffer))
-            + int(get_tensor_size_bytes(self.scale_buffer)),
+            int(get_tensor_size_bytes(self.k_pages))
+            + int(get_tensor_size_bytes(self.scale_pages)),
             0,
         )
 
 
 class DSV41TPUIndexerPool(DeepSeekV4IndexerPool):
-    """Per kv_source layer packed FP8 index keys int32 [P * 33, 128]."""
+    """Per kv_source layer packed FP8 index keys, 8-row aligned per full page.
+
+    Root ``k_pages`` is ``int32 [num_full_pages, rows_per_full, 128]`` where
+    ``rows_per_full = 72`` (r=1, ``page_stride=36``) or ``40`` (r=2,
+    ``page_stride=40``).
+    """
 
     def __init__(
         self,
@@ -232,8 +329,15 @@ class DSV41TPUIndexerPool(DeepSeekV4IndexerPool):
             f"got {index_head_dim}"
         )
         self.ratio = ratio
+        self.num_full_pages = num_main_pages(full_size)
+        self.subpages_per_full = (FULL_PAGE_TOKENS // ratio) // PAGE_RECORDS
+        page_stride = index_page_stride(ratio)
+        self.rows_per_full = self.subpages_per_full * page_stride
         self.layout = PackedFP8Layout(
-            num_index_pages(full_size, ratio), page_size=PAGE_RECORDS
+            self.num_full_pages * self.subpages_per_full,
+            page_stride=page_stride,
+            page_offset=0,
+            page_size=PAGE_RECORDS,
         )
         super().__init__(
             self.layout.pages * PAGE_RECORDS,
@@ -249,17 +353,107 @@ class DSV41TPUIndexerPool(DeepSeekV4IndexerPool):
 
     def _create_buffer(self) -> None:
         rows = self.layout.pages * self.layout.page_stride
+        assert rows == self.num_full_pages * self.rows_per_full
         self.layout.validate((rows,))
-        self.index_k_with_scale_buffer = [
-            _zeros_kv_buffer((rows, WORD_LANES), torch.int32, self.device)
+        self.k_pages = [
+            _zeros_kv_buffer(
+                (self.num_full_pages, self.rows_per_full, WORD_LANES),
+                torch.int32,
+                self.device,
+            )
             for _ in range(self.layer_num)
+        ]
+        self.index_k_with_scale_buffer = [
+            p.view(rows, WORD_LANES) for p in self.k_pages
         ]
 
     def get_bytes_per_token(self) -> int:
-        return INDEX_BYTES_PER_RECORD
+        return index_bytes_per_record(self.ratio)
 
     def get_kv_size_bytes(self) -> Tuple[int, int]:
-        return int(get_tensor_size_bytes(self.index_k_with_scale_buffer)), 0
+        return int(get_tensor_size_bytes(self.k_pages)), 0
+
+
+class TPUPairStatePool(CompressStatePool):
+    """Ratio-2 pending-pair state with one TPU-tile-aligned 3D block per req slot.
+
+    Root ``state_buffer`` has shape ``[num_req_slots + 1, ring_stride, feat_stride]``
+    in fp32 (``ring_stride = 8``, ``feat_stride = 1024`` for ``head_dim = 512``).
+    Slot ``num_req_slots`` is the read-only ``-1`` sentinel initialized once to
+    ``(kv=0, score=-inf)``; ``write_rows`` drops negative slots, so it stays clean
+    without ever issuing an eager in-place write after Raiden registration.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_req_slots: int,
+        ring_size: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        device: str,
+        enable_memory_saver: bool,
+        ratio: int = 2,
+    ):
+        self.num_req_slots = int(num_req_slots)
+        self.head_dim = int(head_dim)
+        self.ring_stride = max(
+            TPU_SUBLANE_ALIGN,
+            ceil_div(int(ring_size), TPU_SUBLANE_ALIGN) * TPU_SUBLANE_ALIGN,
+        )
+        self.feat_stride = ceil_div(2 * self.head_dim, WORD_LANES) * WORD_LANES
+        super().__init__(
+            size=self.num_req_slots * int(ring_size),
+            ring_size=int(ring_size),
+            overlap=False,
+            head_dim=self.head_dim,
+            dtype=dtype,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            ratio=ratio,
+            request_scoped=True,
+            online=False,
+        )
+
+    def _alloc_kv_score_buffer(
+        self, *, dtype: torch.dtype, device: str, enable_memory_saver: bool
+    ) -> None:
+        del enable_memory_saver
+        shape = (self.num_req_slots + 1, self.ring_stride, self.feat_stride)
+        buf = _zeros_kv_buffer(shape, dtype, device)
+        buf[:, :, self.head_dim : 2 * self.head_dim].fill_(float("-inf"))
+        assert buf._base is None and buf.dtype == dtype
+        self.state_buffer = buf
+        # CompressStatePool.__init__ calls self.kv_score_buffer.clear(); keep a
+        # 1-row CPU placeholder so the base constructor never touches HBM state.
+        self.kv_score_buffer = KVAndScore(
+            torch.zeros((1, 2 * self.head_dim), dtype=dtype)
+        )
+
+    def translate_from_req_position_to_state_loc(
+        self, req_pool_indices: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        state_loc = req_pool_indices * self.ring_stride + positions % self.ring_size
+        # Negative positions address the last row of the spare sentinel slot.
+        return state_loc.masked_fill(positions < 0, -1)
+
+    def get_state_by_state_loc(self, state_loc: torch.Tensor) -> KVAndScore:
+        # Derive a fresh view from the root on every call so AOTAutograd tracks
+        # reads against the donated root buffer.
+        flat = self.state_buffer.view(-1, self.feat_stride)
+        rows = flat[state_loc]
+        if self.feat_stride > 2 * self.head_dim:
+            rows = rows[..., : 2 * self.head_dim]
+        return KVAndScore(rows)
+
+    def set_state_by_state_loc(self, state_loc: torch.Tensor, value: KVAndScore):
+        flat = self.state_buffer.view(-1, self.feat_stride)
+        valid = state_loc >= 0
+        if bool(valid.any()):
+            flat[state_loc[valid], : 2 * self.head_dim] = value.kv_score[valid]
+
+    def get_kv_size_bytes(self) -> Tuple[int, int]:
+        return int(get_tensor_size_bytes(self.state_buffer)), 0
 
 
 def _check_dsv41_pool_supported(
@@ -318,6 +512,16 @@ def _check_dsv41_pool_supported(
     ):
         if enabled:
             raise ValueError(f"DSV41TPUTokenToKVPool does not support {feature}")
+    disagg = get_disagg()
+    if (
+        disagg.disaggregation_mode != "null"
+        and disagg.disaggregation_transfer_backend != "raiden"
+    ):
+        raise ValueError(
+            "DSV41TPUTokenToKVPool supports P/D disaggregation only with "
+            "--disaggregation-transfer-backend raiden, got "
+            f"{disagg.disaggregation_transfer_backend!r}"
+        )
 
 
 class _DSV41TPURequestWindowMemory:
@@ -351,6 +555,8 @@ class _DSV41TPURequestWindowMemory:
 
 class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     """DeepSeek-V4.1 TPU pool: core control plane, Pallas-shaped buffers."""
+
+    raiden_state_max_blocks: int = 1
 
     def __init__(
         self,
@@ -450,9 +656,26 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             if ratio not in LOW_RATIOS:
                 raise ValueError(f"no V4.1 TPU storage for compress ratio {ratio}")
             total += (
-                (MAIN_BYTES_PER_RECORD + INDEX_BYTES_PER_RECORD) / ratio * len(sources)
+                (main_bytes_per_record(ratio) + index_bytes_per_record(ratio))
+                / ratio
+                * len(sources)
             )
         return total
+
+    @staticmethod
+    def c2_state_fixed_bytes(
+        *,
+        num_req_slots: int,
+        ring_size: int,
+        head_dim: int,
+        num_layers: int,
+    ) -> int:
+        return c2_state_fixed_bytes(
+            num_req_slots=num_req_slots,
+            ring_size=ring_size,
+            head_dim=head_dim,
+            num_layers=num_layers,
+        )
 
     def get_kv_size_bytes(self) -> Tuple[int, int]:
         pools = [
@@ -461,11 +684,13 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             *self.index_pools.values(),
         ]
         total = sum(pool.get_kv_size_bytes()[0] for pool in pools if pool is not None)
-        total += sum(
-            int(get_tensor_size_bytes(pool.kv_score_buffer.kv_score))
-            for pool in self.compress_state_pools
-            if pool is not None
-        )
+        for pool in self.compress_state_pools:
+            if pool is None:
+                continue
+            if isinstance(pool, TPUPairStatePool):
+                total += pool.get_kv_size_bytes()[0]
+            else:
+                total += int(get_tensor_size_bytes(pool.kv_score_buffer.kv_score))
         return total, 0
 
     # ------------------------------------------------------------------ #
@@ -550,13 +775,38 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             enable_memory_saver=enable_memory_saver,
         )
 
+    def _make_pair_state_pool(self, enable_memory_saver: bool) -> TPUPairStatePool:
+        """Ratio-2 pending-pair state: one tile-aligned 3D block per req slot."""
+        return TPUPairStatePool(
+            num_req_slots=self.num_req_slots,
+            ring_size=self.get_ring_size(2),
+            head_dim=self.qk_nope_head_dim + self.qk_rope_head_dim,
+            dtype=torch.float32,
+            device=self.device,
+            enable_memory_saver=enable_memory_saver,
+            ratio=2,
+        )
+
     # ------------------------------------------------------------------ #
     # Request-slot lifecycle
     # ------------------------------------------------------------------ #
 
+    def clear_request_scoped_state(self, req_pool_idx: int) -> None:
+        """No-op on TPU: never eager-write ``state_buffer`` after allocation.
+
+        On ``torch_tpu``, any eager in-place write (``zero_()`` / ``fill_()``)
+        reallocates the underlying PJRT device buffer and invalidates the
+        pointers registered with Raiden. ``DSV41TPUAttnBackend._pair_partners``
+        masks even and padded positions to the read-only ``-1`` sentinel row,
+        while every odd position reads ``pos - 1`` written by the same request
+        (or transferred from prefill), so stale rows in a reused slot are never
+        observed.
+        """
+        del req_pool_idx
+        return
+
     def clear_request_slots(self, req_pool_indices: Sequence[int]) -> None:
-        """ReqToTokenPool on_alloc_rows hook: reset each reused slot's ratio-2
-        pending-pair ring through the core clear_request_scoped_state."""
+        """ReqToTokenPool on_alloc_rows hook (no-op on TPU; see above)."""
         for req_pool_idx in req_pool_indices:
             self.clear_request_scoped_state(int(req_pool_idx))
 
@@ -582,16 +832,20 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             return rows
         return torch.where(positions >= ends - RING_TOKENS, rows, -1)
 
-    def get_swa_pages(self, layer_id: int) -> torch.Tensor:
-        """bf16 [num_swa_pages64, 64, 512]."""
-        self.wait_layer_transfer(layer_id)
-        return self._swa_storage().kv_buffer[self._swa_local_layer_id(layer_id)]
-
     def _swa_storage(self) -> DSV41TPUSWAKVPool:
         """The paged SWA pool, or the request window's buffers under encoder replay."""
         if self.request_window is not None:
             return self.request_window.state
         return self.swa_kv_pool
+
+    def get_swa_root(self, layer_id: int) -> torch.Tensor:
+        """Base bf16 root ``[num_swa_pages256, 256, 512]`` (``_base is None``)."""
+        self.wait_layer_transfer(layer_id)
+        return self._swa_storage().k_pages[self._swa_local_layer_id(layer_id)]
+
+    def get_swa_pages(self, layer_id: int) -> torch.Tensor:
+        """Fresh bf16 view ``[num_swa_pages64, 64, 512]`` derived from root."""
+        return self.get_swa_root(layer_id).view(-1, SWA_PAGE_TOKENS, LATENT_DIM)
 
     def _low_ratio_item(self, layer_id: int) -> Tuple[int, int]:
         item = self.layer_mapping[layer_id]
@@ -604,18 +858,27 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         """(compress ratio, kv_source index) of the layer's index keys."""
         return self._low_ratio_item(layer_id)
 
-    def get_main_kv(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """(int32 words [R, 128], fp32 scales [R]) of the layer's kv_source."""
+    def get_main_kv_roots(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Base ``(int32 [P, 256 // r, 128], fp32 [P, 8, 128])`` roots."""
         self.wait_layer_transfer(layer_id)
         ratio, source_id = self._low_ratio_item(layer_id)
         pool = self.kv_pools[ratio]
-        return pool.kv_buffer[source_id], pool.scale_buffer[source_id]
+        return pool.k_pages[source_id], pool.scale_pages[source_id]
 
-    def get_index_k(self, layer_id: int) -> torch.Tensor:
-        """Packed FP8 int32 [P * 33, 128] of the layer's kv_source."""
+    def get_main_kv(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Fresh ``(int32 words [R, 128], fp32 scales [P * 1024])`` views."""
+        words_root, scales_root = self.get_main_kv_roots(layer_id)
+        return words_root.view(-1, WORD_LANES), scales_root.view(-1)
+
+    def get_index_k_root(self, layer_id: int) -> torch.Tensor:
+        """Base packed FP8 root ``int32 [P_full, rows_per_full, 128]``."""
         self.wait_layer_transfer(layer_id)
         ratio, source_id = self._low_ratio_item(layer_id)
-        return self.index_pools[ratio].index_k_with_scale_buffer[source_id]
+        return self.index_pools[ratio].k_pages[source_id]
+
+    def get_index_k(self, layer_id: int) -> torch.Tensor:
+        """Fresh packed FP8 view ``int32 [P * page_stride, 128]``."""
+        return self.get_index_k_root(layer_id).view(-1, WORD_LANES)
 
     def index_k_layout(self, layer_id: int) -> Tuple[int, int, int, int]:
         """PackedFP8Layout fields (pages, page_stride, page_offset, page_size)."""
@@ -632,24 +895,29 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     # ------------------------------------------------------------------ #
 
     def _state_slots(self) -> list[tuple[object, str, Optional[int]]]:
-        """(owner, attribute, list index or None) of every tensor the forward reads
-        or writes, in a fixed order: SWA pages, then per ratio main KV words, main
-        KV scales and indexer K, then each compress-state ring."""
+        """(owner, attribute, list index or None) of every root tensor the forward
+        reads or writes, in a fixed order: SWA page roots, then per ratio main KV
+        word roots, main KV scale roots and indexer K roots, then each compress-state
+        ring root."""
         slots: list[tuple[object, str, Optional[int]]] = []
 
         def add_list(owner, attr):
             slots.extend((owner, attr, i) for i in range(len(getattr(owner, attr))))
 
-        add_list(self._swa_storage(), "kv_buffer")
+        add_list(self._swa_storage(), "k_pages")
         for ratio in sorted(self.kv_pools):
             pool = self.kv_pools[ratio]
             if pool is not None:
-                add_list(pool, "kv_buffer")
-                add_list(pool, "scale_buffer")
+                add_list(pool, "k_pages")
+                add_list(pool, "scale_pages")
         for ratio in sorted(self.index_pools):
-            add_list(self.index_pools[ratio], "index_k_with_scale_buffer")
+            add_list(self.index_pools[ratio], "k_pages")
         for pool in (*self.compress_state_pools, *self.indexer_compress_state_pools):
-            if pool is not None:
+            if pool is None:
+                continue
+            if isinstance(pool, TPUPairStatePool):
+                slots.append((pool, "state_buffer", None))
+            else:
                 slots.append((pool.kv_score_buffer, "kv_score", None))
         return slots
 
@@ -671,6 +939,71 @@ class DSV41TPUTokenToKVPool(DeepSeekV4TokenToKVPool):
                 setattr(owner, attr, tensor)
             else:
                 getattr(owner, attr)[index] = tensor
+
+    # ------------------------------------------------------------------ #
+    # Prefill/Decode Disaggregation (Raiden) buffer descriptors
+    # ------------------------------------------------------------------ #
+
+    def raiden_full_buffers(self) -> List[torch.Tensor]:
+        """Deterministic list of 3D full-page roots (uniform ``dim[0]``)."""
+        bufs: List[torch.Tensor] = []
+        for ratio in LOW_RATIOS:
+            kv_pool = self.kv_pools.get(ratio)
+            if kv_pool is not None:
+                bufs.extend(kv_pool.k_pages)
+                bufs.extend(kv_pool.scale_pages)
+            index_pool = self.index_pools.get(ratio)
+            if index_pool is not None:
+                bufs.extend(index_pool.k_pages)
+        return bufs
+
+    def raiden_swa_buffers(self) -> List[torch.Tensor]:
+        """Per-layer 3D 256-token SWA page roots (paged pool or encoder replay window)."""
+        swa_storage = self._swa_storage()
+        if swa_storage is None:
+            return []
+        return list(swa_storage.k_pages)
+
+    def raiden_state_buffers(self) -> List[torch.Tensor]:
+        """Per ratio-2 kv_source 3D pair-state roots (one block per req slot)."""
+        return [
+            pool.state_buffer
+            for pool in self.compress_state_pools
+            if isinstance(pool, TPUPairStatePool)
+        ]
+
+    @staticmethod
+    def _buf_infos(
+        buffers: Sequence[torch.Tensor],
+    ) -> Tuple[List[int], List[int], List[int]]:
+        data_ptrs: List[int] = []
+        data_lens: List[int] = []
+        item_lens: List[int] = []
+        for buf in buffers:
+            data_ptrs.append(buf.data_ptr())
+            data_lens.append(buf.nbytes)
+            item_lens.append(buf[0].nbytes)
+        return data_ptrs, data_lens, item_lens
+
+    def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        return self._buf_infos(self.raiden_full_buffers())
+
+    def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        return self._buf_infos(self.raiden_swa_buffers())
+
+    def get_request_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        return self._buf_infos(self.raiden_state_buffers())
+
+    def request_state_transfer_indices(
+        self, req_pool_idx: int, seq_len: int = 0
+    ) -> np.ndarray:
+        """Always return ``[req_pool_idx]`` (1 block) for Raiden's fixed state engine."""
+        del seq_len
+        req_idx = int(req_pool_idx)
+        assert 0 <= req_idx < self.num_req_slots, (
+            f"req_pool_idx={req_idx} out of range [0, {self.num_req_slots})"
+        )
+        return np.array([req_idx], dtype=np.int32)
 
 
 # ---------------------------------------------------------------------- #
@@ -716,9 +1049,7 @@ def get_tpu_dsv41_bytes_per_swa_token(original, configurator) -> float:
 
 
 def get_tpu_dsv41_bytes_per_full_token(original, configurator) -> float:
-    """AROUND DSV4PoolConfigurator._get_bytes_per_full_token. The core ratio-2
-    pair-state budget (_get_c2_state_fixed_bytes) already matches the core pool
-    this class keeps, and the V4 c4/c128 state hooks return 0 without those layers."""
+    """AROUND DSV4PoolConfigurator._get_bytes_per_full_token."""
     if not uses_dsv41_pool(configurator.stage_compress_ratios):
         return original(configurator)
     swa_ratio = (
@@ -777,6 +1108,23 @@ def get_tpu_dsv41_swa_fixed_bytes(original, configurator) -> float:
         * configurator.draft_ring_layers
     )
     return fixed - configurator.request_window_bytes + tpu_window + draft_ring
+
+
+def get_tpu_dsv41_c2_state_fixed_bytes(
+    original, configurator, max_running_requests: int
+) -> int:
+    """AROUND DSV4PoolConfigurator._get_c2_state_fixed_bytes."""
+    if not uses_dsv41_pool(configurator.stage_compress_ratios):
+        return original(configurator, max_running_requests)
+    num_layers = configurator.num_layers(2)
+    if num_layers == 0:
+        return 0
+    return DSV41TPUTokenToKVPool.c2_state_fixed_bytes(
+        num_req_slots=configurator._get_num_req_slots(max_running_requests),
+        ring_size=configurator.ring_sizes[2],
+        head_dim=configurator.attn_head_dim,
+        num_layers=num_layers,
+    )
 
 
 def derive_tpu_dsv41_pool_sizes(original, kvc, *, config):

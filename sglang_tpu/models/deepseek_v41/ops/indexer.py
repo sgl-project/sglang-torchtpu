@@ -62,7 +62,10 @@ def _write_index_k(
     page_size: int,
 ) -> jax.Array:
     layout = PackedFP8Layout(pages, page_stride, page_offset, page_size)
-    return write_fp8_records((index_k,), records, keys.astype(jnp.bfloat16), layout)[0]
+    updated = write_fp8_records(
+        (index_k.reshape(-1, 128),), records, keys.astype(jnp.bfloat16), layout
+    )[0]
+    return updated.reshape(index_k.shape)
 
 
 def _compact(ids: jax.Array) -> jax.Array:
