@@ -22,12 +22,13 @@ import time
 
 import torch
 
-from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool, TpuSeqAlongLaneKVPool
 from sglang_tpu.kv_pool_host import TpuDMAHostKVPool
 from sglang_tpu.raiden_transfer import RaidenKVTransfer
 
 DEVICE = "tpu:0"
 PAGE_SIZE = 64
+SEQ_ALONG_LANE_PAGE_SIZE = 256
 
 
 def _poll(ev, what):
@@ -43,11 +44,11 @@ class _SingleBufferPool:
     buffer pre-populated with a known pattern (no eager writes after register).
     """
 
-    def __init__(self, buf):
+    def __init__(self, buf, page_size=PAGE_SIZE):
         self._buf = buf
         self.layer_num = 1
         self.start_layer = 0
-        self.page_size = PAGE_SIZE
+        self.page_size = page_size
 
     def get_fused_kv_buffer(self, layer_id):
         return self._buf
@@ -126,8 +127,104 @@ def test_host_pool_wiring():
     print("  page-granular free OK")
 
 
+def test_seq_along_lane_raiden_roundtrip():
+    """D2h/H2d round-trip and TpuDMAHostKVPool wiring for SEQ_ALONG_LANE (p256)."""
+    print("== test 3: SEQ_ALONG_LANE raiden D2h/H2d round-trip (p256) ==")
+    sal_pool = TpuSeqAlongLaneKVPool(
+        size=512,
+        page_size=SEQ_ALONG_LANE_PAGE_SIZE,
+        dtype=torch.bfloat16,
+        head_num=2,
+        head_dim=128,
+        layer_num=2,
+        device=DEVICE,
+        enable_memory_saver=False,
+    )
+    # Pre-populate a CPU mirror of the SEQ_ALONG_LANE layout before moving to
+    # device so no eager write reallocates the PJRT buffer after registration.
+    pat = torch.zeros(sal_pool.kv_buffer[0].shape, dtype=torch.bfloat16)
+    pat[1] = (
+        torch.arange(pat[1].numel(), dtype=torch.float32)
+        .remainder(251)
+        .add(1.0)
+        .to(torch.bfloat16)
+        .view_as(pat[1])
+    )
+    data = pat.to(DEVICE)
+    transfer = RaidenKVTransfer(
+        device_pool=_SingleBufferPool(buf=data, page_size=SEQ_ALONG_LANE_PAGE_SIZE),
+        num_host_pages=4,
+    )
+
+    assert torch.all(data[2].cpu() == 0)
+
+    _poll(
+        ev=transfer.backup(device_page_ids=[1], host_page_ids=[0]),
+        what="SEQ_ALONG_LANE D2h",
+    )
+    _poll(
+        ev=transfer.load(host_page_ids=[0], device_page_ids=[2]),
+        what="SEQ_ALONG_LANE H2d",
+    )
+    torch.accelerator.synchronize()
+
+    got = data[2].cpu()
+    assert torch.equal(got, pat[1]), (
+        "SEQ_ALONG_LANE round-trip mismatch on page 2 "
+        f"(max abs diff = {float((got - pat[1]).abs().max())})"
+    )
+    print("  SEQ_ALONG_LANE page 1 -> host 0 -> page 2 verified OK")
+    del transfer
+
+    host = TpuDMAHostKVPool(
+        device_pool=sal_pool,
+        host_to_device_ratio=2.0,
+        host_size=0,
+        page_size=SEQ_ALONG_LANE_PAGE_SIZE,
+        layout="fused_raiden",
+    )
+    dev_pages = [1, 2]
+    device_indices = torch.tensor(
+        [
+            p * SEQ_ALONG_LANE_PAGE_SIZE + i
+            for p in dev_pages
+            for i in range(SEQ_ALONG_LANE_PAGE_SIZE)
+        ],
+        dtype=torch.int64,
+    )
+    host_indices = host.alloc(len(device_indices))
+    assert host_indices is not None
+    assert host._to_page_ids(host_indices) == [0, 1]
+    assert host._to_page_ids(device_indices) == [1, 2]
+
+    _poll(
+        ev=host.backup_from_device_all_layer(
+            device_pool=sal_pool,
+            host_indices=host_indices,
+            device_indices=device_indices,
+            io_backend="raiden",
+        ),
+        what="SEQ_ALONG_LANE host backup",
+    )
+    _poll(
+        ev=host.load_all_layer(
+            device_pool=sal_pool,
+            host_indices=host_indices,
+            device_indices=device_indices,
+        ),
+        what="SEQ_ALONG_LANE host load",
+    )
+    torch.accelerator.synchronize()
+
+    free_before = host.available_size()
+    host.free(host_indices)
+    assert host.available_size() == free_before + len(host_indices)
+    print("  SEQ_ALONG_LANE TpuDMAHostKVPool alloc/backup/load/free OK")
+
+
 if __name__ == "__main__":
     print(f"TPU chips: {torch.accelerator.device_count()}")
     test_raiden_dma_roundtrip()
     test_host_pool_wiring()
+    test_seq_along_lane_raiden_roundtrip()
     print("\nALL ON-DEVICE RAIDEN TESTS PASSED")

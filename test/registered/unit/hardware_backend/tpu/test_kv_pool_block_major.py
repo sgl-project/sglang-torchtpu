@@ -22,6 +22,7 @@ from sglang_tpu.disaggregation.raiden.common import get_raiden_kv_caches
 from sglang_tpu.kv_pool import (
     TpuBlockMajorMHATokenToKVPool,
     TpuFusedMHATokenToKVPool,
+    TpuSeqAlongLaneKVPool,
 )
 from sglang_tpu.tpu_platform import _check_block_major_supported
 
@@ -130,6 +131,10 @@ class TestBlockMajorLayout(CustomTestCase):
             TpuBlockMajorMHATokenToKVPool.kv_offload_io_backends, frozenset({"raiden"})
         )
         self.assertIn("torch_tpu", TpuFusedMHATokenToKVPool.kv_offload_io_backends)
+        self.assertEqual(
+            TpuSeqAlongLaneKVPool.kv_offload_io_backends,
+            frozenset({"torch_tpu", "raiden"}),
+        )
 
     def test_get_state_round_trip_carries_layer_indices(self):
         """The compiled forward donates every state tensor and swaps in the
