@@ -3567,6 +3567,9 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
         for name, expected_mid in (
             ("pareto_f4w22p88", (0.88, 4, 0.22, 2)),
             ("pareto_f6w24p84", (0.84, 6, 0.24, 1)),
+            ("pareto_f8w24p84", (0.84, 8, 0.24, 1)),
+            ("pareto_f10w24p82", (0.82, 10, 0.24, 1)),
+            ("pareto_f10w26p80", (0.80, 10, 0.26, 1)),
             ("pareto_f4w24p86", (0.86, 4, 0.24, 2)),
             ("pareto_f3w28p88", (0.88, 3, 0.28, 2)),
         ):
@@ -3583,9 +3586,10 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
             )
 
         # 2. Verify 3-tier entropy presets & explicit multi-rule per-layer syntax.
-        for spec_name, mid_exp in (
-            ("pareto_3tier_safe", (0.86, 4, 0.24, 2)),
-            ("pareto_3tier_fast", (0.88, 3, 0.28, 2)),
+        for spec_name, skew_exp, mid_exp in (
+            ("pareto_3tier_safe", (0.88, 4, 0.22, 2), (0.86, 4, 0.24, 2)),
+            ("pareto_3tier_fast", (0.88, 4, 0.22, 2), (0.88, 3, 0.28, 2)),
+            ("pareto_3tier_ms1", (0.84, 6, 0.24, 1), (0.80, 10, 0.26, 1)),
         ):
             parsed_d = breakers_mod.parse_nonuniform_free_spec(spec_name)
             self.assertIsInstance(parsed_d, dict)
@@ -3606,7 +3610,7 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
                     parse_free_spec_fn=v1_mod.parse_free_expert_rows_spec,
                     spec=spec_name,
                 ),
-                (0.88, 4, 0.22, 2),
+                skew_exp,
             )
             self.assertEqual(
                 breakers_mod.resolve_nonuniform_free_for_layer(
@@ -3670,6 +3674,557 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
             self.assertEqual(
                 skew_counts[sub_slice[0]], skew_counts[sub_slice].max()
             )
+
+    def test_w9_b8_native_and_d1_large_batch_free_parity_and_lowering(self):
+        import dataclasses
+        from unittest import mock
+        try:
+            import jax
+            import jax.numpy as jnp
+            from jax.experimental import pallas as pl
+            from jax.experimental.pallas import tpu as pltpu
+            from jax.experimental.topologies import get_topology_desc
+            from jax.sharding import Mesh, PartitionSpec as P
+        except Exception as exc:
+            self.skipTest(f"JAX/Pallas TPU unavailable: {exc}")
+
+        from sglang_tpu.envs import envs as tpu_envs
+        from sglang_tpu.moe.pallas.fused_rs_muse import fused_decode_op as op_mod
+
+        breakers_mod = _load_pkg_module(
+            "decode_hbm_breakers", _MUSE_DIR / "decode_hbm_breakers.py"
+        )
+        routing_mod = _load_pkg_module(
+            "fused_decode_routing", _MUSE_DIR / "fused_decode_routing.py"
+        )
+        v1_mod = _load_pkg_module(
+            "fused_decode_sparse", _MUSE_DIR / "fused_decode_sparse.py"
+        )
+
+        # 1. Default-OFF checks for DECODE_B8 and DECODE_D1_LARGE_BATCH_FREE.
+        self.assertIs(tpu_envs.SGLANG_TPU_MUSE_KERNEL_DECODE_B8.get(), False)
+        self.assertIs(tpu_envs.SGLANG_TPU_MUSE_DECODE_D1_LARGE_BATCH_FREE.get(), False)
+        self.assertNotIn(8, op_mod.supported_fuse_all_batches())
+
+        prev_b8 = os.environ.get("SGLANG_TPU_MUSE_KERNEL_DECODE_B8")
+        try:
+            os.environ["SGLANG_TPU_MUSE_KERNEL_DECODE_B8"] = "1"
+            self.assertIn(8, op_mod.supported_fuse_all_batches(ep=8))
+            self.assertNotIn(8, op_mod.supported_fuse_all_batches(ep=16))
+        finally:
+            if prev_b8 is None:
+                os.environ.pop("SGLANG_TPU_MUSE_KERNEL_DECODE_B8", None)
+            else:
+                os.environ["SGLANG_TPU_MUSE_KERNEL_DECODE_B8"] = prev_b8
+
+        # D1 large-batch scaling vs verify defaults.
+        self.assertEqual(
+            breakers_mod.resolve_nonuniform_free_for_layer(
+                30, 62, 128,
+                min_p_topk=0.86, free_rows=8, free_max_w=0.18, free_min_slot=2,
+                parse_free_spec_fn=v1_mod.parse_free_expert_rows_spec,
+                spec="pareto_f6w24p84", d1_large_batch=False,
+            ),
+            (0.86, 8, 0.18, 2),
+        )
+        self.assertEqual(
+            breakers_mod.resolve_nonuniform_free_for_layer(
+                30, 62, 128,
+                min_p_topk=0.86, free_rows=8, free_max_w=0.18, free_min_slot=2,
+                parse_free_spec_fn=v1_mod.parse_free_expert_rows_spec,
+                spec="pareto_f6w24p84", d1_large_batch=True,
+            ),
+            (0.84, 12, 0.24, 1),
+        )
+        self.assertEqual(
+            breakers_mod.resolve_free_and_min_p_for_batch(
+                256,
+                min_p_topk=0.86, free_rows=8, free_max_w=0.18, free_min_slot=2,
+                parse_free_spec_fn=v1_mod.parse_free_expert_rows_spec,
+                d1_large_batch=True,
+            ),
+            (0.86, 32, 0.18, 2),
+        )
+        with mock.patch.dict(os.environ, {"SGLANG_TPU_MUSE_DECODE_D1_LARGE_BATCH_FREE": "1"}):
+            with mock.patch("sglang.srt.runtime_context.get_spec", return_value=mock.Mock(speculative_algorithm=None)):
+                self.assertIs(breakers_mod.read_d1_large_batch_free(), True)
+            with mock.patch("sglang.srt.runtime_context.get_spec", return_value=mock.Mock(speculative_algorithm="DSPARK")):
+                self.assertIs(breakers_mod.read_d1_large_batch_free(), False)
+
+        # B=8 requires EP <= 8 (EP=16 fails cleanly).
+        with self.assertRaises(ValueError):
+            v1_mod.fused_decode_sparse_from_logits(
+                jnp.zeros((1,), jnp.int32),
+                jnp.zeros((8, 256), jnp.bfloat16),
+                jnp.zeros((1, 256), jnp.float32),
+                jnp.zeros((8, 4096), jnp.bfloat16),
+                jnp.zeros((16, 4096, 4096), jnp.float4_e2m1fn),
+                jnp.zeros((16, 8, 4096), jnp.bfloat16),
+                jnp.zeros((16, 4096, 4096), jnp.float4_e2m1fn),
+                jnp.zeros((16, 8, 4096), jnp.bfloat16),
+                jnp.ones((1, 4096), jnp.bfloat16),
+                ep=16,
+            )
+
+        # 2. CPU Interpret parity for B=8 (ep=8, tile_m=16, m_buckets=(8,)) and
+        #    B=128 (d=1 scaled FREE free_params=(0.86, 16, 0.18, 2)).
+        rng = np.random.default_rng(20261126)
+        h, n1, i_dim, scale_block, ep = 4096, 8192, 4096, 512, 8
+        e_local = 256 // ep
+        w1_u = jnp.asarray(
+            rng.integers(0, 2**31, size=(e_local, h // 8, n1), dtype=np.int32).view(np.uint32)
+        )
+        w2_u = jnp.asarray(
+            rng.integers(0, 2**31, size=(e_local, i_dim // 8, h), dtype=np.int32).view(np.uint32)
+        )
+        s1_j = jnp.asarray(rng.uniform(0.02, 0.08, size=(e_local, h // scale_block, n1)), jnp.bfloat16)
+        s2_j = jnp.asarray(rng.uniform(0.02, 0.08, size=(e_local, i_dim // scale_block, h)), jnp.bfloat16)
+        bias_j = jnp.zeros((1, 256), jnp.float32)
+        norm_j = jnp.asarray(rng.uniform(0.8, 1.2, size=(1, h)), jnp.bfloat16)
+        interp_kw = {
+            "detect_races": True,
+            **(
+                {"uninitialized_memory": "nan"}
+                if "uninitialized_memory" in pltpu.InterpretParams.__annotations__
+                else {}
+            ),
+        }
+        v_sp, h_sp = pl.BlockSpec(memory_space=pltpu.VMEM), pl.BlockSpec(memory_space=pltpu.HBM)
+
+        lg_b8 = jnp.asarray(rng.normal(0.0, 2.0, size=(8, 256)), jnp.bfloat16)
+        x_b8 = jnp.asarray(rng.normal(0.0, 0.25, size=(8, h)), jnp.bfloat16)
+        lg_b128 = jnp.asarray(rng.normal(0.0, 2.0, size=(128, 256)), jnp.bfloat16)
+        x_b128 = jnp.asarray(rng.normal(0.0, 0.25, size=(128, h)), jnp.bfloat16)
+
+        for cur_b, rk_id, fp_vals, cfg_in, lg_j, x_j, expect_zero in (
+            (
+                8,
+                0,
+                (0.88, 1, 0.18, 2),
+                dataclasses.replace(
+                    v1_mod.default_sparse_decode_config(8, ep, scale_block),
+                    route_fast=True,
+                    fast_plan=2,
+                    unroll_strips=True,
+                    fast_gs=True,
+                    pair_rs=False,
+                    bridge_ag=False,
+                ),
+                lg_b8,
+                x_b8,
+                True,
+            ),
+            (
+                8,
+                1,
+                (0.88, 1, 0.18, 2),
+                dataclasses.replace(
+                    v1_mod.default_sparse_decode_config(8, ep, scale_block),
+                    route_fast=True,
+                    fast_plan=2,
+                    unroll_strips=True,
+                    fast_gs=True,
+                    pair_rs=False,
+                    bridge_ag=False,
+                ),
+                lg_b8,
+                x_b8,
+                False,
+            ),
+            (
+                128,
+                0,
+                (0.86, 16, 0.18, 2),
+                dataclasses.replace(
+                    v1_mod.default_sparse_decode_config(128, ep, scale_block),
+                    route_fast=True,
+                    fast_plan=2,
+                    unroll_strips=True,
+                    fast_gs=True,
+                    pair_rs=False,
+                    bridge_ag=False,
+                ),
+                lg_b128,
+                x_b128,
+                False,
+            ),
+        ):
+
+            def _run_e2e_core(cur_cfg, fp_arr=None):
+                sc = v1_mod.build_muse_sparse_scratch_shapes(
+                    ep=ep, batch_size=cur_b, scale_block=scale_block,
+                    s1_dtype=jnp.bfloat16, s2_dtype=jnp.bfloat16,
+                    num_replicas=0, return_sharded=True, config=cur_cfg,
+                )
+                has_fp = fp_arr is not None
+
+                def _k(*all_refs):
+                    it = iter(all_refs)
+                    rk_r = next(it)
+                    fp_r = next(it) if has_fp else None
+                    lg_r, bi_r, x_r = next(it), next(it), next(it)
+                    w1_r, s1_r, w2_r, s2_r, nm_r = (next(it) for _ in range(5))
+                    out_r = next(it)
+                    r_sc = routing_mod.RoutingScratch(
+                        *(next(it) for _ in range(len(routing_mod.RoutingScratch._fields)))
+                    )
+                    w1_b, s1_b, w2_b, s2_b, w1_sm, w2_sm, m_sm = (next(it) for _ in range(7))
+                    x3, io3, l2, a2, ys, gb, ac3 = (next(it) for _ in range(7))
+                    rs_r3, rs_ss, rs_rs, ow3 = (next(it) for _ in range(4))
+
+                    def _dump():
+                        out_r[...] = ac3[pl.ds(0, cur_b), :, :].reshape(cur_b, h).astype(jnp.bfloat16)
+
+                    v1_mod._run_muse_sparse_from_vmem_core(
+                        rk_r[0], lg_r, bi_r, x_r, w1_r, s1_r, w2_r, s2_r, nm_r,
+                        d_scratch=None, r_scratch=r_sc,
+                        w1_buf=w1_b, s1_buf=s1_b, w2_buf=w2_b, s2_buf=s2_b,
+                        w1_sem=w1_sm, w2_sem=w2_sm, misc_sem=m_sm, w1_acc_buf=None,
+                        x_3d_buf=x3, io_3d_buf=io3, lhs_2d_buf=l2,
+                        act_2d_buf=a2, y_stage_buf=ys,
+                        lhs_fp8_buf=None, lhs_sc_buf=None,
+                        masked_x_buf=None, bd_sc_buf=None,
+                        gain_f32_buf=gb, accum_3d=ac3, accum_2d=None, fan_3d_buf=None,
+                        rs_send_bf16=None, rs_pair_recv=None,
+                        rs_chip_send=None, rs_chip_recv=None,
+                        rs_pair_ssem=None, rs_pair_rsem=None,
+                        rs_chip_ssem=None, rs_chip_rsem=None,
+                        rs_recv_3d=rs_r3, rs_send_sem=rs_ss, rs_recv_sem=rs_rs,
+                        owner_3d=ow3, fan_send_sem=None, fan_recv_sem=None,
+                        fan_s2_send_sem=None, fan_s2_recv_sem=None,
+                        barrier_sem=None, output_ref=out_r,
+                        free_params_ref=fp_r,
+                        ep=ep, batch_size=cur_b, scale_block=scale_block, num_replicas=0,
+                        replica_cost_mode="active", return_sharded=True,
+                        ep_axis_name="model", cfg=cur_cfg,
+                        wait_entry_barrier=False,
+                        stop_stage="experts", early_exit_fn=_dump,
+                    )
+
+                sp_args = (jnp.array([rk_id], jnp.int32),) + (
+                    (fp_arr.astype(jnp.float32),) if has_fp else ()
+                )
+                return np.asarray(
+                    pl.pallas_call(
+                        _k,
+                        out_shape=jax.ShapeDtypeStruct((cur_b, h), jnp.bfloat16),
+                        grid_spec=pltpu.PrefetchScalarGridSpec(
+                            num_scalar_prefetch=len(sp_args),
+                            grid=(1,),
+                            in_specs=(v_sp, v_sp, v_sp, h_sp, h_sp, h_sp, h_sp, v_sp),
+                            out_specs=v_sp,
+                            scratch_shapes=sc,
+                        ),
+                        interpret=pltpu.InterpretParams(**interp_kw),
+                    )(*sp_args, lg_j, bias_j, x_j, w1_u, s1_j, w2_u, s2_j, norm_j),
+                    dtype=np.float32,
+                )
+
+            y_dyn = _run_e2e_core(cfg_in, jnp.asarray(fp_vals, jnp.float32))
+            y_stat = _run_e2e_core(
+                dataclasses.replace(
+                    cfg_in,
+                    min_p_topk=fp_vals[0],
+                    free_max_rows=fp_vals[1],
+                    free_max_w=fp_vals[2],
+                    free_min_slot=fp_vals[3],
+                )
+            )
+            self.assertEqual(
+                float(np.max(np.abs(y_dyn - y_stat))), 0.0,
+                msg=f"B={cur_b} rk={rk_id} dynamic free_params vs static mismatch",
+            )
+            if expect_zero:
+                self.assertEqual(float(np.linalg.norm(y_dyn)), 0.0)
+            else:
+                self.assertGreater(float(np.linalg.norm(y_dyn)), 0.0)
+
+        # 3. Real TPU7x 2x2x1 AOT .compile() for both B=8 and B=128 with free_params!
+        tpu_devs = get_topology_desc("tpu7x:2x2x1", platform="tpu").devices
+        if len(tpu_devs) >= 8:
+            mesh = Mesh(
+                np.array(
+                    sorted(tpu_devs, key=lambda d: (d.coords[1], d.coords[0], d.core_on_chip))
+                ),
+                ("model",),
+            )
+            for cur_b, cur_ret_sh in ((8, False), (128, True)):
+                cur_cfg = dataclasses.replace(
+                    v1_mod.default_sparse_decode_config(cur_b, ep, scale_block),
+                    static_holder_mask=True, route_fast=True, fast_plan=2,
+                    unroll_strips=True, fast_gs=True, pair_rs=True,
+                    bridge_ag=True, k256_strip_mode="adaptive",
+                )
+                shapes = (
+                    jax.ShapeDtypeStruct((1,), jnp.int32),
+                    jax.ShapeDtypeStruct((cur_b, 256), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((1, 256), jnp.float32),
+                    jax.ShapeDtypeStruct((cur_b, h), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((e_local, h, n1), jnp.float4_e2m1fn),
+                    jax.ShapeDtypeStruct((e_local, h // scale_block, n1), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((e_local, i_dim, h), jnp.float4_e2m1fn),
+                    jax.ShapeDtypeStruct((e_local, i_dim // scale_block, h), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((1, h), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((4,), jnp.float32),
+                )
+
+                def _aot_fn(*args, _cfg=cur_cfg, _ret=cur_ret_sh):
+                    return v1_mod.fused_decode_sparse_from_logits(
+                        *args[:9], free_params=args[9], ep=8, return_sharded=_ret, config=_cfg,
+                    )
+
+                comp = (
+                    jax.jit(
+                        jax.shard_map(
+                            _aot_fn, mesh=mesh,
+                            in_specs=(P(),) * len(shapes), out_specs=P(), check_vma=False,
+                        )
+                    )
+                    .trace(*shapes)
+                    .lower(lowering_platforms=("tpu",))
+                    .compile()
+                )
+                self.assertIn("tpu_custom_call", comp.as_text())
+                self.assertGreater(
+                    comp.memory_analysis().generated_code_size_in_bytes, 0
+                )
+
+    def test_w9_rank_capped_free_parity_and_aot(self):
+        """Verify Wave-9.18b progressive rank-capped FREE & R=12/16 across router paths and AOT."""
+        import dataclasses
+        import jax
+        import jax.numpy as jnp
+        from sglang_tpu.moe.pallas.fused_rs_muse import fused_decode_sparse as v1_mod
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        from jax.experimental.topologies import get_topology_desc
+        from jax.sharding import Mesh, PartitionSpec as P
+        from sglang_tpu.moe.pallas.fused_rs_muse import decode_hbm_breakers as brk
+        from sglang_tpu.moe.pallas.fused_rs_muse import fused_decode_routing as routing_mod
+        from sglang_tpu.moe.pallas.fused_rs_muse import moe_imbalance_planner as mip
+
+        # 1. Spec parsing and batch scaling invariants.
+        self.assertEqual(brk.parse_free_rank_cap_spec(""), (0, 0, 0.0))
+        self.assertEqual(brk.parse_free_rank_cap_spec("off"), (0, 0, 0.0))
+        self.assertEqual(brk.parse_free_rank_cap_spec("11:2:0.32"), (11, 2, 0.32))
+        self.assertEqual(brk.scale_free_rank_cap_for_batch(11, 2, 16), (0, 0))
+        self.assertEqual(brk.scale_free_rank_cap_for_batch(11, 2, 64), (11, 2))
+        self.assertEqual(
+            brk.scale_free_rank_cap_for_batch(11, 2, 128, d1_large_batch=False), (0, 0)
+        )
+        self.assertEqual(
+            brk.scale_free_rank_cap_for_batch(11, 2, 128, d1_large_batch=True), (16, 4)
+        )
+
+        # 2. Construct deterministic skewed logits where rank 0 has 15 active experts (5 x 1-row
+        #    tail experts with w ~ 0.30) while rank 7 has only 4 active experts (< cap=11).
+        rng = np.random.default_rng(20261128)
+        ep, e_local = 8, 32
+        b_tok = 64
+        logits_64 = np.full((b_tok, 256), -12.0, dtype=np.float32)
+        bias_np = np.zeros((1, 256), dtype=np.float32)
+        lsig = lambda p: float(np.log(p / (1.0 - p)))
+        for t in range(b_tok):
+            # Slot 0 on sparse rank 7 (e=224..227, well below cap=11) or hot rank 0 (e=0..3)
+            e0 = (t % 4) if (t < 32) else (224 + (t % 4))
+            e1 = 4 + (t % 5) if (t < 32) else (32 + (t % 8))
+            logits_64[t, e0] = lsig(0.38)
+            logits_64[t, e1] = lsig(0.31)
+            # Every token gets a 3rd slot (w ~ 0.295): tokens 0..10 put distinct 1-row experts
+            # on rank 0 (e=10..20) pushing rank 0 above cap=11!
+            if t < 11:
+                e2 = 10 + t
+            elif t < 20:
+                e2 = 224 + ((t + 1) % 4)
+            else:
+                e2 = 64 + (t % 16)
+            logits_64[t, e2] = lsig(0.295)
+
+        ref_w_rc = np.asarray(
+            routing_mod.route_weights(
+                jnp.asarray(logits_64, jnp.bfloat16),
+                jnp.asarray(bias_np, jnp.float32),
+                min_p_topk=0.80,
+                free_max_rows=10,
+                free_max_w=0.26,
+                free_min_slot=1,
+                free_rank_cap=11,
+                free_tail_rows=2,
+                free_tail_w=0.32,
+            ),
+            dtype=np.float32,
+        )
+        ref_w_base = np.asarray(
+            routing_mod.route_weights(
+                jnp.asarray(logits_64, jnp.bfloat16),
+                jnp.asarray(bias_np, jnp.float32),
+                min_p_topk=0.80,
+                free_max_rows=10,
+                free_max_w=0.26,
+                free_min_slot=1,
+            ),
+            dtype=np.float32,
+        )
+        r0_act_base = int(np.sum(ref_w_base[:, :32].sum(axis=0) > 0))
+        r0_act_rc = int(np.sum(ref_w_rc[:, :32].sum(axis=0) > 0))
+        r7_act_base = int(np.sum(ref_w_base[:, 224:256].sum(axis=0) > 0))
+        r7_act_rc = int(np.sum(ref_w_rc[:, 224:256].sum(axis=0) > 0))
+        self.assertGreater(r0_act_base, 11)
+        self.assertLessEqual(r0_act_rc, 11)
+        self.assertEqual(r7_act_rc, r7_act_base)
+
+        # Verify InterpretParams(detect_races=True, uninitialized_memory='nan') parity across
+        # route_fast in {False, True} and B in {64, 128}!
+        logits_128 = np.concatenate([logits_64, logits_64], axis=0)
+        ref_w_128 = np.asarray(
+            routing_mod.route_weights(
+                jnp.asarray(logits_128, jnp.bfloat16),
+                jnp.asarray(bias_np, jnp.float32),
+                min_p_topk=0.80,
+                free_max_rows=20,
+                free_max_w=0.26,
+                free_min_slot=1,
+                free_rank_cap=11,
+                free_tail_rows=4,
+                free_tail_w=0.32,
+            ),
+            dtype=np.float32,
+        )
+
+        v_sp = pl.BlockSpec(memory_space=pltpu.VMEM)
+        interp_kw = dict(dma_execution_mode="eager", detect_races=True, uninitialized_memory="nan")
+        for cur_b, cur_lg, cur_ref, cur_fr, cur_tr in (
+            (64, logits_64, ref_w_rc, 10, 2),
+            (128, logits_128, ref_w_128, 20, 4),
+        ):
+            for r_fast in (False, True):
+                sc = routing_mod.routing_scratch_shapes(cur_b, e_local, topk=8, num_experts=256)
+                out_shapes = (
+                    jax.ShapeDtypeStruct((8, 256), jnp.int32),
+                    jax.ShapeDtypeStruct((cur_b, 128), jnp.int32),
+                )
+
+                def _rt_k(rk_r, lg_r, bi_r, cnt_o, pk_o, *sc_refs,
+                          _rf=r_fast, _fr=cur_fr, _tr=cur_tr, _cb=cur_b):
+                    r_sc = routing_mod.RoutingScratch(*sc_refs[:-1])
+                    d_sem = sc_refs[-1]
+                    routing_mod.route_topk_and_counts_in_kernel(
+                        lg_r, bi_r, r_sc, d_sem.at[0],
+                        my_owner=rk_r[0], e_per_owner=32,
+                        topk=8, route_chunk_rows=32,
+                        min_p_topk=0.80, free_max_rows=_fr, free_max_w=0.26, free_min_slot=1,
+                        route_fast=_rf, free_rank_cap=11, free_tail_rows=_tr, free_tail_w=0.32,
+                    )
+                    cnt_o[...] = r_sc.counts_vmem[...]
+                    pk_o[...] = r_sc.route_pack_vmem[:_cb, :]
+
+                cnt_out, pk_out = pl.pallas_call(
+                    _rt_k,
+                    out_shape=out_shapes,
+                    grid_spec=pltpu.PrefetchScalarGridSpec(
+                        num_scalar_prefetch=1,
+                        grid=(1,),
+                        in_specs=(v_sp, v_sp),
+                        out_specs=(v_sp, v_sp),
+                        scratch_shapes=list(sc) + [pltpu.SemaphoreType.DMA((1,))],
+                    ),
+                    interpret=pltpu.InterpretParams(**interp_kw),
+                )(
+                    jnp.array([0], jnp.int32),
+                    jnp.asarray(cur_lg, jnp.bfloat16),
+                    jnp.asarray(bias_np, jnp.float32),
+                )
+                cnt_np = np.asarray(cnt_out[0], dtype=np.int32)
+                exp_cnt = (cur_ref > 0).sum(axis=0).astype(np.int32)
+                np.testing.assert_array_equal(
+                    cnt_np, exp_cnt,
+                    err_msg=f"counts mismatch B={cur_b} route_fast={r_fast}",
+                )
+                pk_i32 = np.asarray(pk_out, dtype=np.int32)
+                pk_f32 = pk_i32.view(np.float32)
+                dense_got = np.zeros((cur_b, 32), dtype=np.float32)
+                for t in range(cur_b):
+                    n_loc = int(pk_i32[t, 0])
+                    for j in range(n_loc):
+                        dense_got[t, int(pk_i32[t, 1 + j])] = float(pk_f32[t, 16 + j])
+                np.testing.assert_allclose(
+                    dense_got, cur_ref[:, :32], atol=1e-5, rtol=1e-5,
+                    err_msg=f"weight parity mismatch B={cur_b} route_fast={r_fast}",
+                )
+
+        # 3. Verify R=12 replica plan build + TPU7x AOT .compile() for rank-capped FREE & R=12.
+        plan_r12 = mip.build_preloaded_replica_plan(
+            np.arange(1, 257, dtype=np.float64),
+            num_owners=8, num_replicas_per_owner=12,
+            owner_to_chip=[r >> 1 for r in range(8)],
+            objective="decode_hybrid", selection_mode="bottleneck_owner",
+        )
+        self.assertEqual(plan_r12.replica_meta.shape, (4, 8 * 12))
+        mip.validate_replica_plan(plan_r12)
+
+        tpu_devs = get_topology_desc("tpu7x:2x2x1", platform="tpu").devices
+        if len(tpu_devs) >= 8:
+            mesh = Mesh(
+                np.array(
+                    sorted(tpu_devs, key=lambda d: (d.coords[1], d.coords[0], d.core_on_chip))
+                ),
+                ("model",),
+            )
+            h, i_dim, n1, sb = 4096, 4096, 8192, 512
+            for cur_b, r_fast, rep_n in ((64, False, 0), (64, True, 12), (128, False, 0)):
+                cur_cfg = dataclasses.replace(
+                    v1_mod.default_sparse_decode_config(cur_b, ep, sb),
+                    route_fast=r_fast, pair_rs=True,
+                    min_p_topk=0.80, free_max_rows=(10 if cur_b == 64 else 20),
+                    free_max_w=0.26, free_min_slot=1,
+                    free_rank_cap=11, free_tail_rows=(2 if cur_b == 64 else 4), free_tail_w=0.32,
+                )
+                shapes = (
+                    jax.ShapeDtypeStruct((1,), jnp.int32),
+                    jax.ShapeDtypeStruct((cur_b, 256), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((1, 256), jnp.float32),
+                    jax.ShapeDtypeStruct((cur_b, h), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((e_local, h, n1), jnp.float4_e2m1fn),
+                    jax.ShapeDtypeStruct((e_local, h // sb, n1), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((e_local, i_dim, h), jnp.float4_e2m1fn),
+                    jax.ShapeDtypeStruct((e_local, i_dim // sb, h), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((1, h), jnp.bfloat16),
+                )
+                if rep_n > 0:
+                    shapes = shapes + (
+                        jax.ShapeDtypeStruct((rep_n, h, n1), jnp.float4_e2m1fn),
+                        jax.ShapeDtypeStruct((rep_n, h // sb, n1), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((rep_n, i_dim, h), jnp.float4_e2m1fn),
+                        jax.ShapeDtypeStruct((rep_n, i_dim // sb, h), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((4, ep * rep_n), jnp.int32),
+                    )
+
+                def _aot_rc(*args, _cfg=cur_cfg, _rn=rep_n):
+                    kw = {}
+                    if _rn > 0:
+                        kw = dict(
+                            rep_w1=args[9], rep_s1=args[10], rep_w2=args[11],
+                            rep_s2=args[12], replica_meta=args[13],
+                        )
+                    return v1_mod.fused_decode_sparse_from_logits(
+                        *args[:9], **kw, ep=8, return_sharded=True, config=_cfg,
+                    )
+
+                comp = (
+                    jax.jit(
+                        jax.shard_map(
+                            _aot_rc, mesh=mesh,
+                            in_specs=(P(),) * len(shapes), out_specs=P(), check_vma=False,
+                        )
+                    )
+                    .trace(*shapes)
+                    .lower(lowering_platforms=("tpu",))
+                    .compile()
+                )
+                self.assertIn("tpu_custom_call", comp.as_text())
+                self.assertGreater(
+                    comp.memory_analysis().generated_code_size_in_bytes, 0
+                )
 
 
 if __name__ == "__main__":

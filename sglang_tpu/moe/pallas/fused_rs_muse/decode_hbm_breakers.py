@@ -208,19 +208,81 @@ def read_free_expert_scale_mode() -> str:
     return str(_env_raw("SGLANG_TPU_MUSE_DECODE_FREE_SCALE_MODE", "b64_ms16")).strip()
 
 
+def _is_d1_non_speculative() -> bool:
+    """Return True when runtime_context reports ``speculative_algorithm is None``."""
+    try:
+        from sglang.srt.runtime_context import get_spec
+
+        return getattr(get_spec(), "speculative_algorithm", None) is None
+    except Exception:
+        return True
+
+
+def read_d1_large_batch_free() -> bool:
+    """Read ``SGLANG_TPU_MUSE_DECODE_D1_LARGE_BATCH_FREE`` (defaults to ``False``, ``d=1`` only)."""
+    return bool(_env_raw("SGLANG_TPU_MUSE_DECODE_D1_LARGE_BATCH_FREE", False)) and _is_d1_non_speculative()
+
+
+def parse_free_rank_cap_spec(spec: str | None = None) -> tuple[int, int, float]:
+    """Parse ``SGLANG_TPU_MUSE_DECODE_FREE_RANK_CAP`` -> ``(rank_cap, tail_rows, tail_w)``.
+
+    Format:
+      - ``""`` / ``"0"`` / ``"off"`` -> ``(0, 0, 0.0)`` (disabled)
+      - ``"<cap>"`` -> ``(cap, 2, 0.31)``
+      - ``"<cap>:<tail_rows>"`` -> ``(cap, tail_rows, 0.31)``
+      - ``"<cap>:<tail_rows>:<tail_w>"`` -> ``(cap, tail_rows, tail_w)``
+    """
+    raw = (
+        str(_env_raw("SGLANG_TPU_MUSE_DECODE_FREE_RANK_CAP", ""))
+        if spec is None
+        else str(spec)
+    ).strip().lower()
+    if not raw or raw in ("0", "false", "no", "off", "none"):
+        return 0, 0, 0.0
+    parts = [p.strip() for p in raw.split(":") if p.strip()]
+    cap = max(0, int(parts[0]))
+    if cap <= 0:
+        return 0, 0, 0.0
+    tail_rows = max(1, int(parts[1])) if len(parts) >= 2 else 2
+    tail_w = float(parts[2]) if len(parts) >= 3 else 0.31
+    return cap, tail_rows, max(0.0, tail_w)
+
+
+def scale_free_rank_cap_for_batch(
+    rank_cap: int,
+    tail_rows: int,
+    batch_size: int,
+    *,
+    e_per_owner: int = 32,
+    d1_large_batch: bool | None = None,
+) -> tuple[int, int]:
+    """Scale ``(rank_cap, tail_rows)`` cleanly by batch size (disabled at ``B < 32``)."""
+    if rank_cap <= 0 or tail_rows <= 0 or batch_size < 32:
+        return 0, 0
+    eff_d1 = read_d1_large_batch_free() if d1_large_batch is None else bool(d1_large_batch)
+    if batch_size >= 128 and not eff_d1:
+        return 0, 0
+    scaled_rows = max(1, int(round(tail_rows * batch_size / 64.0)))
+    if batch_size <= 64:
+        return min(e_per_owner, rank_cap), scaled_rows
+    scaled_cap = int(round(rank_cap * (1.0 + 0.5 * (batch_size / 64.0 - 1.0))))
+    return min(e_per_owner, max(rank_cap, scaled_cap)), scaled_rows
+
+
 def scale_free_expert_for_batch(
     free_rows: int,
     free_min_slot: int,
     batch_size: int,
     mode: str | None = None,
+    d1_large_batch: bool | None = None,
 ) -> tuple[int, int]:
-    """Scale ``(free_rows, free_min_slot)`` for tail decode batch buckets (#2407).
+    """Scale ``(free_rows, free_min_slot)`` for tail and ``d=1`` large decode batch buckets.
 
-    Calibrates ``free_rows`` tuned at steady-state ``B=64`` down to ``B=16, 32``
-    so tail decode steps (e.g. ``<=7`` real tokens padded to ``B=16`` or ``c=16``
-    shared-prefix decode) never collapse real tokens to ``top-1``, while leaving
-    ``free_min_slot`` intact at ``B >= 32`` under default ``mode='b64_ms16'``
-    (and ``B >= 64`` 100% unchanged).
+    Calibrates ``free_rows`` tuned at steady-state ``B=64`` down to ``B=8, 16, 32``
+    so tail decode steps never collapse real tokens to ``top-1``, while leaving
+    ``free_min_slot`` intact at ``B >= 32`` under default ``mode='b64_ms16'``.
+    When ``d1_large_batch=True`` (``d=1`` high-concurrency ``B >= 128`` without
+    speculative verify), scales ``free_rows`` proportionally (`* B / 64`).
     """
     if free_rows <= 0:
         return 0, free_min_slot
@@ -231,19 +293,20 @@ def scale_free_expert_for_batch(
         return free_rows, free_min_slot
     if not eff_mode:
         eff_mode = "b64_ms16"
+    eff_d1 = read_d1_large_batch_free() if d1_large_batch is None else bool(d1_large_batch)
     if eff_mode == "ge32":
         if batch_size < 32:
             return 0, free_min_slot
-        if batch_size < 64:
+        if batch_size < 64 or (eff_d1 and batch_size >= 128):
             scaled = max(1, int(round(free_rows * batch_size / 64.0)))
-            return scaled, max(free_min_slot, 2)
+            return scaled, max(free_min_slot, 2) if batch_size < 64 else free_min_slot
         return free_rows, free_min_slot
     if eff_mode not in ("b64", "b64_ms16", "b64_all"):
         raise ValueError(
             f"Invalid SGLANG_TPU_MUSE_DECODE_FREE_SCALE_MODE={eff_mode!r}; "
             "expected one of ('b64', 'b64_ms16', 'b64_all', 'ge32', 'off')"
         )
-    if batch_size < 64 or eff_mode == "b64_all":
+    if batch_size < 64 or eff_mode == "b64_all" or (eff_d1 and batch_size >= 128):
         scaled = max(1, int(round(free_rows * batch_size / 64.0)))
     else:
         scaled = free_rows
@@ -261,20 +324,22 @@ def resolve_free_and_min_p_for_batch(
     free_min_slot: int,
     parse_free_spec_fn,
     scale_mode: str | None = None,
+    d1_large_batch: bool | None = None,
 ) -> tuple[float, int, float, int]:
     """Resolve ``(min_p_topk, free_rows, free_max_w, free_min_slot)`` for ``batch_size``.
 
-    For verify batches (``batch_size >= 128``), honors optional
-    ``SGLANG_TPU_MUSE_DECODE_VERIFY_MIN_P_TOPK`` (``>= 0.0`` overrides; ``0.0``
-    disables pruning on verify while leaving ``B <= 64`` untouched) and
-    ``SGLANG_TPU_MUSE_DECODE_VERIFY_FREE_EXPERT_ROWS`` (``"off"`` disables FREE on
-    verify; ``"rows[:max_w[:min_slot]]"`` sets verify-specific thresholds directly).
+    For verify batches (``batch_size >= 128`` when ``not d1_large_batch``), honors
+    optional ``SGLANG_TPU_MUSE_DECODE_VERIFY_MIN_P_TOPK`` and
+    ``SGLANG_TPU_MUSE_DECODE_VERIFY_FREE_EXPERT_ROWS``. When ``d1_large_batch``
+    is active (non-spec ``d=1`` large concurrency), scales ``free_rows`` directly
+    for ``B >= 128``.
     """
     eff_min_p = min_p_topk
     eff_rows = free_rows
     eff_max_w = free_max_w
     eff_min_slot = free_min_slot
-    if batch_size >= 128:
+    eff_d1 = read_d1_large_batch_free() if d1_large_batch is None else bool(d1_large_batch)
+    if batch_size >= 128 and not eff_d1:
         v_min_p = float(_env_raw("SGLANG_TPU_MUSE_DECODE_VERIFY_MIN_P_TOPK", -1.0))
         if v_min_p >= 0.0:
             eff_min_p = max(0.0, v_min_p)
@@ -288,7 +353,7 @@ def resolve_free_and_min_p_for_batch(
             return eff_min_p, parsed_rows, parsed_max_w, parsed_min_slot
 
     scaled_rows, scaled_min_slot = scale_free_expert_for_batch(
-        eff_rows, eff_min_slot, batch_size, mode=scale_mode
+        eff_rows, eff_min_slot, batch_size, mode=scale_mode, d1_large_batch=eff_d1
     )
     return eff_min_p, scaled_rows, eff_max_w, scaled_min_slot
 
@@ -300,10 +365,12 @@ _NONUNIFORM_FREE_PRESETS: dict[
     "mid_f10p82": ((6, 0.18, 2, 0.88), (10, 0.22, 1, 0.82), 5),
     "mid_f10p84": ((6, 0.18, 2, 0.88), (10, 0.22, 1, 0.84), 5),
     "mid_f9p84": ((6, 0.18, 2, 0.88), (9, 0.20, 1, 0.84), 5),
-    # Pareto-optimal profiles: low row-cap (3..6) targets wasteful few-row experts
-    # while higher free_max_w + min_p preserve router weight mass & top-2 slots.
+    # Pareto-optimal profiles (min_slot=1 proved critical on E2E bias+Step(c)):
     "pareto_f4w22p88": ((6, 0.18, 2, 0.88), (4, 0.22, 2, 0.88), 5),
     "pareto_f6w24p84": ((6, 0.18, 2, 0.88), (6, 0.24, 1, 0.84), 5),
+    "pareto_f8w24p84": ((6, 0.18, 2, 0.88), (8, 0.24, 1, 0.84), 5),
+    "pareto_f10w24p82": ((6, 0.18, 2, 0.88), (10, 0.24, 1, 0.82), 5),
+    "pareto_f10w26p80": ((6, 0.18, 2, 0.88), (10, 0.26, 1, 0.80), 5),
     "pareto_f4w24p86": ((4, 0.22, 2, 0.88), (4, 0.24, 2, 0.86), 5),
     "pareto_f3w28p88": ((4, 0.22, 2, 0.88), (3, 0.28, 2, 0.88), 5),
 }
@@ -316,6 +383,9 @@ _NONUNIFORM_FREE_LAYER_PRESETS: dict[str, str] = {
     ),
     "pareto_3tier_fast": (
         "default=6:0.18:2:0.88;6-20,26,51-55=4:0.22:2:0.88;21-25,27-50=3:0.28:2:0.88"
+    ),
+    "pareto_3tier_ms1": (
+        "default=6:0.18:2:0.88;6-20,26,51-55=6:0.24:1:0.84;21-25,27-50=10:0.26:1:0.80"
     ),
 }
 
@@ -420,6 +490,7 @@ def resolve_nonuniform_free_for_layer(
     ep: int = 8,
     scale_mode: str | None = None,
     spec: str | None = None,
+    d1_large_batch: bool | None = None,
 ) -> tuple[float, int, float, int]:
     """Resolve ``(min_p_topk, free_rows, free_max_w, free_min_slot)`` for one MoE layer.
 
@@ -427,15 +498,17 @@ def resolve_nonuniform_free_for_layer(
     identically to ``resolve_free_and_min_p_for_batch``. Otherwise applies
     2-tier boundary/middle presets, 3-tier entropy presets, or explicit
     per-layer range rules, with ``ep``-aware clamping at ``B <= 16``
-    (``<= 1`` row on ``EP=16``, ``<= 2`` on ``EP=8``).
+    (``<= 1`` row on ``EP=16``, ``<= 2`` on ``EP=8``) and optional ``d=1``
+    proportional scaling at ``B >= 128`` when ``d1_large_batch=True``.
     """
     eff_spec = (
         str(_env_raw("SGLANG_TPU_MUSE_DECODE_NONUNIFORM_FREE", "")).strip()
         if spec is None
         else str(spec).strip()
     )
+    eff_d1 = read_d1_large_batch_free() if d1_large_batch is None else bool(d1_large_batch)
     parsed = parse_nonuniform_free_spec(eff_spec)
-    if parsed is None or batch_size >= 128:
+    if parsed is None or (batch_size >= 128 and not eff_d1):
         return resolve_free_and_min_p_for_batch(
             batch_size,
             min_p_topk=min_p_topk,
@@ -444,6 +517,7 @@ def resolve_nonuniform_free_for_layer(
             free_min_slot=free_min_slot,
             parse_free_spec_fn=parse_free_spec_fn,
             scale_mode=scale_mode,
+            d1_large_batch=eff_d1,
         )
     if isinstance(parsed, dict):
         eff_idx = (
@@ -460,7 +534,9 @@ def resolve_nonuniform_free_for_layer(
         b_cfg, m_cfg, bn = parsed
         is_boundary = (layer_idx <= bn) or (layer_idx >= max(bn + 1, num_layers - 1 - bn))
         t_rows, t_w, t_ms, t_mp = b_cfg if is_boundary else m_cfg
-    s_rows, s_ms = scale_free_expert_for_batch(t_rows, t_ms, batch_size, mode=scale_mode)
+    s_rows, s_ms = scale_free_expert_for_batch(
+        t_rows, t_ms, batch_size, mode=scale_mode, d1_large_batch=eff_d1
+    )
     if batch_size <= 16 and s_rows > 0:
         s_rows = min(s_rows, 1 if ep >= 16 else 2)
     return t_mp, s_rows, t_w, s_ms

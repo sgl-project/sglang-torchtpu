@@ -243,6 +243,7 @@ def moe_gmm_local_rs_nodedup(
     prefill_hot_interleave: bool | None = None,
     chipmate_xor: int = 1,
     hidden_states_scale: jax.Array | None = None,
+    static_fp8_lhs_scale: float = 0.0,
 ) -> jax.Array:
     """Per-chip MoE using the nodedup gmm_fused_rs kernel.
 
@@ -805,6 +806,7 @@ def moe_gmm_local_rs_nodedup(
         chipmate_xor=chipmate_xor,
         hot_interleave=use_prefill_hi,
         hidden_states_scale=hidden_states_scale,
+        static_fp8_lhs_scale=static_fp8_lhs_scale,
     )
     if return_raw_out_buf:
         return out_buf

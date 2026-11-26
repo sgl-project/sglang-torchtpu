@@ -400,6 +400,7 @@ def inner_kernel(
     vectorized_dequant: bool = False,
     w_strip_fp8_ref=None,
     prequant_lhs_ready: bool = False,
+    skip_lhs_scale_mul: bool = False,
 ):
     """Inner kernel invoked by emit_pipeline to perform matmul.
 
@@ -779,6 +780,7 @@ def inner_kernel(
                 and (prequant_lhs_fp8_ref is not None or _has_ext_pq_lhs_3d)
                 and prequant_lhs_scale_ref is not None
             )
+            _skip_lhs_sc = bool(skip_lhs_scale_mul and prequant_lhs_ready)
             _flq_zero_rmw = (
                 int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_FLQ_ZERO_RMW.get() or 0)
                 if cfgs.dims.size_m > 4096
@@ -1139,6 +1141,7 @@ def inner_kernel(
                         ),
                         prequant_lhs_scale_ref=prequant_lhs_scale_ref,
                         pair_k512_unpack=(scoped_w4a8_mode == 7),
+                        skip_lhs_scale_mul=_skip_lhs_sc,
                     )
                 if use_scoped_w4a8_refs:
                     if _two_level_pow2 >= 1:
@@ -1239,10 +1242,15 @@ def inner_kernel(
                                         preferred_element_type=jnp.float32,
                                     )
                                     sub_acc = pop if sub_acc is None else sub_acc + pop
-                            lhs_s_c = _load_lhs_scale_strip(l_bid, col_size)
-                            term = sub_acc.astype(acc_ref.dtype) * (
-                                col_sc_f32.astype(acc_ref.dtype) * lhs_s_c
-                            )
+                            if _skip_lhs_sc:
+                                term = sub_acc.astype(acc_ref.dtype) * col_sc_f32.astype(
+                                    acc_ref.dtype
+                                )
+                            else:
+                                lhs_s_c = _load_lhs_scale_strip(l_bid, col_size)
+                                term = sub_acc.astype(acc_ref.dtype) * (
+                                    col_sc_f32.astype(acc_ref.dtype) * lhs_s_c
+                                )
                             acc_c = term if acc_c is None else acc_c + term
                         return acc_c
 
@@ -1286,8 +1294,11 @@ def inner_kernel(
                             sub_acc = (
                                 scaled_pop if sub_acc is None else sub_acc + scaled_pop
                             )
-                        lhs_s_c = _load_lhs_scale_strip(l_bid, col_size)
-                        term = sub_acc.astype(acc_ref.dtype) * lhs_s_c
+                        if _skip_lhs_sc:
+                            term = sub_acc.astype(acc_ref.dtype)
+                        else:
+                            lhs_s_c = _load_lhs_scale_strip(l_bid, col_size)
+                            term = sub_acc.astype(acc_ref.dtype) * lhs_s_c
                         acc_c = term if acc_c is None else acc_c + term
                     return acc_c
 
@@ -1442,16 +1453,19 @@ def inner_kernel(
                                 block_lhs_for_matmul = _read_pq_lhs_slice(
                                     start_k, end_k
                                 )
-                                s128 = prequant_lhs_scale_ref[b_id_pq, :, :]
-                                if (
-                                    col_size > s128.shape[1]
-                                    and col_size % s128.shape[1] == 0
-                                ):
-                                    lhs_scale = jnp.concatenate(
-                                        [s128] * (col_size // s128.shape[1]), axis=1
-                                    )
+                                if _skip_lhs_sc:
+                                    lhs_scale = None
                                 else:
-                                    lhs_scale = s128[:, :col_size]
+                                    s128 = prequant_lhs_scale_ref[b_id_pq, :, :]
+                                    if (
+                                        col_size > s128.shape[1]
+                                        and col_size % s128.shape[1] == 0
+                                    ):
+                                        lhs_scale = jnp.concatenate(
+                                            [s128] * (col_size // s128.shape[1]), axis=1
+                                        )
+                                    else:
+                                        lhs_scale = s128[:, :col_size]
                             else:
                                 block_lhs = tiled_lhs[:, start_k:end_k]
                                 block_lhs_for_matmul, lhs_scale = _online_quantize(
@@ -1471,7 +1485,8 @@ def inner_kernel(
                     ).astype(acc_ref.dtype)
 
                     if fp8_activation_quant:
-                        block_acc *= lhs_scale.astype(acc_ref.dtype)
+                        if lhs_scale is not None:
+                            block_acc *= lhs_scale.astype(acc_ref.dtype)
                         if rhs_online_scale is not None:
                             if rhs_online_scale.shape[0] == 8:
                                 block_acc = (
@@ -1538,6 +1553,7 @@ def inner_kernel(
                         zero_spill_sub_m=scoped_w4a8_mode in (2, 3, 4, 5, 6, 7),
                         mh_outer=scoped_w4a8_mode in (3, 4, 5, 6),
                         hoist_rhs_scale=scoped_w4a8_mode >= 4,
+                        skip_lhs_scale_mul=_skip_lhs_sc,
                     )
                 col_size = g_e - g_s
                 use_bf16_inner = fp4_acc_mode == 3
@@ -1580,9 +1596,13 @@ def inner_kernel(
                             )
                         sub_g = sp_g if sub_g is None else sub_g + sp_g
                         sub_u = sp_u if sub_u is None else sub_u + sp_u
-                    lhs_s_c = _load_lhs_scale_strip(l_bid, col_size)
-                    tg = sub_g.astype(acc_ref.dtype) * lhs_s_c
-                    tu = sub_u.astype(acc_ref.dtype) * lhs_s_c
+                    if _skip_lhs_sc:
+                        tg = sub_g.astype(acc_ref.dtype)
+                        tu = sub_u.astype(acc_ref.dtype)
+                    else:
+                        lhs_s_c = _load_lhs_scale_strip(l_bid, col_size)
+                        tg = sub_g.astype(acc_ref.dtype) * lhs_s_c
+                        tu = sub_u.astype(acc_ref.dtype) * lhs_s_c
                     acc_g = tg if acc_g is None else acc_g + tg
                     acc_u = tu if acc_u is None else acc_u + tu
                 return acc_g, acc_u
@@ -2550,7 +2570,8 @@ def dma_gather_gm_start(
         _gm_mode = bs_meta_ref[_aux_base]
 
         def _gather_mode01():
-            if ep_size == 8:
+            _blk_m_g = dst_ref.shape[0] // ep_size
+            if _blk_m_g == 32:
 
                 def _g32_blk(c, _):
                     i0 = c * 32
@@ -2563,7 +2584,7 @@ def dma_gather_gm_start(
                 num_32 = num_rows >> 5
                 lax.fori_loop(0, num_32, _g32_blk, 0)
                 rem_st = num_32 << 5
-            else:
+            elif _blk_m_g == 16:
 
                 def _g16_blk(h, _):
                     i0 = h * 16
@@ -2576,6 +2597,8 @@ def dma_gather_gm_start(
                 num_16 = num_rows >> 4
                 lax.fori_loop(0, num_16, _g16_blk, 0)
                 rem_st = num_16 << 4
+            else:
+                rem_st = 0
 
             def _g_body(i, _):
                 _emit_single_copy(i, indices_ref[m_start + i])

@@ -1699,9 +1699,10 @@ class MuseSparkMoE(nn.Module):
         """Validate and attach §4.5b preloaded hot-expert replica buffers to this MoE layer."""
         ex = self.experts
         num_replicas = int(rep_w1.shape[0])
-        if num_replicas not in (1, 2, 4, 6, 8):
+        if num_replicas not in (1, 2, 4, 6, 8, 12, 16):
             raise ValueError(
-                f"Preloaded replica slots must be in (1, 2, 4, 6, 8), got {num_replicas}"
+                "Preloaded replica slots must be in (1, 2, 4, 6, 8, 12, 16), "
+                f"got {num_replicas}"
             )
         for name, rep, base in (
             ("rep_w1", rep_w1, ex.w13_weight),
@@ -1881,7 +1882,7 @@ class MuseSparkMoE(nn.Module):
                 "full_stage_b",
             )
             or world not in (8, 16)
-            or num_replicas not in (0, 1, 2, 4, 6, 8)
+            or num_replicas not in (0, 1, 2, 4, 6, 8, 12, 16)
             or replica_cost_mode not in ("active", "tiles", "weighted")
             or graph.tpu_compile_tracer != "dynamo"
             or graph.use_spmd_compile
@@ -2150,11 +2151,12 @@ class MuseSparkMoE(nn.Module):
                 return
 
         from sglang_tpu.fp8_moe import _own_storage
-        from sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_op import (
-            SUPPORTED_FUSE_ALL_BATCHES,
-            get_muse_ep_tp2_fallback_op,
-            get_muse_fuse_all_decode_op,
-        )
+        import sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_op as _fdo_mod
+
+        SUPPORTED_FUSE_ALL_BATCHES = _fdo_mod.SUPPORTED_FUSE_ALL_BATCHES
+        get_muse_ep_tp2_fallback_op = _fdo_mod.get_muse_ep_tp2_fallback_op
+        get_muse_fuse_all_decode_op = _fdo_mod.get_muse_fuse_all_decode_op
+        _batches_fn = getattr(_fdo_mod, "supported_fuse_all_batches", None)
 
         self._register_fused_decode_vecs(norm)
         self.register_buffer("_fused_decode_rank", rank_t, persistent=False)
@@ -2164,10 +2166,15 @@ class MuseSparkMoE(nn.Module):
                 _own_storage(pre_gain.detach().reshape(1, -1).contiguous()),
                 persistent=False,
             )
-        ext_batches = (
-            (*SUPPORTED_FUSE_ALL_BATCHES, 384)
-            if (_decode_max_tokens() >= 384 and 384 not in SUPPORTED_FUSE_ALL_BATCHES)
+        base_batches = (
+            _batches_fn(ep=ep_owners)
+            if (mode == "sparse" and _batches_fn is not None)
             else SUPPORTED_FUSE_ALL_BATCHES
+        )
+        ext_batches = (
+            (*base_batches, 384)
+            if (_decode_max_tokens() >= 384 and 384 not in base_batches)
+            else base_batches
         )
         self._fused_decode_batches = (
             ext_batches
@@ -2679,6 +2686,7 @@ class MuseSparkMoE(nn.Module):
         from sglang_tpu.fp8_moe import _own_storage
         from sglang_tpu.moe.pallas.fused_rs_muse.decode_hbm_breakers import (
             parse_nonuniform_free_spec,
+            read_d1_large_batch_free,
             resolve_nonuniform_free_for_layer,
         )
         from sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_routing import (
@@ -2694,6 +2702,7 @@ class MuseSparkMoE(nn.Module):
         if parse_nonuniform_free_spec(raw_spec) is None:
             return False
 
+        d1_large_batch = read_d1_large_batch_free()
         (
             _,
             _,
@@ -2722,6 +2731,7 @@ class MuseSparkMoE(nn.Module):
                 parse_free_spec_fn=parse_free_expert_rows_spec,
                 ep=ep_owners,
                 spec=raw_spec,
+                d1_large_batch=d1_large_batch,
             )
             vec = torch.tensor(
                 [float(mp), float(f_rows), float(f_max_w), float(f_min_slot)],
@@ -4079,7 +4089,7 @@ class MuseSparkDecoderLayer(nn.Module):
                 step_c_flag is not None
                 and bool(step_c_flag.get())
                 and use_qkv_epi
-                and n_tok <= 64
+                and 32 <= n_tok <= 64
                 and getattr(next_layer_attn, "decode_attn_gate_fuse", False)
                 and (capture_mode is None or not capture_mode.is_full())
             ):
@@ -4094,13 +4104,22 @@ class MuseSparkDecoderLayer(nn.Module):
                 backend = _resolve_decode_attn_backend(forward_batch)
                 md = getattr(backend, "forward_metadata", None) if backend is not None else None
                 rpa_mode_str = str(tpu_envs.SGLANG_TPU_RPA_V3_DECODE_FAST.get()).strip()
+                sw = getattr(next_layer_attn.attn, "sliding_window_size", None)
+                if sw is not None and sw <= 0:
+                    sw = None
+                elif sw is not None:
+                    sw = int(sw) + 1
+                lc_swa_step_c = bool(tpu_envs.SGLANG_TPU_MUSE_MK_STEP_C_LC_SWA.get())
                 if (
                     rpa_mode_str
                     and backend is not None
                     and md is not None
                     and getattr(backend, "_decode_prepared_gated_op", None) is not None
                     and getattr(md, "decode_query_size", 0) == 1
-                    and getattr(md, "decode_shared_prefix_pages", None) is None
+                    and (
+                        (lc_swa_step_c and sw is not None)
+                        or getattr(md, "decode_shared_prefix_pages", None) is None
+                    )
                     and backend.can_forward_decode_prepared(
                         next_layer_attn.attn, forward_batch
                     )
@@ -4108,11 +4127,6 @@ class MuseSparkDecoderLayer(nn.Module):
                     kv_cache, kv_layer_idx = _fused_kv_operands(
                         backend.token_to_kv_pool, next_layer_attn.attn.layer_id
                     )
-                    sw = getattr(next_layer_attn.attn, "sliding_window_size", None)
-                    if sw is not None and sw <= 0:
-                        sw = None
-                    elif sw is not None:
-                        sw = int(sw) + 1
                     kv_lens = backend._kv_lens(forward_batch)
                     page_indices = backend._layer_page_indices(
                         next_layer_attn.attn.layer_id, is_swa_layer=(sw is not None)
@@ -4151,10 +4165,11 @@ class MuseSparkDecoderLayer(nn.Module):
                         pages_per_seq=pages_per_seq,
                         phys_page_rows=phys_rows,
                         kv_pack_dense2=dense2,
+                        kv_pack_bd4=bd4,
                         b_tokens=n_tok,
                         max_num_seqs=int(kv_lens.shape[0]),
                     )
-                    if not bd4 and step_c_rpa_ok and (tp != 16 or cfg_rpa.num_slots <= 4):
+                    if step_c_rpa_ok and (tp != 16 or cfg_rpa.num_slots <= 4):
                         op_c = get_b1_moe_b2_rpad_chip_sharded_op(
                             tp,
                             bf16_router=bf16_router,
@@ -4165,6 +4180,7 @@ class MuseSparkDecoderLayer(nn.Module):
                             has_free_params=(fp_buf is not None),
                             has_layer_idx=(kv_layer_idx is not None),
                             kv_pack_dense2=dense2,
+                            kv_pack_bd4=bd4,
                             rpa_mode_str=rpa_mode_str,
                         )
                         lidx_tail = (kv_layer_idx,) if kv_layer_idx is not None else ()
@@ -4225,7 +4241,7 @@ class MuseSparkDecoderLayer(nn.Module):
                             float(getattr(next_layer_attn.attn, "v_scale_float", None) or 1.0),
                             float(next_layer_attn.norm_eps),
                         )
-                        get_step_c_kv_write_op(kv_pack_dense2=dense2)(
+                        get_step_c_kv_write_op(kv_pack_dense2=dense2, kv_pack_bd4=bd4)(
                             kv_merged_c,
                             kv_cache,
                             kv_lens,
@@ -6496,10 +6512,10 @@ class MuseSparkForConditionalGeneration(nn.Module):
                     "SGLANG_TPU_MUSE_KERNEL_DECODE_FULL_MOE requires pure EP8/EP16 "
                     "and cannot be combined with DECODE_EP_TP2 or DECODE_CHIPMATE_REBALANCE"
                 )
-        if decode_replicas not in (0, 1, 2, 4, 6, 8):
+        if decode_replicas not in (0, 1, 2, 4, 6, 8, 12, 16):
             raise ValueError(
                 "SGLANG_TPU_MUSE_KERNEL_DECODE_REPLICA_SLOTS must be one of "
-                f"(0, 1, 2, 4, 6, 8), got {decode_replicas}"
+                f"(0, 1, 2, 4, 6, 8, 12, 16), got {decode_replicas}"
             )
         prefill_eplb_mode = str(
             _env_get("SGLANG_TPU_MUSE_KERNEL_PREFILL_EPLB_MODE", "")
@@ -7008,12 +7024,22 @@ class MuseSparkForConditionalGeneration(nn.Module):
                         tpu_envs, "SGLANG_TPU_MUSE_DECODE_STEP_C_SUPERKERNEL", None
                     )
                     rpa_m = str(tpu_envs.SGLANG_TPU_RPA_V3_DECODE_FAST.get()).strip()
+                    bd4_flag = getattr(tpu_envs, "SGLANG_TPU_KV_PACK_BD4", None)
+                    step_c_bd4 = bool(warm_tp == 16 and bd4_flag is not None and bd4_flag.get())
                     step_c_cfgs = (
                         (
                             (False, False, rpa_m),
                             (False, True, rpa_m),
                             (True, False, rpa_m),
                             (True, True, rpa_m),
+                            *(
+                                (
+                                    (False, False, rpa_m, True),
+                                    (True, False, rpa_m, True),
+                                )
+                                if step_c_bd4
+                                else ()
+                            ),
                         )
                         if (
                             eff_b1_moe_b2_super
@@ -7774,6 +7800,11 @@ class MuseSparkForConditionalGeneration(nn.Module):
                 "SGLANG_TPU_MUSE_KERNEL_DECODE_REPLICA_SELECTION_MODE", "global_top"
             )
         )
+        rep_obj = str(
+            _env_get(
+                "SGLANG_TPU_MUSE_KERNEL_DECODE_REPLICA_OBJECTIVE", "decode_active"
+            )
+        )
         allow_boundary_rep = bool(
             _env_get("SGLANG_TPU_MUSE_KERNEL_DECODE_FP8_FUSE_ALL", False)
             or _env_get("SGLANG_TPU_MUSE_KERNEL_DECODE_SPARSE_FP8", False)
@@ -7801,6 +7832,7 @@ class MuseSparkForConditionalGeneration(nn.Module):
                     num_replicas_per_owner=num_replicas,
                     placement=placement,
                     owner_to_chip=owner_to_chip,
+                    objective=rep_obj,
                     selection_mode=sel_mode,
                 )
                 validate_replica_plan(plan)

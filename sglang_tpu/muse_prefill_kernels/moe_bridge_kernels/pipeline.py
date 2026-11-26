@@ -1644,6 +1644,32 @@ def _d_with_next_in_gather(
     return new_stream, next_in_rest, gathered
 
 
+def _resolve_b2_pipe_chunks(spec: str, t_local: int) -> tuple[int, ...] | None:
+    """Resolve opt-in B2 multi-chunk pipelining schedule for ``t_local``, or None for fallback."""
+    clean = spec.strip()
+    if not clean:
+        return None
+    if clean.lower() == "auto":
+        if t_local == 3072:
+            return (512, 1024, 1024, 512)
+        if t_local == 1536:
+            return (512, 512, 512)
+        return None
+    parts = [p.strip() for p in clean.split(",") if p.strip()]
+    if len(parts) < 2:
+        raise ValueError(
+            f"SGLANG_TPU_MUSE_KERNEL_B2_PIPE_CHUNKS={spec!r} must be 'auto' or >=2 comma-separated ints"
+        )
+    chunks = tuple(int(p) for p in parts)
+    if any(c <= 0 or c % 128 != 0 for c in chunks):
+        raise ValueError(
+            f"SGLANG_TPU_MUSE_KERNEL_B2_PIPE_CHUNKS={spec!r} chunks must be positive multiples of 128"
+        )
+    if sum(chunks) != t_local:
+        return None
+    return chunks
+
+
 def _moe_b2_all_gather(arr, *, axis_name: str):
     """MoE-internal B2 ag_i8 all-gather controlled by XOR1_AG_MOE or XOR1_BRIDGE_AG >= 2."""
     bridge_mode = envs.SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG.get()
@@ -2138,9 +2164,22 @@ def fused_moe_full_bridge_and_ffn(
                 half_idx=half_idx,
             )
 
+        from sglang_tpu.moe.pallas.fused_rs_muse.prefill_gmm_opts import (
+            resolve_static_fp8_lhs_scale,
+        )
+
         hidden_states_scale = None
-        _pq_lhs_mode = int(
+        _pq_lhs_raw = int(
             envs.SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8.get() or 0
+        )
+        _static_fp8_lhs_scale = resolve_static_fp8_lhs_scale(
+            _pq_lhs_raw,
+            envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_LHS.get(),
+        )
+        _pq_lhs_mode = (
+            (_pq_lhs_raw if _pq_lhs_raw > 0 else 6)
+            if _static_fp8_lhs_scale > 0.0
+            else _pq_lhs_raw
         )
         _use_pq_lhs_fp8 = (
             _pq_lhs_mode >= 1
@@ -2159,8 +2198,19 @@ def fused_moe_full_bridge_and_ffn(
                 )
             )
         )
-        _b2_direct_fp8_1pass = _use_pq_lhs_fp8 and _pq_lhs_mode == 4
-        _b2_direct_fp8_2half = _use_pq_lhs_fp8 and _pq_lhs_mode == 5
+        _use_static_fp8_lhs = _use_pq_lhs_fp8 and _static_fp8_lhs_scale > 0.0
+        _b2_direct_fp8_1pass = _use_pq_lhs_fp8 and (
+            _pq_lhs_mode == 4
+            or (
+                _use_static_fp8_lhs
+                and (fused_b1_b2_mode in (1, 2) or (t_local % 256 != 0))
+            )
+        )
+        _b2_direct_fp8_2half = (
+            _use_pq_lhs_fp8
+            and not _b2_direct_fp8_1pass
+            and _pq_lhs_mode in (5, 6)
+        )
         _b2_pow2_env = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_B2_POW2_CHUNKS", None)
         _use_b2_pow2 = bool(
             _b2_direct_fp8_2half and _b2_pow2_env is not None and _b2_pow2_env.get()
@@ -2168,8 +2218,176 @@ def fused_moe_full_bridge_and_ffn(
 
         def _moe_b2_all_gather_local(arr):
             return _moe_b2_all_gather(arr, axis_name=expert_axis)
-        with jax.named_scope("stage1_2_kernel_b1_b2_and_overlapped_ag_routing"):
+
+        def _finish_stage2_routing(tk_u8_loc, tk_u8_glob, tk_w_loc, hs_4d_in=None):
+            eff_n_loc_rt = num_local_experts + eff_cm_slots_pipe
+            eff_go_rt = my_id * eff_n_loc_rt if eff_cm_pipe else go_val
+            (
+                raw_local_tk,
+                local_tk,
+                global_tk,
+                inv_p,
+                local_tk_w,
+                active_cnt,
+                cm_plan,
+            ) = _route_ids(tk_u8_loc, tk_u8_glob, tk_w_loc)
+            if eff_hoist_routing or vt_arg is not None or eff_cm_pipe:
+                lhs_idx, gs, gstart, t_recv = compute_block_scatter_routing(
+                    global_tk,
+                    eff_go_rt,
+                    my_id,
+                    ep_size=ep_size,
+                    num_local_experts=eff_n_loc_rt,
+                    topk=topk,
+                    stable_sort=bool(
+                        (eplb_mode and eplb_mode != "off") or eff_cm_pipe
+                    ),
+                    has_pad_sentinel=(vt_arg is not None),
+                    precomputed_counts=_pallas_counts_slot[0],
+                )
+                if hs_4d_in is None:
+                    inv_p, lhs_idx, gs, gstart, t_recv = jax.lax.optimization_barrier(
+                        (inv_p, lhs_idx, gs, gstart, t_recv)
+                    )
+                else:
+                    hs_4d_in, inv_p, lhs_idx, gs, gstart, t_recv = (
+                        jax.lax.optimization_barrier(
+                            (hs_4d_in, inv_p, lhs_idx, gs, gstart, t_recv)
+                        )
+                    )
+                precomp_rt = (lhs_idx, gs, gstart)
+            else:
+                t_recv = jnp.sum(
+                    (
+                        (local_tk < go_val)
+                        | (local_tk >= go_val + num_local_experts)
+                    ).astype(jnp.int32)
+                )
+                precomp_rt = None
+            return (
+                raw_local_tk,
+                local_tk,
+                global_tk,
+                inv_p,
+                local_tk_w,
+                active_cnt,
+                cm_plan,
+                t_recv,
+                precomp_rt,
+                hs_4d_in,
+            )
+
+        _pipe_chunks_env = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_B2_PIPE_CHUNKS", None)
+        _pipe_chunks = (
+            _resolve_b2_pipe_chunks(str(_pipe_chunks_env.get() or ""), t_local)
             if (
+                (_use_pq_lhs_fp8 and _pq_lhs_mode >= 5)
+                and fused_b1_b2_mode in (3, 4)
+                and _pipe_chunks_env is not None
+            )
+            else None
+        )
+        with jax.named_scope("stage1_2_kernel_b1_b2_and_overlapped_ag_routing"):
+            if _pipe_chunks is not None:
+                k_grp = he_dim // 128
+                fp8_wp = fused_b1_b2_mode == 4
+                ag_chunks = []
+                tk_u8_list = []
+                tk_w_list = []
+                smid = None
+                prev_i8 = None
+                off = 0
+                for idx, ck in enumerate(_pipe_chunks):
+                    if idx == 0:
+                        att_in, st_in = attn_s, stream_s
+                    else:
+                        att_in, st_in, smid, _ = jax.lax.optimization_barrier(
+                            (attn_s, stream_s, smid, prev_i8)
+                        )
+                    fp8_c, sc_c, smid_out, tk_u8_c, tk_w_c = (
+                        pallas_fused_b1_b2_wpool_quant(
+                            att_in,
+                            st_in,
+                            a_attn,
+                            b_attn,
+                            pffn_w,
+                            w_r,
+                            bias,
+                            wp_fp8,
+                            wp_sc,
+                            pe_w,
+                            router_mode=router_mode,
+                            fp8_wpool=fp8_wp,
+                            half_idx=None,
+                            row_range=(off, off + ck),
+                            full_stream_mid=(idx == 0),
+                            stream_mid_prev=smid,
+                            topk=topk,
+                            emit_fp8_gmm=True,
+                        )
+                    )
+                    smid = smid_out
+                    i8_c = fp8_c.reshape(ck * k_grp, 128)
+                    if sc_c is not None:
+                        i8_c, smid, tk_u8_c, tk_w_c, sc_c = jax.lax.optimization_barrier(
+                            (i8_c, smid, tk_u8_c, tk_w_c, sc_c)
+                        )
+                    else:
+                        i8_c, smid, tk_u8_c, tk_w_c = jax.lax.optimization_barrier(
+                            (i8_c, smid, tk_u8_c, tk_w_c)
+                        )
+                    prev_i8 = i8_c
+                    ag_c = _moe_b2_all_gather_local(i8_c)
+                    ag_chunks.append((off, ck, ag_c, sc_c))
+                    tk_u8_list.append(tk_u8_c)
+                    tk_w_list.append(tk_w_c)
+                    off += ck
+                stream_shard_mid = smid
+                local_topk_ids_u8 = jnp.concatenate(tk_u8_list, axis=0)
+                local_topk_weights = jnp.concatenate(tk_w_list, axis=0)
+                global_topk_u8 = jax.lax.all_gather(
+                    local_topk_ids_u8, axis_name=expert_axis, axis=0, tiled=True
+                )
+                if ag_chunks[0][3] is not None:
+                    sc_local = jnp.empty((t_local,), dtype=ag_chunks[0][3].dtype)
+                    for off_c, _, _, sc_v in ag_chunks:
+                        sc_local = jax.lax.dynamic_update_slice(
+                            sc_local, sc_v, (off_c,)
+                        )
+                    hidden_states_scale = jax.lax.all_gather(
+                        sc_local, axis_name=expert_axis, axis=0, tiled=True
+                    ).reshape(-1)
+                else:
+                    hidden_states_scale = None
+                local_topk_ids_u8_b, global_topk_u8_b, _ = jax.lax.optimization_barrier(
+                    (local_topk_ids_u8, global_topk_u8, prev_i8)
+                )
+                (
+                    raw_local_topk_ids,
+                    local_topk_ids,
+                    global_topk_ids,
+                    inv_perm_c,
+                    local_topk_weights,
+                    active_cnt_local,
+                    pipe_cm_plan,
+                    local_t_recv,
+                    precomputed_routing,
+                    hs_4d,
+                ) = _finish_stage2_routing(
+                    local_topk_ids_u8_b, global_topk_u8_b, local_topk_weights, None
+                )
+                hs_buf = jnp.empty(
+                    (ep_size, t_local * k_grp, 128),
+                    dtype=ag_chunks[0][2].dtype,
+                )
+                for off_c, ck_c, ag_c, _ in ag_chunks:
+                    hs_buf = jax.lax.dynamic_update_slice(
+                        hs_buf,
+                        ag_c.reshape(ep_size, ck_c * k_grp, 128),
+                        (0, off_c * k_grp, 0),
+                    )
+                hidden_states = hs_buf.reshape(ep_size * t_local, k_grp, 128)
+            elif (
                 (fused_b1_b2_mode in (1, 2) and (t_local % 128 == 0))
                 or (
                     fused_b1_b2_mode in (3, 4)
@@ -2205,6 +2423,9 @@ def fused_moe_full_bridge_and_ffn(
                         half_idx=None,
                         topk=topk,
                         emit_fp8_gmm=True,
+                        static_fp8_scale=(
+                            _static_fp8_lhs_scale if _use_static_fp8_lhs else 0.0
+                        ),
                     )
                     i8_all = fp8_all.reshape(t_local * (he_dim // 128), 128)
                 else:
@@ -2237,7 +2458,7 @@ def fused_moe_full_bridge_and_ffn(
                 global_topk_u8 = jax.lax.all_gather(
                     local_topk_ids_u8, axis_name=expert_axis, axis=0, tiled=True
                 )
-                if _b2_direct_fp8_1pass:
+                if _b2_direct_fp8_1pass and sc_local_1d is not None:
                     hidden_states_scale = jax.lax.all_gather(
                         sc_local_1d, axis_name=expert_axis, axis=0, tiled=True
                     ).reshape(-1)
@@ -2350,6 +2571,9 @@ def fused_moe_full_bridge_and_ffn(
                             full_stream_mid=True,
                             topk=topk,
                             emit_fp8_gmm=True,
+                            static_fp8_scale=(
+                                _static_fp8_lhs_scale if _use_static_fp8_lhs else 0.0
+                            ),
                         )
                     )
                     i8_0 = fp8_0.reshape(c0_tok * (he_dim // 128), 128)
@@ -2399,6 +2623,9 @@ def fused_moe_full_bridge_and_ffn(
                             stream_mid_prev=smid_0_1,
                             topk=topk,
                             emit_fp8_gmm=True,
+                            static_fp8_scale=(
+                                _static_fp8_lhs_scale if _use_static_fp8_lhs else 0.0
+                            ),
                         )
                     )
                     i8_1 = fp8_1.reshape(c1_tok * (he_dim // 128), 128)
@@ -2430,7 +2657,7 @@ def fused_moe_full_bridge_and_ffn(
                 global_topk_u8 = jax.lax.all_gather(
                     local_topk_ids_u8, axis_name=expert_axis, axis=0, tiled=True
                 )
-                if _b2_direct_fp8_2half:
+                if _b2_direct_fp8_2half and sc_0 is not None:
                     if c0_tok != c1_tok:
                         ag_sc_0 = jax.lax.all_gather(
                             sc_0, axis_name=expert_axis, axis=0, tiled=True
@@ -2472,8 +2699,6 @@ def fused_moe_full_bridge_and_ffn(
                         if (dequant_1pass or _use_pq_lhs_fp8)
                         else dequant_half_gmm_layout(ag_i8_0, None)
                     )
-                eff_n_loc_rt = num_local_experts + eff_cm_slots_pipe
-                eff_go_rt = my_id * eff_n_loc_rt if eff_cm_pipe else go_val
                 (
                     raw_local_topk_ids,
                     local_topk_ids,
@@ -2482,68 +2707,12 @@ def fused_moe_full_bridge_and_ffn(
                     local_topk_weights,
                     active_cnt_local,
                     pipe_cm_plan,
-                ) = _route_ids(
-                    local_topk_ids_u8_b, global_topk_u8_b, local_topk_weights
+                    local_t_recv,
+                    precomputed_routing,
+                    hs_4d,
+                ) = _finish_stage2_routing(
+                    local_topk_ids_u8_b, global_topk_u8_b, local_topk_weights, hs_4d
                 )
-                if eff_hoist_routing or vt_arg is not None or eff_cm_pipe:
-                    lhs_indices, group_sizes, group_start_arg, local_t_recv = (
-                        compute_block_scatter_routing(
-                            global_topk_ids,
-                            eff_go_rt,
-                            my_id,
-                            ep_size=ep_size,
-                            num_local_experts=eff_n_loc_rt,
-                            topk=topk,
-                            stable_sort=bool(
-                                (eplb_mode and eplb_mode != "off") or eff_cm_pipe
-                            ),
-                            has_pad_sentinel=(vt_arg is not None),
-                            precomputed_counts=_pallas_counts_slot[0],
-                        )
-                    )
-                    if hs_4d is None:
-                        (
-                            inv_perm_c,
-                            lhs_indices,
-                            group_sizes,
-                            group_start_arg,
-                            local_t_recv,
-                        ) = jax.lax.optimization_barrier(
-                            (
-                                inv_perm_c,
-                                lhs_indices,
-                                group_sizes,
-                                group_start_arg,
-                                local_t_recv,
-                            )
-                        )
-                    else:
-                        (
-                            hs_4d,
-                            inv_perm_c,
-                            lhs_indices,
-                            group_sizes,
-                            group_start_arg,
-                            local_t_recv,
-                        ) = jax.lax.optimization_barrier(
-                            (
-                                hs_4d,
-                                inv_perm_c,
-                                lhs_indices,
-                                group_sizes,
-                                group_start_arg,
-                                local_t_recv,
-                            )
-                        )
-                    precomputed_routing = (lhs_indices, group_sizes, group_start_arg)
-                else:
-                    local_t_recv = jnp.sum(
-                        (
-                            (local_topk_ids < go_val)
-                            | (local_topk_ids >= go_val + num_local_experts)
-                        ).astype(jnp.int32)
-                    )
-                    precomputed_routing = None
                 if _b2_direct_fp8_2half:
                     if _use_b2_pow2:
                         k_grp = he_dim // 128
@@ -3106,6 +3275,11 @@ def fused_moe_full_bridge_and_ffn(
                     precomputed_routing=precomputed_routing,
                     precomputed_chipmate_plan=pipe_cm_plan,
                     hidden_states_scale=hidden_states_scale,
+                    static_fp8_lhs_scale=(
+                        _static_fp8_lhs_scale
+                        if (_b2_direct_fp8_1pass or _b2_direct_fp8_2half)
+                        else 0.0
+                    ),
                 )
                 if active_cnt_local is not None:
                     safe_rows = min(1024, out_buf_3d.shape[0])

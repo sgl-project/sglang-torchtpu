@@ -30,6 +30,7 @@ in a single ``pallas_call`` across ``TP = EP in (8, 16)`` and ``B in (32, 64, 12
 
 import dataclasses
 import functools
+import math
 import jax
 import jax.numpy as jnp
 
@@ -119,6 +120,7 @@ def _b1_moe_b2_chip_sharded_impl(
     rpa_cfg=None,
     rpa_one_block_per_seq: bool = True,
     rpa_kv_pack_dense2: bool = False,
+    rpa_kv_pack_bd4: bool = False,
     rpa_use_grp_vec: bool = False,
     rpa_skip_kv_write: bool = False,
     step_c_moe_is_scope1: tuple[bool, ...] = (),
@@ -577,6 +579,7 @@ def _b1_moe_b2_chip_sharded_impl(
                     b_tokens=rows,
                     init_sv_vmem_ref=init_sv_vmem_ref,
                     use_grp_vec=rpa_use_grp_vec,
+                    kv_pack_bd4=rpa_kv_pack_bd4,
                 )
                 pre_state_holder.append(pre_state)
 
@@ -672,7 +675,25 @@ def _b1_moe_b2_chip_sharded_impl(
         )
 
         if rpad_refs is not None:
-            q_for_rpa = rpad_q_vmem.at[:, pl.ds(0, 8), :] if world_size == 16 else rpad_q_vmem
+            if rpa_kv_pack_bd4:
+                # TP=16 bd4 packs [K_even | K_odd] across lanes 0..63 and 64..127, so populate
+                # sublanes 8..15 with [0, Q] matching the [Q, 0] in sublanes 0..7.
+                q_rows_tot = rpad_q_vmem.shape[0]
+                step_q = math.gcd(q_rows_tot, 8)
+                for q0 in range(0, q_rows_tot, step_q):
+                    q_sl = pl.ds(q0, step_q)
+                    q_lo_2d = rpad_q_vmem[q_sl, pl.ds(0, 8), :].reshape(step_q * 8, 128)
+                    q_hi_2d = (
+                        jnp.roll(q_lo_2d, 64, axis=1)
+                        if interpret_mode
+                        else pltpu.roll(q_lo_2d, 64, axis=1)
+                    )
+                    rpad_q_vmem[q_sl, pl.ds(8, 8), :] = q_hi_2d.reshape(step_q, 8, 128)
+                q_for_rpa = rpad_q_vmem
+            elif world_size == 16:
+                q_for_rpa = rpad_q_vmem.at[:, pl.ds(0, 8), :]
+            else:
+                q_for_rpa = rpad_q_vmem
             _run_rpad_vmem_core(
                 kv_lens_ref=kv_lens_ref,
                 page_indices_ref=page_indices_ref,
@@ -708,6 +729,7 @@ def _b1_moe_b2_chip_sharded_impl(
                 prestarted_bkv_state=(pre_state_holder[0] if pre_state_holder else None),
                 use_grp_vec=rpa_use_grp_vec,
                 skip_kv_write=rpa_skip_kv_write,
+                kv_pack_bd4=rpa_kv_pack_bd4,
             )
             _dma_wait(out_stream_chip_hbm, sems["s_out_sem"].at[0])
 
@@ -982,7 +1004,9 @@ def _b1_moe_b2_chip_sharded_impl(
         state_vmem_ref = next(s2_it)
         o_vmem_ref = next(s2_it)
         kv_write_vmem_ref = (
-            next(s2_it) if (rpa_kv_pack_dense2 and not rpa_skip_kv_write) else None
+            next(s2_it)
+            if ((rpa_kv_pack_dense2 or rpa_kv_pack_bd4) and not rpa_skip_kv_write)
+            else None
         )
         init_sv_vmem_ref = (
             next(s2_it)
@@ -1618,6 +1642,7 @@ def resolve_step_c_rpa_plan(
     pages_per_seq: int,
     phys_page_rows: int,
     kv_pack_dense2: bool = False,
+    kv_pack_bd4: bool = False,
     b_tokens: int | None = None,
     max_num_seqs: int | None = None,
 ):
@@ -1628,7 +1653,13 @@ def resolve_step_c_rpa_plan(
         parse_decode_fast_config,
     )
 
-    page_size = phys_page_rows * 2 if kv_pack_dense2 else phys_page_rows
+    if kv_pack_bd4:
+        kv_pack_dense2 = False
+    page_size = (
+        phys_page_rows * 4
+        if kv_pack_bd4
+        else (phys_page_rows * 2 if kv_pack_dense2 else phys_page_rows)
+    )
     cfg_rpa = parse_decode_fast_config(
         rpa_mode_str,
         sliding_window=sliding_window,
@@ -1637,6 +1668,7 @@ def resolve_step_c_rpa_plan(
         decode_query_size=1,
         shared_group=get_shared_group_size(rpa_mode_str),
         kv_pack_dense2=kv_pack_dense2,
+        kv_pack_bd4=kv_pack_bd4,
     )
     one_block_per_seq = (
         False
@@ -1750,6 +1782,7 @@ def b1_moe_b2_rpad_chip_sharded_jax(
     rpa_out_norm_eps: float = 1e-5,
     rpa_mode_str: str | None = None,
     kv_pack_dense2: bool = False,
+    kv_pack_bd4: bool = False,
     replica_cost_mode: str = "active",
     ep_axis_name: str = "model",
     config: SparseDecodeConfig | None = None,
@@ -1761,6 +1794,11 @@ def b1_moe_b2_rpad_chip_sharded_jax(
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
     from sglang_tpu.attention.pallas.rpa_v3_decode_fast import align_to, cdiv
+
+    if kv_pack_bd4:
+        if world_size != 16:
+            raise ValueError(f"Step (c) kv_pack_bd4 requires world_size=16, got {world_size}")
+        kv_pack_dense2 = False
 
     st = _prepare_chip_b1_moe_b2_setup(
         rank, stream_chip, gated_attn, wo_w8k, wo_scale, pa_alpha, pa_beta,
@@ -1808,6 +1846,7 @@ def b1_moe_b2_rpad_chip_sharded_jax(
         pages_per_seq=pages_per_seq,
         phys_page_rows=phys_page_rows,
         kv_pack_dense2=kv_pack_dense2,
+        kv_pack_bd4=kv_pack_bd4,
         b_tokens=rows,
         max_num_seqs=max_num_seqs,
     )
@@ -1852,7 +1891,7 @@ def b1_moe_b2_rpad_chip_sharded_jax(
         vmem((rows, q_heads, 128), jnp.bfloat16),
         *(
             (vmem((max(rows, 8), 8, 1, 4, 128), kv_cache_flat.dtype),)
-            if (kv_pack_dense2 and not skip_kv_write)
+            if ((kv_pack_dense2 or kv_pack_bd4) and not skip_kv_write)
             else ()
         ),
         *(
@@ -1948,6 +1987,7 @@ def b1_moe_b2_rpad_chip_sharded_jax(
         rpa_cfg=cfg_rpa,
         rpa_one_block_per_seq=bool(one_block_per_seq),
         rpa_kv_pack_dense2=bool(kv_pack_dense2),
+        rpa_kv_pack_bd4=bool(kv_pack_bd4),
         rpa_use_grp_vec=bool(use_grp_vec),
         rpa_skip_kv_write=bool(skip_kv_write),
         step_c_moe_is_scope1=st["step_c_moe_is_scope1"],
@@ -1958,6 +1998,7 @@ def b1_moe_b2_rpad_chip_sharded_jax(
         step_c_scope2_shapes=scope2_rpad_vmem,
     )
 
+    pack_tag = "_bd4" if kv_pack_bd4 else ("_d2" if kv_pack_dense2 else "")
     st_ch, next_gated, kv_out = pl.pallas_call(
         kernel_fn,
         out_shape=out_shape,
@@ -1979,6 +2020,7 @@ def b1_moe_b2_rpad_chip_sharded_jax(
             f"muse_w9_b1_moe_b2_rpad_b{rows}_tp{world_size}_k{st['scale_block']}"
             f"_r{st['num_replicas']}_{'r16' if st['is_r16'] else 'r32'}"
             f"{'_dfp' if st['has_free_params_arg'] else ''}"
+            f"{pack_tag}"
             f"_{'rope' if st['has_rope'] else 'nope'}"
         ),
     )(*call_args)
@@ -1995,10 +2037,28 @@ def write_decode_kv_merged_jax(
     distribution: jax.Array,
     *,
     kv_pack_dense2: bool = False,
+    kv_pack_bd4: bool = False,
     interpret: bool | object = False,
 ) -> jax.Array:
-    """Fast per-device KV append for Step (c) (single VMEM staging + single-sem async scatter)."""
-    if kv_pack_dense2 or kv_new.shape[0] > 64:
+    """Fast per-device KV append for Step (c) (single packed SMEM prefetch + VMEM scatter)."""
+    if kv_pack_bd4:
+        kv_pack_dense2 = False
+    is_packed_vmem = kv_pack_bd4 or kv_pack_dense2
+    if (
+        kv_new.shape[0] > 64
+        or (
+            is_packed_vmem
+            and (
+                kv_new.shape[0] < 8
+                or (kv_new.shape[0] % 8) != 0
+                or kv_lens.shape[0] > 64
+            )
+        )
+        or (
+            kv_pack_dense2
+            and (kv_new.shape[1:] != (1, 4, 128) or kv_new.dtype != jnp.float8_e4m3fn)
+        )
+    ):
         from sglang_tpu.attention.pallas.ragged_paged_attention_v3 import (
             write_kv_only_rpa_v3,
         )
@@ -2013,12 +2073,13 @@ def write_decode_kv_merged_jax(
             distribution,
             interpret=bool(interpret),
             kv_pack_dense2=kv_pack_dense2,
+            kv_pack_bd4=kv_pack_bd4,
         )
 
     from jax import lax
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
-    from sglang_tpu.attention.pallas.util import cdiv, get_tpu_version
+    from sglang_tpu.attention.pallas.util import align_to, cdiv, get_tpu_version
 
     if kv_new.shape[1:] != kv_cache_fused.shape[2:]:
         raise ValueError(
@@ -2026,19 +2087,46 @@ def write_decode_kv_merged_jax(
         )
     if kv_new.dtype != kv_cache_fused.dtype:
         raise ValueError(f"kv_new dtype {kv_new.dtype} != kv_cache dtype {kv_cache_fused.dtype}")
+    if kv_pack_bd4 and (kv_new.shape[1:] != (1, 4, 128) or kv_new.dtype != jnp.float8_e4m3fn):
+        raise ValueError(
+            f"kv_pack_bd4 requires kv_new trailing shape (1, 4, 128) fp8, got {kv_new.shape[1:]} {kv_new.dtype}"
+        )
 
     phys_page_size = kv_cache_fused.shape[1]
+    max_num_seqs = kv_lens.shape[0]
     num_page_indices = page_indices.shape[0]
     flat_cache = kv_cache_fused.reshape(
         (kv_cache_fused.shape[0] * phys_page_size, *kv_cache_fused.shape[2:])
     )
 
+    # Pack all 5 scalar-prefetch vectors into 1 contiguous SMEM buffer so XLA issues
+    # a single HBM->SMEM transfer instead of 5 per layer (#4345/#4346).
+    off_pg = max_num_seqs
+    off_cq = off_pg + num_page_indices
+    off_ckv = off_cq + (max_num_seqs + 1)
+    off_dist = off_ckv + (max_num_seqs + 1)
+    meta_packed = jnp.concatenate(
+        [
+            kv_lens.reshape(-1),
+            page_indices.reshape(-1),
+            cu_q_lens.reshape(-1),
+            cu_kv_lens.reshape(-1),
+            distribution.reshape(-1),
+        ],
+        axis=0,
+    ).astype(jnp.int32)
+
+    interpret_mode = interpret is not False
+    tpu_version = 0 if interpret_mode else get_tpu_version()
+    out_shape = (
+        pltpu.HBM(shape=flat_cache.shape, dtype=flat_cache.dtype)
+        if tpu_version >= 7
+        else jax.ShapeDtypeStruct(shape=flat_cache.shape, dtype=flat_cache.dtype)
+    )
+    can_2page = phys_page_size >= kv_new.shape[0]
+
     def _kv_write_small_vmem_kernel(
-        kv_lens_ref,
-        page_indices_ref,
-        cu_q_lens_ref,
-        cu_kv_lens_ref,
-        distribution_ref,
+        meta_ref,
         kv_new_ref,
         cache_in_ref,
         cache_out_ref,
@@ -2046,34 +2134,74 @@ def write_decode_kv_merged_jax(
         wr_cnt_smem,
     ):
         del cache_in_ref
-        n_seqs = jnp.clip(distribution_ref[2], 0, kv_lens_ref.shape[0])
+        n_seqs = jnp.clip(meta_ref[off_dist + 2], 0, max_num_seqs)
 
         def _seq_body(seq_idx, wr_cnt):
-            q_start = cu_q_lens_ref[seq_idx]
-            q_len = cu_q_lens_ref[seq_idx + 1] - q_start
-            kv_len = kv_lens_ref[seq_idx]
+            q_start = meta_ref[off_cq + seq_idx]
+            q_len = meta_ref[off_cq + seq_idx + 1] - q_start
+            kv_len = meta_ref[seq_idx]
             active = (q_len > 0) & (kv_len >= q_len)
 
-            @pl.when(active)
-            def _write_seq():
-                kv_start = kv_len - q_len
-                p_start = kv_start // phys_page_size
-                p_end = cdiv(kv_len, phys_page_size)
-                seq_pg_base = cdiv(cu_kv_lens_ref[seq_idx], phys_page_size)
-
-                @pl.loop(p_start, p_end)
-                def _page(p):
-                    tok_lo = jnp.maximum(kv_start, p * phys_page_size)
-                    tok_hi = jnp.minimum(kv_len, (p + 1) * phys_page_size)
-                    n = tok_hi - tok_lo
-                    src_row = q_start + (tok_lo - kv_start)
-                    pg = page_indices_ref[jnp.minimum(seq_pg_base + p, num_page_indices - 1)]
-                    dst_row = pg * phys_page_size + (tok_lo - p * phys_page_size)
+            if can_2page:
+                @pl.when(active & (q_len == 1))
+                def _write_single():
+                    pos = kv_len - 1
+                    seq_pg_base = cdiv(meta_ref[off_ckv + seq_idx], phys_page_size)
+                    pg = meta_ref[
+                        off_pg + jnp.minimum(seq_pg_base + (pos // phys_page_size), num_page_indices - 1)
+                    ]
+                    dst_row = pg * phys_page_size + (pos % phys_page_size)
                     pltpu.make_async_copy(
-                        src_ref=kv_new_ref.at[pl.ds(src_row, n)],
-                        dst_ref=cache_out_ref.at[pl.ds(dst_row, n)],
+                        src_ref=kv_new_ref.at[pl.ds(q_start, 1)],
+                        dst_ref=cache_out_ref.at[pl.ds(dst_row, 1)],
                         sem=out_sem.at[0],
                     ).start()
+
+                @pl.when(active & (q_len > 1))
+                def _write_multi_2page():
+                    kv_start = kv_len - q_len
+                    p0 = kv_start // phys_page_size
+                    seq_pg_base = cdiv(meta_ref[off_ckv + seq_idx], phys_page_size)
+                    tok_hi0 = jnp.minimum(kv_len, (p0 + 1) * phys_page_size)
+                    n0 = tok_hi0 - kv_start
+                    pg0 = meta_ref[off_pg + jnp.minimum(seq_pg_base + p0, num_page_indices - 1)]
+                    dst_row0 = pg0 * phys_page_size + (kv_start - p0 * phys_page_size)
+                    pltpu.make_async_copy(
+                        src_ref=kv_new_ref.at[pl.ds(q_start, n0)],
+                        dst_ref=cache_out_ref.at[pl.ds(dst_row0, n0)],
+                        sem=out_sem.at[0],
+                    ).start()
+
+                    @pl.when(tok_hi0 < kv_len)
+                    def _write_tail_page():
+                        n1 = kv_len - tok_hi0
+                        pg1 = meta_ref[off_pg + jnp.minimum(seq_pg_base + p0 + 1, num_page_indices - 1)]
+                        pltpu.make_async_copy(
+                            src_ref=kv_new_ref.at[pl.ds(q_start + n0, n1)],
+                            dst_ref=cache_out_ref.at[pl.ds(pg1 * phys_page_size, n1)],
+                            sem=out_sem.at[0],
+                        ).start()
+            else:
+                @pl.when(active)
+                def _write_seq():
+                    kv_start = kv_len - q_len
+                    p_start = kv_start // phys_page_size
+                    p_end = cdiv(kv_len, phys_page_size)
+                    seq_pg_base = cdiv(meta_ref[off_ckv + seq_idx], phys_page_size)
+
+                    @pl.loop(p_start, p_end)
+                    def _page(p):
+                        tok_lo = jnp.maximum(kv_start, p * phys_page_size)
+                        tok_hi = jnp.minimum(kv_len, (p + 1) * phys_page_size)
+                        n = tok_hi - tok_lo
+                        src_row = q_start + (tok_lo - kv_start)
+                        pg = meta_ref[off_pg + jnp.minimum(seq_pg_base + p, num_page_indices - 1)]
+                        dst_row = pg * phys_page_size + (tok_lo - p * phys_page_size)
+                        pltpu.make_async_copy(
+                            src_ref=kv_new_ref.at[pl.ds(src_row, n)],
+                            dst_ref=cache_out_ref.at[pl.ds(dst_row, n)],
+                            sem=out_sem.at[0],
+                        ).start()
 
             return wr_cnt + jnp.where(active, q_len, jnp.int32(0))
 
@@ -2085,30 +2213,274 @@ def write_decode_kv_merged_jax(
             src = kv_new_ref.at[pl.ds(0, w_cnt)]
             pltpu.make_async_copy(src, src, out_sem.at[0]).wait()
 
-    interpret_mode = interpret is not False
-    tpu_version = 0 if interpret_mode else get_tpu_version()
-    out_shape = (
-        pltpu.HBM(shape=flat_cache.shape, dtype=flat_cache.dtype)
-        if tpu_version >= 7
-        else jax.ShapeDtypeStruct(shape=flat_cache.shape, dtype=flat_cache.dtype)
-    )
+    def _kv_write_packed_vmem_kernel(
+        meta_ref,
+        kv_new_ref,
+        cache_in_ref,
+        cache_out_ref,
+        rmw_vmem,
+        w_vmem,
+        in_sem,
+        out_sem,
+        cnt_smem,
+    ):
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
+            _load_new_kv_1row_u16,
+            _roll_lanes_fast,
+        )
+
+        pack_factor = 4 if kv_pack_bd4 else 2
+        pack_mask = pack_factor - 1
+        page_size = phys_page_size * pack_factor
+        n_seqs = jnp.clip(meta_ref[off_dist + 2], 0, max_num_seqs)
+        lane_lt_64 = (
+            lax.broadcasted_iota(jnp.int32, (1, 128), 1) < 64
+            if kv_pack_bd4
+            else None
+        )
+        r_sub8 = lax.broadcasted_iota(jnp.int32, (8, 128), 0)
+
+        def _rmw_prefetch_body(seq_idx, rmw_cnt):
+            q_start = meta_ref[off_cq + seq_idx]
+            q_len = meta_ref[off_cq + seq_idx + 1] - q_start
+            kv_len = meta_ref[seq_idx]
+            kv_start = kv_len - q_len
+            need_rmw = (q_len > 0) & (kv_len >= q_len) & ((kv_start & pack_mask) != 0)
+
+            @pl.when(need_rmw)
+            def _fetch_row():
+                p0 = kv_start // page_size
+                seq_pg_base = cdiv(meta_ref[off_ckv + seq_idx], page_size)
+                pg0 = meta_ref[off_pg + jnp.minimum(seq_pg_base + p0, num_page_indices - 1)]
+                dst_row0 = pg0 * phys_page_size + ((kv_start % page_size) // pack_factor)
+                pltpu.make_async_copy(
+                    src_ref=cache_in_ref.at[pl.ds(dst_row0, 1)],
+                    dst_ref=rmw_vmem.at[seq_idx, pl.ds(0, 1)],
+                    sem=in_sem.at[0],
+                ).start()
+
+            return rmw_cnt + jnp.where(need_rmw, jnp.int32(1), jnp.int32(0))
+
+        cnt_smem[0] = lax.fori_loop(0, n_seqs, _rmw_prefetch_body, jnp.int32(0))
+        rmw_cnt = cnt_smem[0]
+
+        @pl.when(rmw_cnt > 0)
+        def _wait_rmw():
+            w_ref = rmw_vmem.at[pl.ds(0, rmw_cnt), pl.ds(0, 1)]
+            pltpu.make_async_copy(w_ref, w_ref, in_sem.at[0]).wait()
+
+        def _read_rmw_row_u32(seq_idx):
+            if interpret_mode:
+                old_u8 = lax.bitcast_convert_type(rmw_vmem[seq_idx, 0], jnp.uint8)
+                return (
+                    old_u8[:, 0, :].astype(jnp.uint32)
+                    | (old_u8[:, 1, :].astype(jnp.uint32) << jnp.uint32(8))
+                    | (old_u8[:, 2, :].astype(jnp.uint32) << jnp.uint32(16))
+                    | (old_u8[:, 3, :].astype(jnp.uint32) << jnp.uint32(24))
+                )
+            rmw_u32_ref = rmw_vmem.bitcast(jnp.uint32).reshape(-1, 8, 128)
+            sub_u32 = rmw_u32_ref[seq_idx]
+            return jnp.sum(
+                jnp.where(r_sub8 == 0, sub_u32.astype(jnp.int32), jnp.int32(0)),
+                axis=0,
+                keepdims=True,
+            ).astype(jnp.uint32)
+
+        def _store_and_dma(w_idx, dst_row, packed_u32):
+            if interpret_mode:
+                b0 = packed_u32.astype(jnp.uint8)
+                b1 = (packed_u32 >> jnp.uint32(8)).astype(jnp.uint8)
+                b2 = (packed_u32 >> jnp.uint32(16)).astype(jnp.uint8)
+                b3 = (packed_u32 >> jnp.uint32(24)).astype(jnp.uint8)
+                row_f8 = lax.bitcast_convert_type(
+                    jnp.stack([b0, b1, b2, b3], axis=1)[:, None, :, :],
+                    jnp.float8_e4m3fn,
+                )
+                w_vmem[w_idx] = jnp.broadcast_to(row_f8, (8, 1, 4, 128))
+            else:
+                w_u32_ref = w_vmem.bitcast(jnp.uint32).reshape(-1, 8, 128)
+                w_u32_ref[w_idx] = jnp.broadcast_to(packed_u32, (8, 128))
+            pltpu.make_async_copy(
+                src_ref=w_vmem.at[w_idx, pl.ds(0, 1)],
+                dst_ref=cache_out_ref.at[pl.ds(dst_row, 1)],
+                sem=out_sem.at[0],
+            ).start()
+
+        def _write_packed_body(seq_idx, w_cur):
+            q_start = meta_ref[off_cq + seq_idx]
+            q_len = meta_ref[off_cq + seq_idx + 1] - q_start
+            kv_len = meta_ref[seq_idx]
+            active = (q_len > 0) & (kv_len >= q_len)
+            seq_pg_base = cdiv(meta_ref[off_ckv + seq_idx], page_size)
+
+            @pl.when(active & (q_len == 1))
+            def _write_packed_single():
+                pos = kv_len - 1
+                pg = meta_ref[
+                    off_pg + jnp.minimum(seq_pg_base + (pos // page_size), num_page_indices - 1)
+                ]
+                dst_row = pg * phys_page_size + ((pos % page_size) // pack_factor)
+                slot = pos & pack_mask
+                raw_u16 = _load_new_kv_1row_u16(
+                    kv_new_ref, q_start, interpret_mode=interpret_mode
+                )
+                if kv_pack_bd4:
+                    u16_ev = jnp.where(lane_lt_64, raw_u16, jnp.uint32(0))
+                    u16_od = jnp.where(
+                        lane_lt_64,
+                        jnp.uint32(0),
+                        _roll_lanes_fast(u16_ev, 64, interpret_mode=interpret_mode),
+                    )
+                else:
+                    u16_ev = raw_u16
+
+                @pl.when(slot == 0)
+                def _s0():
+                    _store_and_dma(w_cur, dst_row, u16_ev)
+
+                @pl.when(slot != 0)
+                def _s_rmw():
+                    old_u32 = _read_rmw_row_u32(seq_idx)
+                    if kv_pack_bd4:
+                        keep_lo = jnp.where(
+                            (slot >= 2) | ((slot == 1) & lane_lt_64),
+                            jnp.uint32(0x0000FFFF),
+                            jnp.uint32(0),
+                        )
+                        keep_hi = jnp.where(
+                            (slot == 3) & lane_lt_64,
+                            jnp.uint32(0xFFFF0000),
+                            jnp.uint32(0),
+                        )
+                        new_v = jnp.where((slot & 1) != 0, u16_od, u16_ev)
+                        new_sh = jnp.where((slot & 2) != 0, new_v << jnp.uint32(16), new_v)
+                        packed = (old_u32 & (keep_lo | keep_hi)) | new_sh
+                    else:
+                        packed = (old_u32 & jnp.uint32(0x0000FFFF)) | (
+                            u16_ev << jnp.uint32(16)
+                        )
+                    _store_and_dma(w_cur, dst_row, packed)
+
+            @pl.when(active & (q_len > 1))
+            def _write_packed_multi():
+                kv_start = kv_len - q_len
+
+                @pl.when((kv_start & pack_mask) == 0)
+                def _zero_unused_rmw():
+                    rmw_vmem[seq_idx] = jnp.zeros((8, 1, 4, 128), kv_new_ref.dtype)
+
+                old_u32 = _read_rmw_row_u32(seq_idx)
+                q_first = kv_start // pack_factor
+                q_last = cdiv(kv_len, pack_factor)
+
+                @pl.loop(q_first, q_last)
+                def _packed_row(q_idx):
+                    tok_base = q_idx * pack_factor
+                    pg = meta_ref[
+                        off_pg + jnp.minimum(seq_pg_base + (tok_base // page_size), num_page_indices - 1)
+                    ]
+                    dst_row = pg * phys_page_size + ((tok_base % page_size) // pack_factor)
+                    w_vmem_idx = w_cur + (q_idx - q_first)
+                    if kv_pack_bd4:
+                        # Quad index 0 reads any pre-existing slots before kv_start from old_u32;
+                        # all quads zero unused slots beyond kv_len (matches write_kv_only_rpa_v3).
+                        k_lo = jnp.where(
+                            (tok_base + 1 < kv_start) | ((tok_base < kv_start) & lane_lt_64),
+                            jnp.uint32(0x0000FFFF),
+                            jnp.uint32(0),
+                        )
+                        k_hi = jnp.where(
+                            (tok_base + 3 < kv_start) | ((tok_base + 2 < kv_start) & lane_lt_64),
+                            jnp.uint32(0xFFFF0000),
+                            jnp.uint32(0),
+                        )
+                        keep_mask = k_lo | k_hi
+                    else:
+                        keep_mask = jnp.uint32(0x0000FFFF)
+                    acc_base = jnp.where(
+                        tok_base < kv_start, old_u32 & keep_mask, jnp.uint32(0)
+                    )
+
+                    def _add_tok(s_off, acc_in):
+                        tok_s = tok_base + s_off
+                        tok_ok = (tok_s >= kv_start) & (tok_s < kv_len)
+                        safe_row = q_start + jnp.clip(tok_s - kv_start, 0, q_len - 1)
+                        raw_s = _load_new_kv_1row_u16(
+                            kv_new_ref, safe_row, interpret_mode=interpret_mode
+                        )
+                        if kv_pack_bd4:
+                            ev_s = jnp.where(lane_lt_64, raw_s, jnp.uint32(0))
+                            od_s = jnp.where(
+                                lane_lt_64,
+                                jnp.uint32(0),
+                                _roll_lanes_fast(ev_s, 64, interpret_mode=interpret_mode),
+                            )
+                            val_s = od_s if (s_off & 1) else ev_s
+                            sh_s = (val_s << jnp.uint32(16)) if (s_off & 2) else val_s
+                        else:
+                            sh_s = (raw_s << jnp.uint32(16)) if s_off else raw_s
+                        return jnp.where(tok_ok, acc_in | sh_s, acc_in)
+
+                    packed = acc_base
+                    for s_off in range(pack_factor):
+                        packed = _add_tok(s_off, packed)
+                    _store_and_dma(w_vmem_idx, dst_row, packed)
+
+            n_packed = jnp.where(
+                active,
+                jnp.where(
+                    q_len == 1,
+                    jnp.int32(1),
+                    cdiv(kv_len, pack_factor) - ((kv_len - q_len) // pack_factor),
+                ),
+                jnp.int32(0),
+            )
+            return w_cur + n_packed
+
+        cnt_smem[1] = lax.fori_loop(0, n_seqs, _write_packed_body, jnp.int32(0))
+        w_cnt = cnt_smem[1]
+
+        @pl.when(w_cnt > 0)
+        def _wait_out():
+            src = w_vmem.at[pl.ds(0, w_cnt), pl.ds(0, 1)]
+            pltpu.make_async_copy(src, src, out_sem.at[0]).wait()
+
+    if is_packed_vmem:
+        scratches = [
+            pltpu.VMEM((align_to(max(max_num_seqs, 1), 8), 8, 1, 4, 128), kv_new.dtype),
+            pltpu.VMEM((align_to(max(kv_new.shape[0], 1), 8), 8, 1, 4, 128), kv_new.dtype),
+            pltpu.SemaphoreType.DMA((1,)),
+            pltpu.SemaphoreType.DMA((1,)),
+            pltpu.SMEM((2,), jnp.int32),
+        ]
+        k_fn = _kv_write_packed_vmem_kernel
+        k_name = (
+            f"StepC_write_kv_only_bd4-p_{phys_page_size * 4}"
+            if kv_pack_bd4
+            else f"StepC_write_kv_only_d2-p_{phys_page_size * 2}"
+        )
+    else:
+        scratches = [
+            pltpu.SemaphoreType.DMA((1,)),
+            pltpu.SMEM((1,), jnp.int32),
+        ]
+        k_fn = _kv_write_small_vmem_kernel
+        k_name = f"StepC_write_kv_only-p_{phys_page_size}"
+
     pallas_kwargs = {
         "grid_spec": pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=5,
+            num_scalar_prefetch=1,
             in_specs=[
                 pl.BlockSpec(memory_space=pltpu.VMEM),
                 pl.BlockSpec(memory_space=pltpu.HBM),
             ],
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
             grid=(1,),
-            scratch_shapes=[
-                pltpu.SemaphoreType.DMA((1,)),
-                pltpu.SMEM((1,), jnp.int32),
-            ],
+            scratch_shapes=scratches,
         ),
         "out_shape": out_shape,
-        "input_output_aliases": {6: 0},
-        "name": f"StepC_write_kv_only-p_{phys_page_size}",
+        "input_output_aliases": {2: 0},
+        "name": k_name,
     }
     if interpret_mode:
         pallas_kwargs["interpret"] = (
@@ -2121,11 +2493,11 @@ def write_decode_kv_merged_jax(
             dimension_semantics=("arbitrary",),
             disable_bounds_checks=True,
         )
-    kernel = pl.pallas_call(_kv_write_small_vmem_kernel, **pallas_kwargs)
+    kernel = pl.pallas_call(k_fn, **pallas_kwargs)
     cache_in = (
         pltpu.with_memory_space_constraint(flat_cache, pltpu.HBM)
         if tpu_version >= 7
         else flat_cache
     )
-    updated = kernel(kv_lens, page_indices, cu_q_lens, cu_kv_lens, distribution, kv_new, cache_in)
+    updated = kernel(meta_packed, kv_new, cache_in)
     return updated.reshape(kv_cache_fused.shape)

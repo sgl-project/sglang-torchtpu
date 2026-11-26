@@ -74,7 +74,7 @@ class _Ops(NamedTuple):
     a3_pro_a2a_chunk: object = None
     a3_pro_last_chunk: object = None
     a3_kdeep_ccs: object = None
-    # Wave-9 Static-FP8 Ulysses sequence-parallel ops (`A1_VARIANT="v10_sp"`, TP=16).
+    # Wave-9 Static-FP8 Ulysses sequence-parallel ops (`A1_VARIANT="v10_sp"`, TP=8 / TP=16).
     a1_ulysses_qkv_chunk: object = None
     a1_ulysses_a2a_pack_chunk: object = None
     a1_ulysses_gate_chunk: object = None
@@ -1081,6 +1081,7 @@ def _ops(
     ccs_fuse_ag_a1: int = 0,
     overlap_deq0_routing_ag: bool = False,
     carb_tag: str = "",
+    ulysses_rev_bf16: bool = False,
 ) -> _Ops:
     """Per-rank torch ops: every tensor is this rank's block (P("model") on dim 0)."""
     import jax
@@ -1600,7 +1601,8 @@ def _ops(
 
         def a1_ul_qkv_body(attn_in_k, wqkvg, wqkvg_sc3d, cos_k, sin_k):
             c_k = attn_in_k.shape[0]
-            me = lax.axis_index(_AXIS)
+            # Avoid outer stablehlo.partition_id; TorchTPU GSPMD rejects it in cpu_export_jax_op.
+            me = kernel_a1.pallas_axis_index_1d(_AXIS)[0]
             x_fp8_k = _prep_ul_fp8_slice(attn_in_k)
             cos_own = lax.dynamic_index_in_dim(
                 cos_k.reshape(tp_d_ul, c_k, 128), me, axis=0, keepdims=False
@@ -1643,15 +1645,19 @@ def _ops(
         def a3_ul_rev_a2a_body(raw_attn_k):
             c_tok, q_loc = raw_attn_k.shape
             c_k = c_tok // tp_d_ul
-            q_fp8_3d = kernel_a3.pallas_ulysses_norm_fp8_for_rev_a2a(
-                raw_attn_k, head_norm_eps=head_norm_eps
+            q_3d = kernel_a3.pallas_ulysses_norm_fp8_for_rev_a2a(
+                raw_attn_k,
+                head_norm_eps=head_norm_eps,
+                quantize_fp8=not ulysses_rev_bf16,
             ).reshape(tp_d_ul, c_k, q_loc)
             return lax.all_to_all(
-                q_fp8_3d, _AXIS, split_axis=0, concat_axis=0, tiled=False
+                q_3d, _AXIS, split_axis=0, concat_axis=0, tiled=False
             ).reshape(tp_d_ul, c_k, q_loc)
 
-        def a3_ul_gate_fuse_body(attn_fp8_3d, gate_k):
-            return kernel_a3.pallas_ulysses_gate_fuse(attn_fp8_3d, gate_k)
+        def a3_ul_gate_fuse_body(attn_3d, gate_k):
+            return kernel_a3.pallas_ulysses_gate_fuse(
+                attn_3d, gate_k, input_is_prescaled=not ulysses_rev_bf16
+            )
 
         def a3_ul_wo_body(q_fp8, wo_in, wo_sc):
             return kernel_a3.pallas_ulysses_wo_local(q_fp8, wo_in, wo_sc)
@@ -1712,15 +1718,17 @@ def _ops(
             "a1_ulysses_a2a_pack_2op", a1_ul_a2a_pack, 2, 2
         )
         a1_ulysses_gate_chunk_op = export("a1_ulysses_gate", a1_ul_gate, 3, 1)
+        rev_bf16_sfx = "_bf16" if ulysses_rev_bf16 else ""
         a3_ulysses_rev_a2a_chunk_op = export(
             "a3_ulysses_rev_a2a_e"
-            + f"{head_norm_eps:g}".replace("-", "m").replace(".", "p"),
+            + f"{head_norm_eps:g}".replace("-", "m").replace(".", "p")
+            + rev_bf16_sfx,
             a3_ul_rev_a2a,
             1,
             1,
         )
         a3_ulysses_gate_fuse_chunk_op = export(
-            "a3_ulysses_gate_fuse", a3_ul_gate_fuse, 2, 1
+            "a3_ulysses_gate_fuse" + rev_bf16_sfx, a3_ul_gate_fuse, 2, 1
         )
         a3_ulysses_wo_op = export("a3_ulysses_wo", a3_ul_wo, 3, 1)
         a3_ulysses_wo_2chunk_op = export(
@@ -2523,6 +2531,42 @@ class _LayerWeights(torch.nn.Module):
         return sum(b.numel() * b.element_size() for b in self.buffers())
 
 
+def _v10_sp_config_error(
+    tp_size: int,
+    *,
+    h_q_local: int,
+    h_kv_local: int,
+    causal_chunk_stream: bool,
+    a3_variant: str,
+    a1_rpa_layout: bool,
+    a3_rpa_out: bool,
+    kv_pack_heads: bool,
+    skip_pad_attn_tokens: bool,
+    ep_tp2_mode: bool = False,
+) -> Optional[str]:
+    """Validate Static-FP8 Ulysses (`A1_VARIANT='v10_sp'`) requirements across TP=8 and TP=16."""
+    expected_kv_pack = tp_size == 8
+    expected_heads = (16, 2) if tp_size == 8 else (8, 1)
+    if (
+        tp_size not in (8, 16)
+        or (h_q_local, h_kv_local) != expected_heads
+        or not causal_chunk_stream
+        or not a1_rpa_layout
+        or a3_variant != "v16"
+        or ep_tp2_mode
+        or a3_rpa_out
+        or skip_pad_attn_tokens
+        or kv_pack_heads != expected_kv_pack
+    ):
+        kv_pack_str = "1" if expected_kv_pack else "0"
+        return (
+            f"native TP{tp_size} A1_VARIANT='v10_sp' requires (h_q_local, h_kv_local)={expected_heads}, "
+            f"CAUSAL_CHUNK_STREAM=1, A1_RPA_LAYOUT=1, A3_VARIANT='v16', pure EP, "
+            f"KV_PACK_HEADS={kv_pack_str}, A3_RPA_OUT=0, and SKIP_PAD_ATTN_TOKENS=0"
+        )
+    return None
+
+
 class MusePrefillKernels(torch.nn.Module):
     """Sequence-parallel kernel run of decoder layers ``[start, end)`` on eligible batches."""
 
@@ -2556,7 +2600,7 @@ class MusePrefillKernels(torch.nn.Module):
         self.capture_dflash = tpu_envs.SGLANG_TPU_MUSE_KERNEL_CAPTURE_DFLASH.get()
         # q / kv go straight to the backend's prepared RPA op; TP=8 needs KV_PACK_HEADS (pack=2),
         # while TP=16 already has h_kv_local=1 (pack=1).
-        self.a1_rpa_layout = (tp_size == 16 and self.a1_variant == "v10_sp") or (
+        self.a1_rpa_layout = (
             tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT.get()
             and not ep_tp2_mode
             and (
@@ -2619,18 +2663,21 @@ class MusePrefillKernels(torch.nn.Module):
             and self.a1_variant == "v1"
             and tpu_envs.SGLANG_TPU_MUSE_KERNEL_TP16_OWNER_A1.get()
         )
-        if self.a1_variant == "v10_sp" and (
-            self.tp_size != 16
-            or not self.causal_chunk_stream
-            or self.a3_variant != "v16"
-            or self.ep_tp2_mode
-            or self.a3_rpa_out
-            or self.skip_pad_attn_tokens
-        ):
-            raise ValueError(
-                "A1_VARIANT='v10_sp' requires TP=16, CAUSAL_CHUNK_STREAM=1, "
-                "A3_VARIANT='v16', pure EP, A3_RPA_OUT=0, and SKIP_PAD_ATTN_TOKENS=0"
+        if self.a1_variant == "v10_sp":
+            v10_err = _v10_sp_config_error(
+                self.tp_size,
+                h_q_local=attn.num_heads,
+                h_kv_local=attn.num_kv_heads,
+                causal_chunk_stream=self.causal_chunk_stream,
+                a3_variant=self.a3_variant,
+                a1_rpa_layout=self.a1_rpa_layout,
+                a3_rpa_out=self.a3_rpa_out,
+                kv_pack_heads=tpu_envs.SGLANG_TPU_KV_PACK_HEADS.get(),
+                skip_pad_attn_tokens=self.skip_pad_attn_tokens,
+                ep_tp2_mode=self.ep_tp2_mode,
             )
+            if v10_err is not None:
+                raise ValueError(v10_err)
         if self.causal_chunk_stream and (
             self.a1_variant not in ("v6", "v10_sp")
             or (self.tp_size != 16 and not self.a1_rpa_layout)
@@ -2688,6 +2735,7 @@ class MusePrefillKernels(torch.nn.Module):
             tpu_envs.SGLANG_TPU_MUSE_KERNEL_CCS_FUSE_AG_A1.get(),
             tpu_envs.SGLANG_TPU_MUSE_KERNEL_OVERLAP_DEQ0_ROUTING_AG.get(),
             _w8_carb_cache_tag(),
+            tpu_envs.SGLANG_TPU_MUSE_KERNEL_ULYSSES_REV_BF16.get(),
         )
         self.a3_kdeep_wo = int(
             tpu_envs.SGLANG_TPU_MUSE_KERNEL_A3_KDEEP_WO.get() or 0
@@ -2897,6 +2945,21 @@ class MusePrefillKernels(torch.nn.Module):
             )
         ):
             reason = "hybrid EP8xTP2 TP16 needs unpacked A1 v1 and A3 v3"
+        elif ((pure_ep_prefill or ep_tp2_prefill) and tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_VARIANT.get() == "v10_sp") and (
+            v10_reason := _v10_sp_config_error(
+                tp,
+                h_q_local=cfg.num_attention_heads // tp,
+                h_kv_local=cfg.num_key_value_heads // tp,
+                causal_chunk_stream=tpu_envs.SGLANG_TPU_MUSE_KERNEL_CAUSAL_CHUNK_STREAM.get(),
+                a3_variant=tpu_envs.SGLANG_TPU_MUSE_KERNEL_A3_VARIANT.get(),
+                a1_rpa_layout=tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT.get(),
+                a3_rpa_out=tpu_envs.SGLANG_TPU_MUSE_KERNEL_A3_RPA_OUT.get(),
+                kv_pack_heads=tpu_envs.SGLANG_TPU_KV_PACK_HEADS.get(),
+                skip_pad_attn_tokens=tpu_envs.SGLANG_TPU_MUSE_KERNEL_SKIP_PAD_ATTN_TOKENS.get(),
+                ep_tp2_mode=ep_tp2_prefill,
+            )
+        ) is not None:
+            reason = v10_reason
         elif native_tp16 and (
             tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_VARIANT.get() not in ("v1", "v6", "v10_sp")
             or tpu_envs.SGLANG_TPU_MUSE_KERNEL_A3_VARIANT.get() not in ("v3", "v16")
@@ -2904,19 +2967,9 @@ class MusePrefillKernels(torch.nn.Module):
                 tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT.get()
                 and tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_VARIANT.get() not in ("v6", "v10_sp")
             )
-            or (
-                tpu_envs.SGLANG_TPU_MUSE_KERNEL_A1_VARIANT.get() == "v10_sp"
-                and (
-                    not tpu_envs.SGLANG_TPU_MUSE_KERNEL_CAUSAL_CHUNK_STREAM.get()
-                    or tpu_envs.SGLANG_TPU_MUSE_KERNEL_A3_VARIANT.get() != "v16"
-                    or tpu_envs.SGLANG_TPU_KV_PACK_HEADS.get()
-                    or tpu_envs.SGLANG_TPU_MUSE_KERNEL_SKIP_PAD_ATTN_TOKENS.get()
-                )
-            )
         ):
             reason = (
-                "native TP16 needs A1 v1/v6/v10_sp (v6/v10_sp for A1_RPA_LAYOUT; "
-                "v10_sp requires CAUSAL_CHUNK_STREAM=1, A3 v16, KV_PACK_HEADS=0, SKIP_PAD_ATTN_TOKENS=0) "
+                "native TP16 needs A1 v1/v6/v10_sp (v6/v10_sp for A1_RPA_LAYOUT) "
                 "and A3 v3/v16"
             )
         elif parallel.attn_dcp_size != 1 or is_dp_attention_enabled():
