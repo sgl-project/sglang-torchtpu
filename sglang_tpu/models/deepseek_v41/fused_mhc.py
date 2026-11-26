@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""DeepSeek-V4.1 fused mHC post-pre (SGLANG_TPU_DSV41_FUSED_MHC=1; the AgentX
-DSV4.1 recipe sets it, an explicit 0 turns it off).
+"""DeepSeek-V4.1 fused mHC post-pre (SGLANG_TPU_DSV41_FUSED_MHC=1, default off;
+no recipe sets it yet).
 
 Between two sublayers the torch path runs the post (stream remix), the next
 sublayer's combine (collapse with the lagged pre) and input RMSNorm, and, at the
