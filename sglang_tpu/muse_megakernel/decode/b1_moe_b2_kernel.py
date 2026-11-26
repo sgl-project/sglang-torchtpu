@@ -546,6 +546,7 @@ def _b1_moe_b2_chip_sharded_impl(
         rpad_bkv_sems=None,
         rpad_cache_write_sem=None,
         sync_entry_barrier: bool = False,
+        prestarted_qkv_gate_dma: bool = True,
     ) -> None:
         qkv_vmem_slice = mate_recv.at[:, pl.ds(0, qkv_cols)]
         mate_tok_slice = send_half.at[pl.ds(0, rows_per_rank), :]
@@ -676,8 +677,8 @@ def _b1_moe_b2_chip_sharded_impl(
             skip_stream_load=True,
             skip_stream_store=False,
             prestarted_w_post_dma=True,
-            prestarted_w_qkv_dma=True,
-            prestarted_w_gate_dma=True,
+            prestarted_w_qkv_dma=prestarted_qkv_gate_dma,
+            prestarted_w_gate_dma=prestarted_qkv_gate_dma,
             gate_dst_ref=b2_gate_dst,
             after_qkv_epi_fn=b2_after_qkv_fn,
             defer_stream_store_wait=defer_store_wait,
@@ -867,9 +868,10 @@ def _b1_moe_b2_chip_sharded_impl(
         return
 
     if (not has_rpad) and use_3scope:
-        # 3-Scope Step (b) for rows > 128 (TP=16 B=256): keeps peak VMEM < 60 MiB.
+        # 3-Scope Step (b) for rows > 128 (TP=16 B=256): w_pre_pair stays in Scope 1 (-16 MiB
+        # outer/Scope 2) and w_qkv+w_gate live in Scope 3, keeping peak VMEM well < 63.94 MiB
+        # even under _dfp (FREE + FREE_RANK_CAP).
         moe_outer_refs = [next(it) for _ in range(step_b3_n_moe_outer)]
-        w_pre_pair_buf = next(it)
         s_buf = next(it)
         my_pair_bf16 = next(it)
         recv_pair_bf16 = next(it)
@@ -899,26 +901,23 @@ def _b1_moe_b2_chip_sharded_impl(
             fan_send_sem=msc_outer_b3["fan_send_sem"],
         )
         if interpret_mode:
-            w_pre_core_buf = w_pre_pair_buf
-            w_post_buf, w_qkv_buf, w_gate_buf = next(it), next(it), next(it)
+            w_post_buf = next(it)
         else:
-            w_pre_core_buf = (
-                w_pre_pair_buf
-                if w_pre_pair_buf.shape[1] == pre_pair_cols
-                else w_pre_pair_buf.at[:, pl.ds(0, pre_pair_cols)]
-            )
-            w_post_buf, w_qkv_buf, w_gate_buf = _alias_b2_weights(
-                msc_outer_b3["w1_buf"],
-                w_pre_pair_buf,
-                w_mode=msc_outer_b3["w_mode"],
-                qkv_cols=qkv_cols,
-                gate_cols=gate_cols,
+            if msc_outer_b3["w_mode"] == "stream3_k2":
+                raise ValueError("b1_moe_b2 aliasing requires 4096-col w1_buf (not stream3_k2)")
+            if msc_outer_b3["w1_buf"].shape != (2, 512, 4096):
+                raise ValueError(
+                    f"Expected w1_buf shape (2, 512, 4096), got {msc_outer_b3['w1_buf'].shape}"
+                )
+            w_post_buf = (
+                msc_outer_b3["w1_buf"].bitcast(jnp.float8_e4m3fn).reshape((4096, 4096))
             )
 
         plan_holder_b3 = []
 
         def _run_b3_scope1(*s1_refs) -> None:
             s1_it = iter(s1_refs)
+            w_pre_core_buf = next(s1_it)
             w_router_buf = next(s1_it)
             own_half = next(s1_it)
             send_half = next(s1_it)
@@ -1076,8 +1075,6 @@ def _b1_moe_b2_chip_sharded_impl(
 
         def _on_experts_done_b3() -> None:
             pltpu.make_async_copy(w_post_hbm, w_post_buf, sems["w_post_sem"].at[0]).start()
-            pltpu.make_async_copy(next_w_qkv_hbm, w_qkv_buf, sems["w_qkv_sem"].at[0]).start()
-            pltpu.make_async_copy(next_w_gate_hbm, w_gate_buf, sems["w_gate_sem"].at[0]).start()
 
         def _run_b3_scope2(*s2_refs) -> None:
             o_it_s2 = iter(moe_outer_refs)
@@ -1166,7 +1163,7 @@ def _b1_moe_b2_chip_sharded_impl(
         pl.run_scoped(_run_b3_scope2, *step_b3_scope2_shapes)
 
         def _run_b3_scope3(*s3_refs) -> None:
-            next_in_vmem, mate_recv_b2, mate_tok_b2 = s3_refs
+            next_in_vmem, mate_recv_b2, mate_tok_b2, w_qkv_buf, w_gate_buf = s3_refs
             _run_stage5_6_b2_rpad(
                 moe_dst_vmem=moe_sh_vmem,
                 w_post_buf=w_post_buf,
@@ -1185,6 +1182,7 @@ def _b1_moe_b2_chip_sharded_impl(
                 sems=sems,
                 rpad_refs=None,
                 sync_entry_barrier=True,
+                prestarted_qkv_gate_dma=False,
             )
 
         pl.run_scoped(_run_b3_scope3, *step_b3_scope3_shapes)
@@ -1700,9 +1698,11 @@ def _prepare_chip_b1_moe_b2_setup(
     step_b3_moe_scope2 = tuple(
         sp for sp, flg in zip(moe_scratch, step_b3_moe_is_scope2) if flg
     )
+    v_interp_b3_post = (
+        [vmem((_H, post_cols), w_post_tp2_w8k.dtype)] if interpret_mode else []
+    )
     step_b3_outer_scratch = [
         *step_b3_moe_outer,
-        v_w_pre_pair_buf,
         v_s_buf,
         v_my_pair_bf16,
         v_recv_pair_bf16,
@@ -1713,10 +1713,11 @@ def _prepare_chip_b1_moe_b2_setup(
         v_b2_dummy_post,
         v_b2_dummy_cols,
         *outer_sems,
-        *v_interp_b2,
+        *v_interp_b3_post,
     ]
     step_b3_scope1_shapes = tuple(
         [
+            vmem((hidden, pre_pair_cols), w_pre_pair_w8k.dtype),
             v_w_router_buf,
             vmem((rows, half), jnp.bfloat16),
             vmem((rows, half), jnp.bfloat16),
@@ -1735,6 +1736,8 @@ def _prepare_chip_b1_moe_b2_setup(
         vmem((rows, hidden), jnp.bfloat16),
         vmem((rows, half), jnp.bfloat16),
         vmem((rows_per_rank, _H), jnp.bfloat16),
+        vmem((hidden, qkv_cols), next_w_qkv_w8k.dtype),
+        vmem((hidden, gate_cols), next_w_gate_w8k.dtype),
     )
 
     is_dense_cfg = config.row_mode == "dense"
@@ -2027,7 +2030,7 @@ def b1_moe_b2_chip_sharded_jax(
             ),
         ),
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=(64 if rows > 64 else 60) * 1024**2,
+            vmem_limit_bytes=(63 if rows > 64 else 60) * 1024**2,
             collective_id=collective_id,
             disable_bounds_checks=True,
         ),

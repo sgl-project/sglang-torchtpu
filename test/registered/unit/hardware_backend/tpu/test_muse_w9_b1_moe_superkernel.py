@@ -3759,6 +3759,7 @@ def test_tp16_b256_step_a_and_b_interpret_parity():
 
 def test_tp16_b256_and_l61_b64_rep_tpu7x_aot():
     """Verify TPU7x 2x2x2 AOT compilation for L61 TP=16 B=64 rep and TP=16 B=256 Step (a)/(b)."""
+    import gc
     import jax
     import jax.numpy as jnp
     from jax.experimental import topologies
@@ -3823,15 +3824,42 @@ def test_tp16_b256_and_l61_b64_rep_tpu7x_aot():
         jax.ShapeDtypeStruct((1, qkv_cols), jnp.float32),
         jax.ShapeDtypeStruct((hidden, gate_cols), jnp.float8_e4m3fn),
         jax.ShapeDtypeStruct((1, gate_cols), jnp.float32),
-        jax.ShapeDtypeStruct((256, 2, 128), jnp.float32),
-    ) + rep8_sds
+    )
+    cs_sds = (jax.ShapeDtypeStruct((256, 2, 128), jnp.float32),)
+    fp_sds = (jax.ShapeDtypeStruct((4,), jnp.float32),)
+    a256_fp_sds = _base_sds(256) + rep8_sds + fp_sds
+    b256_fp_nope_sds = b256_aot_sds + rep8_sds + fp_sds
+    b256_fp_rope_sds = b256_aot_sds + cs_sds + rep8_sds + fp_sds
+
+    def _call_b256_fp_nope(*args):
+        # args = base(18) + b2(10) + rep(5) + free_params(1)
+        return b1_moe_b2_chip_sharded_jax(
+            *args[:28], None, *args[28:33], None, args[33], world_size=16, fuse_qkv_epi=True
+        )
+
+    def _call_b256_fp_rope(*args):
+        # args = base(18) + b2(10) + cs(1) + rep(5) + free_params(1)
+        return b1_moe_b2_chip_sharded_jax(
+            *args[:34], None, args[34], world_size=16, fuse_qkv_epi=True
+        )
+
+    def _call_a256_fp(*args):
+        # args = base(18) + rep(5) + free_params(1)
+        return b1_moe_chip_sharded_jax(
+            *args[:23], None, args[23], world_size=16, return_sharded=True
+        )
+
     for fn_aot, sds_in, out_n in [
         (lambda *a: b1_moe_chip_sharded_jax(*a, world_size=16, return_sharded=False), _base_sds(64) + rep8_sds, 2),
-        (lambda *a: b1_moe_chip_sharded_jax(*a, world_size=16, return_sharded=True), _base_sds(256) + rep8_sds, 2),
-        (lambda *a: b1_moe_b2_chip_sharded_jax(*a, world_size=16, fuse_qkv_epi=True), b256_aot_sds, 4),
+        (_call_a256_fp, a256_fp_sds, 2),
+        (_call_b256_fp_nope, b256_fp_nope_sds, 4),
+        (_call_b256_fp_rope, b256_fp_rope_sds, 4),
     ]:
         comp = jax.jit(
             jax.shard_map(fn_aot, mesh=mesh_aot, in_specs=(P(),) * len(sds_in), out_specs=(P(),) * out_n, check_vma=False)
         ).trace(*sds_in).lower(lowering_platforms=("tpu",)).compile()
         assert comp.memory_analysis().generated_code_size_in_bytes > 0
+        del comp
+        jax.clear_caches()
+        gc.collect()
 
