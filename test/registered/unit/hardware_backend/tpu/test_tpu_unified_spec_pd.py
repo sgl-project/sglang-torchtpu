@@ -20,7 +20,12 @@ from sglang_tpu.disaggregation.raiden import common as r_common
 from sglang_tpu.disaggregation.raiden.host_pool import StagingAdmission
 from sglang_tpu.disaggregation.raiden.receiver import RaidenKVReceiver
 from sglang_tpu.disaggregation.raiden.sender import RaidenKVSender
-from sglang_tpu.disaggregation.raiden.serde import UNIFIED_SWA_KV_LAYOUT, ReshardReq
+from sglang_tpu.disaggregation.raiden.serde import (
+    UNIFIED_SWA_KV_LAYOUT,
+    MessageTag,
+    ReshardReq,
+    RoomFailed,
+)
 from sglang_tpu.kv_pool import TpuBlockMajorMHATokenToKVPool
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -182,9 +187,18 @@ class TestUnifiedSpecRaidenPD(_raiden_ut.RaidenRendezvousTestCase):
             dec.register_decode_request(
                 9901, [1], [2], None, self._bootstrap_info(pre) * 2
             )
+        # A prefill at twice the decode's attention TP fails the room and tells
+        # the decode, instead of raising out of its listener (#1671).
+        pre.attn_tp_size = 2
         req = ReshardReq(9902, "127.0.0.1", dec.rank_port, "tcp://p", [1], 1, [], "")
-        with self.assertRaisesRegex(NotImplementedError, "equal attention TP"):
-            pre._on_reshard_req(req.to_frames())
+        pre._on_reshard_req(req.to_frames())
+        self.assertTrue(pre.is_aborted(9902))
+        failed = RoomFailed.from_frames(
+            self.inboxes[dec.endpoint].take(MessageTag.ROOM_FAILED)
+        )
+        self.assertEqual(failed.room, 9902)
+        self.assertIn("speculative draft KV", failed.reason)
+        pre.attn_tp_size = 1
 
         ctx = _draft_ut.TestDraftCoPricingAndValidation()._ctx
         kvc = _draft_ut._kvc(
