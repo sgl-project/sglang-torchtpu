@@ -53,8 +53,10 @@ class TestMoeRingRoute(CustomTestCase):
             np.testing.assert_array_equal(tok[got], [t for t, _ in want])
             np.testing.assert_array_equal(wt[got], [wts[t, j] for t, j in want])
         # Hit experts by tile size (1-2, 3-4, 5+ pairs here), then by id.
-        size = [[e for e in range(experts) if lo < counts[e] <= hi]
-                for lo, hi in ((0, 2), (2, 4), (4, tokens * k))]
+        size = [
+            [e for e in range(experts) if lo < counts[e] <= hi]
+            for lo, hi in ((0, 2), (2, 4), (4, tokens * k))
+        ]
         self.assertTrue(all(size))  # every size is exercised
         np.testing.assert_array_equal(ends, np.cumsum([len(g) for g in size]))
         np.testing.assert_array_equal(active[: ends[-1]], sum(size, []))
@@ -64,31 +66,49 @@ class TestMoeRingRoute(CustomTestCase):
 class TestMoeRingCostModel(CustomTestCase):
     """The trace-time choice between the ring and gmm_v2 (static shapes only)."""
 
-    def test_measured_points(self):
+    def test_timed_calls(self):
         from sglang_tpu.moe.pallas.moe_ring import gmm_cost_cycles, ring_cost_cycles
 
-        # (tokens, experts, hidden, width) -> measured k cycles (ring, gmm_v2),
-        # routing spread over all experts.
-        measured = {
-            (2, 288, 4096, 256): (46.7, 89.3),
-            (64, 288, 4096, 256): (448.2, 856.9),
-            (256, 288, 4096, 256): (616.6, 1161.1),
-            (64, 288, 4096, 512): (861.8, 1054.3),
-            (64, 288, 4096, 128): (353.8, 747.1),
-            (64, 128, 2048, 256): (181.5, 376.4),
-            (64, 96, 8192, 128): (203.9, 498.8),
-        }
-        for (tokens, experts, hidden, n), (ring, gmm) in measured.items():
-            with self.subTest(tokens=tokens, experts=experts, hidden=hidden, n=n):
-                self.assertAlmostEqual(
-                    ring_cost_cycles(tokens, TOPK, experts, hidden, n) / 1e3 / ring,
-                    1,
-                    delta=0.25,
+        # (experts, hidden, width, tokens, topk, ring cycles, gmm_v2 cycles): timed
+        # calls on one tpu7x TensorCore, routing spread over all experts. The
+        # model is not fitted to them; this checks it stays near them.
+        timed = (
+            (288, 4096, 256, 2, 8, 42200, 88700),
+            (288, 4096, 256, 64, 8, 455100, 862800),
+            (288, 4096, 256, 256, 8, 626700, 1184500),
+            (288, 4096, 256, 16, 16, 313400, 650800),
+            (288, 4096, 256, 256, 16, 862000, 1241600),
+            (288, 4096, 512, 16, 8, 383900, 546700),
+            (288, 4096, 128, 256, 8, 501900, 1076300),
+            (128, 2048, 256, 64, 16, 208000, 421800),
+            (96, 8192, 128, 8, 8, 100400, 188900),
+            (96, 8192, 256, 64, 16, 361200, 647900),
+        )
+        for experts, hidden, n, tokens, topk, ring, gmm in timed:
+            with self.subTest(
+                experts=experts, hidden=hidden, n=n, tokens=tokens, topk=topk
+            ):
+                args = (tokens, topk, experts, hidden, n)
+                self.assertAlmostEqual(ring_cost_cycles(*args) / ring, 1, delta=0.15)
+                self.assertAlmostEqual(gmm_cost_cycles(*args) / gmm, 1, delta=0.3)
+
+    def test_scales_with_the_model_shape(self):
+        from sglang_tpu.moe.pallas.moe_ring import gmm_cost_cycles, ring_cost_cycles
+
+        base = (64, TOPK, EXPERTS, HIDDEN, INTER)
+        for cost in (ring_cost_cycles, gmm_cost_cycles):
+            with self.subTest(cost=cost.__name__):
+                self.assertGreater(
+                    cost(64, TOPK, 2 * EXPERTS, HIDDEN, INTER), cost(*base)
                 )
-                self.assertAlmostEqual(
-                    gmm_cost_cycles(tokens, TOPK, experts, hidden, n) / 1e3 / gmm,
-                    1,
-                    delta=0.25,
+                self.assertGreater(
+                    cost(64, TOPK, EXPERTS, 2 * HIDDEN, INTER), cost(*base)
+                )
+                self.assertGreater(
+                    cost(64, TOPK, EXPERTS, HIDDEN, 2 * INTER), cost(*base)
+                )
+                self.assertGreater(
+                    cost(64, 2 * TOPK, EXPERTS, HIDDEN, INTER), cost(*base)
                 )
 
     def test_prefers_ring_at_decode_sizes(self):
@@ -96,15 +116,17 @@ class TestMoeRingCostModel(CustomTestCase):
 
         for tokens in (1, 2, 8, 32, 64, 128, 256, 512):
             for hidden, n in ((4096, 256), (4096, 512), (4096, 128), (2048, 256)):
-                with self.subTest(tokens=tokens, hidden=hidden, n=n):
-                    self.assertTrue(prefers_ring(tokens, TOPK, EXPERTS, hidden, n))
+                for topk in (8, 16):
+                    if tokens * topk > 4096:
+                        continue  # beyond the dumped sizes; _route's compare dominates
+                    with self.subTest(tokens=tokens, hidden=hidden, n=n, topk=topk):
+                        self.assertTrue(prefers_ring(tokens, topk, EXPERTS, hidden, n))
 
     def test_few_experts_many_tokens_prefers_gmm(self):
         from sglang_tpu.moe.pallas.moe_ring import prefers_ring
 
         # Every expert gets hundreds of rows: row tiles, not weight bytes, set the
-        # time, and gmm_v2's larger tiles win (measured from about 128 tokens on
-        # 16 experts).
+        # cost, and gmm_v2's larger tiles win.
         self.assertFalse(prefers_ring(512, TOPK, 16, HIDDEN, INTER))
         self.assertTrue(prefers_ring(16, TOPK, 16, HIDDEN, INTER))
 
