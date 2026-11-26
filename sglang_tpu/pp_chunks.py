@@ -201,15 +201,17 @@ class StepCostModel:
         ``step_tokens`` tokens (``step_pairs`` chunk*prefix products and
         ``step_squares`` squared chunk lengths) within the target. A chunk
         that does not finish the request leaves the step total on a granule
-        multiple and is at least a quarter of a step when the step has the
-        room, since a run of tiny steps costs more than the balance it buys;
+        multiple and, when the step has the room, brings the step to at least
+        a quarter of a step, since a run of tiny steps costs more than the
+        balance it buys; in a step that already holds a quarter step it takes
+        only what the target leaves;
         ``step_limit`` keeps the step within a smaller bucket, and with a
         schedule capacity the chunk's attention pairs must fit beside the
         ``step_schedule`` pairs already in the step. 0 when nothing
         fits."""
         best = 0
         attn = self.attn_ms_per_token_pair
-        floor = min(remaining, self.buckets[-1] // 4)
+        quarter = self.buckets[-1] // 4
         for bucket in self.buckets:
             if step_limit is not None and bucket > step_limit:
                 continue
@@ -226,7 +228,7 @@ class StepCostModel:
                     fit, int(-prefix + math.sqrt(prefix * prefix + 2 * spare / attn))
                 )
             if fit < remaining:
-                fit = min(max(fit, floor), room)
+                fit = min(max(fit, quarter - step_tokens), remaining, room)
             if fit < remaining:
                 total = step_tokens + fit
                 fit = total - total % self.granularity - step_tokens

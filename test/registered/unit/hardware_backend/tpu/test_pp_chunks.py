@@ -165,13 +165,35 @@ def test_chunk_behind_a_prefix_shrinks_to_a_bucket_that_fits():
     assert model.chunk(16384, 5000, 0, 0.0, 0.0) == 5000
 
 
-def test_a_clipped_chunk_is_at_least_a_quarter_step():
+def test_a_clipped_chunk_brings_the_step_to_a_quarter_step():
     model = _model(granularity=2048)
-    # Very deep in a prompt the time budget would allow under 2K tokens.
-    assert model.chunk(200 * 1024, 16384, 0, 0.0, 0.0) == 4096
-    # The floor never exceeds the room left in the step.
-    assert model.chunk(200 * 1024, 16384, 14336, 0.0, 0.0) == 2048
-    assert model.chunk(200 * 1024, 16384, 16384, 0.0, 0.0) == 0
+    deep = 600 * 1024  # the time budget alone allows under a granule here
+    assert model.chunk(deep, 16384, 0, 0.0, 0.0) == 4096
+    # The floor counts the tokens already in the step.
+    assert model.chunk(deep, 16384, 2048, 0.0, 2048.0**2) == 2048
+    assert model.chunk(deep, 3000, 2048, 0.0, 2048.0**2) == 2048
+    # A step holding a few decode tokens keeps the floor, and still finishes
+    # a short request.
+    assert model.chunk(deep, 16384, 37, 0.0, 37.0) == 4096 - 37
+    assert model.chunk(deep, 3000, 37, 0.0, 37.0) == 3000
+    # A step that already holds a quarter step gets only what the target
+    # leaves; a full step has no room.
+    assert model.chunk(deep, 16384, 14336, 0.0, 0.0) == 0
+    assert model.chunk(deep, 16384, 16384, 0.0, 0.0) == 0
+
+
+def test_a_chunk_behind_another_requests_last_chunk_keeps_the_step_on_target():
+    # One pipeline stage's fit; prompts of 131,072 tokens with 117,760 cached
+    # end each 13,312-token tail on a 3,072-token last chunk, and the next
+    # request's first chunk joins that step.
+    buckets = [512] + list(range(1024, 8193, 1024))
+    ladder = [15.6, 19.4, 28.8, 38.5, 48.6, 59.4, 69.0, 82.0, 91.8]
+    model = StepCostModel(buckets, dict(zip(buckets, ladder)), 8.755e-8, 104.2, 1024)
+    step = (3072, 3072 * 128000.0, 3072.0**2)
+    chunk = model.chunk(117760, 13312, *step)
+    assert chunk == 1024
+    pairs, squares = step[1] + chunk * 117760.0, step[2] + chunk**2
+    assert model.step_ms(4096, pairs, squares) <= model.target_ms
 
 
 def test_a_step_limit_holds_the_step_to_a_smaller_bucket():
