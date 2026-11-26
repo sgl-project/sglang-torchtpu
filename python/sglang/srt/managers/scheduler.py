@@ -394,6 +394,7 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_GET_NEXT_BATCH,
     SCHEDULER_STAGE_IDLE,
+    SCHEDULER_STAGE_LAUNCH_SAMPLE,
     SCHEDULER_STAGE_PROCESS_BATCH_RESULT,
     SCHEDULER_STAGE_PROCESS_REQUESTS,
     SCHEDULER_STAGE_RUN_BATCH,
@@ -2442,7 +2443,7 @@ class Scheduler(
 
     def increment_scheduler_iterations(self) -> None:
         if get_observability().enable_metrics:
-            self.metrics_collector.increment_scheduler_iterations()
+            self.metrics_reporter.increment_scheduler_iterations()
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -6236,6 +6237,7 @@ class Scheduler(
             else:
                 batch_result.copy_done = self.async_d2h_worker.submit(copy_fn)
 
+    @scheduler_stage_method(SCHEDULER_STAGE_LAUNCH_SAMPLE)
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult, cur_batch: ScheduleBatch
     ) -> Union[GenerationBatchResult]:
@@ -6300,9 +6302,8 @@ class Scheduler(
             # An inner idle batch ran a forward (`_run_batch_prebuilt`), and
             # its launch is this result's: the host sees that forward end
             # before the step is processed.
-            copy_done = getattr(result, "copy_done", None)
-            if copy_done is not None:
-                copy_done.synchronize()
+            if getattr(result, "copy_done", None) is not None:
+                self.batch_result_processor.wait_copy_done(result)
             self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
