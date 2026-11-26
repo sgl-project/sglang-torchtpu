@@ -1135,6 +1135,8 @@ class TpuEnvs:
     # writes unpacked bf16[T, 1024] directly from its epilogue (16 MiB vs 32 MiB), dropping
     # prepare_outputs copy, KV_PACK pair-sum, and A3 attn_ref relayout copy. Exact.
     SGLANG_TPU_RPA_V3_PREFILL_A3_LAYOUT = EnvBool(False)
+    # Unlock mk128 on TP=16 SWA Stationary-Q RPAm instead of vreg_acc (default False).
+    SGLANG_TPU_RPA_V3_TP16_SWA_MK128 = EnvBool(False)
     # Opt-in 2-kernel LC Full prefill top-k slice pruning (default 0 = disabled).
     # When > 0 (multiple of 4, < half-slices per bkv block), keeps the top-k
     # 128-key half-slices per prefix bkv block while keeping sink (bkv=0) and
