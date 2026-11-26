@@ -222,6 +222,7 @@ from sglang.srt.models.deepseek_common.utils import (
 )
 from sglang.srt.models.utils import is_non_idle_and_non_empty
 from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     LoRABatchLayout,
     attention_backends,
@@ -2184,8 +2185,12 @@ class DeepseekV2AttentionMLA(
             and not reduce_results
             and can_defer_cp_decode_attn_tp()
         )
-        self.dcp_size = mla_attention_dcp_size(
-            config, dcp_size=get_parallel().attn_dcp_size, is_nextn=is_nextn
+        self.dcp_size = (
+            mla_attention_dcp_size(
+                config, dcp_size=get_parallel().attn_dcp_size, is_nextn=is_nextn
+            )
+            if current_platform.runs_mla_dcp_in_model()
+            else 1
         )
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0

@@ -2,9 +2,9 @@
 
 Four pieces, each checked against a reference built from a plain dense softmax:
 
-* ``merge_across_ranks`` merges one partial (output, LSE) pair per rank into
-  the full-sequence result; ``own_heads`` then hands each rank back its own
-  head block when the ranks hold different heads.
+* ``cp_lse_ag_out_rs`` merges one partial (output, LSE) pair per rank into
+  the full-sequence result and hands each rank back its own head block
+  (or keeps every head when ``scatter_heads=False``).
 * ``sink_fold`` applies the attention sink once, after the merge, as
   ``out * sigmoid(lse - sink)``.
 * ``merge_lse`` joins the cached-prefix pass with the chunk-local pass of an
@@ -35,10 +35,9 @@ from sglang_tpu.attention_pallas_rpa_batched import (
     TpuPallasRpaBatchedAttnBackend,
 )
 from sglang_tpu.attention_pallas_rpa_dcp import (
+    cp_lse_ag_out_rs,
     gather_heads,
-    merge_across_ranks,
     merge_lse,
-    own_heads,
     sink_fold,
 )
 
@@ -64,9 +63,9 @@ _requires_dcp_helpers = unittest.skipIf(
 class _FakeDcpGroup:
     """GroupCoordinator stand-in for one rank of a DCP group.
 
-    ``all_reduce`` answers the ``i``-th call with the sum of what every rank
-    handed to its own ``i``-th call in the previous simulation pass, and
-    records this pass's operand for the next one.
+    Each collective answers the ``i``-th call from what every rank handed to
+    its own ``i``-th call in the previous simulation pass, and records this
+    pass's operand for the next one.
     """
 
     def __init__(self, world_size, rank, previous, record):
@@ -75,17 +74,38 @@ class _FakeDcpGroup:
         self._previous = previous
         self._record = record
 
-    def all_reduce(self, tensor):
+    def _exchange(self, tensor):
         call = len(self._record)
         self._record.append(tensor.clone())
         if self._previous is None or any(len(r) <= call for r in self._previous):
+            return None
+        return [r[call] for r in self._previous]
+
+    def all_reduce(self, tensor):
+        peers = self._exchange(tensor)
+        if peers is None:
             return tensor
-        return torch.stack([r[call] for r in self._previous]).sum(dim=0)
+        return torch.stack(peers).sum(dim=0)
+
+    def all_gather(self, tensor, dim=-1):
+        peers = self._exchange(tensor)
+        if peers is None:
+            return torch.cat([tensor] * self.world_size, dim=dim)
+        return torch.cat(peers, dim=dim)
+
+    def reduce_scatter_along_dim(self, tensor, dim=-1):
+        peers = self._exchange(tensor)
+        if peers is None:
+            chunk = tensor.shape[dim] // self.world_size
+            return tensor.narrow(dim, self.rank_in_group * chunk, chunk).clone()
+        summed = torch.stack(peers).sum(dim=0)
+        chunk = summed.shape[dim] // self.world_size
+        return summed.narrow(dim, self.rank_in_group * chunk, chunk).clone()
 
 
 def _simulate_group(world, fn, passes=4):
-    """Run ``fn(group)`` on every rank until each collective sees the sum of
-    the operands the ranks computed for it; ``passes`` >= collectives + 1."""
+    """Run ``fn(group)`` on every rank until each collective sees the operands
+    every rank computed for it; ``passes`` >= collectives + 1."""
     previous = None
     results = None
     for _ in range(passes):
@@ -98,31 +118,24 @@ def _simulate_group(world, fn, passes=4):
     return results
 
 
-def _rank_tensors(world_size, rank):
-    """The rank as the device tensors the helpers take: one-hot mask, index."""
-    return torch.arange(world_size) == rank, torch.tensor([rank])
+def _rank_tensor(rank):
+    """The rank as the ``i32[1]`` device tensor the helpers take."""
+    return torch.tensor([rank], dtype=torch.int32)
 
 
 def _run_cp_merge(partial_outs, partial_lses):
-    """Run ``merge_across_ranks`` on every rank and keep the rank's own head
-    block (ranks holding different heads); return each rank's result."""
+    """Run ``cp_lse_ag_out_rs`` on every rank; return each rank's result."""
     world = len(partial_lses)
-
-    def run(group):
-        rank_mask, rank_index = _rank_tensors(world, group.rank_in_group)
-        out, lse = merge_across_ranks(
+    return _simulate_group(
+        world,
+        lambda group: cp_lse_ag_out_rs(
             partial_outs[group.rank_in_group].clone(),
             partial_lses[group.rank_in_group].clone(),
             group,
             group.world_size,
-            rank_mask,
-        )
-        return (
-            own_heads(out, world, rank_index),
-            own_heads(lse, world, rank_index),
-        )
-
-    return _simulate_group(world, run)
+            _rank_tensor(group.rank_in_group),
+        ),
+    )
 
 
 def _softmax_over(scores, values, keys):
@@ -224,8 +237,8 @@ class TestCpLseAgOutRsMha(CustomTestCase):
         out = torch.randn(2, 3, 4)
         lse = torch.randn(2, 3)
         group = _FakeDcpGroup(1, 0, None, [])
-        merged, merged_lse = merge_across_ranks(
-            out, lse, group, group.world_size, _rank_tensors(1, 0)[0]
+        merged, merged_lse = cp_lse_ag_out_rs(
+            out, lse, group, group.world_size, _rank_tensor(0)
         )
         self.assertIs(merged, out)
         self.assertIs(merged_lse, lse)
@@ -235,18 +248,45 @@ class TestCpLseAgOutRsMha(CustomTestCase):
         # so rank r's heads must land in block r.
         cp = 2
         queries = [torch.randn(3, 4, 5) for _ in range(cp)]
-        gathered = _simulate_group(
-            cp,
-            lambda group: gather_heads(
-                queries[group.rank_in_group],
-                group,
-                group.world_size,
-                _rank_tensors(cp, group.rank_in_group)[0],
-            ),
-        )
-        expected = torch.cat(queries, dim=1)
+        for dynamo in (False, True):
+            with (
+                self.subTest(dynamo=dynamo),
+                patch("torch.compiler.is_dynamo_compiling", return_value=dynamo),
+            ):
+                gathered = _simulate_group(
+                    cp,
+                    lambda group: gather_heads(
+                        queries[group.rank_in_group],
+                        group,
+                        group.world_size,
+                        _rank_tensor(group.rank_in_group),
+                    ),
+                )
+                expected = torch.cat(queries, dim=1)
+                for rank in range(cp):
+                    torch.testing.assert_close(gathered[rank], expected)
+
+    def test_dynamo_all_reduce_gather_matches_native_ag(self):
+        cp, num_tokens, num_keys = 4, 5, 31
+        heads = self.HEADS_PER_RANK * cp
+        scores, values = _random_problem(num_tokens, heads, num_keys, self.HEAD_DIM, 42)
+        key_rank = torch.arange(num_keys) % cp
+        partial_outs, partial_lses = [], []
         for rank in range(cp):
-            torch.testing.assert_close(gathered[rank], expected)
+            owned = (key_rank == rank).view(1, 1, num_keys).expand_as(scores)
+            out, lse = _softmax_over(scores, values, owned)
+            partial_outs.append(out)
+            partial_lses.append(lse)
+        ag_rs = _run_cp_merge(partial_outs, partial_lses)
+        with patch("torch.compiler.is_dynamo_compiling", return_value=True):
+            dynamo_res = _run_cp_merge(partial_outs, partial_lses)
+        for rank in range(cp):
+            torch.testing.assert_close(
+                ag_rs[rank][0], dynamo_res[rank][0], atol=1e-5, rtol=1e-5
+            )
+            torch.testing.assert_close(
+                ag_rs[rank][1], dynamo_res[rank][1], atol=1e-5, rtol=1e-5
+            )
 
 
 class TestSinkFold(CustomTestCase):
@@ -412,12 +452,13 @@ class TestAllHeadsLocal(CustomTestCase):
                     )
                     results = _simulate_group(
                         cp,
-                        lambda group: merge_across_ranks(
+                        lambda group: cp_lse_ag_out_rs(
                             partials[group.rank_in_group][0].clone(),
                             partials[group.rank_in_group][1].clone(),
                             group,
                             group.world_size,
-                            _rank_tensors(cp, group.rank_in_group)[0],
+                            _rank_tensor(group.rank_in_group),
+                            scatter_heads=False,
                         ),
                     )
                     for out, lse in results:
@@ -449,7 +490,6 @@ class TestAllHeadsLocal(CustomTestCase):
         # Every rank holds the same heads (attention TP 1 or ring mode).
         backend._dcp_head_blocks = 1
         backend._dcp_op = dcp_op
-        backend._cp_rank_mask, backend._cp_rank_index = _rank_tensors(cp, rank)
         tensor = torch.zeros(1, dtype=torch.int32)
         backend.forward_metadata = PallasForwardMetadata(
             kv_lens=tensor,
@@ -459,7 +499,7 @@ class TestAllHeadsLocal(CustomTestCase):
             distribution=tensor,
             active_num_tokens=tensor,
             dcp_kv_lens_global=tensor,
-            dcp_cp_rank=tensor,
+            dcp_rank=_rank_tensor(rank),
         )
         return backend
 
