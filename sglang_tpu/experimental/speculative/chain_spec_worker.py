@@ -48,6 +48,7 @@ from sglang.srt.speculative.ragged_verify import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
+from sglang_tpu._logging import get_logger
 from sglang_tpu.experimental import register_pd_carry_seeder, runs_draft_prompt_pass
 from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
 from sglang_tpu.experimental.speculative.chain_draft_input import (
@@ -61,6 +62,11 @@ from sglang_tpu.experimental.speculative.chain_info import HostPaddedChainDraftI
 from sglang_tpu.experimental.speculative.draft_forward import forward_draft_rows
 from sglang_tpu.experimental.speculative.eagle3.eagle3_draft_worker import (
     TpuEagle3DraftWorker,
+)
+from sglang_tpu.experimental.speculative.mtp.kv_only_prompt import (
+    gather_last_rows,
+    last_prompt_rows,
+    last_row_view,
 )
 from sglang_tpu.experimental.speculative.mtp.mtp_draft_worker import (
     TpuMtpDraftWorker,
@@ -80,6 +86,8 @@ from sglang_tpu.experimental.speculative.spec_types import (
     VerifyRows,
 )
 from sglang_tpu.experimental.speculative.spec_utils import pad_rows, padded_h2d
+
+logger = get_logger(__name__)
 
 _DRAFT_WORKER_CLS: dict[SpeculativeAlgorithm, type[TpuChainDraftWorker]] = {
     # MTP: core resolves NEXTN to EAGLE.
@@ -128,6 +136,8 @@ class TpuChainSpecWorker(TpuSpecWorker):
         if self._disagg_mode == "decode":
             register_pd_carry_seeder(self._seed_carry)
         self._pd_seed_placeholder: torch.Tensor | None = None
+        # Token buckets whose two-pass draft prompt pass has been logged once.
+        self._kv_only_buckets_seen: set[int] = set()
 
     def init_cuda_graphs(self) -> None:
         super().init_cuda_graphs()
@@ -372,7 +382,8 @@ class TpuChainSpecWorker(TpuSpecWorker):
         mm_input_embeds: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Draft forward on the prompt shifted by one token; store and return each
-        request's last hidden and DSA top-k capture (None without index sharing)."""
+        request's last hidden and DSA top-k capture (None without index sharing).
+        A token bucket the drafter lists takes two passes (kv_only_prompt.py)."""
         # finalize keeps HOST_PADDED target hidden (and mm embeds) at the token bucket.
         padded_tokens = target_hidden.shape[0]
         draft_ids = self._draft_prompt_ids(
@@ -380,22 +391,27 @@ class TpuChainSpecWorker(TpuSpecWorker):
         )
         drafter = self._chain_draft_worker
         with drafter.draft_context(), torch.no_grad():
-            forward_batch = self._draft_prompt_batch(
+            forward_batch = self._draft_prompt_forward_batch(
                 batch,
-                hidden_states=target_hidden,
-                padded_tokens=padded_tokens,
-                extend_lens=batch.extend_lens,
+                draft_ids=draft_ids,
+                target_hidden=target_hidden,
+                mm_input_embeds=mm_input_embeds,
+                kv_only=padded_tokens in drafter.kv_only_prompt_tokens,
             )
-            forward_batch.input_ids = draft_ids
-            seed_capture = forward_batch.spec_info.dsa_seed_topk_capture
-            if mm_input_embeds is not None:
-                assert mm_input_embeds.shape[0] == padded_tokens
-                # Embeds in hand keep the draft off its mm_inputs path, whose
-                # per-slot reads would specialize the program on batch packing.
-                forward_batch.input_embeds = self._draft_prompt_embeds(
-                    batch, mm_input_embeds=mm_input_embeds, draft_ids=draft_ids
-                )
             draft_out = self._draft_runner.forward(forward_batch).logits_output
+            if forward_batch.spec_info.kv_only:
+                if padded_tokens not in self._kv_only_buckets_seen:
+                    self._kv_only_buckets_seen.add(padded_tokens)
+                    logger.info(
+                        "Draft prompt pass took two passes at token bucket %d.",
+                        padded_tokens,
+                    )
+                # Pass 2 reads the draft KV pass 1 stored for every prompt row.
+                forward_batch = self._last_rows_forward_batch(
+                    batch, draft_ids=draft_ids, target_hidden=target_hidden
+                )
+                draft_out = self._draft_runner.forward(forward_batch).logits_output
+        seed_capture = forward_batch.spec_info.dsa_seed_topk_capture
         _, tail_hidden = _draft_logits_and_hidden(draft_out)
         # LAST capture keeps one row per request at the extend cap; padded rows hit pool row 0.
         cap = tail_hidden.shape[0]
@@ -409,6 +425,60 @@ class TpuChainSpecWorker(TpuSpecWorker):
             seed_table.index_copy_(0, pool_rows, seed_capture)
         return tail_hidden, seed_capture
 
+    def _draft_prompt_forward_batch(
+        self,
+        batch: ScheduleBatch,
+        *,
+        draft_ids: torch.Tensor,
+        target_hidden: torch.Tensor,
+        mm_input_embeds: torch.Tensor | None,
+        kv_only: bool,
+    ) -> ForwardBatch:
+        """The draft prompt forward over every padded row: the whole layer, or with
+        kv_only its pass 1, which only stores the draft KV."""
+        padded_tokens = target_hidden.shape[0]
+        forward_batch = self._draft_prompt_batch(
+            batch,
+            hidden_states=target_hidden,
+            padded_tokens=padded_tokens,
+            extend_lens=batch.extend_lens,
+            kv_only=kv_only,
+        )
+        forward_batch.input_ids = draft_ids
+        if mm_input_embeds is not None:
+            assert mm_input_embeds.shape[0] == padded_tokens
+            # Embeds in hand keep the draft off its mm_inputs path, whose
+            # per-slot reads would specialize the program on batch packing.
+            forward_batch.input_embeds = self._draft_prompt_embeds(
+                batch, mm_input_embeds=mm_input_embeds, draft_ids=draft_ids
+            )
+        return forward_batch
+
+    def _last_rows_forward_batch(
+        self,
+        batch: ScheduleBatch,
+        *,
+        draft_ids: torch.Tensor,
+        target_hidden: torch.Tensor,
+    ) -> ForwardBatch:
+        """Pass 2: the draft prompt forward on each request's last prompt row only.
+
+        It runs the warmed draft prompt program at the extend cap's token bucket.
+        """
+        num_tokens = self._chain_draft_worker.kv_only_last_row_tokens
+        # Padded rows gather row 0; their tokens belong to no request.
+        rows = padded_h2d(last_prompt_rows(batch.extend_lens), num_tokens, self.device)
+        last_ids, last_hidden = gather_last_rows(draft_ids, target_hidden, rows)
+        view = last_row_view(batch)
+        forward_batch = self._draft_prompt_batch(
+            view,
+            hidden_states=last_hidden,
+            padded_tokens=num_tokens,
+            extend_lens=view.extend_lens,
+        )
+        forward_batch.input_ids = last_ids
+        return forward_batch
+
     def _draft_prompt_batch(
         self,
         batch: ScheduleBatch,
@@ -416,6 +486,7 @@ class TpuChainSpecWorker(TpuSpecWorker):
         hidden_states: torch.Tensor,
         padded_tokens: int,
         extend_lens: Sequence[int],
+        kv_only: bool = False,
     ) -> ForwardBatch:
         """The draft prompt forward's batch, shaped as its warmed program was traced.
 
@@ -423,7 +494,8 @@ class TpuChainSpecWorker(TpuSpecWorker):
         cannot drift apart. Call it inside draft_context(): under DP attention that
         scope narrows the draft to EP 1, and init_new reads the narrowed EP to leave
         num_token_non_padded unset, as the warmup does. A draft that shares its DSA
-        top-k gets the capture on idle ranks too; the warmed program has it.
+        top-k gets the capture on idle ranks too; the warmed program has it. The
+        KV-only pass 1 scores no top-k, so it has no capture.
         """
         forward_batch = ForwardBatch.init_new(
             batch,
@@ -431,12 +503,15 @@ class TpuChainSpecWorker(TpuSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.LAST,
             return_hidden_states_before_norm=False,
         )
-        seed_capture, seed_select = self._prompt_seed_capture(extend_lens)
+        seed_capture, seed_select = (
+            (None, None) if kv_only else self._prompt_seed_capture(extend_lens)
+        )
         forward_batch.spec_info = chain_draft_forward_input(
             hidden_states=hidden_states,
             width=1,
             dsa_seed_topk_capture=seed_capture,
             dsa_seed_topk_select=seed_select,
+            kv_only=kv_only,
         )
         forward_batch.return_logprob = False
         self._set_draft_prefill_dp_counts(forward_batch, padded_tokens=padded_tokens)
@@ -801,6 +876,7 @@ class TpuChainSpecWorker(TpuSpecWorker):
                         is_sampled,
                         torch.zeros((pbs,), dtype=torch.int64, device=self.device),
                     )
+            self._warmup_last_rows_gather()
             pool_rows = torch.zeros((cap,), dtype=torch.int64).to(self.device)
             tail_hidden = torch.zeros(
                 (cap, self._chain_draft_worker.carry_size),
@@ -815,6 +891,24 @@ class TpuChainSpecWorker(TpuSpecWorker):
                 if self._disagg_mode == "prefill":
                     # The cut _attach_pd_seeds makes for the PD wire; core copies it to host.
                     seeds[:, : self._pd_dsa_seed_width].cpu()
+
+    def _warmup_last_rows_gather(self) -> None:
+        """Pass 2's gather of the last rows, per token bucket taking two passes."""
+        drafter = self._chain_draft_worker
+        if not drafter.kv_only_prompt_tokens:
+            return
+        rows = torch.zeros((drafter.kv_only_last_row_tokens,), dtype=torch.int64)
+        rows = rows.to(self.device)
+        for padded_tokens in sorted(drafter.kv_only_prompt_tokens):
+            warmup_compiled_op(
+                gather_last_rows,
+                torch.zeros((padded_tokens,), dtype=torch.int64).to(self.device),
+                torch.zeros(
+                    (padded_tokens, drafter.target_feature_size),
+                    dtype=self._draft_runner.dtype,
+                ).to(self.device),
+                rows,
+            )
 
 
 @compiled_op()

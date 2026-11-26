@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import abstractmethod
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -30,6 +31,11 @@ from sglang_tpu.experimental.speculative.chain_draft_input import (
 from sglang_tpu.experimental.speculative.draft_worker import TpuDraftWorker
 from sglang_tpu.host_upload import device_scalar
 
+if TYPE_CHECKING:
+    from sglang_tpu.experimental.speculative.mtp.kv_only_prompt import (
+        KvOnlyPromptPlan,
+    )
+
 # (forward_batch, carry, req_pool_indices, positions, cache_locs, seq_lens,
 #  temperatures, top_ks, uniforms, dsa_seed_topk_table)
 #  -> (drafts [pbs, N], dense logits [pbs, N, V] | None).
@@ -51,6 +57,9 @@ class TpuChainDraftWorker(TpuDraftWorker):
         (MTP index sharing), or None when every draft forward runs its indexer.
       fused_draft_tensor_attrs: Non-parameter draft-model tensors the fused draft
         reads (direct_compile model_extra_tensor_attrs).
+      kv_only_prompt_tokens: Token buckets whose draft prompt pass takes two
+        passes (kv_only_prompt.py); empty when it never does. Set by precompile.
+      kv_only_last_row_tokens: Token bucket of pass 2; 0 without two passes.
     """
 
     carry_size: int
@@ -65,6 +74,8 @@ class TpuChainDraftWorker(TpuDraftWorker):
         self._fused_draft: FusedDraft | None = None
         # Per batch bucket; the fused program overwrites it before the first draft forward.
         self._hidden_placeholders: dict[int, torch.Tensor] = {}
+        self.kv_only_prompt_tokens: frozenset[int] = frozenset()
+        self.kv_only_last_row_tokens = 0
 
     @abstractmethod
     def first_draft_logits(self, carry: torch.Tensor) -> torch.Tensor:
@@ -138,17 +149,31 @@ class TpuChainDraftWorker(TpuDraftWorker):
         assert table is not None and table.shape == current.shape, table
         self._dsa_seed_topk_table = table
 
+    def kv_only_prompt_plan(
+        self, compile_policy: TpuChainSpecDecodeCompilePolicyMixin
+    ) -> KvOnlyPromptPlan | None:
+        """The drafter's two-pass prompt plan (kv_only_prompt.KvOnlyPromptPlan),
+        or None to keep the single pass; drafters that can store their prompt KV
+        in a separate pass override it."""
+        return None
+
     def precompile_draft(self) -> None:
         compile_policy = self._compile_policy()
         self._fused_draft = compile_policy.compile_fused_draft(
             self._fused_draft_steps,
             model_extra_tensor_attrs=self.fused_draft_tensor_attrs,
         )
+        plan = self.kv_only_prompt_plan(compile_policy)
+        if plan is not None:
+            compile_policy.set_kv_only_backbone(plan.backbone)
+            self.kv_only_prompt_tokens = plan.tokens
+            self.kv_only_last_row_tokens = plan.last_row_tokens
         compile_policy.precompile_draft(
             self.model_runner.attn_backend,
             target_feature_size=self.target_feature_size,
             dsa_seed_topk_width=self.dsa_seed_topk_width,
             fused_draft_warmup=self._warmup_fused_draft,
+            kv_only_prompt_tokens=self.kv_only_prompt_tokens,
         )
 
     def fused_draft_batch(
