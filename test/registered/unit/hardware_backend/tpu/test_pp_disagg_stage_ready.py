@@ -236,6 +236,114 @@ def test_prefill_loop_reports_launches_and_the_tokens_its_send_copied():
     assert scheduler.send_output_work == ["work"]
 
 
+class _Forward:
+    """A launched forward's ready event; the test finishes it."""
+
+    def __init__(self):
+        self.done = False
+
+    def query(self):
+        return self.done
+
+
+def _run_last_stage(depth, *, finish_after, iterations=9, pp_size=2):
+    """Drive the last stage's output path of the PP prefill loop at one launch per
+    iteration. Forward u finishes `finish_after` iterations after its launch
+    (None: never on its own). Returns, per micro-batch, the iteration of its
+    send, of its token copy, and of the commit of its send work."""
+    loop_size = pp_size + depth
+    now = [0]
+    sent, copied, committed = {}, {}, {}
+
+    class Tokens:
+        def __init__(self, u):
+            self.u = u
+
+        def cpu(self):
+            # The blocking copy of the deferred send: the forward must end first.
+            forwards[self.u].done = True
+            return torch.tensor([self.u])
+
+    def ship(tensors, **kwargs):
+        u = int(tensors["next_token_ids"])
+        sent[u] = now[0]
+        return [u]
+
+    kv_manager = Mock()
+    kv_manager.on_outputs_copied.side_effect = lambda slot, tokens: copied.__setitem__(
+        int(tokens), now[0]
+    )
+    scheduler = SchedulerPPMixin()
+    scheduler.pp_comm_stream_ctx = nullcontext()
+    scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(kv_manager=kv_manager)
+    scheduler.pp_group = SimpleNamespace(is_last_rank=True)
+    scheduler._pp_wave = object()
+    scheduler.pp_loop_size = loop_size
+    scheduler.mbs = [None] * loop_size
+    scheduler.pp_outputs = None
+    scheduler.last_rank_comm_queue = deque()
+    scheduler.send_output_work = []
+    scheduler._pp_pd_early_output_work = {}
+    scheduler._pp_send_dict_to_next_stage = ship
+    forwards = []
+    with (
+        patch(
+            "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
+            return_value=SimpleNamespace(pp_async_batch_depth=depth),
+        ),
+        patch(
+            "sglang.srt.managers.scheduler_pp_mixin._pp_can_skip_output_comm",
+            return_value=False,
+        ),
+        patch.object(torch.accelerator, "current_stream"),
+    ):
+        for t in range(iterations):
+            now[0] = t
+            for u in scheduler.send_output_work:
+                committed[u] = t
+            scheduler.send_output_work = []
+            for u, forward in enumerate(forwards):
+                if finish_after is not None and t >= u + finish_after:
+                    forward.done = True
+            slot = t % loop_size
+            forwards.append(_Forward())
+            scheduler.mbs[slot] = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+            scheduler.last_rank_comm_queue.append(
+                (forwards[t], PPProxyTensors({"next_token_ids": Tokens(t)}))
+            )
+            scheduler._pp_pd_send_deferred_output((slot - depth) % loop_size)
+            scheduler._pp_pd_send_finished_outputs(slot)
+    return sent, copied, committed
+
+
+def test_last_stage_sends_outputs_once_their_forward_finishes():
+    """At async batch depth d the last stage sent micro-batch u's outputs, and
+    closed its Raiden share, only at iteration u + d. A finished forward now
+    leaves at the next send point, in launch order, while its send work still
+    retires at iteration u + d + 1 as before, so no stage waits earlier."""
+    depth = 4
+    sent, copied, committed = _run_last_stage(depth, finish_after=1)
+    launched = range(9 - depth)
+    assert [sent[u] for u in launched] == [u + 1 for u in launched]
+    assert [copied[u] for u in launched] == [u + 1 for u in launched]
+    assert list(sent) == sorted(sent)
+    assert [committed[u] for u in range(9 - depth - 1)] == [
+        u + depth + 1 for u in range(9 - depth - 1)
+    ]
+
+
+def test_unfinished_outputs_wait_for_their_deferred_send():
+    """A forward still running is never waited on early: its outputs go at
+    iteration u + d, and at depth 1 nothing moves."""
+    for depth in (1, 3):
+        sent, copied, committed = _run_last_stage(depth, finish_after=None)
+        launched = range(9 - depth)
+        assert [sent[u] for u in launched] == [u + depth for u in launched]
+        assert [copied[u] for u in launched] == [u + depth for u in launched]
+    sent, _, _ = _run_last_stage(1, finish_after=0)
+    assert [sent[u] for u in range(8)] == [u + 1 for u in range(8)]
+
+
 def test_result_point_keeps_pages_exposed_before_it_out_of_the_radix_cache():
     """With stage groups or early close, a transfer may read a stage's pages
     before the request's final result. Inserting them there freed the ones the
