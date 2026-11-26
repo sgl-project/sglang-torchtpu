@@ -961,3 +961,641 @@ def test_wave10_step_c_full_attn_adaptive_1k_and_8k1k_aot(tp: int):
     hlo_txt = lowered.as_text()
     assert "_c1024_rope" in hlo_txt, f"Missing adaptive 1K branch in lowered HLO for TP={tp}"
     assert lowered.compile() is not None
+
+
+def _compile_step_c_aot(
+    *,
+    tp: int,
+    B: int,
+    pps: int,
+    sw: int,
+    mode: str,
+    dense2: bool,
+    bd4: bool,
+    dist_len: int = 3,
+    has_rope: bool = False,
+):
+    """Lower and AOT-compile b1_moe_b2_rpad_chip_sharded_jax for TPU7x and assert <63 MiB VMEM."""
+    import gc
+    from unittest import mock
+
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import topologies
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    from sglang_tpu.muse_megakernel.decode.b1_moe_b2_kernel import (
+        b1_moe_b2_rpad_chip_sharded_jax,
+    )
+
+    phys_rows = 128 if bd4 else (256 if dense2 else 512)
+    r_pair = B // (tp // 2)
+    qkv_cols = 640 if tp == 16 else 1280
+    gate_cols = 512 if tp == 16 else 1024
+    hidden, h_pre = 8192, 4096
+    nb = B * pps + 4
+
+    topo_str = "tpu7x:2x2x2" if tp == 16 else "tpu7x:2x2x1"
+    tpu_devs = topologies.get_topology_desc(topo_str, platform="tpu").devices
+    mesh = Mesh(
+        np.array(sorted(tpu_devs, key=lambda dv: (dv.coords[1], dv.coords[0], dv.core_on_chip))),
+        ("model",),
+    )
+
+    s = lambda sh, dt: jax.ShapeDtypeStruct(sh, dt)
+    in_specs = (
+        P("model"), P("model", None), P(None, "model"),
+        P("model", None), P(), P(), P(), P(),
+        P(None, "model"), P("model"), P(), P(), P(),
+        P("model", None, None), P("model", None, None), P("model", None, None), P("model", None, None),
+        P(), P("model", None), P(), P(), P(), P(), P(),
+        P("model", None), P(), P("model", None), P(),
+        P(), P(), P(), P(), P(), P(),
+        *((P(),) if has_rope else ()),
+        P(),
+    )
+    abstract = (
+        s((tp,), jnp.int32), s((tp * r_pair, hidden), jnp.float32), s((B, tp * gate_cols), jnp.bfloat16),
+        s((tp * gate_cols, hidden), jnp.float8_e4m3fn), s((hidden,), jnp.float32),
+        s((hidden,), jnp.float32), s((hidden,), jnp.float32), s((hidden,), jnp.float32),
+        s((hidden, tp * (h_pre // 2)), jnp.float8_e4m3fn), s((tp * (h_pre // 2),), jnp.float32),
+        s((hidden, 256), jnp.bfloat16), s((h_pre,), jnp.float32), s((1, 256), jnp.float32),
+        s((tp * 32, 512, 8192), jnp.uint32), s((tp * 32, 8, 8192), jnp.bfloat16),
+        s((tp * 32, 512, 4096), jnp.uint32), s((tp * 32, 8, 4096), jnp.bfloat16),
+        s((h_pre,), jnp.float32), s((tp * h_pre, h_pre), jnp.float8_e4m3fn), s((h_pre,), jnp.float32),
+        s((hidden,), jnp.float32), s((hidden,), jnp.float32), s((hidden,), jnp.float32), s((hidden,), jnp.float32),
+        s((tp * hidden, qkv_cols), jnp.float8_e4m3fn), s((qkv_cols,), jnp.float32),
+        s((tp * hidden, gate_cols), jnp.float8_e4m3fn), s((gate_cols,), jnp.float32),
+        s((nb, phys_rows, 1, 4, 128), jnp.float8_e4m3fn),
+        s((B,), jnp.int32), s((B * pps,), jnp.int32), s((B + 1,), jnp.int32), s((B + 1,), jnp.int32),
+        s((dist_len,), jnp.int32),
+        *((s((B, 2, 128), jnp.bfloat16),) if has_rope else ()),
+        s((4,), jnp.float32),
+    )
+
+    def _run_aot(*args):
+        rk, st, gt, wo, wos, pa, pb, pfg, wp, sp, wr, pe, bs, w1, s1, w2, s2, nm, wpt, spt, pff, pfa, pfb, nig, wqk, sqk, wg, sg, kvc, kvl, pi, cq, ckv, dt = args[:34]
+        cs = args[34] if has_rope else None
+        fp = args[35] if has_rope else args[34]
+        return b1_moe_b2_rpad_chip_sharded_jax(
+            rk, st, gt, wo, wos, pa, pb, pfg, wp, sp, wr, pe, bs,
+            w1, s1, w2, s2, nm, wpt, spt, pff, pfa, pfb, nig, wqk, sqk, wg, sg,
+            kvc, kvl, pi, cq, ckv, dt,
+            cos_sin_step=cs, free_params=fp,
+            world_size=tp,
+            rpa_sm_scale=64.0**-0.5,
+            rpa_sliding_window=sw,
+            rpa_mode_str=mode,
+            kv_pack_dense2=dense2,
+            kv_pack_bd4=bd4,
+            replica_cost_mode="tiles",
+            skip_kv_write=True,
+        )
+
+    with mock.patch("sglang_tpu.attention.pallas.util.get_torch_tpu_device_kind", return_value="TPU v7"):
+        lowered = jax.jit(
+            jax.shard_map(
+                _run_aot,
+                mesh=mesh,
+                in_specs=in_specs,
+                out_specs=(P("model", None), P("model"), P()),
+                check_vma=False,
+            )
+        ).lower(*abstract)
+        hlo = lowered.as_text()
+        comp = lowered.compile()
+        assert comp is not None
+        del comp, lowered
+        jax.clear_caches()
+        gc.collect()
+    return hlo
+
+
+@pytest.mark.parametrize(
+    "tp,B,dense2,bd4,has_rope",
+    [
+        (8, 128, True, False, True),
+        (16, 128, False, True, True),
+        (16, 256, False, True, False),
+        (16, 256, False, True, True),
+    ],
+)
+def test_wave11_step_c_b128_b256_3scope_swa_aot(
+    tp: int, B: int, dense2: bool, bd4: bool, has_rope: bool
+):
+    """Verify 3-scope Step (c) compiles <63 MiB VMEM on TPU7x for valid B=128/256 SWA (_dfp, rope/nope)."""
+    hlo = _compile_step_c_aot(
+        tp=tp,
+        B=B,
+        pps=4,
+        sw=2049,
+        mode="w8,s4,batchfull,g4k,foldcol,shared16",
+        dense2=dense2,
+        bd4=bd4,
+        dist_len=3,
+        has_rope=has_rope,
+    )
+    assert f"muse_w9_b1_moe_b2_rpad_b{B}_tp{tp}_" in hlo
+
+
+@pytest.mark.parametrize(
+    "tp,dense2,bd4,mode,dist_len",
+    [
+        (8, True, False, "w8,s4,c2048,shared64,coal,noz,pbf16,q1024,shsplit,shfp8,batchfull,foldcol", 4),
+        (16, False, True, "w8,s4,c4096,shared64,coal,noz,pbf16,q1024,shfp8,batchfull,foldcol", 4),
+    ],
+)
+def test_wave11_step_c_lc_shared_full_attn_aot(
+    tp: int, dense2: bool, bd4: bool, mode: str, dist_len: int
+):
+    """Verify Step (c) supports LC shared64 Full-Attn (DENSE2 TP=8 & BD4 TP=16) <63 MiB VMEM."""
+    hlo = _compile_step_c_aot(
+        tp=tp,
+        B=64,
+        pps=512,
+        sw=-1,
+        mode=mode,
+        dense2=dense2,
+        bd4=bd4,
+        dist_len=dist_len,
+        has_rope=False,
+    )
+    assert f"muse_w9_b1_moe_b2_rpad_b64_tp{tp}_" in hlo
+
+
+@pytest.mark.parametrize("case", ["b128_swa_3scope", "b64_lc_shared16"])
+def test_wave11_step_c_interpret_parity_vs_step_b(case: str):
+    """Verify eager race/NaN-detect InterpretParams parity of 3-scope B=128 Step (c) and LC shared16 Step (c)."""
+    import dataclasses
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    from sglang_tpu.attention.pallas.rpa_v3_decode_fast import run_decode_fast_rpa
+    from sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_sparse import (
+        default_sparse_decode_config,
+    )
+    from sglang_tpu.muse_megakernel.decode.b1_moe_b2_kernel import (
+        b1_moe_b2_chip_sharded_jax,
+        b1_moe_b2_rpad_chip_sharded_jax,
+        write_decode_kv_merged_jax,
+    )
+
+    import gc
+
+    world_size = 8
+    devs = jax.devices("cpu")
+    if len(devs) < world_size:
+        pytest.skip(f"Requires XLA_FLAGS=--xla_force_host_platform_device_count={world_size}")
+    mesh = Mesh(np.array(devs[:world_size]), ("model",))
+
+    is_lc = case == "b64_lc_shared16"
+    B = 64 if is_lc else 128
+    hidden, h_pre, scale_block, qkv_cols, gate_cols = 8192, 4096, 512, 1280, 1024
+    r_pair = B // (world_size // 2)
+    rng = np.random.default_rng(20262210 + (1 if is_lc else 0))
+
+    cfg = dataclasses.replace(
+        default_sparse_decode_config(B, world_size, scale_block),
+        weight_mode="half_n" if B > 64 else "stream3",
+        pair_rs=True,
+        bridge_ag=True,
+        m_buckets=(32, 64) if B > 64 else (16, 32),
+        route_chunk_rows=32,
+        static_holder_mask=True,
+        route_fast=True,
+        fast_plan=2,
+        unroll_strips=True,
+        fast_gs=True,
+        spec_prime_parts=0,
+    )
+    _rf8 = lambda sh: jnp.asarray((rng.standard_normal(sh) * 0.15).astype(np.float32), jnp.float8_e4m3fn)
+    ranks = jnp.arange(world_size, dtype=jnp.int32)
+    stream_chip = jnp.asarray((rng.standard_normal((world_size * r_pair, hidden)) * 0.1).astype(np.float32))
+    gated = jnp.asarray((rng.standard_normal((B, world_size * gate_cols)) * 0.1).astype(np.float32), jnp.bfloat16)
+    wo, wos = _rf8((world_size * gate_cols, hidden)), jnp.ones((hidden,), jnp.float32) * 0.05
+    ones_h = jnp.ones((hidden,), jnp.float32)
+    w_pre, s_pre = _rf8((hidden, world_size * (h_pre // 2))), jnp.ones((world_size * (h_pre // 2),), jnp.float32) * 0.05
+    w_router = jnp.asarray((rng.standard_normal((hidden, 256)) * 0.02).astype(np.float32), jnp.bfloat16)
+    bias_np = np.zeros((1, 256), np.float32)
+    bias_np[0, 0:256:32] = 12.0
+    pre_exp, bias = jnp.ones((h_pre,), jnp.float32), jnp.asarray(bias_np)
+    # 8 biased experts (32..256 step 32 -> 1 per rank) with non-zero weights on held ranks.
+    w1_u = np.zeros((world_size * 32, 512, 8192), dtype=np.uint32)
+    w2_u = np.zeros((world_size * 32, 512, 4096), dtype=np.uint32)
+    w1_u[::32] = rng.integers(0, 0x11111111, size=(world_size, 512, 8192), dtype=np.uint32)
+    w2_u[::32] = rng.integers(0, 0x11111111, size=(world_size, 512, 4096), dtype=np.uint32)
+    w1, s1 = jnp.asarray(w1_u, jnp.uint32), jnp.ones((world_size * 32, 8, 8192), jnp.bfloat16) * 0.02
+    w2, s2 = jnp.asarray(w2_u, jnp.uint32), jnp.ones((world_size * 32, 8, 4096), jnp.bfloat16) * 0.02
+    del w1_u, w2_u, bias_np
+    gc.collect()
+    post_exp = jnp.ones((h_pre,), jnp.float32)
+    w_post, s_post = _rf8((world_size * h_pre, h_pre)), jnp.ones((h_pre,), jnp.float32) * 0.05
+    w_qkv, s_qkv = _rf8((world_size * hidden, qkv_cols)), jnp.ones((qkv_cols,), jnp.float32) * 0.05
+    w_gate, s_gate = _rf8((world_size * hidden, gate_cols)), jnp.ones((gate_cols,), jnp.float32) * 0.05
+    fp = jnp.asarray([0.84, 2.0, 0.20, 1.0], jnp.float32)
+
+    pps = 6 if is_lc else 4
+    phys_rows = 256
+    nb = B * pps + 4
+    if is_lc:
+        sh_pgs = 3
+        kvl_np = np.array([sh_pgs * 512 + 30 + (i & 31) for i in range(B)], dtype=np.int32)
+        pg_mat = np.zeros((B, pps), dtype=np.int32)
+        nxt = 0
+        for g in range(B // 16):
+            sh = np.arange(nxt, nxt + sh_pgs, dtype=np.int32)
+            nxt += sh_pgs
+            for j in range(16):
+                row = g * 16 + j
+                pg_mat[row, :sh_pgs] = sh
+                pg_mat[row, sh_pgs:] = np.arange(nxt, nxt + (pps - sh_pgs), dtype=np.int32)
+                nxt += pps - sh_pgs
+        pg_j = jnp.asarray(pg_mat.reshape(-1), jnp.int32)
+        nb = nxt + 4
+        shared_p = jnp.full((B // 16,), sh_pgs, dtype=jnp.int32)
+        dist = jnp.concatenate([jnp.asarray([B, B, B], jnp.int32), shared_p])
+        sw = -1
+        mode = "w8,s4,c2048,shared16,coal,noz,pbf16,q512,shsplit,shfp8,batchfull,foldcol"
+    else:
+        kvl_np = np.array([150 + (i & 63) + 512 * (i % 3) for i in range(B)], dtype=np.int32)
+        pg_j = jnp.asarray(rng.permutation(nb)[: B * pps].astype(np.int32), jnp.int32)
+        shared_p = None
+        dist = jnp.asarray([B, B, B], jnp.int32)
+        sw = 2049
+        mode = "w8,s4,batchfull,g4k,foldcol"
+
+    kvc_base = jax.lax.bitcast_convert_type(
+        jnp.asarray(np.full((nb, phys_rows, 1, 4, 128), 0x38, dtype=np.uint8), jnp.uint8),
+        jnp.float8_e4m3fn,
+    )
+    kvl_j = jnp.asarray(kvl_np, jnp.int32)
+    cuq = jnp.arange(B + 1, dtype=jnp.int32)
+    cukv = jnp.arange(B + 1, dtype=jnp.int32) * (pps * 512)
+
+    base_args = (
+        ranks, stream_chip, gated, wo, wos, ones_h, ones_h, ones_h, w_pre, s_pre, w_router, pre_exp, bias,
+        w1, s1, w2, s2, post_exp, w_post, s_post, ones_h, ones_h, ones_h, ones_h, w_qkv, s_qkv, w_gate, s_gate,
+        kvc_base, kvl_j, pg_j, cuq, cukv, dist, fp,
+    )
+    in_specs = (
+        P("model"), P("model", None), P(None, "model"),
+        P("model", None), P(), P(), P(), P(),
+        P(None, "model"), P("model"), P(), P(), P(),
+        P("model", None, None), P("model", None, None), P("model", None, None), P("model", None, None),
+        P(), P("model", None), P(), P(), P(), P(), P(),
+        P("model", None), P(), P("model", None), P(),
+        P(), P(), P(), P(), P(), P(), P(),
+    )
+
+    def _ref_b(*args):
+        rk, st, gt, wo_, wos_, pa, pb, pfg, wp, sp, wr, pe, bs, w1_, s1_, w2_, s2_, nm, wpt, spt, pff, pfa, pfb, nig, wqk, sqk, wg_, sg_, kvc_, kvl_, pi_, cq_, ckv_, dt_, fp_ = args
+        st_o, q_5d, kvm, gt_o = b1_moe_b2_chip_sharded_jax(
+            rk, st, gt, wo_, wos_, pa, pb, pfg, wp, sp, wr, pe, bs, w1_, s1_, w2_, s2_, nm,
+            wpt, spt, pff, pfa, pfb, nig, wqk, sqk, wg_, sg_, cos_sin_step=None, free_params=fp_,
+            world_size=world_size, fuse_qkv_epi=True, replica_cost_mode="tiles", config=cfg, interpret=True,
+        )
+        out_g, kvc_o = run_decode_fast_rpa(
+            q_5d, kvm, None, kvc_, kvl_, pi_, cq_, ckv_, dt_[:3],
+            sm_scale=64.0**-0.5, sliding_window=(None if sw <= 0 else sw),
+            k_scale=1.0, v_scale=1.0, mode_str=mode, decode_query_size=1,
+            fused_out_pack=2, prepared_inputs=True, gate=gt_o, out_norm_eps=1e-5,
+            kv_pack_dense2=True, shared_pages=shared_p, interpret=True,
+        )
+        return st_o, out_g, kvc_o
+
+    ip_race = pltpu.InterpretParams(
+        dma_execution_mode="eager",
+        detect_races=True,
+        uninitialized_memory="nan",
+    )
+
+    def _fast_c(*args):
+        rk, st, gt, wo_, wos_, pa, pb, pfg, wp, sp, wr, pe, bs, w1_, s1_, w2_, s2_, nm, wpt, spt, pff, pfa, pfb, nig, wqk, sqk, wg_, sg_, kvc_, kvl_, pi_, cq_, ckv_, dt_, fp_ = args
+        st_o, out_g, kvm = b1_moe_b2_rpad_chip_sharded_jax(
+            rk, st, gt, wo_, wos_, pa, pb, pfg, wp, sp, wr, pe, bs, w1_, s1_, w2_, s2_, nm,
+            wpt, spt, pff, pfa, pfb, nig, wqk, sqk, wg_, sg_, kvc_, kvl_, pi_, cq_, ckv_, dt_,
+            cos_sin_step=None, free_params=fp_, world_size=world_size,
+            rpa_sm_scale=64.0**-0.5, rpa_sliding_window=sw,
+            rpa_mode_str=mode, kv_pack_dense2=True, replica_cost_mode="tiles",
+            config=cfg, skip_kv_write=True, interpret=ip_race,
+        )
+        kvc_o = write_decode_kv_merged_jax(
+            kvm, kvc_, kvl_, pi_, cq_, ckv_, dt_, kv_pack_dense2=True, interpret=ip_race,
+        )
+        return st_o, out_g, kvc_o
+
+    ref_res = jax.jit(
+        jax.shard_map(_ref_b, mesh=mesh, in_specs=in_specs, out_specs=(P("model", None), P(), P()), check_vma=False)
+    )(*base_args)
+    ref_st_np = np.asarray(ref_res[0], dtype=np.float64).ravel()
+    ref_g_np = np.asarray(ref_res[1], dtype=np.float64).ravel()
+    ref_kv_u8 = np.asarray(ref_res[2]).view(np.uint8).copy()
+    del ref_res
+    jax.clear_caches()
+    gc.collect()
+
+    fast_res = jax.jit(
+        jax.shard_map(_fast_c, mesh=mesh, in_specs=in_specs, out_specs=(P("model", None), P(), P()), check_vma=False)
+    )(*base_args)
+    fast_st_np = np.asarray(fast_res[0], dtype=np.float64).ravel()
+    fast_g_np = np.asarray(fast_res[1], dtype=np.float64).ravel()
+    fast_kv_u8 = np.asarray(fast_res[2]).view(np.uint8).copy()
+    del fast_res, base_args, w1, w2, s1, s2, kvc_base
+    jax.clear_caches()
+    gc.collect()
+
+    for x, y, nm in [(ref_st_np, fast_st_np, "stream"), (ref_g_np, fast_g_np, "gated")]:
+        cos = float(np.dot(x, y) / (np.linalg.norm(x) * np.linalg.norm(y) + 1e-12))
+        assert cos > 0.9999, f"{case} {nm} cos={cos}"
+    assert np.array_equal(ref_kv_u8, fast_kv_u8)
+
+
+def test_wave11_step_c_rpa_plan_shared_and_large_b():
+    """Verify resolve_step_c_rpa_plan accepts LC shared_group_size>0 at B<=64 and SWA <=16*512 at B=128/256."""
+    from sglang_tpu.muse_megakernel.decode.b1_moe_b2_kernel import (
+        resolve_step_c_rpa_plan,
+    )
+
+    # B=128/256 SWA fits 16*512 Limit; Full 8K/1K >16*512 stays gated to Step (b).
+    _, _, _, _, ok_swa_256 = resolve_step_c_rpa_plan(
+        "w8,s4,batchfull,g4k,foldcol",
+        sliding_window=2049,
+        pages_per_seq=4,
+        phys_page_rows=128,
+        kv_pack_bd4=True,
+        b_tokens=256,
+        max_num_seqs=256,
+    )
+    assert ok_swa_256 is True
+
+    _, _, _, _, ok_full_256 = resolve_step_c_rpa_plan(
+        "w8,s4,batchfull,g4k,foldcol",
+        sliding_window=None,
+        pages_per_seq=32,
+        phys_page_rows=128,
+        kv_pack_bd4=True,
+        b_tokens=256,
+        max_num_seqs=256,
+    )
+    assert ok_full_256 is False
+
+    # LC shared64 accepted ONLY when explicit shared_group_size>0 and divisible.
+    cfg_sh, _, _, _, ok_sh64 = resolve_step_c_rpa_plan(
+        "w8,s4,c4096,shared64,coal,noz,pbf16,q1024,shfp8,batchfull,foldcol",
+        sliding_window=None,
+        pages_per_seq=512,
+        phys_page_rows=128,
+        kv_pack_bd4=True,
+        b_tokens=64,
+        max_num_seqs=64,
+        shared_group_size=64,
+        has_shared_prefix=True,
+    )
+    assert ok_sh64 is True and cfg_sh.shared_group_size == 64
+
+    _, _, _, _, ok_sh_missing = resolve_step_c_rpa_plan(
+        "shared16",
+        sliding_window=None,
+        pages_per_seq=32,
+        phys_page_rows=128,
+        kv_pack_bd4=True,
+        b_tokens=64,
+        max_num_seqs=64,
+        shared_group_size=0,
+        has_shared_prefix=True,
+    )
+    assert ok_sh_missing is False
+
+
+def test_wave11_muse_spark_step_c_b128_b256_and_lc_full_dispatch():
+    """Verify MuseSparkDecoderLayer Step (c) dispatches B=128/256 SWA and gates LC Full on SGLANG_TPU_MUSE_MK_STEP_C_LC_FULL."""
+    import os
+    import types
+    from unittest import mock
+
+    import torch
+    from sglang.srt.model_executor.forward_batch_info import (
+        CaptureHiddenMode,
+        ForwardMode,
+    )
+
+    from sglang_tpu.envs import envs as tpu_envs
+    from sglang_tpu.models.muse_spark import MuseSparkDecoderLayer
+
+    assert tpu_envs.SGLANG_TPU_MUSE_MK_STEP_C_LC_FULL.default is False
+
+    h_dim, h_pre = 8192, 4096
+
+    def _run_case(
+        *,
+        tp: int,
+        batch: int,
+        sw: int | None,
+        pps: int,
+        dist_len: int,
+        rpa_mode: str,
+        lc_full_env: str,
+        lc_swa_env: str = "1",
+    ):
+        r_pair = batch // (tp // 2)
+        qkv_cols = 640 if tp == 16 else 1280
+        gate_cols = 512 if tp == 16 else 1024
+        dense2 = tp == 8
+        bd4 = tp == 16
+        phys_rows = 128 if bd4 else 256
+        nb = batch * pps + 4
+
+        norm_stub = types.SimpleNamespace(
+            eps=1e-5, scale_input=False, gain=lambda: torch.ones((h_dim,), dtype=torch.float32)
+        )
+        gate_stub = types.SimpleNamespace(
+            alpha=torch.ones((h_dim,), dtype=torch.float32),
+            beta=torch.ones((h_dim,), dtype=torch.float32),
+        )
+        mlp = types.SimpleNamespace(
+            _fused_decode_mode="sparse",
+            _fused_decode_op=object(),
+            _fused_decode_batches=(32, 64, 128, 256),
+            _fused_decode_rank=torch.zeros((tp,), dtype=torch.int32),
+            _fused_decode_num_replicas=0,
+            _fused_decode_has_spec_slot=False,
+            _fused_decode_replica_cost_mode="tiles",
+            router_multiplier=1.0,
+            pre_expert_norm=norm_stub,
+            _bias_2d=lambda: torch.zeros((1, 256), dtype=torch.float32),
+            _norm_2d=lambda: torch.ones((1, h_pre), dtype=torch.float32),
+            _free_params_for_batch=lambda _b: torch.ones((4,), dtype=torch.float32),
+            _buffers={
+                "_w7_wrouter_km": torch.zeros((h_dim, 256), dtype=torch.bfloat16),
+                "_w8_wpre_pair_w8k": torch.zeros((h_dim, h_pre // 2), dtype=torch.float8_e4m3fn),
+                "_w8_spre_pair": torch.ones((h_pre // 2,), dtype=torch.float32),
+                "_w9_wpost_pair_w8k": torch.zeros((h_pre, h_pre), dtype=torch.float8_e4m3fn),
+                "_w9_spost_pair": torch.ones((h_pre,), dtype=torch.float32),
+            },
+            experts=types.SimpleNamespace(
+                w13_weight=torch.zeros((1, 1, 1), dtype=torch.float4_e2m1fn_x2).expand(256 // tp, 4096, 4096),
+                w13_weight_scale=torch.ones((1, 8, 1), dtype=torch.bfloat16).expand(256 // tp, 8, 4096),
+                w2_weight=torch.zeros((1, 1, 1), dtype=torch.float4_e2m1fn_x2).expand(256 // tp, 2048, 4096),
+                w2_weight_scale=torch.ones((1, 8, 1), dtype=torch.bfloat16).expand(256 // tp, 8, 4096),
+            ),
+        )
+        self_attn = types.SimpleNamespace(
+            _o_proj_w8k=torch.zeros((gate_cols, h_dim), dtype=torch.float8_e4m3fn),
+            _o_proj_scale=torch.ones((h_dim,), dtype=torch.float32),
+        )
+        next_layer_attn = types.SimpleNamespace(
+            decode_attn_gate_fuse=True,
+            rotary_emb=object() if sw is not None else None,
+            norm_eps=1e-5,
+            query_scale=1.0,
+            _buffers={
+                "_w7_wqkv_w8k": torch.zeros((h_dim, qkv_cols), dtype=torch.float8_e4m3fn),
+                "_w7_sqkv": torch.ones((qkv_cols,), dtype=torch.float32),
+                "_w7_wgate_w8k": torch.zeros((h_dim, gate_cols), dtype=torch.float8_e4m3fn),
+                "_w7_sgate": torch.ones((gate_cols,), dtype=torch.float32),
+            },
+            attn=types.SimpleNamespace(
+                layer_id=1,
+                sliding_window_size=(sw - 1) if sw is not None else None,
+                scaling=64.0**-0.5,
+                k_scale_float=1.0,
+                v_scale_float=1.0,
+            ),
+        )
+        layer = types.SimpleNamespace(
+            _w9_b1_moe_b2_superkernel=True,
+            _w8_bridge_qkv_epi=True,
+            mlp=mlp,
+            self_attn=self_attn,
+            post_attention_layernorm=norm_stub,
+            pre_feedforward_layernorm=norm_stub,
+            post_feedforward_layernorm=norm_stub,
+            post_attention_residual_gate=gate_stub,
+            post_feedforward_residual_gate=gate_stub,
+            _can_run_b1_moe_superkernel=lambda n, *, tp, is_dec_step, replicated=False: MuseSparkDecoderLayer._can_run_b1_moe_superkernel(
+                layer, n, tp=tp, is_dec_step=is_dec_step, replicated=replicated
+            ),
+            _epi_scalars=lambda next_ln, next_at: MuseSparkDecoderLayer._epi_scalars(
+                layer, next_ln, next_at
+            ),
+        )
+        md = types.SimpleNamespace(
+            decode_query_size=1,
+            cu_q_lens=torch.arange(batch + 1, dtype=torch.int32),
+            cu_kv_lens=torch.arange(batch + 1, dtype=torch.int32) * (pps * 512),
+            distribution=torch.asarray([batch, batch, batch], dtype=torch.int32),
+            full_decode_distribution=(
+                torch.asarray([batch, batch, batch] + [500] * (dist_len - 3), dtype=torch.int32)
+                if dist_len > 3
+                else None
+            ),
+            swa_page_indices=torch.zeros((batch * pps,), dtype=torch.int32) if sw is not None else None,
+            swa_group_page_indices=None,
+        )
+        backend_stub = types.SimpleNamespace(
+            _dcp=1,
+            _decode_prepared_gated_op=object(),
+            _kv_pack_dense2=dense2,
+            _kv_pack_bd4=bd4,
+            _swa_layer_groups={1: 0},
+            forward_metadata=md,
+            token_to_kv_pool=types.SimpleNamespace(
+                swa_kv_pool=types.SimpleNamespace(kv_pack_dense2=dense2, kv_pack_bd4=bd4),
+                full_kv_pool=types.SimpleNamespace(kv_pack_dense2=dense2, kv_pack_bd4=bd4),
+            ),
+            can_forward_decode_prepared=lambda _a, _fb: True,
+            _kv_lens=lambda _fb: torch.full((batch,), 256, dtype=torch.int32),
+            _layer_page_indices=lambda _lid, is_swa_layer=False: torch.zeros((batch * pps,), dtype=torch.int32),
+            _layer_distribution=lambda is_swa_layer=False: (
+                md.distribution
+                if (is_swa_layer or md.full_decode_distribution is None)
+                else md.full_decode_distribution
+            ),
+        )
+        fb = types.SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            spec_info=None,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            attn_backend=backend_stub,
+        )
+        calls: list[str] = []
+        pending: list = []
+        env_map = {
+            "SGLANG_TPU_MUSE_DECODE_STEP_C_SUPERKERNEL": "1",
+            "SGLANG_TPU_MUSE_DECODE_TP16_QKV_EPI": "1" if tp == 16 else "0",
+            "SGLANG_TPU_MUSE_MK_STEP_C_LC_SWA": lc_swa_env,
+            "SGLANG_TPU_MUSE_MK_STEP_C_LC_FULL": lc_full_env,
+            "SGLANG_TPU_RPA_V3_DECODE_FAST": rpa_mode,
+        }
+        with (
+            mock.patch.dict(os.environ, env_map),
+            mock.patch("sglang_tpu.models.muse_spark._can_use_bridge_qkv_epi", return_value=True),
+            mock.patch("sglang_tpu.decode_qkv_epilogue_tpu._resolve_decode_attn_backend", return_value=backend_stub),
+            mock.patch(
+                "sglang_tpu.attention_pallas_rpa_base._fused_kv_operands",
+                return_value=(torch.zeros((nb, phys_rows, 1, 4, 128), dtype=torch.float8_e4m3fn), None),
+            ),
+            mock.patch(
+                "sglang_tpu.muse_megakernel.decode.b1_moe_ops.get_b1_moe_b2_rpad_chip_sharded_op",
+                side_effect=lambda *_a, **_kw: (
+                    lambda *_args: (
+                        calls.append("step_c")
+                        or (
+                            torch.zeros((r_pair, h_dim), dtype=torch.float32),
+                            torch.zeros((batch, gate_cols), dtype=torch.bfloat16),
+                            torch.zeros((batch, 1, 4, 128), dtype=torch.float8_e4m3fn),
+                        )
+                    )
+                ),
+            ),
+            mock.patch(
+                "sglang_tpu.muse_megakernel.decode.b1_moe_ops.get_b1_moe_b2_chip_sharded_op",
+                side_effect=lambda *_a, **_kw: (
+                    lambda *_args: (
+                        calls.append("step_b")
+                        or (
+                            torch.zeros((r_pair, h_dim), dtype=torch.float32),
+                            torch.zeros((batch, 1, qkv_cols // 128, 2, 128), dtype=torch.bfloat16),
+                            torch.zeros((batch, 1, 4, 128), dtype=torch.float8_e4m3fn),
+                            torch.zeros((batch, gate_cols), dtype=torch.bfloat16),
+                        )
+                    )
+                ),
+            ),
+        ):
+            MuseSparkDecoderLayer._try_b1_moe_superkernel(
+                layer,
+                positions=torch.arange(batch, dtype=torch.int32),
+                stream=torch.zeros((r_pair, h_dim), dtype=torch.float32),
+                attn_input=None,
+                forward_batch=fb,
+                n_tok=batch,
+                tp=tp,
+                b2_kind=3,
+                is_dec_step=True,
+                pa_alpha_arg=gate_stub.alpha,
+                pa_beta_arg=gate_stub.beta,
+                pre_ff_gain=torch.ones((h_dim,), dtype=torch.float32),
+                pre_exp_gain=torch.ones((h_pre,), dtype=torch.float32),
+                cos_sin_step=torch.zeros((batch, 2, 128), dtype=torch.bfloat16) if sw is not None else None,
+                cs_kw={},
+                precomputed_qkv_gate=None,
+                precomputed_prepared_qkvg=None,
+                precomputed_gated=torch.zeros((batch, gate_cols), dtype=torch.bfloat16),
+                next_input_layernorm=norm_stub,
+                next_layer_attn=next_layer_attn,
+                final_layernorm=None,
+                pending_step_c_kv_writes=pending,
+            )
+        return calls, len(pending)
+
+    # Target 1: B=128 TP=8 & B=256 TP=16 SWA dispatch Step (c) and queue StepC_write_kv_multi.
+    assert _run_case(tp=8, batch=128, sw=2049, pps=4, dist_len=3, rpa_mode="w8,s4,batchfull,g4k,foldcol", lc_full_env="0") == (["step_c"], 1)
+    assert _run_case(tp=16, batch=256, sw=2049, pps=4, dist_len=3, rpa_mode="w8,s4,batchfull,g4k,foldcol", lc_full_env="0") == (["step_c"], 1)
+
+    # Target 2: LC Full shared64 stays gated to Step (b) by default (LC_FULL=0) and enters Step (c) only with LC_FULL=1.
+    lc_mode = "w8,s4,c4096,shared64,coal,noz,pbf16,q1024,shfp8,batchfull,foldcol"
+    assert _run_case(tp=16, batch=64, sw=None, pps=512, dist_len=4, rpa_mode=lc_mode, lc_full_env="0") == (["step_b"], 0)
+    assert _run_case(tp=16, batch=64, sw=None, pps=512, dist_len=4, rpa_mode=lc_mode, lc_full_env="1") == (["step_c"], 1)

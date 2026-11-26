@@ -4094,7 +4094,7 @@ class MuseSparkDecoderLayer(nn.Module):
                 step_c_flag is not None
                 and bool(step_c_flag.get())
                 and use_qkv_epi
-                and 32 <= n_tok <= 64
+                and n_tok in (32, 64, 128, 256)
                 and getattr(next_layer_attn, "decode_attn_gate_fuse", False)
                 and (capture_mode is None or not capture_mode.is_full())
             ):
@@ -4115,6 +4115,19 @@ class MuseSparkDecoderLayer(nn.Module):
                 elif sw is not None:
                     sw = int(sw) + 1
                 lc_swa_step_c = bool(tpu_envs.SGLANG_TPU_MUSE_MK_STEP_C_LC_SWA.get())
+                lc_full_step_c = bool(tpu_envs.SGLANG_TPU_MUSE_MK_STEP_C_LC_FULL.get())
+                has_shared_lc = (
+                    md is not None
+                    and (
+                        getattr(md, "full_decode_distribution", None) is not None
+                        or int(
+                            getattr(
+                                getattr(md, "distribution", None), "shape", (3,)
+                            )[0]
+                        )
+                        > 3
+                    )
+                )
                 if (
                     rpa_mode_str
                     and backend is not None
@@ -4122,8 +4135,9 @@ class MuseSparkDecoderLayer(nn.Module):
                     and getattr(backend, "_decode_prepared_gated_op", None) is not None
                     and getattr(md, "decode_query_size", 0) == 1
                     and (
-                        (lc_swa_step_c and sw is not None)
-                        or getattr(md, "decode_shared_prefix_pages", None) is None
+                        (not has_shared_lc)
+                        or (lc_swa_step_c and sw is not None)
+                        or (lc_full_step_c and sw is None)
                     )
                     and backend.can_forward_decode_prepared(
                         next_layer_attn.attn, forward_batch
@@ -4164,7 +4178,13 @@ class MuseSparkDecoderLayer(nn.Module):
                     pages_per_seq = int(page_indices.shape[0]) // max(
                         1, int(kv_lens.shape[0])
                     )
-                    has_shared_prefix = int(distribution.shape[0]) > 3
+                    dist_len = int(distribution.shape[0])
+                    n_seqs_step_c = int(kv_lens.shape[0])
+                    shared_grp_step_c = (
+                        n_seqs_step_c // (dist_len - 3)
+                        if (dist_len > 3 and (n_seqs_step_c % (dist_len - 3)) == 0)
+                        else 0
+                    )
                     cfg_rpa, _, _, _, step_c_rpa_ok = resolve_step_c_rpa_plan(
                         rpa_mode_str,
                         sliding_window=sw,
@@ -4173,8 +4193,9 @@ class MuseSparkDecoderLayer(nn.Module):
                         kv_pack_dense2=dense2,
                         kv_pack_bd4=bd4,
                         b_tokens=n_tok,
-                        max_num_seqs=int(kv_lens.shape[0]),
-                        has_shared_prefix=has_shared_prefix,
+                        max_num_seqs=n_seqs_step_c,
+                        shared_group_size=shared_grp_step_c,
+                        has_shared_prefix=(dist_len > 3),
                     )
                     if step_c_rpa_ok and (tp != 16 or cfg_rpa.num_slots <= 4):
                         op_c = get_b1_moe_b2_rpad_chip_sharded_op(
