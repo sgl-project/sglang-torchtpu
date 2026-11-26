@@ -1,33 +1,26 @@
 # Adapted from vllm-project/vllm-torchtpu (Apache-2.0).
-# Source: src/vllm_torchtpu/kernels/deepseek_v41/index_selection/fp8/cache.py
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Feature-major FP8 pages with an in-page FP32 scale per key.
-
-For token t and feature d, byte d%4 of word [d//4,t] contains K[t,d].
-Field 32 holds scales[t] as FP32 bits. Each [33,page_size] page is rounded
-to whole owner rows. Unwritten keys are masked by sequence lengths.
-"""
-
-from dataclasses import dataclass
+"""Write packed FP8 index keys with an in-page FP32 scale per key."""
 
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-PAGE_RECORDS = 128
-PAGE_ROWS = 33
+from sglang_tpu.kernels.index_selection.fp8.pages import (
+    TOKENS_PER_ROW,
+    WORD_BYTES,
+    page_rows,
+)
 
 # Stage up to 128 touched pages, stopping at the sorted invalid-record tail.
 PACKED_FP8_WRITE_BATCH = 128
 
 
 def quantize_index_rows(values: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Return E4M3 values, FP32 scales and E8M0 scale bytes for D128 vectors."""
+    """Return E4M3 values, FP32 scales and E8M0 scale bytes per vector."""
     # One power-of-two scale covers each post-RoPE vector, independent of layout.
-    if values.shape[-1] != 128:
-        raise ValueError("V4.1 FP8 index vectors must have 128 channels")
     values = values.astype(jnp.float32)
     amax = jnp.maximum(jnp.abs(values).max(axis=-1), 1e-4)
     exponent = jnp.ceil(jnp.log2(amax / 448.0)).astype(jnp.int32)
@@ -39,113 +32,15 @@ def quantize_index_rows(values: jax.Array) -> tuple[jax.Array, jax.Array, jax.Ar
     return quantized, scales, scale_bytes
 
 
-@dataclass(frozen=True, init=False)
-class PackedFP8Layout:
-    """Location of this layer's pages inside one or two shared word-row owners."""
-
-    pages: int
-    page_stride: int
-    page_offset: int
-    page_size: int
-
-    def __init__(
-        self,
-        pages: int,
-        page_stride: int | None = None,
-        page_offset: int = 0,
-        page_size: int = PAGE_RECORDS,
-    ) -> None:
-        rows = (PAGE_ROWS * page_size + PAGE_RECORDS - 1) // PAGE_RECORDS
-        for name, value in (
-            ("pages", pages),
-            ("page_stride", rows if page_stride is None else page_stride),
-            ("page_offset", page_offset),
-            ("page_size", page_size),
-        ):
-            object.__setattr__(self, name, value)
-
-    @property
-    def page_rows(self) -> int:
-        return (PAGE_ROWS * self.page_size + PAGE_RECORDS - 1) // PAGE_RECORDS
-
-    def validate(self, bank_rows: tuple[int, ...]) -> None:
-        if self.page_size < 1 or self.page_size & (self.page_size - 1):
-            raise ValueError("Packed FP8 page capacity must be a power of two")
-        if len(bank_rows) not in (1, 2) or any(
-            rows < self.page_rows for rows in bank_rows
-        ):
-            raise ValueError("Packed FP8 cache requires one or two nonempty banks")
-        if self.pages < 1 or self.page_stride < self.page_rows or self.page_offset < 0:
-            raise ValueError("Packed FP8 pages require nonoverlapping page slots")
-        end = self.page_offset + (self.pages - 1) * self.page_stride + self.page_rows
-        if end > sum(bank_rows) or max(bank_rows) >= 1 << 29:
-            raise ValueError("Packed FP8 page addresses exceed their owners")
-        if len(bank_rows) == 2:
-            page = min(
-                self.pages - 1,
-                max(0, (bank_rows[0] - self.page_offset) // self.page_stride),
-            )
-            start = self.page_offset + page * self.page_stride
-            if start < bank_rows[0] < start + self.page_rows:
-                raise ValueError("A packed FP8 page must not cross the bank boundary")
-
-
-def _record_addresses(records: jax.Array, layout: PackedFP8Layout):
-    valid = (records >= 0) & (records < layout.pages * layout.page_size)
-    safe = jnp.clip(records, 0, layout.pages * layout.page_size - 1)
-    base = layout.page_offset + (safe // layout.page_size) * layout.page_stride
-    return base, safe % layout.page_size, valid
-
-
-def write_fp8_records(
-    banks: tuple[jax.Array, ...],
-    records: jax.Array,
-    keys: jax.Array,
-    layout: PackedFP8Layout,
-) -> tuple[jax.Array, ...]:
-    """Quantize and write new keys, using fused preparation for verified decode."""
-    if not supports_sorted_fp8(banks, records, keys, layout.page_size):
-        return _write_fp8_records_native(banks, records, keys, layout)
-    layout.validate(tuple(bank.shape[0] for bank in banks))
-    bases, columns, valid = _record_addresses(records, layout)
-    bases = jnp.where(valid, bases, -1)
-    count = records.size
-    first_rows = banks[0].shape[0]
-    total_rows = sum(bank.shape[0] for bank in banks)
-    valid = (bases >= 0) & (bases + layout.page_rows <= first_rows)
-    valid |= (bases >= first_rows) & (bases + layout.page_rows <= total_rows)
-    bases, order = jax.lax.sort_key_val(
-        jnp.where(valid, bases, total_rows), jnp.arange(count, dtype=jnp.int32)
-    )
-    _, scales, _ = quantize_index_rows(keys)
-    columns, values = prepare_sorted_fp8(keys, columns, order, scales)
-    batch = min(count, PACKED_FP8_WRITE_BATCH)
-    bases = jnp.pad(bases, (0, -count % batch + 1), constant_values=total_rows)
-    return _write_sorted_packed_pages(
-        banks,
-        bases,
-        columns,
-        values,
-        count=count,
-        fields=PAGE_ROWS,
-        page_size=layout.page_size,
-        interpret=False,
-    )
-
-
-def _write_fp8_records_native(
-    banks: tuple[jax.Array, ...],
-    records: jax.Array,
-    keys: jax.Array,
-    layout: PackedFP8Layout,
-) -> tuple[jax.Array, ...]:
-    """Quantize only new keys and update their columns; valid slots are unique."""
-    layout.validate(tuple(bank.shape[0] for bank in banks))
-    if keys.shape != (records.size, PAGE_RECORDS) or records.ndim != 1:
-        raise ValueError("Expected one logical record slot per D128 key")
+def write_index_keys(
+    cache: jax.Array, records: jax.Array, keys: jax.Array
+) -> jax.Array:
+    """Quantize only new keys and update their slots; valid slots are unique."""
+    _, fields, _, page_size = cache.shape
+    keys = keys.reshape(records.size, (fields - 1) * WORD_BYTES)
     quantized, scales, _ = quantize_index_rows(keys)
     bits = jax.lax.bitcast_convert_type(quantized, jnp.uint8).astype(jnp.uint32)
-    bits = bits.reshape(-1, 32, 4)
+    bits = bits.reshape(records.size, fields - 1, WORD_BYTES)
     words = bits[:, :, 0] | (bits[:, :, 1] << 8)
     words |= (bits[:, :, 2] << 16) | (bits[:, :, 3] << 24)
     values = jnp.concatenate(
@@ -155,130 +50,50 @@ def _write_fp8_records_native(
         ),
         axis=1,
     )
-    base, columns, valid = _record_addresses(records, layout)
-    if jax.default_backend() == "tpu":
-        return write_packed_pages(
-            banks,
-            jnp.where(valid, base, -1),
-            columns,
-            values,
-            page_size=layout.page_size,
-        )
-    updated = []
-    offset = 0
-    for bank in banks:
-        words = (
-            base[:, None] * PAGE_RECORDS
-            + jnp.arange(PAGE_ROWS)[None, :] * layout.page_size
-            + columns[:, None]
-        )
-        local = words // PAGE_RECORDS - offset
-        active = valid[:, None] & (local >= 0) & (local < bank.shape[0])
-        local = jnp.where(active, local, bank.shape[0])
-        updated.append(bank.at[local, words % PAGE_RECORDS].set(values, mode="drop"))
-        offset += bank.shape[0]
-    return tuple(updated)
-
-
-def read_fp8_records(
-    banks: tuple[jax.Array, ...], records: jax.Array, layout: PackedFP8Layout
-) -> jax.Array:
-    """Decode selected records to BF16 for eager consumers; invalid slots are zero."""
-    layout.validate(tuple(bank.shape[0] for bank in banks))
-    shape = records.shape
-    base, columns, valid = _record_addresses(records.reshape(-1), layout)
-    addresses = (
-        base[:, None] * PAGE_RECORDS
-        + jnp.arange(PAGE_ROWS)[None, :] * layout.page_size
-        + columns[:, None]
-    )
-    words = jnp.zeros(addresses.shape, jnp.int32)
-    offset = 0
-    for bank in banks:
-        local = addresses // PAGE_RECORDS - offset
-        active = valid[:, None] & (local >= 0) & (local < bank.shape[0])
-        gathered = bank[jnp.clip(local, 0, bank.shape[0] - 1), addresses % PAGE_RECORDS]
-        words = jnp.where(active, gathered, words)
-        offset += bank.shape[0]
-    bits = (words[:, :32, None].astype(jnp.uint32) >> (jnp.arange(4) * 8)) & 255
-    values = jax.lax.bitcast_convert_type(
-        bits.astype(jnp.uint8).reshape(-1, PAGE_RECORDS), jnp.float8_e4m3fn
-    )
-    scales = jax.lax.bitcast_convert_type(words[:, 32], jnp.float32)
-    result = (values.astype(jnp.float32) * scales[:, None]).astype(jnp.bfloat16)
-    return jnp.where(valid[:, None], result, 0).reshape(*shape, PAGE_RECORDS)
+    return write_packed_pages(cache, records // page_size, records % page_size, values)
 
 
 def write_packed_pages(
-    banks: tuple[jax.Array, ...],
-    bases: jax.Array,
+    cache: jax.Array,
+    pages: jax.Array,
     columns: jax.Array,
     values: jax.Array,
     *,
-    page_size: int | None = None,
     interpret: bool = False,
-) -> tuple[jax.Array, ...]:
-    """Update unique token slots in one or two banks using global row bases."""
-    count, fields = values.shape
+) -> jax.Array:
+    """Write int32 `values` [N, fields] at unique (page, column) slots; -1 skips."""
+    count = values.shape[0]
     if not count:
-        return banks
-    page_tokens = banks[0].shape[1]
-    page_size = page_tokens if page_size is None else page_size
-    page_rows = pl.cdiv(fields * page_size, page_tokens)
-    padded_fields = page_rows * page_tokens // page_size
-    first_rows = banks[0].shape[0]
-    total_rows = sum(bank.shape[0] for bank in banks)
+        return cache
+    num_pages = cache.shape[0]
     batch = min(count, PACKED_FP8_WRITE_BATCH)
-    valid = (bases >= 0) & (bases + page_rows <= first_rows)
-    if len(banks) == 2:
-        valid |= (bases >= first_rows) & (bases + page_rows <= total_rows)
-    bases, order = jax.lax.sort_key_val(
-        jnp.where(valid, bases, total_rows), jnp.arange(count, dtype=jnp.int32)
+    valid = (pages >= 0) & (pages < num_pages)
+    pages, order = jax.lax.sort_key_val(
+        jnp.where(valid, pages, num_pages), jnp.arange(count, dtype=jnp.int32)
     )
     columns, values = columns[order], values[order]
     # The final sentinel terminates the last page's merge without an end scan.
-    bases = jnp.pad(bases, (0, -count % batch + 1), constant_values=total_rows)
+    pages = jnp.pad(pages, (0, -count % batch + 1), constant_values=num_pages)
     columns = jnp.pad(columns, (0, -count % batch))
-    values = jnp.pad(values.T, ((0, padded_fields - fields), (0, -count % page_tokens)))
+    values = jnp.pad(values.T, ((0, 0), (0, -count % TOKENS_PER_ROW)))
 
     return _write_sorted_packed_pages(
-        banks,
-        bases,
-        columns,
-        values,
-        count=count,
-        fields=fields,
-        page_size=page_size,
-        interpret=interpret,
+        cache, pages, columns, values, count=count, interpret=interpret
     )
 
 
-def _write_sorted_packed_pages(
-    banks,
-    bases,
-    columns,
-    values,
-    *,
-    count: int,
-    fields: int,
-    page_size: int,
-    interpret: bool,
-):
-    page_tokens = banks[0].shape[1]
-    page_rows = pl.cdiv(fields * page_size, page_tokens)
-    padded_fields = page_rows * page_tokens // page_size
-    first_rows = banks[0].shape[0]
-    total_rows = sum(bank.shape[0] for bank in banks)
+def _write_sorted_packed_pages(cache, pages, columns, values, *, count, interpret):
+    num_pages, fields, _, page_size = cache.shape
+    rows, parts = page_rows(cache.shape), page_size // TOKENS_PER_ROW
     batch = min(count, PACKED_FP8_WRITE_BATCH)
 
-    def kernel(base_ref, column_ref, value_ref, *refs):
-        outputs = refs[len(banks) : 2 * len(banks)]
-        pages, sem = refs[2 * len(banks) :]
+    def kernel(page_ref, column_ref, value_ref, _, output, staged, sem):
+        words = output.bitcast(jnp.int32).reshape(num_pages * rows, TOKENS_PER_ROW)
 
         def first(record):
-            base = base_ref[record]
-            return (base < total_rows) & (
-                (record == 0) | (base != base_ref[jnp.maximum(record - 1, 0)])
+            page = page_ref[record]
+            return (page < num_pages) & (
+                (record == 0) | (page != page_ref[jnp.maximum(record - 1, 0)])
             )
 
         def each_valid(action):
@@ -291,7 +106,7 @@ def _write_sorted_packed_pages(
             jax.lax.while_loop(
                 lambda slot: (
                     (slot < batch)
-                    & (base_ref[pl.program_id(0) * batch + slot] < total_rows)
+                    & (page_ref[pl.program_id(0) * batch + slot] < num_pages)
                 ),
                 body,
                 jnp.int32(0),
@@ -300,28 +115,17 @@ def _write_sorted_packed_pages(
         def copies(*, write, wait):
             def body(slot, carry):
                 record = pl.program_id(0) * batch + slot
-                base = base_ref[record]
 
                 @pl.when(first(record))
                 def _():
-                    def move(bank, offset):
-                        hbm = outputs[bank].at[pl.ds(base - offset, page_rows), :]
-                        vmem = pages.at[slot]
-                        src, dst = (vmem, hbm) if write else (hbm, vmem)
-                        copy = pltpu.make_async_copy(src, dst, sem)
-                        if wait:
-                            copy.wait()
-                        else:
-                            copy.start()
-
-                    if len(banks) == 1:
-                        move(0, 0)
+                    hbm = words.at[pl.ds(page_ref[record] * rows, rows), :]
+                    vmem = staged.at[slot]
+                    src, dst = (vmem, hbm) if write else (hbm, vmem)
+                    copy = pltpu.make_async_copy(src, dst, sem)
+                    if wait:
+                        copy.wait()
                     else:
-                        jax.lax.cond(
-                            base < first_rows,
-                            lambda: move(0, 0),
-                            lambda: move(1, first_rows),
-                        )
+                        copy.start()
 
                 return carry
 
@@ -338,31 +142,31 @@ def _write_sorted_packed_pages(
                 def update(record):
                     word = jnp.take_along_axis(
                         value_ref[
-                            :, pl.ds(record // page_tokens * page_tokens, page_tokens)
+                            :,
+                            pl.ds(
+                                record // TOKENS_PER_ROW * TOKENS_PER_ROW,
+                                TOKENS_PER_ROW,
+                            ),
                         ],
-                        jnp.full((padded_fields, page_tokens), record % page_tokens),
+                        jnp.full((fields, TOKENS_PER_ROW), record % TOKENS_PER_ROW),
                         axis=1,
                         mode="fill",
                     )
-                    if page_size < page_tokens:
-                        word = word[:, :page_size].reshape(page_rows, page_tokens)
-                    elif page_size > page_tokens:
-                        word = jnp.tile(word, (1, page_size // page_tokens)).reshape(
-                            page_rows, page_tokens
-                        )
-                    positions = jnp.arange(page_rows * page_tokens).reshape(
-                        page_rows, page_tokens
+                    # Row f * parts + h holds field f of part h.
+                    if parts > 1:
+                        word = jnp.tile(word, (1, parts)).reshape(rows, TOKENS_PER_ROW)
+                    positions = jnp.arange(rows * TOKENS_PER_ROW).reshape(
+                        rows, TOKENS_PER_ROW
                     )
-                    pages[slot] = jnp.where(
-                        (positions % page_size == column_ref[record])
-                        & (positions < fields * page_size),
+                    staged[slot] = jnp.where(
+                        positions % page_size == column_ref[record],
                         word,
-                        pages[slot],
+                        staged[slot],
                     )
                     return record + 1
 
                 jax.lax.while_loop(
-                    lambda record: base_ref[record] == base_ref[start], update, start
+                    lambda record: page_ref[record] == page_ref[start], update, start
                 )
 
             return carry
@@ -373,123 +177,21 @@ def _write_sorted_packed_pages(
 
     return pl.pallas_call(
         kernel,
-        out_shape=tuple(jax.ShapeDtypeStruct(bank.shape, bank.dtype) for bank in banks),
+        out_shape=jax.ShapeDtypeStruct(cache.shape, cache.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
             grid=(pl.cdiv(count, batch),),
             in_specs=(
                 pl.BlockSpec(memory_space=pltpu.VMEM),
-                *(pl.BlockSpec(memory_space=pltpu.HBM) for _ in banks),
+                pl.BlockSpec(memory_space=pltpu.HBM),
             ),
-            out_specs=tuple(pl.BlockSpec(memory_space=pltpu.HBM) for _ in banks),
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
             scratch_shapes=(
-                pltpu.VMEM((batch, page_rows, page_tokens), jnp.int32),
+                pltpu.VMEM((batch, rows, TOKENS_PER_ROW), jnp.int32),
                 pltpu.SemaphoreType.DMA,
             ),
         ),
-        input_output_aliases={3 + i: i for i in range(len(banks))},
+        input_output_aliases={3: 0},
         interpret=pltpu.InterpretParams() if interpret else False,
         name="write_packed_fp8_pages",
-    )(bases, columns, values, *banks)
-
-
-# Decode token counts whose fused write was measured on TPU v7 to match the
-# native writer bitwise; other counts take the native path.
-_MEASURED_TOKENS = frozenset({128, 256, 288, 384, 512})
-
-
-def supports_sorted_fp8(
-    banks: tuple[jax.Array, ...],
-    records: jax.Array,
-    keys: jax.Array,
-    page_size: int,
-) -> bool:
-    return (
-        jax.default_backend() == "tpu"
-        and keys.ndim == 2
-        and keys.shape[0] in _MEASURED_TOKENS
-        and keys.shape[1] == 128
-        and keys.dtype == jnp.bfloat16
-        and records.shape == (keys.shape[0],)
-        and records.dtype == jnp.int32
-        # 128-record pages (block-outer layouts at --block-size 256) make each
-        # page one owner row wide; the write is bitwise the native writer's.
-        and page_size in (128, 256)
-        and len(banks) == 2
-        and all(
-            bank.ndim == 2 and bank.shape[1] == 128 and bank.dtype == jnp.int32
-            for bank in banks
-        )
-    )
-
-
-def prepare_sorted_fp8(
-    keys: jax.Array, columns: jax.Array, order: jax.Array, scales: jax.Array
-) -> tuple[jax.Array, jax.Array]:
-    """Quantize and reorder, yielding the original writer's exact layout."""
-    count = keys.shape[0]
-    padded = pl.cdiv(count, 128) * 128
-
-    def kernel(key_ref, column_ref, order_ref, scale_ref, column_out, value_out):
-        order = order_ref[:]
-        # Mosaic dynamic_gather requires 32-bit data for int32 indices.
-        # Encode first: reorder 33 packed fields instead of 128 widened keys.
-        values = key_ref[:, :].astype(jnp.float32)
-        # Preserve the original XLA ceil(log2) producer's rounding at powers
-        # of two. Recomputing it inside Mosaic can change the encoded scale.
-        scale = scale_ref[:]
-        quantized = (values / scale[:, None]).astype(jnp.float8_e4m3fn)
-        # Native bitcast packs the second-minor dimension. Feature-major
-        # FP8 therefore becomes the writer's 32 packed int32 feature rows.
-        words = pltpu.bitcast(quantized.T, jnp.int32)
-        packed = jnp.concatenate(
-            (
-                words,
-                jax.lax.bitcast_convert_type(scale, jnp.int32)[None, :],
-            ),
-            axis=0,
-        )
-        active = jnp.arange(padded) < count
-        # Include columns in the same gather; both use the identical permutation.
-        sorted_values = _tiled_gather(
-            jnp.concatenate((packed, column_ref[:][None, :]), axis=0), order
-        )
-        value_out[:, :] = jnp.where(active[None, :], sorted_values[:33], 0)
-        column_out[:] = jnp.where(active, sorted_values[33], 0)
-
-    return pl.pallas_call(
-        kernel,
-        out_shape=(
-            jax.ShapeDtypeStruct((padded,), jnp.int32),
-            jax.ShapeDtypeStruct((33, padded), jnp.int32),
-        ),
-        in_specs=(
-            pl.BlockSpec((padded, 128), lambda: (0, 0)),
-            pl.BlockSpec((padded,), lambda: (0,)),
-            pl.BlockSpec((padded,), lambda: (0,)),
-            pl.BlockSpec((padded,), lambda: (0,)),
-        ),
-        out_specs=(pl.BlockSpec(), pl.BlockSpec()),
-        name="indexer_sorted_fp8_prepare",
-    )(
-        jnp.pad(keys, ((0, padded - count), (0, 0))),
-        jnp.pad(columns, (0, padded - count)),
-        jnp.pad(order, (0, padded - count)),
-        jnp.pad(scales, (0, padded - count), constant_values=1),
-    )
-
-
-def _tiled_gather(values, order):
-    """Mosaic permits one 128-lane source register per dynamic gather."""
-    outputs = []
-    for output in range(order.shape[0] // 128):
-        indices = order[output * 128 : (output + 1) * 128]
-        local = jnp.broadcast_to(indices[None, :] % 128, (values.shape[0], 128))
-        result = jnp.zeros(local.shape, values.dtype)
-        for source in range(values.shape[1] // 128):
-            part = jnp.take_along_axis(
-                values[:, source * 128 : (source + 1) * 128], local, axis=1
-            )
-            result = jnp.where(indices[None, :] // 128 == source, part, result)
-        outputs.append(result)
-    return jnp.concatenate(outputs, axis=1)
+    )(pages, columns, values, cache)

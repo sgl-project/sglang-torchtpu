@@ -1,5 +1,4 @@
 # Adapted from vllm-project/vllm-torchtpu (Apache-2.0).
-# Source: src/vllm_torchtpu/kernels/deepseek_v41/index_selection/fp8/sparse_logits.py
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """FP8 pair-union scoring with contiguous per-query output windows."""
@@ -14,16 +13,16 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang_tpu.kernels.index_selection.fp8.cache import PAGE_RECORDS, PAGE_ROWS
 from sglang_tpu.kernels.index_selection.fp8.mqa_logits.utils import (
     QueryTile,
-    _dma_rows,
-    _head_order,
-    _next_query_tile,
-    _reduce_heads,
-    _reduce_on_mxu,
-    _weighted_selector,
+    dma_rows,
+    head_order,
+    next_query_tile,
+    reduce_heads,
+    reduce_on_mxu,
+    weighted_selector,
 )
+from sglang_tpu.kernels.index_selection.fp8.pages import TOKENS_PER_ROW, key_fields
 from sglang_tpu.models.deepseek_v41.kernels.index_candidates.tuned import (
     PACKED_FP8_PREPARED_MQA_CONFIG,
     PACKED_FP8_PREPARED_PAIRS,
@@ -68,15 +67,16 @@ def _kernel(
     keys = pltpu.annotate(keys, no_store=True)
     weights = pltpu.annotate(weights, no_store=True)
     tokens, heads, dim = weights.shape[0], weights.shape[1], q.shape[-1]
+    fields = key_fields(dim)
     q_tile, mxu, sublanes = config.query_tile, info.mxu_column_size, info.num_sublanes
     pairs = PACKED_FP8_PREPARED_PAIRS
     begin, width = query_start[()], out.shape[1]
     group_rows = pool.shape[0] // (offsets.shape[0] - 1)
     next_query = partial(
-        _next_query_tile, offsets=offsets, tile_size=q_tile, end=begin + out.shape[0]
+        next_query_tile, offsets=offsets, tile_size=q_tile, end=begin + out.shape[0]
     )
-    lanes = jnp.arange(PAGE_RECORDS)
-    owners = _head_order(
+    lanes = jnp.arange(TOKENS_PER_ROW)
+    owners = head_order(
         jnp.repeat(jnp.arange(q_tile), heads)[:, None], q_tile, sublanes
     )[:, 0]
     selector = (jnp.arange(q_tile)[:, None] == owners[None, :]).astype(jnp.bfloat16)
@@ -116,7 +116,7 @@ def _kernel(
         destination = queries.at[pl.ds(slot * q_tile, q_tile)]
         if not wait:
             destination[...] = jnp.zeros(destination.shape, destination.dtype)
-        _dma_rows(
+        dma_rows(
             q,
             destination,
             q_sem.at[slot],
@@ -130,7 +130,7 @@ def _kernel(
         )
 
     def load_keys(query, buffer, wait=False):
-        count = pl.cdiv(limit(query), PAGE_RECORDS) * PAGE_ROWS
+        count = pl.cdiv(limit(query), TOKENS_PER_ROW) * fields
 
         @pl.when(count > 0)
         def transfer():
@@ -146,13 +146,13 @@ def _kernel(
 
     def release(slot):
         src = output(slot)
-        _dma_rows(src, src, write_sem.at[slot], counts[slot], wait=True)
+        dma_rows(src, src, write_sem.at[slot], counts[slot], wait=True)
 
     def visible(row, offset):
         # Window mask in output columns; column zero is union token offset.
         start, split, end1, end2 = (windows[row * 4 + i] - offset for i in range(4))
-        shape = (width // PAGE_RECORDS, PAGE_RECORDS)
-        positions = lax.broadcasted_iota(jnp.int32, shape, 0) * PAGE_RECORDS
+        shape = (width // TOKENS_PER_ROW, TOKENS_PER_ROW)
+        positions = lax.broadcasted_iota(jnp.int32, shape, 0) * TOKENS_PER_ROW
         positions += lax.broadcasted_iota(jnp.int32, shape, 1)
         return ((positions >= start) & (positions < end1)) | (
             (positions >= split) & (positions < end2)
@@ -163,24 +163,26 @@ def _kernel(
         # Every output column is overwritten, so the buffer needs no -inf fill.
         query_rows = rows(query)
         start = windows[query_rows[1] * 4]
-        aligned_start = start // PAGE_RECORDS * PAGE_RECORDS
+        aligned_start = start // TOKENS_PER_ROW * TOKENS_PER_ROW
         window = scores[
             slot,
             1:2,
-            pl.ds(pl.multiple_of(aligned_start, PAGE_RECORDS), width + PAGE_RECORDS),
+            pl.ds(
+                pl.multiple_of(aligned_start, TOKENS_PER_ROW), width + TOKENS_PER_ROW
+            ),
         ]
-        shift = PAGE_RECORDS - start % PAGE_RECORDS
-        rotated = pltpu.roll(window.reshape(-1, PAGE_RECORDS), shift, axis=1)
+        shift = TOKENS_PER_ROW - start % TOKENS_PER_ROW
+        rotated = pltpu.roll(window.reshape(-1, TOKENS_PER_ROW), shift, axis=1)
         rotated = jnp.where(lanes[None, :] < shift, rotated[:-1], rotated[1:])
         # Dense [pages, 128] masks cost far less than per-fragment [2, 128] ones.
         scores[slot, 1:2, pl.ds(0, width)] = jnp.where(
             visible(query_rows[1], start), rotated, -jnp.inf
         ).reshape(1, -1)
-        first = scores[slot, 0:1, pl.ds(0, width)].reshape(-1, PAGE_RECORDS)
+        first = scores[slot, 0:1, pl.ds(0, width)].reshape(-1, TOKENS_PER_ROW)
         scores[slot, 0:1, pl.ds(0, width)] = jnp.where(
             visible(query_rows[0], 0), first, -jnp.inf
         ).reshape(1, -1)
-        _dma_rows(
+        dma_rows(
             output(slot),
             out,
             write_sem.at[slot],
@@ -196,13 +198,13 @@ def _kernel(
                 keys[
                     buffer,
                     pl.ds(
-                        (fragment * mxu + offset) // PAGE_RECORDS * PAGE_ROWS,
-                        PAGE_ROWS - 1,
+                        (fragment * mxu + offset) // TOKENS_PER_ROW * fields,
+                        fields - 1,
                     ),
                 ],
                 q.dtype,
             )
-            for offset in range(0, mxu, PAGE_RECORDS)
+            for offset in range(0, mxu, TOKENS_PER_ROW)
         ]
 
     def body(state):
@@ -225,8 +227,8 @@ def _kernel(
             slot, buffer = slot_of(step, p), key_buffer(step, p)
             query_rows = rows(query)
             weight = jnp.concatenate([weights[r][:, None] for r in query_rows])
-            head_weights = _head_order(weight, q_tile, sublanes)
-            mxu_selector = _weighted_selector(
+            head_weights = head_order(weight, q_tile, sublanes)
+            mxu_selector = weighted_selector(
                 selector, weights, query_rows, sublanes=sublanes
             )
             # A short group's resident second row is the next group's query;
@@ -236,7 +238,7 @@ def _kernel(
                 if resident
                 else queries[pl.ds(slot * q_tile, q_tile)]
             )
-            lhs = _head_order(source.reshape(q_tile * heads, dim), q_tile, sublanes)
+            lhs = head_order(source.reshape(q_tile * heads, dim), q_tile, sublanes)
 
             def qk(fragment):
                 parts = key_parts(buffer, fragment)
@@ -258,24 +260,24 @@ def _kernel(
                 return jnp.maximum(logits.astype(jnp.bfloat16), jnp.bfloat16(0))
 
             def store(products, fragment, stage, count):
-                values = _reduce_heads(
+                values = reduce_heads(
                     products,
                     head_weights,
                     mxu_selector,
                     sublanes=sublanes,
                     # Stagger the MXU reductions of the group's pairs.
-                    use_mxu=_reduce_on_mxu(
+                    use_mxu=reduce_on_mxu(
                         fragment * pairs + p, stage, count, every=5, drain=2
                     ),
                 )
-                for offset in range(0, mxu, PAGE_RECORDS):
-                    page = (fragment * mxu + offset) // PAGE_RECORDS
+                for offset in range(0, mxu, TOKENS_PER_ROW):
+                    page = (fragment * mxu + offset) // TOKENS_PER_ROW
                     scale = lax.bitcast_convert_type(
-                        keys[buffer, pl.ds((page + 1) * PAGE_ROWS - 1, 1)], jnp.float32
+                        keys[buffer, pl.ds((page + 1) * fields - 1, 1)], jnp.float32
                     )
                     # Unmasked; windows are applied once per output row.
-                    scores[slot, :, pl.ds(page * PAGE_RECORDS, PAGE_RECORDS)] = (
-                        values[:, offset : offset + PAGE_RECORDS] * scale
+                    scores[slot, :, pl.ds(page * TOKENS_PER_ROW, TOKENS_PER_ROW)] = (
+                        values[:, offset : offset + TOKENS_PER_ROW] * scale
                     )
 
             return qk, store
@@ -363,21 +365,22 @@ def fp8_gathered_mqa_logits(
     info = cast(pltpu.TpuInfo, pltpu.get_tpu_info())
     groups = query_start_loc.shape[0] - 1
     group_rows = keys.shape[0] // groups
-    if keys.shape != (groups * group_rows, PAGE_RECORDS) or group_rows % PAGE_ROWS:
+    fields = key_fields(q.shape[-1])
+    if keys.shape != (groups * group_rows, TOKENS_PER_ROW) or group_rows % fields:
         raise ValueError("Gathered K must contain equal packed regions per group")
     if windows.shape != (q.shape[0], 4) or windows.dtype != jnp.int32:
         raise ValueError("Query windows must be int32 [queries, 4]")
-    capacity = group_rows // PAGE_ROWS * PAGE_RECORDS
+    capacity = group_rows // fields * TOKENS_PER_ROW
     if output_width > capacity:
         raise ValueError("Output width exceeds gathered K capacity")
     tile = pl.cdiv(capacity, info.mxu_column_size) * info.mxu_column_size
-    padded_rows = tile // PAGE_RECORDS * PAGE_ROWS
+    padded_rows = tile // TOKENS_PER_ROW * fields
     keys = jnp.pad(
-        keys.reshape(groups, group_rows, PAGE_RECORDS),
+        keys.reshape(groups, group_rows, TOKENS_PER_ROW),
         ((0, 0), (0, padded_rows - group_rows), (0, 0)),
-    ).reshape(-1, PAGE_RECORDS)
+    ).reshape(-1, TOKENS_PER_ROW)
     config = replace(PACKED_FP8_PREPARED_MQA_CONFIG, key_tile=tile)
-    width = pl.cdiv(output_width, PAGE_RECORDS) * PAGE_RECORDS
+    width = pl.cdiv(output_width, TOKENS_PER_ROW) * TOKENS_PER_ROW
     q_tile, heads, dim = config.query_tile, q.shape[1], q.shape[2]
     if q_tile != 2:
         raise ValueError("Contiguous pair scoring requires a two-query tile")
@@ -389,7 +392,7 @@ def fp8_gathered_mqa_logits(
     scratch = (
         pltpu.VMEM((slots * q_tile, heads, dim), q.dtype),
         pltpu.VMEM((config.key_buffers, padded_rows, dim), jnp.int32),
-        pltpu.VMEM((slots, q_tile, tile + PAGE_RECORDS), jnp.float32),
+        pltpu.VMEM((slots, q_tile, tile + TOKENS_PER_ROW), jnp.float32),
         pltpu.SMEM((slots,), jnp.int32),
         pltpu.SemaphoreType.DMA((config.key_buffers,)),
         pltpu.SemaphoreType.DMA((slots, q_tile)),

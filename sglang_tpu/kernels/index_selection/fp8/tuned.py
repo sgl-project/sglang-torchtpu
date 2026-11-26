@@ -1,5 +1,4 @@
 # Adapted from vllm-project/vllm-torchtpu (Apache-2.0).
-# Source: src/vllm_torchtpu/kernels/deepseek_v41/index_selection/fp8/tuned.py
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """TPU v7 tiles and pipeline depths for the packed FP8 indexer."""
@@ -8,8 +7,6 @@ import math
 from dataclasses import astuple, dataclass
 
 from jax.experimental.pallas import tpu as pltpu
-
-from .cache import PAGE_RECORDS, PAGE_ROWS
 
 
 @dataclass(frozen=True)
@@ -32,7 +29,6 @@ class PagedMQAConfig:
 
 # TPU v7, H32/D128, transposed packed FP8 pages.
 PACKED_FP8_MQA_CONFIG = PagedMQAConfig(6, 65536, 10, 4)
-
 # Bound short-output padding to one tile; 4K is the smallest measured choice.
 PACKED_FP8_DENSE_MIN_KEY_TILE = 4096
 
@@ -40,9 +36,6 @@ PACKED_FP8_DENSE_MIN_KEY_TILE = 4096
 def paged_mqa_key_tile(width: int, page_size: int, cap: int) -> int:
     """Balance tiles at the device MXU-column granularity."""
     alignment = math.lcm(page_size, pltpu.get_tpu_info().mxu_column_size)
-    # Tiny storage pages use padded owner rows; keep the same K-buffer budget.
-    page_rows = (PAGE_ROWS * page_size + PAGE_RECORDS - 1) // PAGE_RECORDS
-    cap = cap * PAGE_ROWS * page_size // (PAGE_RECORDS * page_rows)
     cap = max(alignment, cap // alignment * alignment)
     tiles = max(1, (width + cap - 1) // cap)
     tile = (width + tiles * alignment - 1) // (tiles * alignment) * alignment
