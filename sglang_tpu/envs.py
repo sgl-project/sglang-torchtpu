@@ -868,6 +868,13 @@ class TpuEnvs:
     # rows per EP rank and all-gathers a larger one. Needs
     # SGLANG_TPU_DSV41_FUSED_EP=1 (checked at startup).
     SGLANG_TPU_DSV41_FUSED_EP_DISPATCH = EnvStr("all_gather")
+    # DeepSeek-V4.1 fused mHC post-pre: one Pallas call per sublayer boundary
+    # (post, collapse, next input norm, next coefficients) on batches
+    # of at least SGLANG_TPU_DSV41_FUSED_MHC_MIN_TOKENS rows; smaller batches
+    # keep the torch path (models/deepseek_v41/fused_mhc.py). Read when the
+    # plugin hooks are built; False registers nothing.
+    SGLANG_TPU_DSV41_FUSED_MHC = EnvBool(False)
+    SGLANG_TPU_DSV41_FUSED_MHC_MIN_TOKENS = EnvInt(1)
 
     # DP routing by pending uncached prompt tokens (dp_prompt_backlog.py,
     # hooks/dp_prompt_backlog.py). 0 disables. m > 0: leave the stock rank when its

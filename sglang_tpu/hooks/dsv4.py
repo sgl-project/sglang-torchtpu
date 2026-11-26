@@ -435,6 +435,13 @@ class LiveHcSubLayer:
         layer = self._layer
         return layer._hc_attn_bf16_parts if self._attn else layer._hc_ffn_bf16_parts
 
+    @property
+    def fused_fn_parts(self):
+        """fn's bf16 split buffer for the fused V4.1 mHC seam
+        (models/deepseek_v41/fused_mhc.py), None if not built."""
+        name = "hc_attn_fn_parts" if self._attn else "hc_ffn_fn_parts"
+        return getattr(self._layer, name, None)
+
 
 def tpu_dsv4_live_hc_sublayers(result, layer, *args, **kwargs) -> None:
     """AFTER _init_hyper_connections: read the hyper-connections live off CUDA."""

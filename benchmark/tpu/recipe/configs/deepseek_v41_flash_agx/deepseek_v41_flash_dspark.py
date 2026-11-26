@@ -85,6 +85,10 @@ CONFIG["runtime_env"].update(
         # above; rows without a tuned push recipe run the plain K32Z program.
         "SGLANG_TPU_DSV41_EXPERT_FORMAT": "k32z",
         "SGLANG_TPU_DSV41_FUSED_EP_DISPATCH": "auto",
+        # mHC post-pre at each sublayer boundary as one Pallas kernel
+        # (kernels/mhc_v41.py); within 1 bf16 ulp of f64 and no worse than the
+        # torch path. Set SGLANG_TPU_DSV41_FUSED_MHC=0 to keep the torch path.
+        "SGLANG_TPU_DSV41_FUSED_MHC": "1",
         # Spec-step host pipelining: upload the DSV4.1 metadata fields in one
         # packed transfer, build the slot-only draft/verify attention metadata
         # ahead of the blocking reads, and build the position-dependent rows on

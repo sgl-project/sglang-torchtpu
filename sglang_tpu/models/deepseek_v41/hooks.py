@@ -399,6 +399,26 @@ prepare_tpu_dsv41_fused_oproj, MQALayer._project_wo_a / _project_wo_b
        sglang_tpu.models.deepseek_v41.output_projection.
   Upstream PR or issue: not filed.
   Remove when: core grows an output-projection seam for fused kernels.
+
+cache_fn_parts, post_fusion
+  (registered only with SGLANG_TPU_DSV41_FUSED_MHC=1, see fused_mhc_hook_specs)
+  Why: the V4.1 mHC post-pre step (post, collapse with the lagged pre, next input
+       RMSNorm, next coefficients) picks its fused kernels in
+       deepseek_v4_mhc._post_fusion by GPU platform checks and has no backend
+       seam; on TPU it runs the torch post, then the combine, norm and
+       _mix_stats_impl as separate XLA ops. The TPU Pallas post-pre kernel
+       (sglang_tpu/kernels/mhc_v41.py) must stay out of core.
+  How: AFTER DeepseekV4DecoderLayerBase.refresh_mhc_norm_weight_cache splits
+       each hyper-connection's fp32 fn into bf16 parts once (layer buffers)
+       and builds the kernel's custom op before any trace. AROUND
+       deepseek_v4_mhc._post_fusion is called with a next boundary, at
+       least SGLANG_TPU_DSV41_FUSED_MHC_MIN_TOKENS rows and the kernel's
+       shapes to the kernel and returns HcState(streams, pre, HcNormed,
+       next coefficients), as the core's fused boundaries do; everything else
+       calls the original. Bodies in sglang_tpu.models.deepseek_v41.fused_mhc.
+  Upstream PR or issue: not filed.
+  Remove when: the mHC post fusion dispatches through a backend registry that
+       sglang_tpu fills from init_backend().
 """
 
 from __future__ import annotations
@@ -1308,6 +1328,31 @@ def dspark_markov_shard_hook_specs():
     ]
 
 
+def fused_mhc_hook_specs():
+    """The fused mHC post-pre hooks, only when SGLANG_TPU_DSV41_FUSED_MHC=1. Otherwise
+    nothing is registered and the default path is untouched."""
+    from sglang.srt.plugins.hook_registry import HookType
+    from sglang_tpu.envs import envs as tpu_envs
+
+    if not tpu_envs.SGLANG_TPU_DSV41_FUSED_MHC.get():
+        return []
+    from sglang_tpu.models.deepseek_v41.fused_mhc import cache_fn_parts, post_fusion
+
+    return [
+        (
+            "sglang.srt.models.deepseek_v4.DeepseekV4DecoderLayerBase"
+            ".refresh_mhc_norm_weight_cache",
+            cache_fn_parts,
+            HookType.AFTER,
+        ),
+        (
+            "sglang.srt.models.deepseek_v4_mhc._post_fusion",
+            post_fusion,
+            HookType.AROUND,
+        ),
+    ]
+
+
 def engram_flush_hook_specs():
     """The early Engram commit flush, only with SGLANG_TPU_DSV41_FLUSH_ENGRAM_AT_LENGTH_READ=1."""
     from sglang.srt.plugins.hook_registry import HookType
@@ -1527,4 +1572,5 @@ def hook_specs():
         *engram_flush_hook_specs(),
         *fused_oproj_hook_specs(),
         *dspark_markov_shard_hook_specs(),
+        *fused_mhc_hook_specs(),
     ] + fused_ep_hook_specs()
