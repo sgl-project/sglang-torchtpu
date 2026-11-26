@@ -298,13 +298,15 @@ built-in platform with `PlatformEnum.OOT`, keeps `is_tpu()` true, and adds:
   (`SGLANG_DIFFUSION_PLATFORM_OVERRIDE=tpu`) keeps the default and still hangs
   with CFG-parallel and Ulysses on the two-stage pipeline.
 - Runtime patches applied at worker init (`multimodal_gen/worker.py`), each with
-  the debt header: `rope.py` (RoPE without stride-2 lane access) and
+  the debt header: `rope.py` (RoPE without stride-2 lane access),
   `minimax_h3.py` (MiniMax-H3 packed sequences padded to a multiple of 512
   rows, only the 50 DiT blocks compiled, the breakable-CUDA-graph break point
   skipped, regionally compiled blocks marked spmd-safe, the embedding built
-  with shapes that do not move with the prompt length); worker init also
-  registers srt's ATen fallbacks (`patches._register_aten_fallbacks`, e.g.
-  `logaddexp`).
+  with shapes that do not move with the prompt length) and `qwen_image21.py`
+  (Qwen-Image 2.1 prefix padded to 512 rows with its real length and image rows
+  on device, prefix-then-target resumable attention, pair-swap RoPE, prompt
+  tokens padded to 256, spmd-safe regional blocks); worker init also registers
+  srt's ATen fallbacks (`patches._register_aten_fallbacks`, e.g. `logaddexp`).
 
 Gates that take the OOT arm, with the same outcome as the built-in platform:
 

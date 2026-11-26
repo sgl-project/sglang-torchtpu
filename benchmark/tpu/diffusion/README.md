@@ -15,6 +15,7 @@ and run Ulysses across the two cores of a chip with a K/V all-gather ring across
 | `wan22_a14b.sh` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers`, `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | 8 | CFG 2 x Ulysses 2 x ring 2 |
 | `ltx2.sh` | `Lightricks/LTX-2` | 8 | CFG 2 x Ulysses 4 |
 | `pika_h3_flex.sh` | `Pika-Labs/Pika-H3-Flex` | 8 | Ulysses 8, LoRA adapters unmerged |
+| `qwen_image21.sh` | `Qwen/Qwen-Image-2.1` | 1 or 8 | Ulysses = cores (32 heads) |
 
 Override `NUM_GPUS`, `PARALLEL_ARGS`, `MODEL_ARGS`, `HOST` (default `127.0.0.1`) or `PORT` from the environment
 (an empty `PARALLEL_ARGS`/`MODEL_ARGS` drops the recipe's flags). Flags in `LIBTPU_INIT_ARGS` are kept; the clock and
@@ -42,6 +43,10 @@ stage boundaries (otherwise queued denoising work is counted in the decode stage
 | Pika-H3-Flex | T2VA 1344x768, 5 s, 6 steps | 8 | 11.2 s | 1.14 s | 3.2 s | 83.4 GiB |
 | Pika-H3-Flex | FL2VA 1344x768 (first frame), 5 s, 6 steps | 8 | 12.0 s | 1.29 s | 3.2 s | 84.1 GiB |
 | Pika-H3-Flex | Ref2VA 1344x768 (2 images, video with audio), 5 s, 6 steps | 8 | 57.5 s | 5.65 s | 3.2 s | 93.0 GiB |
+| Qwen-Image-2.1 | T2I 1024x1024, 40 steps | 8 | 1.31 s | 0.026 s | 0.16 s | 35.7 GB |
+| Qwen-Image-2.1 | T2I 2048x2048, 40 steps | 1 | 24.2 s | | | 93.6 GB |
+| Qwen-Image-2.1 | T2I 2048x2048, 40 steps | 8 | 5.19 s | 0.103 s | 0.59 s | 86.0 GB |
+| Qwen-Image-2.1 | Edit 1024x1024, 40 steps | 8 | 1.79 s | 0.034 s | 0.16 s | 41.8 GB |
 
 
 ## Example requests
