@@ -549,7 +549,8 @@ class TpuEnvs:
     # Muse decode Wave-7: fast B=64 sparse decode execution mode inside fused_decode_sparse
     # (0 = stock; 1 = single-chunk 64x256 VPU routing + unrolled prologue/RS + m=8 fast bucket
     # + loop-free <=8-row gather/scatter; 2 = 1 + contiguous w1_2x_w2_1x + spec_prime;
-    # 3 = dense-rows B=64 mode eliminating token pack/gather/switch/scatter).
+    # 3 = dense-rows B=64 mode eliminating token pack/gather/switch/scatter;
+    # 4 = Wave-10 Pareto preset (nc_split512 + m_buckets=(16,32) + cur1 epi + route_fast + fast_plan=2)).
     SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_B64 = EnvInt(0)
     # Muse decode Wave-7: L0/L61 FP8 sparse decode streaming variant ("" = stream3_half,
     # "w1_k2_w2_1x" = 3x16 MiB contiguous K-half streaming, "w1_k2_w8a8" = contiguous K-half + W8A8).

@@ -365,6 +365,18 @@ def default_sparse_decode_config(
         route_fast,
         fast_plan,
     ) = _read_sparse_w9_sub_knobs()
+    if fast_b64 == 4:
+        import os
+
+        if os.environ.get("SGLANG_TPU_MUSE_KERNEL_DECODE_NC_SPLIT512") is None:
+            nc_split512 = True
+        if os.environ.get("SGLANG_TPU_MUSE_KERNEL_DECODE_ROUTE_FAST") is None:
+            route_fast = True
+        if (
+            os.environ.get("SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_PLAN") is None
+            and fast_plan == 0
+        ):
+            fast_plan = 2
     spec_prime_fast, spec_home_slot = _read_spec_prime_fast_knobs()
     if route_fast and not spec_prime_fast:
         # Silicon-proven (#2647 / #2767): vertical ROUTE_FAST (~3.5 us) finishes before
@@ -514,6 +526,7 @@ def default_sparse_decode_config(
         route_chunk_rows=32,
         static_holder_mask=static_mask,
         spec_prime_parts=spec_eff,
+        fast_b64_epi_pro=(fast_b64 >= 4),
         **route_kw,
     )
 
@@ -2754,7 +2767,12 @@ def run_muse_sparse_experts_and_rs_from_vmem(
 
             if cfg.fast_b64_epi_pro:
 
-                @pl.when(cur_rows <= 8)
+                @pl.when(cur_rows == 1)
+                def _gather_one():
+                    t0 = r_scratch.packed_tok_ids[base_pos]
+                    io_3d_buf[pl.ds(0, 1), :, :] = x_3d_buf[pl.ds(t0, 1), :, :]
+
+                @pl.when((cur_rows > 1) & (cur_rows <= 8))
                 def _gather_le8():
                     ts8 = [
                         r_scratch.packed_tok_ids[
@@ -2911,7 +2929,16 @@ def run_muse_sparse_experts_and_rs_from_vmem(
 
             if cfg.fast_b64_epi_pro:
 
-                @pl.when(cur_rows <= 8)
+                @pl.when(cur_rows == 1)
+                def _acc_one():
+                    tok = r_scratch.packed_tok_ids[base_pos]
+                    w = r_scratch.packed_tok_w[base_pos]
+                    ys = io_3d_buf[pl.ds(0, 1), :, :].astype(jnp.float32) * w
+                    accum_3d[pl.ds(tok, 1), :, :] = (
+                        accum_3d[pl.ds(tok, 1), :, :] + ys
+                    )
+
+                @pl.when((cur_rows > 1) & (cur_rows <= 8))
                 def _acc_le8():
                     y8 = io_3d_buf[pl.ds(0, 8), :, :]
                     for s in range(8):
@@ -5065,6 +5092,8 @@ def fused_decode_sparse_from_logits(
         f"{f'_sp{config.spec_prime_parts}' if config.spec_prime_parts else ''}"
         f"{'_rf1' if config.route_fast else ''}"
         f"{f'_fp{config.fast_plan}' if config.fast_plan else ''}"
+        f"{'_ns1' if config.nc_split512 else ''}"
+        f"{'_fe1' if config.fast_b64_epi_pro else ''}"
         f"{'_us1' if config.unroll_strips else ''}"
         f"{'_fgs1' if config.fast_gs else ''}"
         f"{f'_rc{config.free_rank_cap}' if config.free_rank_cap else ''}"

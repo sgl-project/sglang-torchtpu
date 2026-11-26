@@ -4226,6 +4226,371 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
                     comp.memory_analysis().generated_code_size_in_bytes, 0
                 )
 
+    def test_w10_r16_fast_plan_cur1_epi_and_tail_planner(self):
+        """Verify R<=16 unrolled fast_plan, tail-excess replica planner, and FAST_B64=4 cur1 parity + AOT."""
+        import dataclasses
+        import numpy as np
+
+        mip = _load_pkg_module(
+            "moe_imbalance_planner", _MUSE_DIR / "moe_imbalance_planner.py"
+        )
+        v1_mod = _load_pkg_module(
+            "fused_decode_sparse", _MUSE_DIR / "fused_decode_sparse.py"
+        )
+
+        # 1. Verify minimax tail-excess planner modes & multi-holder (_h2) across EP=8/16 & R=8/12.
+        rng = np.random.default_rng(20261130)
+        skew_c = np.full(256, 20.0, dtype=np.float64)
+        skew_c[:32] = np.linspace(500.0, 2200.0, 32)
+        skew_c[128:144] = np.linspace(250.0, 900.0, 16)
+        for ep, r_slots in ((8, 12), (16, 8)):
+            o2c = [r >> 1 for r in range(ep)]
+            for mode in (
+                "bottleneck_owner",
+                "bottleneck_owner_tail_p3",
+                "bottleneck_owner_tail_p3_h2",
+            ):
+                plan = mip.build_preloaded_replica_plan(
+                    skew_c,
+                    num_owners=ep,
+                    num_replicas_per_owner=r_slots,
+                    owner_to_chip=o2c,
+                    objective="decode_active",
+                    selection_mode=mode,
+                )
+                mip.validate_replica_plan(plan)
+                self.assertEqual(plan.replica_meta.shape, (4, ep * r_slots))
+
+        # 2. Verify FAST_B64=4 single-knob config vs legacy FAST_B64=0 defaults.
+        clean_env = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith("SGLANG_TPU_MUSE_")
+        }
+        with mock.patch.dict(os.environ, clean_env, clear=True):
+            cfg_legacy = v1_mod.default_sparse_decode_config(64, 8, 512)
+            self.assertFalse(cfg_legacy.nc_split512 or cfg_legacy.route_fast)
+            self.assertEqual(cfg_legacy.fast_plan, 0)
+            self.assertFalse(cfg_legacy.fast_b64_epi_pro)
+
+        with mock.patch.dict(
+            os.environ,
+            {**clean_env, "SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_B64": "4"},
+            clear=True,
+        ):
+            c32 = v1_mod.default_sparse_decode_config(32, 8, 512)
+            c64 = v1_mod.default_sparse_decode_config(64, 8, 512)
+            c128 = v1_mod.default_sparse_decode_config(128, 8, 512)
+            self.assertTrue(c64.nc_split512 and c64.route_fast and c64.fast_b64_epi_pro)
+            self.assertFalse(c64.fast_gs or c64.unroll_strips)
+            self.assertEqual(c64.fast_plan, 2)
+            self.assertEqual(c64.m_buckets, (16, 32))
+            self.assertEqual(c32.m_buckets, (16, 32))
+            self.assertEqual(c64.weight_mode, "stream3")
+            self.assertEqual(c128.weight_mode, "half_n")
+            self.assertTrue(c128.fast_b64_epi_pro and c128.route_fast)
+            self.assertEqual(c128.fast_plan, 2)
+
+        try:
+            import jax
+            import jax.numpy as jnp
+            from jax.experimental import pallas as pl
+            from jax.experimental.pallas import tpu as pltpu
+            from jax.experimental.topologies import get_topology_desc
+            from jax.sharding import Mesh, PartitionSpec as P
+        except Exception as exc:
+            self.skipTest(f"JAX/Pallas TPU unavailable: {exc}")
+
+        # 3. Eager race/nan-detect Interpret parity for R=12/16 fast_plan, nc_split512, and cur_rows==1 gather/scatter.
+        from jax import lax
+
+        routing_mod = _load_pkg_module(
+            "fused_decode_routing", _MUSE_DIR / "fused_decode_routing.py"
+        )
+        interp_p = {
+            "dma_execution_mode": "eager",
+            "detect_races": True,
+            **({"uninitialized_memory": "nan"} if "uninitialized_memory" in pltpu.InterpretParams.__annotations__ else {}),
+        }
+
+        # 3a. R=12 & R=16 unrolled vs fori_loop planner + exec_plan bit-exact parity.
+        for cur_ep, cur_r in ((8, 12), (8, 16), (16, 12)):
+            e_loc = 256 // cur_ep
+            max_ex = e_loc + cur_r
+            cur_plan = mip.build_preloaded_replica_plan(
+                skew_c,
+                num_owners=cur_ep,
+                num_replicas_per_owner=cur_r,
+                owner_to_chip=[r >> 1 for r in range(cur_ep)],
+                objective="decode_active",
+                selection_mode="bottleneck_owner_tail_p3",
+            )
+            counts_np = rng.integers(0, 6, size=(1, 256), dtype=np.int32)
+
+            def _run_plan_kernel(fast_u: int):
+                sc_spec = routing_mod.routing_scratch_shapes(
+                    64, max_ex, topk=8, num_experts=256
+                )
+                extra_specs = (
+                    pltpu.SMEM((cur_ep,), jnp.int32),
+                    pltpu.SMEM((8,), jnp.int32),
+                    pltpu.SMEM((e_loc,), jnp.int32),
+                    pltpu.SMEM((cur_r,), jnp.int32),
+                )
+
+                def _kern(rm_ref, cnt_ref, sup_out, exec_id_out, exec_src_out, exec_cnt_out, *sc_refs):
+                    rs = routing_mod.RoutingScratch(*sc_refs[: len(sc_spec)])
+                    ol, mv, sup, hs = sc_refs[len(sc_spec) :]
+
+                    @pl.loop(0, 256)
+                    def _cp(e):
+                        rs.counts_smem[0, e] = cnt_ref[0, e]
+
+                    mip.plan_preloaded_replicas_smem(
+                        jnp.int32(0), e_loc, cur_ep, cur_r,
+                        rs.counts_smem, rm_ref, sup, hs, ol,
+                        cost_mode="tiles", tile_m=32, moved_flag_smem=mv,
+                        fast_unroll=fast_u,
+                    )
+                    for le in range(e_loc):
+                        sup_out[le] = sup[le]
+                    n_ex = routing_mod.build_exec_plan_from_masks_smem(
+                        jnp.int32(0), e_loc, cur_r, sup, hs, rs,
+                        fast_plan=bool(fast_u),
+                    )
+                    exec_cnt_out[0] = n_ex
+
+                    @pl.loop(0, max_ex)
+                    def _out(i):
+                        ok = i < n_ex
+                        exec_id_out[i] = jnp.where(ok, rs.exec_expert_id[i], jnp.int32(-1))
+                        exec_src_out[i] = jnp.where(ok, rs.exec_weight_src[i], jnp.int32(-1))
+
+                sm = pl.BlockSpec(memory_space=pltpu.SMEM)
+                return pl.pallas_call(
+                    _kern,
+                    out_shape=(
+                        jax.ShapeDtypeStruct((e_loc,), jnp.int32),
+                        jax.ShapeDtypeStruct((max_ex,), jnp.int32),
+                        jax.ShapeDtypeStruct((max_ex,), jnp.int32),
+                        jax.ShapeDtypeStruct((1,), jnp.int32),
+                    ),
+                    grid_spec=pltpu.PrefetchScalarGridSpec(
+                        num_scalar_prefetch=0,
+                        grid=(1,),
+                        in_specs=(sm, sm),
+                        out_specs=(sm, sm, sm, sm),
+                        scratch_shapes=list(sc_spec) + list(extra_specs),
+                    ),
+                    interpret=pltpu.InterpretParams(**interp_p),
+                )(jnp.asarray(cur_plan.replica_meta, jnp.int32), jnp.asarray(counts_np, jnp.int32))
+
+            s_ref, id_ref, src_ref, n_ref = _run_plan_kernel(0)
+            s_fast, id_fast, src_fast, n_fast = _run_plan_kernel(2)
+            self.assertEqual(int(n_ref[0]), int(n_fast[0]))
+            self.assertTrue(np.array_equal(np.asarray(s_ref), np.asarray(s_fast)))
+            self.assertTrue(np.array_equal(np.asarray(id_ref), np.asarray(id_fast)))
+            self.assertTrue(np.array_equal(np.asarray(src_ref), np.asarray(src_fast)))
+
+        # 3b. Lightweight Interpret parity for nc_split512 (_fp4_gmm_chunked).
+        m_rows, k_dim, n_col, sb = 16, 4096, 1024, 512
+        x_small = jnp.asarray(rng.normal(0.0, 0.25, size=(m_rows, k_dim)), jnp.bfloat16)
+        w_u32_small = jnp.asarray(
+            rng.integers(0, 0xFFFFFFFF, size=(k_dim // 8, n_col), dtype=np.uint32)
+        )
+        sc_small = jnp.asarray(rng.uniform(0.01, 0.05, size=(k_dim // sb, n_col)), jnp.bfloat16)
+
+        def _run_gmm_test(nc_split: bool):
+            def _kern(x_r, w_r, s_r, o_r):
+                o_r[...] = v1_mod._fp4_gmm_chunked(
+                    x_r, w_r, s_r, m_rows, k_dim, 0, n_col, True, sb,
+                    hoist_scales=True, nc_split512=nc_split, k512_chain=False,
+                )
+
+            vm = pltpu.VMEM
+            return pl.pallas_call(
+                _kern,
+                out_shape=jax.ShapeDtypeStruct((m_rows, n_col), jnp.float32),
+                grid_spec=pltpu.PrefetchScalarGridSpec(
+                    num_scalar_prefetch=0, grid=(1,),
+                    in_specs=(pl.BlockSpec(memory_space=vm),) * 3,
+                    out_specs=pl.BlockSpec(memory_space=vm),
+                ),
+                interpret=pltpu.InterpretParams(**interp_p),
+            )(x_small, w_u32_small, sc_small)
+
+        gmm_ref = np.asarray(_run_gmm_test(False))
+        gmm_nc = np.asarray(_run_gmm_test(True))
+        np.testing.assert_allclose(gmm_nc, gmm_ref, atol=1e-3, rtol=1e-3)
+
+        # 3c. Lightweight Interpret parity for cur_rows==1 vs <=8 gather/scatter under uninitialized_memory="nan".
+        b_gs = 16
+        x_3d_in = jnp.asarray(rng.normal(0.0, 0.3, size=(b_gs, 32, 128)), jnp.bfloat16)
+        p_ids = np.array([3, 7, 11, 2], dtype=np.int32)  # exp0: cur_rows=1, exp1: cur_rows=3
+        p_w = np.array([0.8, 0.4, 0.35, 0.25], dtype=np.float32)
+        starts_np = np.array([0, 1, 4], dtype=np.int32)
+
+        def _run_cur1_gs_test(cur1_fast: bool):
+            def _kern2(x_r, ids_r, w_r, st_r, out_r):
+                def _body(io_b, acc):
+                    acc[...] = jnp.zeros((b_gs + 1, 32, 128), jnp.float32)
+
+                    def _step(k, _c):
+                        bp = st_r[k]
+                        cr = st_r[k + 1] - bp
+                        if cur1_fast:
+                            @pl.when(cr == 1)
+                            def _g1():
+                                t0 = ids_r[bp]
+                                io_b[pl.ds(0, 1), :, :] = x_r[pl.ds(t0, 1), :, :]
+
+                            @pl.when((cr > 1) & (cr <= 8))
+                            def _gm():
+                                ts8 = [ids_r[jnp.where(s < cr, bp + s, bp)] for s in range(8)]
+                                io_b[pl.ds(0, 8), :, :] = jnp.concatenate(
+                                    [x_r[pl.ds(t, 1), :, :] for t in ts8], axis=0
+                                )
+                        else:
+                            ts8 = [ids_r[jnp.where(s < cr, bp + s, bp)] for s in range(8)]
+                            io_b[pl.ds(0, 8), :, :] = jnp.concatenate(
+                                [x_r[pl.ds(t, 1), :, :] for t in ts8], axis=0
+                            )
+
+                        # Simulate m_rows=16 compute transforming row 0..cr and writing io_b[0..16]
+                        io_b[pl.ds(0, 16), :, :] = (
+                            io_b[pl.ds(0, 16), :, :].astype(jnp.float32) * 1.25
+                        ).astype(jnp.bfloat16)
+
+                        if cur1_fast:
+                            @pl.when(cr == 1)
+                            def _s1():
+                                tok = ids_r[bp]
+                                wt = w_r[bp]
+                                ys = io_b[pl.ds(0, 1), :, :].astype(jnp.float32) * wt
+                                acc[pl.ds(tok, 1), :, :] = acc[pl.ds(tok, 1), :, :] + ys
+
+                            @pl.when((cr > 1) & (cr <= 8))
+                            def _sm():
+                                y8 = io_b[pl.ds(0, 8), :, :]
+                                for s in range(8):
+                                    @pl.when(s < cr)
+                                    def _sc(_s=s):
+                                        tok = ids_r[bp + _s]
+                                        wt = w_r[bp + _s]
+                                        ys = y8[_s : _s + 1, :, :].astype(jnp.float32) * wt
+                                        acc[pl.ds(tok, 1), :, :] = acc[pl.ds(tok, 1), :, :] + ys
+                        else:
+                            y8 = io_b[pl.ds(0, 8), :, :]
+                            for s in range(8):
+                                @pl.when(s < cr)
+                                def _sc(_s=s):
+                                    tok = ids_r[bp + _s]
+                                    wt = w_r[bp + _s]
+                                    ys = y8[_s : _s + 1, :, :].astype(jnp.float32) * wt
+                                    acc[pl.ds(tok, 1), :, :] = acc[pl.ds(tok, 1), :, :] + ys
+                        return _c
+
+                    lax.fori_loop(0, 2, _step, jnp.int32(0))
+                    out_r[...] = acc[pl.ds(0, b_gs), :, :]
+
+                pl.run_scoped(
+                    _body,
+                    pltpu.VMEM((16, 32, 128), jnp.bfloat16),
+                    pltpu.VMEM((b_gs + 1, 32, 128), jnp.float32),
+                )
+
+            vm = pl.BlockSpec(memory_space=pltpu.VMEM)
+            sm = pl.BlockSpec(memory_space=pltpu.SMEM)
+            return pl.pallas_call(
+                _kern2,
+                out_shape=jax.ShapeDtypeStruct((b_gs, 32, 128), jnp.float32),
+                grid_spec=pltpu.PrefetchScalarGridSpec(
+                    num_scalar_prefetch=0, grid=(1,),
+                    in_specs=(vm, sm, sm, sm),
+                    out_specs=vm,
+                ),
+                interpret=pltpu.InterpretParams(**interp_p),
+            )(x_3d_in, jnp.asarray(p_ids, jnp.int32), jnp.asarray(p_w, jnp.float32), jnp.asarray(starts_np, jnp.int32))
+
+        gs_ref = np.asarray(_run_cur1_gs_test(False))
+        gs_cur1 = np.asarray(_run_cur1_gs_test(True))
+        self.assertTrue(np.all(np.isfinite(gs_cur1)))
+        self.assertTrue(np.array_equal(gs_ref, gs_cur1))
+
+        # 4. tpu7x:2x2x1 AOT compilation for FAST_B64=4 across B=64 (R=12) and B=128 (R=8).
+        ep, h, n1, i_dim, sb = 8, 4096, 8192, 4096, 512
+        e_local = 256 // ep
+        tpu_devs = get_topology_desc("tpu7x:2x2x1", platform="tpu").devices
+        if len(tpu_devs) >= 8:
+            tpu_mesh = Mesh(
+                np.array(
+                    sorted(tpu_devs, key=lambda d: (d.coords[1], d.coords[0], d.core_on_chip))
+                ),
+                ("model",),
+            )
+            for cur_b, cur_r in ((64, 12), (128, 8)):
+                with mock.patch.dict(
+                    os.environ,
+                    {**clean_env, "SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_B64": "4"},
+                    clear=True,
+                ):
+                    cur_cfg = dataclasses.replace(
+                        v1_mod.default_sparse_decode_config(cur_b, ep, sb),
+                        pair_rs=True,
+                        free_max_rows=10,
+                        free_max_w=0.26,
+                        free_min_slot=1,
+                        min_p_topk=0.80,
+                    )
+                shapes = (
+                    jax.ShapeDtypeStruct((1,), jnp.int32),
+                    jax.ShapeDtypeStruct((cur_b, 256), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((1, 256), jnp.float32),
+                    jax.ShapeDtypeStruct((cur_b, h), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((e_local, h, n1), jnp.float4_e2m1fn),
+                    jax.ShapeDtypeStruct((e_local, h // sb, n1), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((e_local, i_dim, h), jnp.float4_e2m1fn),
+                    jax.ShapeDtypeStruct((e_local, i_dim // sb, h), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((1, h), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((cur_r, h, n1), jnp.float4_e2m1fn),
+                    jax.ShapeDtypeStruct((cur_r, h // sb, n1), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((cur_r, i_dim, h), jnp.float4_e2m1fn),
+                    jax.ShapeDtypeStruct((cur_r, i_dim // sb, h), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((4, ep * cur_r), jnp.int32),
+                )
+
+                def _aot_w10(*args, _cfg=cur_cfg):
+                    return v1_mod.fused_decode_sparse_from_logits(
+                        *args[:9],
+                        rep_w1=args[9],
+                        rep_s1=args[10],
+                        rep_w2=args[11],
+                        rep_s2=args[12],
+                        replica_meta=args[13],
+                        ep=ep,
+                        return_sharded=True,
+                        config=_cfg,
+                    )
+
+                comp = (
+                    jax.jit(
+                        jax.shard_map(
+                            _aot_w10,
+                            mesh=tpu_mesh,
+                            in_specs=(P(),) * len(shapes),
+                            out_specs=P(),
+                            check_vma=False,
+                        )
+                    )
+                    .trace(*shapes)
+                    .lower(lowering_platforms=("tpu",))
+                    .compile()
+                )
+                self.assertIn("tpu_custom_call", comp.as_text())
+                self.assertGreater(
+                    comp.memory_analysis().generated_code_size_in_bytes, 0
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

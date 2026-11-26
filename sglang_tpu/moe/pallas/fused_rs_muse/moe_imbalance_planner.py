@@ -898,7 +898,15 @@ def build_preloaded_replica_plan(
         else:
             rng_mc = np.random.default_rng(1729)
             p_raw = placed_raw / float(placed_raw.sum())
-            q_inc = _topk_inclusion_probs(p_raw, topk)
+            if "_p2" in sel_mode:
+                eff_topk = 2
+            elif "_p3" in sel_mode or "_tail" in sel_mode:
+                eff_topk = 3
+            elif "_p4" in sel_mode:
+                eff_topk = 4
+            else:
+                eff_topk = topk
+            q_inc = _topk_inclusion_probs(p_raw, eff_topk)
             if "_b64" in sel_mode:
                 mc_batches = (max(8, int(calib_batch)),)
                 draws_per_b = 192
@@ -975,7 +983,17 @@ def build_preloaded_replica_plan(
                         ),
                         cp_col,
                     )
-                    gains_vec = (cp_col - new_pk_mat).mean(axis=0)  # (E_avail,)
+                    if "_tail" in sel_mode:
+                        # Minimize quadratic tail excess above draw-mean rank load plus light peak tie-break.
+                        cap_col = np.ceil(loads_m.mean(axis=1, keepdims=True)).astype(np.int32)
+                        ex_cur = np.maximum(cp_col - cap_col, 0) ** 2
+                        ex_new = np.maximum(new_pk_mat - cap_col, 0) ** 2
+                        gains_vec = (
+                            (ex_cur - ex_new).mean(axis=0)
+                            + 0.05 * (cp_col - new_pk_mat).mean(axis=0)
+                        )
+                    else:
+                        gains_vec = (cp_col - new_pk_mat).mean(axis=0)  # (E_avail,)
                     d_agg = float(holder_agg_load[d])
                     d_chip = int(chip_map[d]) if multi_chip else -1
                     for idx_a, eid_val in enumerate(eids_arr.tolist()):
@@ -2042,7 +2060,7 @@ def plan_preloaded_replicas_smem(
         def _init_sup(le):
             local_suppress_smem[le] = jnp.int32(0)
 
-    if fast_unroll and num_replicas <= 8:
+    if fast_unroll and num_replicas <= 16:
         for s in range(num_replicas):
             holder_slot_expert_smem[s] = jnp.int32(-1)
     else:
@@ -2172,7 +2190,7 @@ def plan_preloaded_replicas_smem(
                 is_d, safe_eid, holder_slot_expert_smem[slot]
             )
 
-        if int(fast_unroll) >= 2 and k_rep <= 64:
+        if int(fast_unroll) >= 2 and k_rep <= 128:
             for k_i in range(k_rep):
                 _decide_step_branchless(k_i)
         else:
