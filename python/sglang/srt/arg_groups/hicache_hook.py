@@ -80,6 +80,7 @@ def handle_hicache(server_args: Any):
         return
 
     validate_hicache_host_memory_mode(server_args)
+    validate_hicache_swa_fraction(server_args)
 
     if cfg.disaggregation_decode_host_receive_threshold < 1:
         # The shared host pool must match KV transfer's per-layer buffers.
@@ -395,6 +396,20 @@ def resolve_unified_memory_layout_io(server_args: Any):
         "pool's strided KV rows, switching to the page_first layout with the "
         "kernel io backend"
     )
+
+
+def validate_hicache_swa_fraction(server_args: Any):
+    cfg = resolving_view(server_args)
+    fraction = cfg.hicache_swa_fraction
+    if fraction is None:
+        return
+    if not 0 < fraction < 1:
+        raise ValueError("--hicache-swa-fraction must be in (0, 1).")
+    if cfg.hicache_size <= 0:
+        # --hicache-ratio sizes each host pool from its own device pool.
+        raise ValueError(
+            "--hicache-swa-fraction splits --hicache-size; pass --hicache-size."
+        )
 
 
 def validate_hicache_host_memory_mode(server_args: Any):

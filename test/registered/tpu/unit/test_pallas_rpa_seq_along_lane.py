@@ -618,5 +618,107 @@ class TestKernelBlockSizes(CustomTestCase):
                     )
 
 
+class TestScheduleSizeBound(CustomTestCase):
+    """The HBM schedule holds every step the schedule kernel writes for a call.
+
+    The kernel writes each full SMEM schedule, and then the last one, to HBM
+    without a bounds check; past the end, the attention kernel halts with a
+    BoundsCheck. SMEM holds fewer steps as the page table grows.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from sglang.test.test_utils import enter_scope
+        from sglang_tpu import pallas_export
+
+        # tpu7x SMEM on any host.
+        enter_scope(
+            self,
+            patch.object(
+                pallas_export, "get_pallas_tpu_device_kind", return_value="TPU7x"
+            ),
+        )
+        enter_scope(self, pallas_export.tpu_info_for_cpu_export())
+
+    def _config(self, mode, *, num_seqs, context, total_q_tokens, decode_query_size=1):
+        import jax.numpy as jnp
+
+        from sglang_tpu.attention.pallas.batched_rpa import configs, wrapper
+
+        model = configs.ModelConfigs(
+            num_q_heads=16, num_kv_heads=2, head_dim=64, mask_value=float("-inf")
+        )
+        serve = configs.ServingConfigs(
+            num_seqs=num_seqs,
+            page_size=256,
+            total_q_tokens=total_q_tokens,
+            num_page_indices=num_seqs * (context // 256),
+            dtype_q=jnp.bfloat16,
+            dtype_kv=jnp.float8_e4m3fn,
+            dtype_out=jnp.bfloat16,
+            decode_query_size=decode_query_size,
+        )
+        decode, mixed = wrapper.calculate_block_sizes(model, serve, 64 << 20)
+        return configs.RpaConfigs(
+            block=decode if mode == configs.RpaCase.DECODE else mixed,
+            model=model,
+            serve=serve,
+            mode=mode,
+            vmem_limit_bytes=64 << 20,
+        )
+
+    def _assert_fits(self, cfg, *, num_seqs, query_len, prefix_len):
+        from sglang_tpu.pp_chunks import chunk_pairs
+
+        # num_seqs rows of query_len queries behind prefix_len cached tokens.
+        pairs = num_seqs * chunk_pairs(
+            (0, cfg.bq_sz, cfg.bkv_sz), query_len, prefix_len
+        )
+        schedules_written = pairs // (cfg.max_steps_ub * cfg.batch_size) + 1
+        self.assertLessEqual(schedules_written, cfg.max_schedule_size_multiplier)
+
+    def test_long_context_steps_fit(self):
+        from sglang_tpu.attention.pallas.batched_rpa import configs
+
+        context = 1 << 20
+        with self.subTest("prefill: 32 rows of 1M, a 4096-token chunk on 260K"):
+            cfg = self._config(
+                configs.RpaCase.MIXED,
+                num_seqs=32,
+                context=context,
+                total_q_tokens=4096,
+            )
+            self._assert_fits(cfg, num_seqs=1, query_len=4096, prefix_len=260 << 10)
+        for num_seqs, decode_query_size in ((64, 1), (16, 4)):
+            with self.subTest(
+                f"decode: {num_seqs} rows of {decode_query_size} queries at 1M"
+            ):
+                cfg = self._config(
+                    configs.RpaCase.DECODE,
+                    num_seqs=num_seqs,
+                    context=context,
+                    total_q_tokens=num_seqs * decode_query_size,
+                    decode_query_size=decode_query_size,
+                )
+                self._assert_fits(
+                    cfg,
+                    num_seqs=num_seqs,
+                    query_len=decode_query_size,
+                    prefix_len=context - decode_query_size,
+                )
+
+    def test_up_to_128k_keeps_sixteen_schedules(self):
+        """Up to 128K context, 64 rows of this geometry stay at the 16-schedule
+        floor; a looser bound would grow the buffer and the PP chunk capacity."""
+        from sglang_tpu.attention.pallas.batched_rpa import configs
+
+        for mode in (configs.RpaCase.MIXED, configs.RpaCase.DECODE):
+            with self.subTest(mode=mode):
+                cfg = self._config(
+                    mode, num_seqs=64, context=1 << 17, total_q_tokens=16384
+                )
+                self.assertEqual(cfg.max_schedule_size_multiplier, 16)
+
+
 if __name__ == "__main__":
     unittest.main()

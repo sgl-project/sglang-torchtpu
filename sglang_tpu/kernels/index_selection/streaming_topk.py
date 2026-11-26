@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import functools
 import math
+from dataclasses import dataclass
 from typing import NamedTuple
 
 import jax
@@ -22,11 +23,6 @@ from jax.experimental import pallas as pl
 from jax.experimental import xla_metadata
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
-
-from sglang_tpu.kernels.deepseek_v41.index_selection.tuned_block_sizes import (
-    STREAMING_TOPK_CONFIG,
-    StreamingTopKConfig,
-)
 
 # Byte-wise radix passes over IEEE FP32 keys. These describe the representation,
 # independently of TensorCore/SparseCore lane counts.
@@ -43,6 +39,25 @@ FP32_NEG_INF_BITS = 0xFF800000
 ORDERED_NEG_INF = UINT32_MAX ^ FP32_NEG_INF_BITS
 BF16_BITS = jnp.finfo(jnp.bfloat16).bits
 BF16_HIGH_MASK = (UINT32_MAX << BF16_BITS) & UINT32_MAX
+
+
+@dataclass(frozen=True)
+class StreamingTopKConfig:
+    loop_unroll: int = 1
+    bootstrap_multiplier: int = 4
+    bitonic_ids: bool = False
+
+
+# (generation, score width, topk): measured scan, bootstrap and output sorting.
+STREAMING_TOPK_CONFIG = {
+    (7, width, 512): StreamingTopKConfig(4, 8, True)
+    for width in (16384, 32768, 49408, 98816)
+}
+
+
+def topk_reconstruction_threshold(k: int) -> int:
+    """Bound the live candidate excess proportionally to the output width."""
+    return min(8192, 4 * k)
 
 
 class _Selection(NamedTuple):

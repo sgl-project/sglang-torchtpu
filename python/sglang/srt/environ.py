@@ -2843,6 +2843,9 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     "SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK": _DeprecatedEnv(
         note="Please use '--prefill-delayer-token-usage-low-watermark' instead."
     ),
+    "SGLANG_PREFILL_CHUNK_SHARE_MIN_TOKENS": _DeprecatedEnv(
+        note="Please use '--prefill-chunk-share-min-tokens' instead."
+    ),
     "SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD": _DeprecatedEnv(
         note="Please use '--speculative-dspark-lm-head-dtype fp8' instead."
     ),

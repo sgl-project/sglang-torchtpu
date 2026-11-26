@@ -97,13 +97,11 @@ CACHE_MAX_NEW_TOKENS = int(E("CACHE_PROBE_MAX_NEW_TOKENS", "64"))
 MIN_SPEC_ACCEPT_LENGTH = float(E("MIN_SPEC_ACCEPT_LENGTH", "1.0"))
 EXTRA_SERVER_ARGS: Tuple[str, ...] = ("--reasoning-parser", "gpt-oss")
 # Bound the compile grid + allow spec recompiles: the unbounded bs<=max_running
-# verify-graph capture spikes host RAM and OOM-kills the decode. RESHARD off:
-# symmetric prefill/decode TP needs no strided reshard.
+# verify-graph capture spikes host RAM and OOM-kills the decode.
 EXTRA_LAUNCH_ENV: Dict[str, str] = {
     "SGLANG_TPU_FUSED_MOE_SC_GATHER": "0",
     "TPU_COMPILE_BS": "1 2 4 16",
     "TPU_COMPILE_TOKENS": "512 2048 4096",
-    "SGLANG_RAIDEN_RESHARD": "0",
 }
 
 # EAGLE3 speculative decoding, shared by both engines: the P/D handoff carries

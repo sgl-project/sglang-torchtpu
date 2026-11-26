@@ -1506,6 +1506,9 @@ class Scheduler(
         self.prefill_decode_interval_min_bs = (
             get_schedule().prefill_decode_interval_min_bs
         )
+        self.prefill_decode_interval_below_min_bs = (
+            get_schedule().prefill_decode_interval_below_min_bs
+        )
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
         )
@@ -1563,15 +1566,22 @@ class Scheduler(
         if self._prefill_decode_interval_remaining == 0:
             return False
 
-        # A small running batch admits prefill every round so it can grow;
-        # the interval only protects decode once the batch is large enough.
+        # A small running batch admits prefill after the below-min-bs rounds
+        # (none by default) so it can grow; the full interval only protects
+        # decode once the batch is large enough.
         # With nothing decoding there is no decode to protect, and waiting only
         # idles the GPU between chunks. DP attention keeps the synchronized
         # cadence because peer ranks may still be decoding.
+        # Arming always sets the full interval, so this counts from the last arm.
+        rounds_deferred = (
+            self.prefill_decode_interval - self._prefill_decode_interval_remaining
+        )
+        small_batch_ready = (
+            running_batch.batch_size() < self.prefill_decode_interval_min_bs
+            and rounds_deferred >= self.prefill_decode_interval_below_min_bs
+        )
         nothing_decodes = running_batch.is_empty() or running_batch.is_prefill_only
-        if running_batch.batch_size() < self.prefill_decode_interval_min_bs or (
-            nothing_decodes and not self.require_mlp_sync
-        ):
+        if small_batch_ready or (nothing_decodes and not self.require_mlp_sync):
             self._prefill_decode_interval_remaining = 0
             return False
 
@@ -1579,8 +1589,8 @@ class Scheduler(
         return True
 
     def _negotiate_prefill_delayer_while_deferring(self) -> None:
-        # A DP peer below prefill_decode_interval_min_bs does not defer and runs
-        # the delayer's all-gather; join it with nothing to prefill.
+        # A DP peer below prefill_decode_interval_min_bs stops deferring sooner and
+        # runs the delayer's all-gather; join it with nothing to prefill.
         if (
             not self.require_mlp_sync
             or self.prefill_decode_interval_min_bs == 0
@@ -1624,6 +1634,7 @@ class Scheduler(
             self.schedule_low_priority_values_first,
             shortest_prefill_aging_factor=get_schedule().shortest_prefill_aging_factor,
             bounded_lpm_enabled=self.dllm_config is None,
+            prefill_chunk_share_min_tokens=get_schedule().prefill_chunk_share_min_tokens,
         )
         self.policy._on_bounded_state_change = lambda active: (
             self.waiting_queue.set_on_leave(
@@ -5048,7 +5059,7 @@ class Scheduler(
         resumed_req = self.chunked_req
         if resumed_req is not None:
             resumed_req.init_next_round_input()
-            adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
+            adder.chunked_req_limit = self.policy.continuing_chunk_limit(
                 resumed_req,
                 self.waiting_queue,
                 adder.rem_chunk_tokens or 0,
@@ -5125,6 +5136,14 @@ class Scheduler(
             if adder.can_run_list and (
                 (req.token_indices_to_pool is not None)
                 != (adder.can_run_list[0].token_indices_to_pool is not None)
+            ):
+                if bounded_active:
+                    self.policy.mark_admission_skipped(req)
+                continue
+            # Chunk sharing passes over a request too long for what the continuing
+            # chunk left this pass, instead of ending admission at it.
+            if self.chunked_req is not None and not self.policy.fits_shared_chunk(
+                req, adder.rem_chunk_tokens
             ):
                 if bounded_active:
                     self.policy.mark_admission_skipped(req)

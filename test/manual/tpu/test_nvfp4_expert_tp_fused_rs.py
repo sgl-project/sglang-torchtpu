@@ -7,7 +7,8 @@ the serving wrapper chunks expert-TP calls, is checked against the stock gmm_v2 
 the same weights dequantized, all-reduced, normed and combined in f32, with and without
 the post-expert norm. ``--weights bf16`` runs fused-RS on those dequantized weights
 instead. Set SGLANG_TPU_ENABLE_FUSED_RS_ETP_TWOLEVEL=1 to cover the two-level
-reduce-scatter (4096 tokens reach it).
+reduce-scatter (4096 tokens reach it). ``--invalid-ids`` gives some slots an expert id
+outside [0, 256), as a NaN router score can; the reference treats them as weight 0.
 
     eval $(python3 -m torch.tpu.distributed)
     export TORCH_TPU_TOPOLOGY TORCH_TPU_SLICEBUILDER_ADDRESSES WORLD_SIZE
@@ -98,6 +99,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tokens", default="64,4096")
     ap.add_argument("--weights", choices=("fp4", "bf16"), default="fp4")
+    ap.add_argument("--invalid-ids", action="store_true")
     args = ap.parse_args()
     dist.init_process_group(backend="tpu_dist")
     from sglang_tpu.compile_cache import add_tpu_kernel_inputs_to_compile_cache_key
@@ -157,6 +159,7 @@ def main() -> None:
                 topk=TOP_K,
                 activation="silu",
                 has_post_expert_norm=post_norm,
+                fp8_direct_write=False,
                 expert_tp=True,
             )
             for s, n in chunks(x.shape[0])
@@ -180,19 +183,29 @@ def main() -> None:
             torch.bfloat16
         )
         xd, idd, twd = x.to(device), ids.to(device), tw.to(device)
+        ref_ids, ref_tw = ids, tw
+        if args.invalid_ids:
+            bad = torch.zeros(tokens, TOP_K, dtype=torch.bool)
+            bad[::97, 0] = True
+            bad[1::97, TOP_K - 1] = True
+            idd = torch.where(bad, N_EXPERTS, ids)
+            idd[1::97, TOP_K - 1] = -1
+            idd = idd.to(device)
+            ref_ids = torch.where(bad, 0, ids)
+            ref_tw = torch.where(bad, 0, tw)
         y = fused_moe_call(
             hidden_states=xd,
             w1=w13,
             w2=w2,
             topk_weights=torch.ones_like(twd),
-            topk_ids=idd,
+            topk_ids=ref_ids.to(device),
             topk=TOP_K,
             activation="silu",
             no_combine=True,
             global_num_experts=N_EXPERTS,
         ).float()
         dist.all_reduce(y)
-        ref = _combine(y.cpu(), gain if post_norm else None, tw)
+        ref = _combine(y.cpu(), gain if post_norm else None, ref_tw)
         shards = compiled(xd, twd, idd, post_norm)
         got, want = [], []
         for (s, n), shard in zip(chunks(tokens), shards):

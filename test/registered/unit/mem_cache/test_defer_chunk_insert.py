@@ -4,15 +4,22 @@ The insert at the end of a prefill must still run: a follow-up turn diverges rig
 after the prompt, and its match needs the SWA window that insert keeps.
 """
 
+import random
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import torch
+from swa_cache_world import PAGE, WINDOW, KVWorld
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.common import checkpoint_kv_cache
+from sglang.srt.managers.req_types import FINISH_LENGTH
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache.allocation import retire_window
+from sglang.srt.mem_cache.common import checkpoint_kv_cache, release_kv_cache
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -107,6 +114,88 @@ class TestUnifiedDeferChunkCheckpoint(unittest.TestCase):
             self.assertFalse(UnifiedRadixCache.defer_chunk_checkpoint(cache, req))
             cache._components_tuple[0].free_out_of_window_slots.assert_not_called()
             self.assertEqual(req.prefix_len, 0)
+
+
+def _tokens(seed: int, n: int) -> list[int]:
+    rng = random.Random(seed)
+    return [rng.randrange(1, 50000) for _ in range(n)]
+
+
+class _TurnWorld(KVWorld):
+    """A real hybrid-SWA UnifiedRadixCache driven as the scheduler drives a turn:
+    admission match + lock, chunked prefill with checkpoint_kv_cache after every
+    chunk (mid_prefill before the last one), decode that retires the request's
+    own window, and release_kv_cache at the finish."""
+
+    def turn(self, prompt: list[int], *, chunk: int) -> None:
+        req = Req(
+            rid=f"r{self.rid}",
+            origin_input_text="",
+            origin_input_ids=array("q", prompt),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1 << 20),
+        )
+        self.rid += 1
+        self.req_to_token_pool.alloc([req])
+        req.init_next_round_input(tree_cache=self.cache)
+        req.lock = self.cache.lock(req.last_node)
+        row, pos = req.kv.req_pool_idx, req.prefix_len
+        if pos:
+            self.req_to_token_pool.write(
+                (row, slice(0, pos)), self.cache.prefix_device_indices(req)
+            )
+        while pos < len(prompt):
+            end = min(pos + chunk, len(prompt))
+            req.prefix_len, req.extend_end = pos, end
+            self.req_to_token_pool.write(
+                (row, slice(pos, end)), self._alloc(prompt[pos:end], pos)
+            )
+            req.kv.kv_committed_len = req.kv.kv_allocated_len = end
+            pos = end
+            if pos < len(prompt):
+                checkpoint_kv_cache(req, self.cache, mid_prefill=True)
+                req.init_next_round_input()
+        req.output_ids.append(self._next_token(req))
+        checkpoint_kv_cache(req, self.cache)
+        for _ in range(2 * WINDOW):
+            self.decode_step(req)
+        retire_window(req, req.seqlen - 1, self.cache)
+        req.finished_reason = FINISH_LENGTH(length=0)
+        release_kv_cache(req, self.cache, checkpoint=True)
+
+
+class TestSwaBranchCheckpoint(unittest.TestCase):
+    CHUNK = 8 * PAGE
+
+    def test_branch_and_prompt_end_stay_matchable(self):
+        """A turn whose match stops at an SWA branch (Full KV cached past the last
+        live window) must leave both the branch and its own prompt end matchable
+        once decode has retired its window, wherever the branch falls among its
+        chunks and whether or not mid-prefill inserts are deferred. Otherwise the
+        next turn matches only the branch and recomputes, and so does every turn
+        after it."""
+        earlier = _tokens(1, 17 * PAGE)
+        branch = len(earlier)
+        # Chunks end at 128, 256, ...: the branch at 272 falls in the last chunk
+        # of a 332-token prompt and in a mid chunk of a 472-token one.
+        for stride in (0, 1 << 20):
+            for new_tokens in (60, 200):
+                with (
+                    self.subTest(stride=stride, new_tokens=new_tokens),
+                    envs.SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE.override(stride),
+                ):
+                    w = _TurnWorld(full_tokens=8192, swa_tokens=4096)
+                    w.turn(earlier, chunk=self.CHUNK)
+                    w.evict(swa_tokens=10**6)  # the earlier turn's windows are gone
+                    prompt = earlier + _tokens(2, new_tokens)
+                    self.assertEqual(w.match(prompt).swa_branching_seqlen, branch)
+                    w.turn(prompt, chunk=self.CHUNK)
+                    follow_up = w.match(prompt + _tokens(3, PAGE))
+                    self.assertEqual(
+                        follow_up.device_prefix_len, len(prompt) // PAGE * PAGE
+                    )
+                    sibling = w.match(earlier + _tokens(4, PAGE))
+                    self.assertEqual(sibling.device_prefix_len, branch)
+                    w.cache.sanity_check()
 
 
 if __name__ == "__main__":

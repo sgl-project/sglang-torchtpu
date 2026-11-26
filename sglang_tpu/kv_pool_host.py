@@ -58,6 +58,9 @@ from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.runtime_context import get_memory
 from sglang.srt.utils import next_power_of_2
+from sglang_tpu.disaggregation.decode_dram_offload.host_page_metadata import (
+    discard_host_page_metadata,
+)
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.tpu_dma_hicache import (
     NOOP_EVENT,
@@ -539,6 +542,7 @@ class TpuDMAHostKVPool(HostKVCache):
 
     def clear(self) -> None:
         with self.lock:
+            discard_host_page_metadata(self)
             # Free list of host *pages*. Page 0..page_num-1.
             self.free_pages = deque(range(self.page_num))
 
@@ -568,6 +572,7 @@ class TpuDMAHostKVPool(HostKVCache):
     def free(self, indices: torch.Tensor) -> int:
         page_ids = torch.unique(indices.cpu() // self.page_size).tolist()
         with self.lock:
+            discard_host_page_metadata(self, page_ids)
             self.free_pages.extend(page_ids)
         return len(indices)
 
@@ -592,6 +597,7 @@ class TpuDMAHostKVPool(HostKVCache):
             return NOOP_EVENT
         device_pages = self._to_page_ids(device_indices)
         host_pages = self._to_page_ids(host_indices)
+        discard_host_page_metadata(self, host_pages)
         if self._device_page_translator is not None:
             device_pages = self._device_page_translator(device_pages)
         if self._host_page_translator is not None:
@@ -1032,13 +1038,17 @@ class TpuDMAUnifiedHostKVPool(TpuDMAHostKVPool):
         return self._state.available_tokens(self.pool_label)
 
     def clear(self) -> None:
-        self._state.clear(self.pool_label)
+        with self.lock:
+            discard_host_page_metadata(self)
+            self._state.clear(self.pool_label)
 
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         return self._state.alloc(self.pool_label, need_size)
 
     def free(self, indices: torch.Tensor) -> int:
-        return self._state.free(self.pool_label, indices)
+        with self.lock:
+            discard_host_page_metadata(self, self._to_page_ids(indices))
+            return self._state.free(self.pool_label, indices)
 
     def destroy(self) -> None:
         if not self._released:
@@ -1084,6 +1094,7 @@ class TpuDMAUnifiedHostKVPool(TpuDMAHostKVPool):
             device_indices, self._unified_pool.swa_group_pages
         )
         host_pages = self._expand_pages(host_indices, self._state.swa_group_pages)
+        discard_host_page_metadata(self, self._to_page_ids(host_indices))
         return self.transfer.backup(device_pages, host_pages)
 
     def load_all_layer(

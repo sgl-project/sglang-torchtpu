@@ -2211,5 +2211,57 @@ class TestHostLoadEvictsTheTargetWindowOnly(CustomTestCase):
         self.assertEqual(evicted[0].window_tokens, {"window_4096": 16})
 
 
+class TestHybridSwaHostSplit(CustomTestCase):
+    """--hicache-swa-fraction gives the SWA host pool a fixed share of
+    --hicache-size; the other pools keep their device-byte proportions."""
+
+    @staticmethod
+    def _pool(device_bytes):
+        return SimpleNamespace(host_capacity_bytes=device_bytes)
+
+    def test_other_pools_split_the_rest_by_device_bytes(self):
+        full, swa, mamba = self._pool(12), self._pool(4), self._pool(4)
+        for swa_fraction, expected in ((None, (6, 2, 2)), (0.5, (3.75, 5, 1.25))):
+            with self.subTest(swa_fraction=swa_fraction):
+                self.assertEqual(
+                    hybrid_pool_assembler._split_hybrid_swa_hicache_size(
+                        10,
+                        full_kv_pool=full,
+                        swa_kv_pool=swa,
+                        other_pools=(mamba,),
+                        swa_fraction=swa_fraction,
+                    ),
+                    expected,
+                )
+
+    def test_hybrid_swa_stack_sizes_its_host_pools_by_the_fraction(self):
+        params = SimpleNamespace(
+            page_size=4,
+            token_to_kv_pool_allocator=SimpleNamespace(swa_attn_allocator=None),
+            mtp_draft_device_pools=(),
+        )
+        for swa_fraction, expected in ((None, (12, 4)), (0.5, (8, 8))):
+            memory = SimpleNamespace(hicache_size=16, hicache_swa_fraction=swa_fraction)
+            with (
+                self.subTest(swa_fraction=swa_fraction),
+                patch.object(hybrid_pool_assembler, "get_memory", return_value=memory),
+                patch.object(hybrid_pool_assembler, "build_hybrid_swa_group") as group,
+                patch.object(hybrid_pool_assembler, "_build_cache_controller"),
+            ):
+                hybrid_pool_assembler.build_hybrid_swa_stack(
+                    params=params,
+                    full_kv_pool=self._pool(12),
+                    swa_kv_pool=self._pool(4),
+                    full_layer_mapping={1: 0},
+                    swa_layer_mapping={0: 0},
+                    load_cache_event=None,
+                    storage_backend=None,
+                )
+                kwargs = group.call_args.kwargs
+                self.assertEqual(
+                    (kwargs["kv_host_size"], kwargs["swa_host_size"]), expected
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

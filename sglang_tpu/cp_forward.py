@@ -25,11 +25,14 @@ import torch
 from sglang.srt.layers.logits_processor import LogitsMetadata
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_forward_context
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang_tpu.cp_layout import (
     TpuCpHostLayout,
-    build_tpu_cp_layout,
-    max_local_rows,
+    build_gather_layout,
+    build_ring_layout,
+    gather_max_local_rows,
+    ring_max_local_rows,
 )
 from sglang_tpu.kv_row_write import write_rows_torch
 
@@ -65,6 +68,36 @@ def _int_list(values: Any, count: int, name: str) -> list[int]:
     return values[:count]
 
 
+def _build_layout(
+    *,
+    extend_lens: list[int],
+    prefix_lens: list[int],
+    cp_size: int,
+    cp_rank: int,
+    pad_b: int,
+    t_bucketer: Any,
+) -> TpuCpHostLayout:
+    """Host layout of one extend batch in the configured PCP mode, padded to
+    the smallest local token bucket that fits its busiest rank."""
+    batch = dict(
+        extend_lens=extend_lens,
+        prefix_lens=prefix_lens,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+        pad_b=pad_b,
+    )
+    if current_platform.pcp_ring_enabled():
+        page_size = get_schedule().page_size
+        rows = ring_max_local_rows(extend_lens, cp_size, page_size)
+        local_rows_padded = t_bucketer.next_bucket(max(rows, pad_b))
+        return build_ring_layout(
+            **batch, local_rows_padded=local_rows_padded, page_size=page_size
+        )
+    rows = gather_max_local_rows(extend_lens, cp_size)
+    local_rows_padded = t_bucketer.next_bucket(max(rows, pad_b))
+    return build_gather_layout(**batch, local_rows_padded=local_rows_padded)
+
+
 def prepare_tpu_cp_forward_batch(
     forward_batch: Any,
     *,
@@ -82,6 +115,9 @@ def prepare_tpu_cp_forward_batch(
     rank), pads the request-indexed fields to the request bucket, and attaches
     the layout to the batch. Token-indexed fields keep the global row count;
     the compiled-forward shim gathers the local rows from them.
+
+    Ring mode (``SGLANG_TPU_PCP_MODE=ring``) uses the page-aligned layout
+    (``build_ring_layout``); its caller passes the ring-mode token bucketer.
 
     Returns the real (global) token count and the real request count.
     """
@@ -110,17 +146,15 @@ def prepare_tpu_cp_forward_batch(
             f"{real_q} rows; context parallelism needs a pure extend batch."
         )
 
-    local_rows_padded = t_bucketer.next_bucket(
-        max(max_local_rows(extend_lens, cp_size), pad_b)
-    )
-    host = build_tpu_cp_layout(
+    host = _build_layout(
         extend_lens=extend_lens,
         prefix_lens=prefix_lens,
         cp_size=cp_size,
         cp_rank=cp_rank,
         pad_b=pad_b,
-        local_rows_padded=local_rows_padded,
+        t_bucketer=t_bucketer,
     )
+    local_rows_padded = host.local_rows_padded
     local_rows = torch.from_numpy(np.clip(host.local_rows, 0, None)).to(
         device, non_blocking=True
     )
@@ -273,7 +307,7 @@ def all_gather_and_write_kv(
     quantize: (
         Callable[[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]] | None
     ) = None,
-) -> None:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """All-gather this layer's local K/V over the context-parallel group and
     write the gathered rows into ``kv_cache`` along ``write_segments``.
 
@@ -284,7 +318,7 @@ def all_gather_and_write_kv(
     here would re-lay out the whole pool around it on every layer.
 
     For an fp8 pool ``k``/``v`` are the compute-dtype tensors and ``quantize``
-    maps the gathered K/V to the pool dtype.
+    maps the gathered K/V to the pool dtype. Returns the gathered K/V.
     """
     if quantize is None and kv_cache.dtype in (*_FP8_DTYPES, torch.uint8):
         raise ValueError(
@@ -303,6 +337,7 @@ def all_gather_and_write_kv(
         k_all, v_all = quantize(k_all, v_all)
     gathered = fused_kv_rows(k_all, v_all, kv_cache).contiguous().view(kv_cache.dtype)
     write_rows_torch(write_num_segments, write_segments, gathered, kv_cache)
+    return k_all, v_all
 
 
 # ---------------------------------------------------------------------------

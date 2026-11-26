@@ -378,6 +378,7 @@ def outer_kernel(
         "max_mixed_tile_size",
         "batched_only",
         "prefill_only",
+        "recurrent_scan",
         "zero_initialize_out",
         "compute_precision",
         "state_plan",
@@ -414,6 +415,7 @@ def fused_conv1d_gdn(
     num_spec_tokens: int = 0,
     batched_only: bool = False,
     prefill_only: bool = False,
+    recurrent_scan: bool = False,
     track_indices: jax.Array | None = None,
     track_end: jax.Array | None = None,
     zero_initialize_out: bool = True,
@@ -492,6 +494,8 @@ def fused_conv1d_gdn(
         batched_only: Run only the leading decode/verify segment.
         prefill_only: Run only PER_SEQ, leaving decode/verify checkpoints
             untouched. Mutually exclusive with batched_only.
+        recurrent_scan: Run the token-recurrent scan on every tile instead of
+            the chunked solve.
         packed_weights: KDA only, no conv bias: conv weight, dt_bias and a_log
             packed into one f32 array (kda_layout.kda_packed_weights_shape),
             used instead of `conv_weight` / `dt_bias` / `a_log`.
@@ -720,6 +724,7 @@ def fused_conv1d_gdn(
             kernel_size=kernel_size,
             tile_size=tile_size,
             window_size=window_size,
+            recurrent_scan=recurrent_scan,
             dim_size=dim,
             num_kq_heads=n_kq,
             num_v_heads=n_v,

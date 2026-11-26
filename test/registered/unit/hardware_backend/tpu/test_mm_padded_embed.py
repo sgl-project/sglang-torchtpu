@@ -13,7 +13,7 @@ from sglang_tpu.mm_embedding import (
     concat_embeddings,
 )
 
-register_cpu_ci(est_time=5, suite="stage-a-test-cpu-intel")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 NUM_TOKENS = 64
 

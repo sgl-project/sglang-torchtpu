@@ -56,6 +56,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel, process_model_config
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.expert_loading import _wait_for
@@ -319,8 +320,10 @@ def _uses_quantized_experts(
 ) -> bool:
     """Whether a layer's experts are serialized NVFP4.
 
-    The checkpoint excludes whole layers with dotted substrings such as
-    ``"layers.0."``, which ModelOpt's component-wise matcher does not accept.
+    The exclusions are either module paths (``modules_to_not_convert``, mapped
+    onto this model by ``hf_to_sglang_mapper``) or whole layers as dotted
+    substrings such as ``"layers.0."`` (``exclude_modules``), which ModelOpt's
+    component-wise matcher does not accept.
     """
     if quant_config is None:
         return False
@@ -849,6 +852,10 @@ class MuseSparkTextModel(nn.Module):
 
 class MuseSparkForConditionalGeneration(nn.Module):
     """Muse Spark served text-only."""
+
+    # Maps the quantization config's checkpoint module paths (modules_to_not_convert)
+    # onto this decoder, which drops the checkpoint's language_model level.
+    hf_to_sglang_mapper = WeightsMapper(orig_to_new_prefix={_TEXT_PREFIX: "model."})
 
     # Parameters a subclass loads itself (perception towers); the checkpoint
     # completeness check here skips them.

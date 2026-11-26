@@ -95,6 +95,23 @@ class TestGlm5NextMhcHooks(CustomTestCase):
             self.assertIsNone(hooks.hc_ffn_post_pre(original, layer, *args, None, None))
             original.assert_not_called()
 
+            # Scattered (sequence-parallel) batches also route to the kernel.
+            with patch(
+                "sglang.srt.layers.layer_boundary.adapters.attention.get_attn_tp_context",
+                return_value=SimpleNamespace(input_scattered=True),
+            ):
+                kernel.hc_pre.return_value = "kernel_pre"
+                kernel.hc_post_pre.return_value = "kernel_seam"
+                kernel.hc_post.return_value = "kernel_post"
+                self.assertEqual(
+                    hooks.hc_pre(original, layer, *args, None, None), "kernel_pre"
+                )
+                self.assertEqual(
+                    hooks.hc_ffn_post_pre(original, layer, *args, None, None),
+                    "kernel_seam",
+                )
+                self.assertEqual(hooks.hc_post(original, layer, *args), "kernel_post")
+
 
 if __name__ == "__main__":
     unittest.main()

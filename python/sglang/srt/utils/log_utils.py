@@ -356,6 +356,9 @@ def freeze_gc(context: str, gc_threshold: Optional[Sequence[int]] = None):
         f"gen1: {g1_before}->{g1_after}, "
         f"gen2: {g2_before}->{g2_after}"
     )
+    # Through 3.13, a full collection waits until promotions exceed 1/4 of the survivors of the
+    # last one; collecting here skips frozen objects and resets that count.
+    gc.collect()
 
 
 def configure_gc_logger():

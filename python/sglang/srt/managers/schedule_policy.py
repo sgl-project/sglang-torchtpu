@@ -56,6 +56,9 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     split_cached_prefix_by_tier,
 )
+from sglang.srt.managers.scheduler_components.prefill_chunk_sharer import (
+    PrefillChunkSharer,
+)
 from sglang.srt.mem_cache.allocation import retire_window
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -218,6 +221,7 @@ class SchedulePolicy:
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
         shortest_prefill_aging_factor: float = 0.0,
+        prefill_chunk_share_min_tokens: int = 0,
         bounded_lpm_enabled: bool = True,
     ):
         self._lpm_gate_calls = 0
@@ -242,6 +246,28 @@ class SchedulePolicy:
             raise ValueError(
                 "shortest_prefill_aging_factor requires schedule_policy=shortest-prefill-first"
             )
+        if prefill_chunk_share_min_tokens < 0:
+            raise ValueError(
+                f"prefill_chunk_share_min_tokens must be >= 0, got {prefill_chunk_share_min_tokens}"
+            )
+        if (
+            prefill_chunk_share_min_tokens
+            and self.policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+        ):
+            raise ValueError(
+                "prefill_chunk_share_min_tokens does not apply to schedule_policy=shortest-prefill-first, "
+                "which reserves room for shorter prefills itself"
+            )
+        self._chunk_sharer = (
+            PrefillChunkSharer(
+                min_tokens=prefill_chunk_share_min_tokens,
+                tree_cache=tree_cache,
+                prefill_work=self._shortest_prefill_work,
+                scan_limit=WAITING_QUEUE_PREFIX_MATCH_MAX,
+            )
+            if prefill_chunk_share_min_tokens
+            else None
+        )
         self.tree_cache = tree_cache
         self.enable_hierarchical_cache = enable_hierarchical_cache
         self.enable_priority_scheduling = enable_priority_scheduling
@@ -686,6 +712,39 @@ class SchedulePolicy:
             return None
         # Page alignment keeps continuation boundaries allocator-compatible.
         return (budget - reserved) // page_size * page_size
+
+    def continuing_chunk_limit(
+        self,
+        chunked_req: Req,
+        waiting_queue: List[Req],
+        budget: int,
+        page_size: int,
+        *,
+        processed_tokens: int,
+    ) -> Optional[int]:
+        """Cap the continuing chunk to leave room for waiting requests, or None."""
+        if self._chunk_sharer is not None:
+            return self._chunk_sharer.chunk_limit(
+                chunked_req=chunked_req,
+                waiting_queue=waiting_queue,
+                budget=budget,
+                page_size=page_size,
+                prefix_matched=self.waiting_queue_prefix_matched(waiting_queue),
+            )
+        return self.shortest_prefill_chunk_limit(
+            chunked_req,
+            waiting_queue,
+            budget,
+            page_size,
+            processed_tokens=processed_tokens,
+        )
+
+    def fits_shared_chunk(self, req: Req, rem_chunk_tokens: Optional[int]) -> bool:
+        """Whether req may try to join a pass beside a continuing chunk; always
+        true without chunk sharing."""
+        return self._chunk_sharer is None or self._chunk_sharer.can_join(
+            req=req, rem_chunk_tokens=rem_chunk_tokens
+        )
 
     @staticmethod
     def _sort_by_longest_prefix(

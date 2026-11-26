@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -279,17 +279,24 @@ class Qwen3VLVisionTransformer(nn.Module):
         **_: Any,
     ) -> Qwen3VLVisionOutput:
         hidden_states = hidden_states.to(device=self.device, dtype=self.dtype)
+        host_grid_thw = grid_thw.cpu()
         grid_thw = grid_thw.to(self.device)
         hidden_states = self.patch_embed(hidden_states)
         position_embeddings = self._interpolate_position_embeddings(grid_thw)
         hidden_states = hidden_states + position_embeddings.to(hidden_states.dtype)
 
         position_ids = _vision_position_ids(grid_thw, self.spatial_merge_size)
-        rotary = self.rotary_pos_emb(int(grid_thw[:, 1:].max()))[position_ids]
+        rotary = self.rotary_pos_emb(int(host_grid_thw[:, 1:].max()))[position_ids]
         rotary = rotary.flatten(1)
         rotary = torch.cat((rotary, rotary), dim=-1)
         position_embeddings = (rotary.cos(), rotary.sin())
-        metadata = PackedSequenceMetadata.from_cu_seqlens(_vision_cu_seqlens(grid_thw))
+        # The packed bounds come from the host grid, which the attention reads
+        # anyway: no int cumsum on the device, which TPU fails to compile for
+        # more than one grid row (H3 ref2va's images and video).
+        metadata = PackedSequenceMetadata.from_cu_seqlens(
+            _vision_cu_seqlens(host_grid_thw)
+        )
+        metadata = replace(metadata, cu_seqlens=metadata.cu_seqlens.to(self.device))
 
         deepstack_features = []
         for layer_idx, block in enumerate(self.blocks):

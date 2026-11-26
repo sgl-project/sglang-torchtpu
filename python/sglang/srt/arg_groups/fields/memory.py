@@ -103,6 +103,32 @@ class Memory(msgspec.Struct):
         bool,
         "Track per-session references on UnifiedRadixCache KV: eviction consumes unreferenced entries before referenced ones, and closing a session only dereferences its KV.",
     ] = False
+    session_leaf_at_prompt_end: A[
+        bool,
+        "With --enable-session-radix-cache, a finished request's session leaf is the deepest node of its inserted path that ends at or below its page-aligned prompt, not the end of its output. Agentic clients resend the assistant turn as re-rendered text, so the next turn diverges at the prompt end and only a prompt-end leaf lets the session's coverage advance.",
+    ] = False
+    session_release_evicted_leaf: A[
+        bool,
+        "With --enable-session-radix-cache, when a session leaf's node leaves the tree (its KV is gone from device and host), release that coverage instead of moving it to the nearest reusable ancestor, so a session that stopped advancing stops protecting its path.",
+    ] = False
+    session_coverage_host_only: A[
+        bool,
+        "With --enable-session-radix-cache, session coverage orders only the host LRU lists: device eviction (Full and SWA) stays plain LRU over the hot working set, while idle sessions' resume points are kept last on host. Coverage bookkeeping is unchanged.",
+    ] = False
+    session_id_header: A[
+        Optional[str],
+        Arg(
+            help=(
+                "Take a request's session_id from this HTTP header on the OpenAI "
+                "chat and completions endpoints when the body sets neither "
+                "session_id nor session_params (with --enable-session-radix-cache, "
+                "one radix-native session per header value). Without a value: "
+                "X-Correlation-ID. Off when omitted."
+            ),
+            nargs="?",
+            const="X-Correlation-ID",
+        ),
+    ] = None
     radix_cache_backend: A[
         Optional[str],
         "Name of a radix-cache backend previously registered via register_radix_cache_backend. Omit this flag to use the built-in default cache selection chain.",
@@ -130,6 +156,10 @@ class Memory(msgspec.Struct):
         int,
         "The size of host KV cache memory pool in gigabytes. Overrides --hicache-ratio in either host memory mode.",
     ] = 0
+    hicache_swa_fraction: A[
+        Optional[float],
+        "Fraction of --hicache-size given to the sliding-window (SWA) host pool of a hybrid full/SWA model; the other host pools split the rest by device bytes. Unset, every pool's share follows its device bytes. A cached prefix is reusable only up to a node whose window is still cached, so agentic multi-turn traffic can need a larger SWA share than the device pools imply. Needs --hicache-size; ignored with a unified KV pool (--enable-unified-memory).",
+    ] = None
     hicache_host_memory_fraction: A[
         Optional[float],
         "Fraction of the available host memory, bounded by visible cgroup memory.max/memory.high or v1 memory limits (after a 10 GiB reserve) that the HiCache host pools of all ranks on this machine may use. Applies only when neither --hicache-ratio nor --hicache-size is set: the default ratio is then reduced until the pools fit. Lower it when several engines share a memory cgroup.",

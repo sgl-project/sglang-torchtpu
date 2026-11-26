@@ -447,6 +447,8 @@ class TpuEnvs:
     # so a prefill chunk larger than the grid hands the epilogue the same row sets as
     # grid-sized chunks. 0 registers no hook.
     SGLANG_TPU_LOGPROB_GRID_ROWS = EnvInt(0)
+    # True on-policy RL: serve with the batch-invariant kernels (rl/true_on_policy/hooks.py).
+    SGLANG_TPU_ENABLE_TRUE_ON_POLICY = EnvBool(False)
     # Put each request's logit row on ForwardBatch.logit_rows before every plain
     # EXTEND forward (compilation/logit_rows.py), for models that run their last
     # layer on those rows only. Off leaves the field None.
@@ -491,6 +493,11 @@ class TpuEnvs:
     # 100 GB of host RAM per host to compile them). Compilation is frozen after warmup, so
     # scheduler intake rejects multimodal requests with a 400 (sglang_tpu/patches.py).
     SGLANG_TPU_VL_TEXT_ONLY_EXTEND = EnvBool(False)
+    # Prefill context parallelism mode (TpuSRTPlatform.pcp_ring_enabled): "gather" replicates the
+    # KV pool on every CP rank; "ring" page-stripes it like decode context
+    # parallelism and prefills through the fused ring kernel (needs
+    # --dcp-size == --attn-cp-size; validation sets an unset --dcp-size).
+    SGLANG_TPU_PCP_MODE = EnvStr("gather")
     # MoE: offload the gather in permute and unpermute to SparseCore.
     SGLANG_TPU_FUSED_MOE_SC_GATHER = EnvBool(True)
     # MoE: gather on the TensorCore below this many routed rows (tokens x topk);

@@ -20,16 +20,16 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from sglang_tpu.kernels.deepseek_v41.index_selection.fp8.cache import (
+from sglang_tpu.kernels.index_selection.fp8.cache import (
     PackedFP8Layout,
     quantize_index_rows,
     read_fp8_records,
     write_fp8_records,
 )
-from sglang_tpu.kernels.deepseek_v41.index_selection.fp8.candidates import (
+from sglang_tpu.models.deepseek_v41.kernels.index_candidates.candidates import (
     gather_candidate_keys,
 )
-from sglang_tpu.kernels.deepseek_v41.index_selection.selection import (
+from sglang_tpu.models.deepseek_v41.kernels.index_candidates.selection import (
     prepare_fp8_candidates,
     select_fp8_prepared,
 )

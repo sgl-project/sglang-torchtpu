@@ -68,7 +68,11 @@ class Schedule(msgspec.Struct):
     ] = None
     prefill_decode_interval_min_bs: A[
         int,
-        "Apply --prefill-decode-interval only while the running batch holds at least this many requests. Below it, prefill is admitted every round so the batch fills quickly. In data-parallel attention mode, each rank compares its own running batch. Set to 0 to apply the interval at any batch size.",
+        "Apply --prefill-decode-interval only while the running batch holds at least this many requests. Below it, prefill is admitted once --prefill-decode-interval-below-min-bs decode rounds have run (by default every round) so the batch fills quickly. In data-parallel attention mode, each rank compares its own running batch. Set to 0 to apply the interval at any batch size.",
+    ] = 0
+    prefill_decode_interval_below_min_bs: A[
+        int,
+        "The number of decode rounds to run after a prefill batch while the running batch holds fewer than --prefill-decode-interval-min-bs requests; at or above that size the full --prefill-decode-interval applies. A batch that shrinks below that size mid-interval ends the interval once this many rounds have run. Set to 0 to admit prefill every round below that size. Requires --prefill-decode-interval-min-bs > 0.",
     ] = 0
     enable_dynamic_chunking: A[
         bool,
@@ -89,6 +93,10 @@ class Schedule(msgspec.Struct):
         Optional[int],
         "The maximum number of requests in a prefill batch. If not specified, there is no limit.",
     ] = None
+    prefill_chunk_share_min_tokens: A[
+        int,
+        "While a prompt is prefilled in chunks, waiting requests whose uncached prefill fits share each prefill batch with it, in queue order, passing over longer ones; the chunked prompt keeps at least this many tokens of each batch. Cuts the wait of short turns behind a long cold prompt. Not for --schedule-policy shortest-prefill-first, which reserves room for shorter prefills itself. 0 disables.",
+    ] = 0
     schedule_policy: A[
         str,
         Arg(

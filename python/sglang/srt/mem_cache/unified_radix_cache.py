@@ -249,6 +249,7 @@ class UnifiedRadixCache(BasePrefixCache):
         assert params.tree_slots is not None
         self.tree_components = params.tree_components
         self.enable_session_radix_cache = params.enable_session_radix_cache
+        self.session_leaf_at_prompt_end = params.session_leaf_at_prompt_end
         component_registry = COMPONENT_REGISTRY
         if params.component_registry_override:
             component_registry = {
@@ -1886,8 +1887,43 @@ class UnifiedRadixCache(BasePrefixCache):
 
             if not isinstance(req.finished_reason, FINISH_ABORT):
                 self.session_refs.register_session_ref(
-                    req, leaf=result.last_device_node
+                    req,
+                    leaf=self.finished_session_leaf(
+                        result.last_device_node, len(prompt_key)
+                    ),
                 )
+
+        # After the last prefill chunk, decode retires the request's own window, so
+        # the rest of the forward must enter the tree now to keep a window at its end.
+        if (
+            not is_finished
+            and result.swa_branch_inserted
+            and effective_cache_len < len(token_ids)
+            and up_to >= len(req.origin_input_ids)
+        ):
+            self.checkpoint_into_tree(req, up_to=up_to, **kwargs)
+
+    def finished_session_leaf(self, last_node: NodeId, prompt_len: int) -> NodeId:
+        """The node a finished request registers as its session's leaf: the end of its
+        inserted path, or with session_leaf_at_prompt_end the deepest node on that path
+        ending at or below `prompt_len` (key tokens, page-aligned). The prompt end is
+        where the session's next turn continues: the client resends the assistant turn
+        as re-rendered text, which diverges from the cached output tokens."""
+        if not self.session_leaf_at_prompt_end:
+            return last_node
+        core = self.tree_core
+        path = []
+        node = core.node_by_id(last_node)
+        while node is not None and node is not core.root_node:
+            path.append(node)
+            node = node.parent
+        best, end = core.root_node, 0
+        for node in reversed(path):
+            end += len(node.key)
+            if end > prompt_len:
+                break
+            best = node
+        return best.id
 
     @rank_consensus(same_params=["req.rid"])
     def advance_unpublished_req(self, req: Req) -> None:
