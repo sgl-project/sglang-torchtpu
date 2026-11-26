@@ -8,7 +8,7 @@ first for single-tile row counts. It reuses #2411's packed mix-weight buffer
 and owner reference on the next norm (ops/mhc.py), runs the boundary kernel
 with the qa_chain epilogue (kernels/qa_chain.py), and stashes (q_lora, kv) for
 the next attention's ``prepare_mqa_qkv`` under the identity of the normed
-input it returns. kv RoPE stays the existing call there.
+input it returns. Eligible target verify buckets also rotate the KV here.
 
 c4 XProf (6 rows/rank, padded to 16): -0.41 ms per verify; GSM8K-1319 0.919.
 
@@ -76,6 +76,8 @@ def _boundary_qa(
     norm_eps: float,
     q_rank: int,
     qa_eps: float,
+    positions: jax.Array | None = None,
+    table: jax.Array | None = None,
 ) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """#2411's ``_shifted_jax`` plus the qa_chain epilogue, rows padded to 16."""
     from sglang_tpu.models.deepseek_v41.kernels.mhc import shifted_post_pre_rms as mhc
@@ -89,13 +91,18 @@ def _boundary_qa(
             jnp.pad(a, ((0, rows - t),) + ((0, 0),) * (a.ndim - 1))
             for a in (y, residual, post, comb, pre)
         )
+    cos_sin = None
+    if positions is not None:
+        from sglang_tpu.dsv4.rope import cos_sin_rows
+
+        cos_sin = cos_sin_rows(table, positions)
     epilogue = qa_chain_epilogue(
         rows,
         qa_weight,
         qa_weight_scale,
         q_norm_weight,
         kv_norm_weight,
-        None,
+        cos_sin,
         q_rank=q_rank,
         eps=qa_eps,
     )
@@ -189,6 +196,34 @@ def _next_attention(next_boundary):
     return getattr(layer, owner[1]), attn
 
 
+def _verify_rotary_inputs(attn, y):
+    # The target model binds its actual forward argument for this trace. Metadata
+    # may instead hold a separately padded/cast tensor or the compact extend tail.
+    from sglang.srt.model_executor.forward_context import (
+        get_attn_backend,
+        has_forward_context,
+    )
+
+    if y.shape[0] not in (48, 96) or not has_forward_context():
+        return None
+    positions = getattr(get_attn_backend(), "verify_positions", None)
+    table = getattr(attn, "freqs_cis", None)
+    if (
+        positions is None
+        or positions.shape != (y.shape[0],)
+        or positions.dtype not in (torch.int32, torch.int64)
+        or table is None
+        or table.ndim != 2
+        or table.shape[0] == 0
+        or table.shape[1] != 128
+        or table.dtype != torch.float32
+        or positions.device != y.device
+        or table.device != y.device
+    ):
+        return None
+    return positions, table
+
+
 def try_boundary_qa(hc, y, residual, coefficients, next_boundary):
     """The boundary + next attention chain as one call, or None when it does
     not apply (flag off, no attention after the seam, multi-tile rows, ...)."""
@@ -244,6 +279,8 @@ def try_boundary_qa(hc, y, residual, coefficients, next_boundary):
     from sglang.srt.models.deepseek_v4_mhc import HcNormed, HcState
 
     pre, post, comb = coefficients
+    rotary = _verify_rotary_inputs(attn, y)
+    rotary_args = () if rotary is None else (rotary[0].to(torch.int32), rotary[1])
     updated, next_post, next_comb, normalized, next_pre, q_lora, kv = _op()(
         y,
         residual.flatten(1),
@@ -264,9 +301,10 @@ def try_boundary_qa(hc, y, residual, coefficients, next_boundary):
         next_boundary.norm.variance_epsilon,
         int(attn.q_lora_rank),
         float(attn.eps),
+        *rotary_args,
     )
-    _log_engagement(rows, True)
-    stash(normalized, q_lora, kv)
+    _log_engagement(rows, True, "with_kv_rope" if rotary else "")
+    stash(normalized, q_lora, kv, rotary)
     return HcState(
         updated.view_as(residual),
         pre,
@@ -275,17 +313,21 @@ def try_boundary_qa(hc, y, residual, coefficients, next_boundary):
     )
 
 
-def stash(normalized: torch.Tensor, q_lora: torch.Tensor, kv: torch.Tensor) -> None:
+def stash(
+    normalized: torch.Tensor, q_lora: torch.Tensor, kv: torch.Tensor, rotary=None
+) -> None:
     # An entry nobody took (the attention sliced its input) dies with its input.
     for key in [k for k, v in _PRECOMPUTED.items() if v[0]() is None]:
         del _PRECOMPUTED[key]
-    _PRECOMPUTED[id(normalized)] = (weakref.ref(normalized), q_lora, kv)
+    _PRECOMPUTED[id(normalized)] = (weakref.ref(normalized), q_lora, kv, rotary)
 
 
-def take_precomputed(x: torch.Tensor):
-    """The boundary's (normed q_lora, normed kv without RoPE) for this exact
-    input, or None."""
+def take_precomputed(x: torch.Tensor, positions=None, table=None):
+    """Take Q and KV only for the original activation and rotary inputs."""
     entry = _PRECOMPUTED.pop(id(x), None)
     if entry is None or entry[0]() is not x:
         return None
-    return entry[1], entry[2]
+    _, q, kv, rotary = entry
+    if rotary is not None and not (rotary[0] is positions and rotary[1] is table):
+        return None
+    return q, kv, rotary is not None

@@ -1925,12 +1925,13 @@ class DSV41TPUAttnBackend(AttentionBackend):
         # A module reference, never a tensor: safe to keep across traces.
         self.rope_owners.setdefault(layer.layer_id, layer)
         # G-B-lite: the mHC boundary already ran this layer's wqkv_a and norms.
-        precomputed = take_precomputed(x_linear)
+        table = rope_table(layer.freqs_cis)
+        precomputed = take_precomputed(x_linear, positions, table)
+        kv_rotated = False
         if precomputed is not None:
-            q_lora, kv = precomputed
+            q_lora, kv, kv_rotated = precomputed
         else:
             q_lora = layer.q_norm(q_lora)
-        table = rope_table(layer.freqs_cis)
         if (
             self.qb_rope_op is not None
             and q_lora.device.type == "tpu"
@@ -1954,7 +1955,8 @@ class DSV41TPUAttnBackend(AttentionBackend):
             else:
                 kv, _ = layer.wkv(x_linear)
             kv = layer.kv_norm(kv)
-        kv = apply_rope(kv, positions, layer.freqs_cis)
+        if not kv_rotated:
+            kv = apply_rope(kv, positions, table)
         if q_out is not None:
             q_out.copy_(q)
             q = q_out

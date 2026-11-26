@@ -269,6 +269,51 @@ def test_direct_trace_chains_boundaries_and_reuses_updated_packed_buffer(tpu):
     assert not torch.equal(before[0][-1].cpu(), after[0][-1].cpu())
 
 
+@pytest.mark.parametrize("tokens", [48, 96])
+def test_boundary_qa_kv_rope_matches_separate_rotation(tpu, tokens):
+    from sglang_tpu.compilation.direct_compile import direct_compile
+    from sglang_tpu.dsv4.dsv4_attention_backend import apply_tpu_dsv4_rope
+    from sglang_tpu.models.deepseek_v41 import qa_chain_op
+
+    y, residual, pre, post, comb, fn, scale, base, norm = _case(tokens)
+    y[-1].zero_()
+    residual[-1].zero_()
+    rng = torch.Generator().manual_seed(17)
+    positions = torch.randint(256, (tokens,), generator=rng, dtype=torch.int32)
+    positions[:4] = torch.tensor([0, 1, 254, 255])
+    angles = torch.randn(256, 32, generator=rng)
+    table = torch.cat((angles.cos(), angles.sin()), -1).view(-1, 128)
+    tensors = (
+        y,
+        residual.flatten(1),
+        post,
+        comb,
+        ops.pack_mix_weight(fn),
+        scale,
+        base,
+        pre,
+        norm,
+        torch.randn(D, 1792, generator=rng).to(torch.float8_e4m3fn),
+        torch.ones(1792),
+        torch.ones(1280).bfloat16(),
+        torch.ones(512).bfloat16(),
+    )
+    op = qa_chain_op._op()
+    scalars = (1e-20, HC_EPS, SINKHORN_ITERS, 1e-20, 1280, 1e-20)
+
+    def paired(inputs, positions, table):
+        baseline = op(*inputs, *scalars)
+        expected = (*baseline[:-1], apply_tpu_dsv4_rope(baseline[-1], positions, table))
+        return expected, op(*inputs, *scalars, positions, table)
+
+    compiled = direct_compile(paired, specialization_key=lambda *args: tokens)
+    expected, actual = compiled(
+        tuple(t.to(tpu) for t in tensors), positions.to(tpu), table.to(tpu)
+    )
+    for a, b in zip(actual, expected, strict=True):
+        torch.testing.assert_close(a.cpu(), b.cpu(), atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("tokens", [0, 8, 15, 40])
 def test_unsupported_token_bucket_falls_back(tpu, tokens):
     cfg = SimpleNamespace(mult=M, hidden=D)

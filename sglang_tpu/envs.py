@@ -521,6 +521,8 @@ class TpuEnvs:
     # RMSNorm in the boundary kernel; the mHC dispatch calls it before #2411's
     # shifted boundary. Off keeps the dispatch on #2411 / the original path.
     SGLANG_TPU_DSV41_MHC_QA_EPILOGUE = EnvBool(False)
+    # Rotate KV inside the QA epilogue for measured target-verify buckets.
+    SGLANG_TPU_DSV41_MHC_QA_KV_ROPE = EnvBool(False)
     # mHC boundary dispatch: rows up to this go to the G-B-lite chain (when it
     # applies), larger rows to the shifted mHC kernel (96..8192), else the original.
     SGLANG_TPU_DSV41_MHC_GBLITE_MAX_ROWS = EnvInt(128)

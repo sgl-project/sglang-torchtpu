@@ -3,6 +3,7 @@ produced, declines unless its flag, the owner and the shape all fit, and its
 exported op has a schema torch can infer."""
 
 import inspect
+import types
 import typing
 import unittest
 import weakref
@@ -122,6 +123,41 @@ class StashTest(unittest.TestCase):
         self.assertIs(got[1], kv)
         self.assertIsNone(qa_chain_op.take_precomputed(x))
 
+    def test_rotated_kv_requires_the_original_positions_and_table(self):
+        x, q, kv = (torch.randn(3, 4) for _ in range(3))
+        positions = torch.arange(3)
+        table = torch.zeros(8, 128)
+        for p, t in ((positions.clone(), table), (positions, table.clone())):
+            qa_chain_op.stash(x, q, kv, (positions, table))
+            self.assertIsNone(qa_chain_op.take_precomputed(x, p, t))
+        qa_chain_op.stash(x, q, kv, (positions, table))
+        q_out, kv_out, rotated = qa_chain_op.take_precomputed(x, positions, table)
+        self.assertTrue(rotated)
+        self.assertIs(q_out, q)
+        self.assertIs(kv_out, kv)
+
+
+class VerifyRopeTest(unittest.TestCase):
+    def test_only_bound_verify_rows_with_lane_table(self):
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+        )
+
+        y = torch.empty(48, 5120, dtype=torch.bfloat16)
+        positions = torch.arange(48)
+        attn = SimpleNamespace(freqs_cis=torch.empty(1024, 128))
+        be = SimpleNamespace(verify_positions=None)
+        with forward_context(ForwardContext(attn_backend=be)):
+            self.assertIsNone(qa_chain_op._verify_rotary_inputs(attn, y))
+            be.verify_positions = positions
+            pair = qa_chain_op._verify_rotary_inputs(attn, y)
+            self.assertIs(pair[0], positions)
+            self.assertIs(pair[1], attn.freqs_cis)
+            self.assertIsNone(qa_chain_op._verify_rotary_inputs(attn, y[:24]))
+            attn.freqs_cis = torch.empty(1024, 64)
+            self.assertIsNone(qa_chain_op._verify_rotary_inputs(attn, y))
+
 
 class SchemaTest(unittest.TestCase):
     """torch.library must infer the op's schema (jax.Array read as Tensor); a
@@ -133,6 +169,8 @@ class SchemaTest(unittest.TestCase):
         def conv(a):
             if a is jax.Array:
                 return torch.Tensor
+            if typing.get_origin(a) is types.UnionType:
+                return typing.Optional[conv(typing.get_args(a)[0])]
             if typing.get_origin(a) in (tuple, typing.Tuple):
                 return typing.Tuple[tuple(conv(x) for x in typing.get_args(a))]
             return a

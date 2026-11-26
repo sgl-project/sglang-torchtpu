@@ -53,6 +53,8 @@ CONFIG["runtime_env"]["SGLANG_TPU_FUSED_EP_V2_COMBINE_FUSE_SCALES"] = "1"
 # rows; larger seams take the shifted mHC kernel. c4: -0.41 ms per step; AgentX c32
 # paired p90 interactivity ratio 1.039; GSM8K 0.919.
 CONFIG["runtime_env"]["SGLANG_TPU_DSV41_MHC_QA_EPILOGUE"] = "1"
+# T48/T96 target verify: consume the next attention's KV RoPE in this epilogue.
+CONFIG["runtime_env"]["SGLANG_TPU_DSV41_MHC_QA_KV_ROPE"] = "1"
 # DSpark Markov drafts split over the vocab across the attention-DP ranks (needs
 # the vocab-parallel head). AgentX real-draft pairs: c4 paired p90 interactivity
 # ratio 1.047 (95% CI 1.014-1.082), c32 tok/s/chip +2.8% at flat p90, c256 p90

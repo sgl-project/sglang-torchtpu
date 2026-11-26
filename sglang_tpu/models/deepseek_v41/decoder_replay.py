@@ -535,13 +535,16 @@ class FullLayoutTail:
 
 
 @contextlib.contextmanager
-def _model_forward(backend):
+def _model_forward(backend, verify_positions=None):
     """Mark ``backend`` as inside a model forward, where core reads its tail."""
+    outer_positions = getattr(backend, "verify_positions", None)
+    backend.verify_positions = verify_positions
     outer = backend.in_model_forward
     backend.in_model_forward = True
     try:
         yield
     finally:
+        backend.verify_positions = outer_positions
         backend.in_model_forward = outer
 
 
@@ -555,7 +558,15 @@ def scatter_dspark_capture(
     read its compact-tail branch as the identity (``FullLayoutTail``)."""
     from sglang.srt.model_executor.forward_context import get_attn_backend
 
-    with _model_forward(get_attn_backend()):
+    from sglang_tpu.envs import envs as tpu_envs
+
+    verify_positions = None
+    if (
+        tpu_envs.SGLANG_TPU_DSV41_MHC_QA_KV_ROPE.get()
+        and forward_batch.forward_mode.is_target_verify()
+    ):
+        verify_positions = positions
+    with _model_forward(get_attn_backend(), verify_positions):
         return _scatter_dspark_capture(
             original, model, input_ids, positions, forward_batch, *args, **kwargs
         )
