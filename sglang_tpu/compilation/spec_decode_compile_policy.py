@@ -108,13 +108,13 @@ class BaseSpecDecodeCompilePolicyMixin:
         if disagg_mode != "prefill":
             cases += [
                 EagerLogitsCase(
-                    num_tokens=bs * self.draft_token_num,
+                    num_tokens=bs * width,
                     bs=bs,
                     mode=ForwardMode.TARGET_VERIFY,
                     capture_hidden_mode=CaptureHiddenMode.FULL,
-                    spec_info=self.make_verify_spec_info(),
+                    spec_info=self.make_verify_spec_info(width=width),
                 )
-                for bs in self.b_bucketer.buckets
+                for bs, width in self.target_verify_shapes()
             ]
         if disagg_mode != "decode":
             bs = self._extend_compile_cap()
@@ -132,19 +132,16 @@ class BaseSpecDecodeCompilePolicyMixin:
 
     def _precompile_target_verify(self) -> list[PendingCall]:
         """Compile TARGET_VERIFY across the batch-size buckets."""
-        assert self.b_bucketer is not None
-        draft_token_num = self.draft_token_num
-        bs_buckets = list(self.b_bucketer.buckets)
+        shapes = self.target_verify_shapes()
         modes = self.target_verify_logits_output_modes()
         logger.info(
             "[spec compile policy] TARGET_VERIFY: %d shapes "
-            "(bs=%s, draft_token_num=%d, logits=%s)",
-            len(bs_buckets) * len(modes),
-            bs_buckets,
-            draft_token_num,
+            "((bs, width)=%s, logits=%s)",
+            len(shapes) * len(modes),
+            list(shapes),
             [mode.name for mode in modes],
         )
-        cases = [(bs, mode) for bs in bs_buckets for mode in modes]
+        cases = [(bs, width, mode) for bs, width in shapes for mode in modes]
         compile_range = (
             tqdm.tqdm(
                 cases,
@@ -155,8 +152,8 @@ class BaseSpecDecodeCompilePolicyMixin:
             else cases
         )
         pending = []
-        for bs, logits_output_mode in compile_range:
-            num_tokens = bs * draft_token_num
+        for bs, width, logits_output_mode in compile_range:
+            num_tokens = bs * width
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
             warmup = self._run_one(
@@ -165,7 +162,7 @@ class BaseSpecDecodeCompilePolicyMixin:
                 mode=ForwardMode.TARGET_VERIFY,
                 logits_output_mode=logits_output_mode,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
-                spec_info=self.make_verify_spec_info(),
+                spec_info=self.make_verify_spec_info(width=width),
             )
             if warmup is not None:
                 pending.append(warmup)
@@ -176,6 +173,11 @@ class BaseSpecDecodeCompilePolicyMixin:
                     f" {logits_output_mode.name}) in {elapsed:.1f}s{hbm_str}"
                 )
         return pending
+
+    def target_verify_shapes(self) -> tuple[tuple[int, int], ...]:
+        """Every (batch bucket, verify rows per request) the spec worker sends."""
+        assert self.b_bucketer is not None
+        return tuple((bs, self.draft_token_num) for bs in self.b_bucketer.buckets)
 
     def target_verify_logits_output_modes(self) -> tuple[LogitsOutputMode, ...]:
         """Every logits mode the spec worker requests for its verify forward."""
@@ -262,8 +264,10 @@ class BaseSpecDecodeCompilePolicyMixin:
         """
         raise NotImplementedError
 
-    def make_verify_spec_info(self) -> SpecInput:
+    def make_verify_spec_info(self, *, width: int | None = None) -> SpecInput:
         """Create dummy speculative verify input metadata for verify compilation.
+
+        width is the verify rows per request, draft_token_num when None.
 
         Raises:
           NotImplementedError: Must be implemented by subclasses.

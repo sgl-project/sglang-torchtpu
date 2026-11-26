@@ -694,9 +694,9 @@ class TestFixedWidthAsDecode(CustomTestCase):
     """Fixed-width spec phases take the kernel's DECODE range.
 
     The kernel's decode loop bounds are static, so the width forwarded to the
-    op must match the width this backend was built for. Target verification
-    of that width and a decode-phase draft extension whose every row has that
-    width qualify; every other forward stays on the dynamic routes with 1.
+    op must be one this forward fills exactly. Target verification at the built
+    width or narrower and a decode-phase draft extension whose every row has
+    the built width qualify; every other forward stays on the dynamic routes with 1.
     """
 
     PAGE_SIZE = 16
@@ -861,6 +861,28 @@ class TestFixedWidthAsDecode(CustomTestCase):
             self._forward_width(backend, ForwardMode.TARGET_VERIFY, self.WIDTH + 1),
             1,
         )
+
+    def test_narrower_verify_keeps_its_own_decode_tiles(self):
+        # An adaptive verify width alternates on one backend; it must not change
+        # the configured width or the cached distributions.
+        backend = self._backend(self.WIDTH + 1)
+        # Off by default: other narrower verifies (a DSpark anchor block) keep MIXED.
+        self.assertEqual(
+            self._forward_width(backend, ForwardMode.TARGET_VERIFY, self.WIDTH), 1
+        )
+        backend.narrow_verify_decode_tiles = True
+        for width in (self.WIDTH, self.WIDTH + 1, 2, self.WIDTH + 1):
+            with self.subTest(width=width):
+                self.assertEqual(
+                    self._forward_width(backend, ForwardMode.TARGET_VERIFY, width),
+                    width,
+                )
+                meta = backend.forward_metadata
+                self.assertEqual(
+                    meta.cu_q_lens.tolist(), [0, width, 2 * width, 3 * width]
+                )
+                self.assertEqual(meta.distribution.tolist(), [3, 3, 3])
+                self.assertEqual(backend.decode_query_size, self.WIDTH + 1)
 
     def _verify_distribution(self, backend, num_tokens_per_req):
         bs = 3

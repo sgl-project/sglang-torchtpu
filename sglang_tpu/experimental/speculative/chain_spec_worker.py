@@ -48,6 +48,7 @@ from sglang.srt.speculative.ragged_verify import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.experimental import register_pd_carry_seeder, runs_draft_prompt_pass
 from sglang_tpu.experimental.speculative.base_spec_worker import TpuSpecWorker
 from sglang_tpu.experimental.speculative.chain_draft_input import (
@@ -106,6 +107,10 @@ class TpuChainSpecWorker(TpuSpecWorker):
         if get_spec().speculative_draft_window_size is not None:
             raise NotImplementedError(
                 "TpuChainSpecWorker does not support --speculative-draft-window-size."
+            )
+        if tpu_envs.SGLANG_TPU_SPEC_VERIFY_WIDTH_BY_BS.get() is not None:
+            raise NotImplementedError(
+                "SGLANG_TPU_SPEC_VERIFY_WIDTH_BY_BS supports DFLASH on TpuBlockSpecWorker only."
             )
         target_runner = target_worker.model_runner
         self._spec_algorithm = target_runner.spec_algorithm

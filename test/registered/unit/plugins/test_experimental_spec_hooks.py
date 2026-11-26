@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import pkgutil
 import subprocess
 import sys
@@ -31,9 +32,16 @@ from sglang_tpu.experimental.speculative.block_info import (
 )
 from sglang_tpu.experimental.speculative.block_spec_worker import TpuBlockSpecWorker
 from sglang_tpu.experimental.speculative.chain_info import HostPaddedChainDraftInput
+from sglang_tpu.experimental.speculative.spec_ops import finalize_accept
 from sglang_tpu.experimental.speculative.spec_types import (
     DraftResult,
+    SpecState,
     TpuSpecVerifyInput,
+)
+from sglang_tpu.experimental.speculative.verify_width import (
+    parse_verify_width_table,
+    simulated_accept_lengths,
+    verify_width_table,
 )
 from sglang_tpu.hooks.experimental_spec import (
     alloc_extend,
@@ -154,8 +162,11 @@ class TestExperimentalSpecHooks(CustomTestCase):
         worker = object.__new__(TpuBlockSpecWorker)
         worker.num_verify_rows = 8
         worker._target_has_linear_attn = True
+        worker._verify_width_table = None
         batch, rows, drafts, logits, accept, committed = [object() for _ in range(6)]
-        bucket = SimpleNamespace(state=SimpleNamespace(seq_lens=object()))
+        bucket = SimpleNamespace(
+            state=SimpleNamespace(seq_lens=SimpleNamespace(shape=(4,)))
+        )
         addressing = SimpleNamespace(
             verify_cache_candidates=object(), committed_lens=object()
         )
@@ -1173,6 +1184,8 @@ class TestExperimentalSpecHooks(CustomTestCase):
             draft_candidates=None,
         )
         worker._all_drafts = {4: None}
+        worker.num_verify_rows = 3
+        rows = SimpleNamespace(cache_locs=torch.zeros((4, 3), dtype=torch.int64))
         bucket = SimpleNamespace(
             state=SimpleNamespace(seq_lens=torch.zeros(4), bonus_tokens=None),
             live_mask=None,
@@ -1183,7 +1196,7 @@ class TestExperimentalSpecHooks(CustomTestCase):
         results = {}
         for sampled in (True, False):
             worker._sampled_drafts = sampled
-            results[sampled] = worker.draft(None, bucket, None, None)
+            results[sampled] = worker.draft(None, bucket, rows, None)
         self.assertEqual(results[True].draft_tokens, "sampled")
         self.assertIs(results[False].draft_tokens, greedy)
         self.assertIsNone(results[False].draft_logits)
@@ -1763,6 +1776,287 @@ class TestExperimentalSpecHooks(CustomTestCase):
                 ):
                     worker.init_cuda_graphs()
                 self.assertEqual(calls, expected)
+
+
+class TestVerifyWidthTable(CustomTestCase):
+    def test_bucket_takes_last_step_at_or_below(self):
+        table = parse_verify_width_table("16:6, 1:8,64:4", max_width=8)
+        widths = {bs: table.width_for(bs) for bs in (1, 8, 16, 32, 64, 128)}
+        self.assertEqual(widths, {1: 8, 8: 8, 16: 6, 32: 6, 64: 4, 128: 4})
+        self.assertEqual(table.reachable_widths([1, 2, 4, 8, 16]), (6, 8))
+        table = parse_verify_width_table("1:8,3:4", max_width=8)
+        self.assertEqual(
+            table.shapes([1, 2, 3, 12, 16]),
+            ((1, 8), (2, 8), (3, 4), (12, 4), (16, 4)),
+        )
+
+    def test_rejects_invalid_tables(self):
+        # A table must cover bucket 1: "3:4" leaves buckets 1-2 without a width.
+        for spec in ("", "3:4", "1:9", "1:1", "0:4", "1:4,1:6", "4", "a:b"):
+            with self.subTest(spec=spec), self.assertRaises(ValueError):
+                parse_verify_width_table(spec, max_width=8)
+
+    def test_only_dflash_drafts_at_a_narrower_width(self):
+        with envs.SGLANG_TPU_SPEC_VERIFY_WIDTH_BY_BS.override("1:8,3:4"):
+            table = verify_width_table(8, spec_algorithm=SpeculativeAlgorithm.DFLASH)
+            self.assertEqual(table.width_for(3), 4)
+            with self.assertRaises(NotImplementedError):
+                verify_width_table(8, spec_algorithm=SpeculativeAlgorithm.DSPARK)
+
+    def test_simulation_needs_an_accept_length_per_narrower_width(self):
+        """The full-width accept length clamped to a narrower width would accept every draft."""
+
+        def lengths(spec):
+            with envs.SGLANG_TPU_SIMULATE_ACC_LEN_BY_WIDTH.override(spec):
+                return simulated_accept_lengths(
+                    (4, 8), full_width=8, full_accept_length=4.05
+                )
+
+        self.assertEqual(lengths("4:3.06"), {8: 4.05, 4: 3.06})
+        # The full width belongs to SGLANG_SIMULATE_ACC_LEN alone.
+        for spec in (None, "6:3.5", "4:4.5", "4:3,4:3.5", "4:3.06,8:4.5"):
+            with self.subTest(spec=spec), self.assertRaises(ValueError):
+                lengths(spec)
+
+
+class _NarrowRecordingDrafter:
+    """Draft worker stand-in recording the block width active around each forward."""
+
+    def __init__(self):
+        self.active = [8]
+
+    def draft_context(self):
+        return contextlib.nullcontext()
+
+    @contextlib.contextmanager
+    def narrow_block(self, width):
+        self.active.append(width)
+        try:
+            yield
+        finally:
+            self.active.pop()
+
+
+class TestAdaptiveVerifyWidth(CustomTestCase):
+    MASK = 9
+
+    def _worker(self, spec="1:8,3:4"):
+        worker = object.__new__(TpuBlockSpecWorker)
+        worker.num_verify_rows = 8
+        worker._verify_width_table = parse_verify_width_table(spec, max_width=8)
+        worker._target_has_linear_attn = False
+        worker._draft_block_width = 8
+        worker._mask_token_id = self.MASK
+        worker._block_draft_worker = _NarrowRecordingDrafter()
+        worker._draft_runner = None
+        worker._spec_algorithm = SpeculativeAlgorithm.DFLASH
+        worker._draft_block_spec_infos = {
+            w: SimpleNamespace(draft_token_num=w) for w in (4, 8)
+        }
+        worker._all_drafts = {pbs: torch.full((pbs,), 7) for pbs in (2, 4)}
+        worker._narrow_drafts = {(4, 4): torch.full((4,), 3)}
+        worker._sampled_drafts = False
+        worker._tp_sync = SimpleNamespace(sync=lambda site, tokens: tokens)
+        return worker
+
+    def _step(self, worker, padded_bs):
+        """One decode step with the target verify and commit stubbed out."""
+        seen = {}
+
+        def forward_draft_rows(**kwargs):
+            width = kwargs["width"]
+            seen["forward"] = (
+                width,
+                kwargs["spec_info"].draft_token_num,
+                worker._block_draft_worker.active[-1],
+                kwargs["inputs"].input_ids.view(padded_bs, width),
+            )
+            return LogitsProcessorOutput(
+                next_token_logits=None,
+                hidden_states=torch.zeros(padded_bs * width, 2),
+                next_draft_tokens=torch.zeros(
+                    (padded_bs, width - 1), dtype=torch.int64
+                ),
+            )
+
+        def verify(batch, bucket, rows, draft_result, verify_input, **kwargs):
+            seen["rows"], seen["draft"] = rows, draft_result
+            return None, None
+
+        state = SpecState(
+            bonus_tokens=torch.full((padded_bs,), 5),
+            seq_lens=torch.full((padded_bs,), 100),
+            req_pool_indices=torch.arange(1, padded_bs + 1),
+        )
+        bucket = SimpleNamespace(
+            state=state,
+            live_mask=torch.ones(padded_bs, dtype=torch.bool),
+            temperatures=None,
+            top_ks=None,
+        )
+        verify_input = SimpleNamespace(
+            verify_cache_candidates=torch.arange(padded_bs * 16).view(padded_bs, 16),
+            committed_lens=torch.full((padded_bs,), 100),
+        )
+        with (
+            patch(
+                "sglang_tpu.experimental.speculative.block_spec_worker.forward_draft_rows",
+                forward_draft_rows,
+            ),
+            patch.object(worker, "verify", verify),
+            patch.object(worker, "commit", return_value=None),
+        ):
+            worker.step(None, bucket, verify_input)
+        return seen
+
+    def test_a_bucket_verifies_and_drafts_natively_at_its_width(self):
+        """From min_bs on, the draft forwards a width-row block [r, m, m, m] inside the
+        drafter's narrow_block and verifies those drafts, instead of cutting a full block."""
+        worker = self._worker()
+        for padded_bs, width in ((2, 8), (4, 4)):
+            with self.subTest(padded_bs=padded_bs):
+                seen = self._step(worker, padded_bs)
+                self.assertEqual(seen["rows"].cache_locs.shape, (padded_bs, width))
+                forward_width, spec_width, active, input_ids = seen["forward"]
+                self.assertEqual((forward_width, spec_width, active), (width,) * 3)
+                expected_ids = torch.tensor([5] + [self.MASK] * (width - 1))
+                self.assertTrue(
+                    torch.equal(input_ids, expected_ids.expand_as(input_ids))
+                )
+                draft = seen["draft"]
+                self.assertEqual(draft.draft_tokens.shape, (padded_bs, width - 1))
+                self.assertEqual(
+                    draft.num_verify_drafts.tolist(), [width - 1] * padded_bs
+                )
+        # The drafter's block size is restored after the narrow step.
+        self.assertEqual(worker._block_draft_worker.active, [8])
+
+    def test_narrow_step_result_strides_by_its_width(self):
+        """The scheduler unflattens accept tokens by the result's stride; a narrow step
+        reporting the configured width would hand requests each other's tokens."""
+        from sglang.srt.managers.scheduler_components.batch_result_processor import (
+            _get_speculative_output_stride,
+        )
+
+        worker = self._worker()
+        accept = finalize_accept(
+            torch.arange(12).view(4, 3),
+            torch.tensor([3, 1, 0, 0]),
+            torch.tensor([50, 51, 52, 0]),
+            torch.full((4,), 100),
+            torch.tensor([True, True, True, False]),
+        )
+        state = SpecState(
+            bonus_tokens=accept.bonus_tokens,
+            seq_lens=accept.next_seq_lens,
+            req_pool_indices=torch.arange(1, 5),
+        )
+        logits_output = LogitsProcessorOutput(next_token_logits=torch.zeros(16, 3))
+        result = worker._pack_decode_result(
+            bs=3, next_state=state, logits_output=logits_output, accept=accept
+        )
+        stride = _get_speculative_output_stride(result)
+        self.assertEqual(stride, 4)
+        self.assertTrue(
+            torch.equal(result.next_token_ids.view(3, stride), accept.accept_tokens[:3])
+        )
+        self.assertEqual(result.accept_lens.tolist(), [4, 2, 1])
+        self.assertEqual(logits_output.next_token_logits.shape[0], 3 * 4)
+
+    def test_simulated_accept_draws_each_width_from_its_own_length(self):
+        worker = self._worker()
+        worker._simulate_acc_lens = {8: 4.05, 4: 3.06}
+        worker._simulated_correct = {(4, n): torch.full((4,), n) for n in range(8)}
+        worker._simulated_bonus = {4: torch.zeros(4)}
+        worker._simulated_drafts = {
+            (4, w): torch.zeros((4, w - 1), dtype=torch.int64) for w in (4, 8)
+        }
+        torch.manual_seed(0)
+        for width, expected in ((4, {3, 4}), (8, {4, 5})):
+            with self.subTest(width=width):
+                draws = []
+                for _ in range(200):
+                    correct, _, drafts = worker._simulated_accept(4, width)
+                    draws.append(int(correct[0]) + 1)
+                    self.assertEqual(drafts.shape, (4, width - 1))
+                self.assertEqual(set(draws), expected)
+
+    def test_compile_policy_warms_each_bucket_at_the_workers_width(self):
+        """The target verify, KV commit and draft graphs are warmed per (bucket, width)
+        the worker sends, never width x bucket, and narrow drafts trace natively."""
+        from sglang_tpu.experimental.compilation.block_compile_policy import (
+            TpuBlockSpecDecodeCompilePolicyMixin,
+        )
+
+        buckets = (1, 2, 3, 4, 8, 16)
+        policy = object.__new__(TpuBlockSpecDecodeCompilePolicyMixin)
+        policy.draft_token_num = 8
+        policy.b_bucketer = SimpleNamespace(buckets=buckets)
+        policy.model_runner = SimpleNamespace(
+            spec_algorithm=SpeculativeAlgorithm.DFLASH,
+            model=SimpleNamespace(lm_head=None),
+            device="cpu",
+        )
+        drafter = _NarrowRecordingDrafter()
+        traced = []
+
+        def run_one(*, num_tokens, bs, spec_info, **kwargs):
+            traced.append(
+                (bs, num_tokens // bs, spec_info.draft_token_num, drafter.active[-1])
+            )
+
+        policy._run_one = run_one
+        policy._precompile_shapes = lambda desc, items, run: [run(i) for i in items]
+        worker = self._worker()
+        with (
+            envs.SGLANG_TPU_SPEC_VERIFY_WIDTH_BY_BS.override("1:8,3:4"),
+            patch.object(worker, "_bucket_sizes", return_value=buckets),
+        ):
+            shapes = policy.target_verify_shapes()
+            policy._precompile_draft_block(
+                None, block_width=8, narrow_block=drafter.narrow_block
+            )
+            self.assertEqual(list(shapes), worker._verify_shapes())
+        self.assertEqual(shapes, ((1, 8), (2, 8), (3, 4), (4, 4), (8, 4), (16, 4)))
+        self.assertEqual(traced, [(bs, w, w, w) for bs, w in shapes])
+
+
+class TestDflashNarrowBlock(CustomTestCase):
+    def test_narrow_block_keeps_requests_apart(self):
+        """The grouped convolutions index rows modulo the block size: a narrow block
+        convolved at the full size would read the previous request's rows."""
+        from sglang.srt.models.dflash import DFlashDraftModel, DFlashGroupedConv
+        from sglang_tpu.experimental.speculative.dflash.dflash_draft_worker import (
+            TpuDflashDraftWorker,
+        )
+
+        torch.manual_seed(0)
+        conv = DFlashGroupedConv(hidden_size=8, block_size=8, taps=3, group_size=4)
+        model = object.__new__(DFlashDraftModel)
+        torch.nn.Module.__init__(model)
+        layer = torch.nn.Module()
+        layer.attention_conv, layer.mlp_conv = conv, None
+        model.layers = torch.nn.ModuleList([layer])
+        drafter = object.__new__(TpuDflashDraftWorker)
+        drafter._dflash_model = model
+        drafter.block_width = 8
+        # Two requests' 4-row blocks; the second one's rows must not see the first's.
+        rows = torch.randn(8, 8)
+        perturbed = rows.clone()
+        perturbed[:4] += 1.0
+        delta = torch.randn(8, 3, 2)
+
+        def second_request(x):
+            return conv._convolve(x, delta, side=0)[4:]
+
+        with drafter.narrow_block(4):
+            self.assertTrue(
+                torch.equal(second_request(rows), second_request(perturbed))
+            )
+        self.assertEqual(conv.block_size, 8)
+        self.assertFalse(torch.equal(second_request(rows), second_request(perturbed)))
+        with self.assertRaises(ValueError), drafter.narrow_block(9):
+            pass
 
 
 if __name__ == "__main__":

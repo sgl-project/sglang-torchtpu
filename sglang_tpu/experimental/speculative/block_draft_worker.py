@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from abc import abstractmethod
 from collections.abc import Callable
 from typing import NamedTuple
@@ -104,6 +105,18 @@ class TpuBlockDraftWorker(TpuDraftWorker):
         del block_hidden, bonus_tokens
         return None
 
+    def narrow_block(self, width: int) -> contextlib.AbstractContextManager[None]:
+        """Run the block forwards traced or served inside it at width rows.
+
+        A narrower block proposes width - 1 drafts natively, for a verify narrower
+        than block_width; drafters that cannot raise.
+        """
+        if width != self.block_width:
+            raise NotImplementedError(
+                f"{type(self).__name__} drafts only its {self.block_width}-row block."
+            )
+        return contextlib.nullcontext()
+
     @property
     def full_to_swa(self) -> torch.Tensor | None:
         """Host full-to-SWA slot map when the draft KV lives in the SWA sub-pool, else None."""
@@ -137,6 +150,7 @@ class TpuBlockDraftWorker(TpuDraftWorker):
             self.model_runner.attn_backend,
             kv_writer=self._write_draft_kv_eager,
             block_width=self.block_width,
+            narrow_block=self.narrow_block,
         )
 
     def write_draft_kv(
