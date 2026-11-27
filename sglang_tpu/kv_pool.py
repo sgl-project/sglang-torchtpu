@@ -23,6 +23,7 @@ buffer.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Optional, Tuple
 
 import numpy as np
@@ -35,6 +36,7 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
 )
 from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.kernels.index_selection.fp8 import pages as fp8_pages
 
 logger = logging.getLogger(__name__)
 
@@ -1440,12 +1442,16 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         index_head_dim: int,
         index_key_layers: list[bool],
         index_kpool: int,
+        page_size: int,
         raw_ring: bool = False,
         qk_rope_head_dim: int = 64,
     ) -> int:
         """Bytes one token takes across all layers' buffers, as allocated.
         A raw ring is sized by request slots, not tokens, so it is not counted."""
-        index_bytes = cls.index_key_record_bytes(index_head_dim) // index_kpool
+        _, index_shape = cls._index_key_cache_spec(
+            1, page_size, index_head_dim, index_kpool
+        )
+        index_bytes = math.prod(index_shape) // page_size
         if index_kpool > 1 and not raw_ring:
             index_bytes += 2 * index_head_dim * torch.bfloat16.itemsize
         layer_bytes = cls.NOPE_BYTES + cls.rope_bytes_per_token(qk_rope_head_dim)
@@ -1469,6 +1475,25 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
         key_bytes = _cdiv(index_head_dim, lane) * lane
         return _cdiv(key_bytes + key_bytes // lane, lane) * lane
 
+    @classmethod
+    def _index_key_cache_spec(
+        cls, num_pages: int, page_size: int, index_head_dim: int, index_kpool: int
+    ) -> tuple[str, tuple[int, ...]]:
+        """The layout passed to the backend and the buffer shape it requires."""
+        if (
+            page_size in (128, 256)
+            and index_head_dim == 128
+            and index_kpool == 1
+            and tpu_envs.SGLANG_TPU_DSA_PACKED_INDEX_CACHE.get()
+        ):
+            return "packed", fp8_pages.cache_shape(num_pages, page_size, index_head_dim)
+        return "record", (
+            num_pages,
+            page_size // (cls.TOKENS_PER_ROW * index_kpool),
+            cls.TOKENS_PER_ROW,
+            cls.index_key_record_bytes(index_head_dim),
+        )
+
     def _create_buffers(self):
         rows_per_page = self.page_size // self.TOKENS_PER_ROW
         nope_shape = (
@@ -1489,11 +1514,8 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
             # (zero_rope), so one row stands in for it. It is not a page
             # buffer: P/D transfer and HiCache leave it out.
             rope_shape = (1, 1, self.TOKENS_PER_ROW, self.LANE_BYTES)
-        index_key_shape = (
-            self.num_pages,
-            rows_per_page // self._index_kpool,
-            self.TOKENS_PER_ROW,
-            self.index_key_record_bytes(self._index_head_dim),
+        self.index_key_layout, index_key_shape = self._index_key_cache_spec(
+            self.num_pages, self.page_size, self._index_head_dim, self._index_kpool
         )
         logger.info(
             "Allocating split TPU MLA KV buffers: layers=%d, nope=%s, rope=%s, "

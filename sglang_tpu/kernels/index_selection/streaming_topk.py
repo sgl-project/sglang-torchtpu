@@ -1,5 +1,4 @@
 # Adapted from vllm-project/vllm-torchtpu (Apache-2.0).
-# Source: src/vllm_torchtpu/kernels/deepseek_v41/index_selection/streaming_topk.py
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright 2024-2025 SGLang Team
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
@@ -20,25 +19,10 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
-from jax.experimental import xla_metadata
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
-# Byte-wise radix passes over IEEE FP32 keys. These describe the representation,
-# independently of TensorCore/SparseCore lane counts.
-RADIX_BITS = jnp.iinfo(jnp.uint8).bits
-RADIX_BUCKETS = 1 << RADIX_BITS
-RADIX_MASK = RADIX_BUCKETS - 1
-FP32_BITS = jnp.finfo(jnp.float32).bits
-FP32_SIGN_BIT = 1 << (FP32_BITS - 1)
-FP32_EXPONENT_MASK = ((1 << jnp.finfo(jnp.float32).nexp) - 1) << jnp.finfo(
-    jnp.float32
-).nmant
-UINT32_MAX = jnp.iinfo(jnp.uint32).max
-FP32_NEG_INF_BITS = 0xFF800000
-ORDERED_NEG_INF = UINT32_MAX ^ FP32_NEG_INF_BITS
-BF16_BITS = jnp.finfo(jnp.bfloat16).bits
-BF16_HIGH_MASK = (UINT32_MAX << BF16_BITS) & UINT32_MAX
+from sglang_tpu.kernels import scheduling_group
 
 
 @dataclass(frozen=True)
@@ -60,6 +44,23 @@ def topk_reconstruction_threshold(k: int) -> int:
     return min(8192, 4 * k)
 
 
+# Byte-wise radix passes over IEEE FP32 keys. These describe the representation,
+# independently of TensorCore/SparseCore lane counts.
+RADIX_BITS = jnp.iinfo(jnp.uint8).bits
+RADIX_BUCKETS = 1 << RADIX_BITS
+RADIX_MASK = RADIX_BUCKETS - 1
+FP32_BITS = jnp.finfo(jnp.float32).bits
+FP32_SIGN_BIT = 1 << (FP32_BITS - 1)
+FP32_EXPONENT_MASK = ((1 << jnp.finfo(jnp.float32).nexp) - 1) << jnp.finfo(
+    jnp.float32
+).nmant
+UINT32_MAX = jnp.iinfo(jnp.uint32).max
+FP32_NEG_INF_BITS = 0xFF800000
+ORDERED_NEG_INF = UINT32_MAX ^ FP32_NEG_INF_BITS
+BF16_BITS = jnp.finfo(jnp.bfloat16).bits
+BF16_HIGH_MASK = (UINT32_MAX << BF16_BITS) & UINT32_MAX
+
+
 class _Selection(NamedTuple):
     count: jax.Array
     threshold: jax.Array
@@ -68,7 +69,7 @@ class _Selection(NamedTuple):
     boundary_ties: jax.Array
 
 
-def _ordered_bits(keys: jax.Array) -> jax.Array:
+def ordered_bits(keys: jax.Array) -> jax.Array:
     """Preserve FP32 radix ordering, including signed zero."""
     bits = keys.view(jnp.uint32)
     sign = (bits.view(jnp.int32) >> (FP32_BITS - 1)).view(jnp.uint32)
@@ -134,7 +135,7 @@ def is_supported(
     logical_block_count: int = 0,
 ) -> bool:
     """Check lane alignment and the minimum per-subcore scratch footprint."""
-    if jax.default_backend() != "tpu" or not 0 < k <= width:
+    if not 0 < k <= width:
         return False
     info = pltpu.get_tpu_info()
     sc = info.sparse_core
@@ -498,7 +499,7 @@ def streaming_topk(
                     bits = (
                         ~source_ids[pl.ds(i, lanes)].astype(jnp.uint32)
                         if by_id
-                        else _ordered_bits(source_keys[pl.ds(i, lanes)])
+                        else ordered_bits(source_keys[pl.ds(i, lanes)])
                     )
                     digits = digits_for(bits)
                     valid = i + lane_ids < remaining
@@ -523,7 +524,7 @@ def streaming_topk(
                     survivors, outputs = carry
                     keys = source_keys[pl.ds(i, lanes)]
                     ids = source_ids[pl.ds(i, lanes)]
-                    bits = ~ids.astype(jnp.uint32) if by_id else _ordered_bits(keys)
+                    bits = ~ids.astype(jnp.uint32) if by_id else ordered_bits(keys)
                     digits = digits_for(bits)
                     valid = i + lane_ids < remaining
                     accept = valid & (digits > pivot)
@@ -607,7 +608,7 @@ def streaming_topk(
                 ids = selected_ids[pl.ds(i, lanes)]
                 candidates[pl.ds(i, lanes)] = keys
                 candidate_ids[pl.ds(i, lanes)] = ids
-                bits = jnp.where(ids >= 0, _ordered_bits(keys), jnp.uint32(UINT32_MAX))
+                bits = jnp.where(ids >= 0, ordered_bits(keys), jnp.uint32(UINT32_MAX))
                 if not unordered:
                     last_id = jnp.where(
                         bits < minimum,
@@ -862,7 +863,7 @@ def streaming_topk(
                                             ids < threshold_id
                                         )
                                 else:
-                                    bits = _ordered_bits(keys)
+                                    bits = ordered_bits(keys)
                                     accept = bits > threshold
                                     if not unordered:
                                         accept |= (bits == threshold) & (
@@ -1005,11 +1006,7 @@ def streaming_topk(
     result = kernel(scores, lengths, (logical_blocks,) if mapped else (), start)
     if output_width != k:
         result = result[:, :k]
-    if scheduling_group_id is not None:
-        result = xla_metadata.set_xla_metadata(
-            result, _scheduling_group_id=scheduling_group_id
-        )
-    return result
+    return scheduling_group.tag(result, scheduling_group_id)
 
 
 __all__ = ["streaming_topk"]

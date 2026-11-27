@@ -120,6 +120,9 @@ class TpuEnvs:
     # all-reduce buffer, [attn_tp, rows, topk] int32 per DSA layer, grows with
     # the chunk); decode and verify keep the replicated path.
     SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT_MIN_TOKENS = EnvInt(1024)
+    # GLM-5.2 on v7x, page size 128 or 256: pack unpooled index keys into
+    # 132 bytes/token and use the shared FP8 scorer and top-k.
+    SGLANG_TPU_DSA_PACKED_INDEX_CACHE = EnvBool(False)
     # Sparse MLA, on top of the indexer token split: each rank attends only the
     # rows it selected, with every head, so each selected cache row is gathered
     # by one rank instead of all; a Pallas all-to-all (kernels/oneshot_all_to_all.py)

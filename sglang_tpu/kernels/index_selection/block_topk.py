@@ -1,5 +1,4 @@
 # Adapted from vllm-project/vllm-torchtpu (Apache-2.0).
-# Source: src/vllm_torchtpu/kernels/deepseek_v41/index_selection/block_topk.py
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright 2026 Google LLC
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
@@ -7,8 +6,8 @@
 
 Block maxima, reduced on SparseCore, rank the blocks first. Every key scoring
 above the `blocks`-th largest block maximum lies in the top `blocks` blocks,
-and each of those blocks holds a key at or above it (publication forces one
-to +inf). With `blocks > k` their keys therefore contain a valid top-k, so
+and each of those blocks holds a key at or above it (force_last_block forces
+one to +inf). With `blocks > k` their keys therefore contain a valid top-k, so
 only they are gathered and radix-selected instead of the whole score row.
 
 Rows that fit SparseCore VMEM stay resident. Wider rows (1M-token contexts)
@@ -21,17 +20,17 @@ import math
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
-from jax.experimental import xla_metadata
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
+from sglang_tpu.kernels import scheduling_group
 from sglang_tpu.kernels.index_selection.streaming_topk import (
     FP32_BITS,
     ORDERED_NEG_INF,
     RADIX_BITS,
     RADIX_BUCKETS,
     RADIX_MASK,
-    _ordered_bits,
+    ordered_bits,
 )
 
 
@@ -197,8 +196,6 @@ def _plan(rows, width, block_width, k, blocks, block_size):
 
 def is_supported(rows: int, width: int, k: int, block_size: int) -> bool:
     """Lane-aligned shapes whose block maxima fit SparseCore VMEM."""
-    if jax.default_backend() != "tpu":
-        return False
     info = pltpu.get_tpu_info()
     sc = info.sparse_core
     if sc is None or rows < 1 or block_size < 1 or sc.num_lanes % block_size:
@@ -220,7 +217,8 @@ def block_topk(
     *,
     k: int,
     block_size: int,
-    publish: int = 0,
+    top_blocks: int = 0,
+    force_last_block: bool = False,
     scheduling_group_id: int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Return ascending top-k key IDs per row, padded with -1.
@@ -230,9 +228,10 @@ def block_topk(
         lengths: Int32 [rows] visible keys, clipped to [0, width].
         k: Selected keys per row. Negative infinity is never selected.
         block_size: Keys per block maximum.
-        publish: Also return the IDs of the `publish` highest block maxima,
-            the newest visible block forced first; ascending, -1 padded, and
-            ties keep the lowest IDs.
+        top_blocks: Also return the IDs of the `top_blocks` highest block
+            maxima; ascending, -1 padded, and ties keep the lowest IDs.
+        force_last_block: Rank each row's last visible block above every
+            other block, so `top_blocks` always includes it.
         scheduling_group_id: Optional XLA scheduling-group ID.
     """
     rows, width = scores.shape
@@ -242,10 +241,10 @@ def block_topk(
         scores.dtype != jnp.float32
         or lengths.shape != (rows,)
         or not is_supported(rows, width, k, block_size)
-        or publish % lanes
+        or top_blocks % lanes
     ):
         raise ValueError("Unsupported block top-k shapes or dtypes")
-    blocks = default_blocks(k, lanes, forced=bool(publish))
+    blocks = default_blocks(k, lanes, forced=force_last_block)
     candidates = blocks * block_size
     block_width = pl.cdiv(pl.cdiv(width, block_size), alignment) * alignment
     lengths = jnp.clip(lengths.astype(jnp.int32), 0, width)
@@ -263,8 +262,8 @@ def block_topk(
         num_cores=min(sc.num_cores, pl.cdiv(rows, sc.num_subcores)),
     )
     out_types = (jax.ShapeDtypeStruct((rows, k), jnp.int32),)
-    if publish:
-        out_types += (jax.ShapeDtypeStruct((rows, publish), jnp.int32),)
+    if top_blocks:
+        out_types += (jax.ShapeDtypeStruct((rows, top_blocks), jnp.int32),)
 
     @pl.kernel(
         out_type=out_types,
@@ -274,8 +273,8 @@ def block_topk(
             maxima=pltpu.VMEM((block_width,), jnp.float32),
             histogram=pltpu.VMEM((RADIX_BUCKETS,), jnp.int32),
             block_ids=pltpu.VMEM((blocks,), jnp.int32),
-            # Ordered key bits; first holds the published block IDs.
-            keys=pltpu.VMEM((max(candidates, publish),), jnp.int32),
+            # Ordered key bits; first holds the top block IDs.
+            keys=pltpu.VMEM((max(candidates, top_blocks),), jnp.int32),
             output=pltpu.VMEM((k,), jnp.int32),
             limits=pltpu.VMEM((_length_words(rows),), jnp.int32),
             # Streamed rows: the chosen blocks' keys, fetched from HBM.
@@ -283,7 +282,7 @@ def block_topk(
             score_sems=pltpu.SemaphoreType.DMA((2,)),
             output_sem=pltpu.SemaphoreType.DMA,
             length_sem=pltpu.SemaphoreType.DMA,
-            publish_sem=pltpu.SemaphoreType.DMA,
+            top_block_sem=pltpu.SemaphoreType.DMA,
             fetch_sem=pltpu.SemaphoreType.DMA,
         ),
         compiler_params=pltpu.CompilerParams(needs_layout_passes=False),
@@ -293,7 +292,7 @@ def block_topk(
         score_ref,
         length_ref,
         out_ref,
-        *publish_refs,
+        *top_block_refs,
         score_buffers,
         maxima,
         histogram,
@@ -305,7 +304,7 @@ def block_topk(
         score_sems,
         output_sem,
         length_sem,
-        publish_sem,
+        top_block_sem,
         fetch_sem,
     ):
         radix = Radix(histogram, lanes)
@@ -413,23 +412,23 @@ def block_topk(
             def prepare_blocks(i):
                 positions = radix.positions(i)
                 values = block_values(i)
-                if publish:
-                    # Publication rule: the newest visible block always wins.
+                if force_last_block:
+                    # The last visible block outranks every other block.
                     values = jnp.where(positions == live_blocks - 1, jnp.inf, values)
                 live = positions < live_blocks
-                bits = _ordered_bits(jnp.where(live, values, -jnp.inf))
+                bits = ordered_bits(jnp.where(live, values, -jnp.inf))
                 maxima[pl.ds(i * lanes, lanes)] = bits.view(jnp.float32)
                 radix.add(bits)
 
-            publish_copy = None
-            if publish:
-                (publish_ref,) = publish_refs
+            top_block_copy = None
+            if top_blocks:
+                (top_block_ref,) = top_block_refs
                 # Staged in `keys`, which stage 2 overwrites after the copy.
-                published = keys.at[pl.ds(0, publish)]
-                top = radix.threshold(maxima, block_chunks, publish)
-                radix.emit(maxima, block_chunks, publish, top, published)
-                publish_copy = pltpu.async_copy(
-                    published, publish_ref.at[row_id], publish_sem
+                top_ids = keys.at[pl.ds(0, top_blocks)]
+                top = radix.threshold(maxima, block_chunks, top_blocks)
+                radix.emit(maxima, block_chunks, top_blocks, top, top_ids)
+                top_block_copy = pltpu.async_copy(
+                    top_ids, top_block_ref.at[row_id], top_block_sem
                 )
                 # The selection consumed the histogram; refill its top byte.
                 radix.clear()
@@ -447,8 +446,8 @@ def block_topk(
                 owner = plsc.load_gather(block_ids, [candidate // block_size])
                 return owner, owner * block_size + candidate % block_size
 
-            if publish_copy is not None:
-                publish_copy.wait()
+            if top_block_copy is not None:
+                top_block_copy.wait()
             chosen_blocks = jnp.minimum(chosen[0], blocks)
             key_chunks = pl.cdiv(chosen_blocks * block_size, lanes)
             if not resident:
@@ -464,7 +463,7 @@ def block_topk(
                     values = plsc.load_gather(score_buffers, [index])
                 else:
                     values = fetched[pl.ds(i * lanes, lanes)]
-                bits = _ordered_bits(jnp.where(valid, values, -jnp.inf))
+                bits = ordered_bits(jnp.where(valid, values, -jnp.inf))
                 keys[pl.ds(i * lanes, lanes)] = bits.view(jnp.int32)
                 radix.add(bits)
 
@@ -486,12 +485,5 @@ def block_topk(
             last_row = first + ((rows - 1 - first) // stride) * stride
             pltpu.make_async_copy(output, out_ref.at[last_row], output_sem).wait()
 
-    result = kernel(scores, token_lengths)
-    if scheduling_group_id is not None:
-        result = jax.tree.map(
-            lambda x: xla_metadata.set_xla_metadata(
-                x, _scheduling_group_id=scheduling_group_id
-            ),
-            result,
-        )
-    return result if publish else result[0]
+    result = scheduling_group.tag(kernel(scores, token_lengths), scheduling_group_id)
+    return result if top_blocks else result[0]

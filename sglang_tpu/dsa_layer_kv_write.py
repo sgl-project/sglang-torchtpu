@@ -21,7 +21,6 @@ import torch
 from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
 from sglang_tpu.dsa_indexer_tpu import (
     index_key,
-    key_store_mode,
     pooled_index_key_and_gate,
 )
 
@@ -144,5 +143,4 @@ def write_dsa_layer_kv(
         k=k,
         k_rope=k_rope,
         index_keys=index_key(indexer, x=hidden_states, positions=positions),
-        key_store=key_store_mode(indexer, hidden_states.shape[0]),
     )

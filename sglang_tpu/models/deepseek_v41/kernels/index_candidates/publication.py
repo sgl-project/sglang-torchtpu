@@ -1,17 +1,14 @@
 # Adapted from vllm-project/vllm-torchtpu (Apache-2.0).
-# Source: src/vllm_torchtpu/kernels/deepseek_v41/index_selection/publication.py
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright 2026 Google LLC
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Per-block candidate scores for candidate publication.
+"""DeepSeek-V4.1 candidate publication.
 
 A candidate-source layer publishes, per query, the IDs of its best token
-blocks for later layers to rescore. This module computes the block scores:
-each block's maximum visible token score, with the newest visible block forced
-to +inf so it is always published. Selecting the top blocks happens in
-``selection._publish_candidate_blocks``. The source's SparseCore
-``publish_candidates`` kernel has no caller in the FP8 path and is not
-ported.
+blocks for later layers to rescore: the blocks with the highest maximum visible
+token score, the newest visible block forced to +inf so it is always
+published. Decode takes the same blocks from ``block_topk``'s top-k pass
+(``top_blocks`` with ``force_last_block``).
 """
 
 import functools
@@ -21,8 +18,9 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang_tpu.models.deepseek_v41.kernels.index_candidates import (
-    tuned as tuned_block_sizes,
+from sglang_tpu.kernels.index_selection import streaming_topk
+from sglang_tpu.models.deepseek_v41.kernels.index_candidates.tuned import (
+    PUBLISH_BLOCK_MAX_CONFIG,
 )
 
 
@@ -39,12 +37,10 @@ def candidate_block_scores(
         scores.dtype == jnp.float32
         and lengths.dtype == jnp.int32
         and any(
-            key[1:] == (rows, width, block_size)
-            for key in tuned_block_sizes.PUBLISH_BLOCK_MAX_CONFIG
+            key[1:] == (rows, width, block_size) for key in PUBLISH_BLOCK_MAX_CONFIG
         )
-        and jax.default_backend() == "tpu"
     ):
-        config = tuned_block_sizes.PUBLISH_BLOCK_MAX_CONFIG.get(
+        config = PUBLISH_BLOCK_MAX_CONFIG.get(
             (pltpu.get_tpu_info().generation, rows, width, block_size)
         )
     if config is not None:
@@ -110,3 +106,34 @@ def _candidate_block_scores(scores, lengths, block_size, config):
         name="indexer_candidate_block_max",
     )(lengths, scores)
     return result[:, :blocks]
+
+
+def publish_candidate_blocks(
+    scores,
+    lengths,
+    count,
+    block_size,
+    unordered,
+    *,
+    scheduling_group_id=None,
+):
+    """Publish winning block IDs in ascending order with -1 suffix padding."""
+    width = scores.shape[1]
+    lengths = jnp.clip(lengths, 0, width)
+    block_scores = candidate_block_scores(scores, lengths, block_size=block_size)
+    blocks = block_scores.shape[1]
+    cand_k = min(count, blocks)
+    if unordered and blocks >= 2048 and streaming_topk.is_supported(blocks, cand_k):
+        published = streaming_topk.streaming_topk(
+            block_scores,
+            valid_lengths=jnp.minimum(pl.cdiv(lengths, block_size), blocks),
+            k=cand_k,
+            exclude_neg_inf=True,
+            unordered=False,
+            scheduling_group_id=scheduling_group_id,
+        )
+    else:
+        values, ids = jax.lax.top_k(block_scores, cand_k)
+        ids = jnp.sort(jnp.where(values > -jnp.inf, ids, blocks), axis=-1)
+        published = jnp.where(ids < blocks, ids, -1)
+    return jnp.pad(published, ((0, 0), (0, count - cand_k)), constant_values=-1)

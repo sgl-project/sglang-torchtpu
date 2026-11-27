@@ -367,7 +367,6 @@ def indexer_forward(
         key=key,
         head_weights=head_weights,
         weight_scale=weight_scale,
-        key_store=key_store_mode(indexer, x.shape[0]),
     )
 
 
@@ -395,25 +394,6 @@ def index_key(
     # for the query: aliasing the key would rotate it twice if rope is in place.
     _, k_rope = indexer.rotary_emb(positions, k_rope.clone(), k_rope)
     return torch.cat([k_rope.to(key.dtype), key[..., rope_dim:]], dim=-1)
-
-
-# Batches up to this many tokens store their index keys with the Pallas
-# writer, which walks the tokens one by one (about 1 us each); larger batches
-# (prefill) keep the XLA whole-row scatter.
-_PALLAS_KEY_STORE_MAX_TOKENS = 16
-
-
-def key_store_mode(indexer: "Indexer", num_tokens: int) -> str:
-    """The ``key_store`` of ``dsa_indexer_step`` for this layer and batch."""
-    from sglang_tpu.envs import envs as tpu_envs
-
-    if (
-        num_tokens > _PALLAS_KEY_STORE_MAX_TOKENS
-        or indexer.head_dim % 128
-        or not tpu_envs.SGLANG_TPU_DSA_PALLAS_KEY_STORE.get()
-    ):
-        return "xla"
-    return "pallas"
 
 
 def pooled_index_key_and_gate(

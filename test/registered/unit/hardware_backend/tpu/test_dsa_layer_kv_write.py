@@ -33,7 +33,6 @@ from sglang_tpu.attention_pallas_mla_sparse import TpuPallasSparseMlaAttnBackend
 from sglang_tpu.dsa_indexer_tpu import (
     index_key,
     indexer_forward,
-    key_store_mode,
     kpool_indexer_forward,
     pooled_index_key_and_gate,
 )
@@ -390,9 +389,6 @@ class TestWriteDsaLayerKv(CustomTestCase):
                     if kind == "plain":
                         want = index_key(indexer, x=hidden, positions=positions)
                         self.assertTrue(torch.equal(kwargs["index_keys"], want))
-                        self.assertEqual(
-                            kwargs["key_store"], key_store_mode(indexer, _T)
-                        )
                     else:
                         keys, gates = pooled_index_key_and_gate(indexer, hidden)
                         self.assertTrue(torch.equal(kwargs["keys"], keys))

@@ -141,7 +141,7 @@ class TestIndexTopkKeepsLocalRows(CustomTestCase):
         local = torch.arange(512 * 16, dtype=torch.int32).view(512, 16)
         backend._index_topk_split_op = mock.MagicMock(return_value=local)
         backend._idx_split_group.all_reduce = mock.MagicMock(side_effect=lambda t: t)
-        backend.token_to_kv_pool = mock.MagicMock()
+        backend.token_to_kv_pool = mock.MagicMock(index_key_layout="record")
         backend._kv_lens = lambda forward_batch: None
         backend._topk = 16
         with mock.patch(
