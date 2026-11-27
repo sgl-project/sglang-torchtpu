@@ -5754,3 +5754,403 @@ def pallas_ulysses_local_gate(
         ),
         name=f"pallas_ulysses_gate_c{c_k}_n{n_dim}_tb{t_blk}_bn{eff_bn}",
     )(x_fp8_shard, w_gate_fp8, w_gate_sc_2d)
+
+
+def pallas_a1_ulysses_qkv_gate_async_a2a(
+    x_fp8_shard: jax.Array,
+    w_qkv_3d: jax.Array,
+    w_qkv_sc_3d: jax.Array,
+    w_gate_fp8: jax.Array,
+    w_gate_sc_2d: jax.Array,
+    cos_own: jax.Array,
+    sin_own: jax.Array,
+    *,
+    h_q_local: int = 8,
+    h_kv_local: int = 1,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    fold_q_scale: bool = False,
+    rope_mode: str = "interleaved_roll",
+    tp_axis: str = "model",
+    max_q_slots: int = 16,
+    vmem_limit_mb: int = 62,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Fused A1 Ulysses QKV+Norm+RoPE + async P2P A2A overlapped with local Gate.
+
+    Reads ``x_fp8_shard`` once per ``t_blk <= 1024`` block and interleaves per-rank Gate
+    slices ``d`` with XOR peer QKV+Norm+RoPE + ``make_async_remote_copy`` A2A pushes
+    using up to ``max_q_slots`` (16) VMEM send slots so ICI transfers overlap MXU compute
+    at 0-ULP bit-exact parity with ``pallas_a1_ulysses_qkv_local`` + ``lax.all_to_all`` +
+    ``pallas_ulysses_local_gate``.
+    """
+    assert h_kv_local in (1, 2) and h_q_local % 2 == 0
+    c_k, k_dim = x_fp8_shard.shape
+    tp_deg, w_k, qkv_cols = w_qkv_3d.shape
+    wg_k, n_dim = w_gate_fp8.shape
+    assert w_k == k_dim and wg_k == k_dim
+    q_size = h_q_local * HEAD_DIM
+    kv_cols = 2 * h_kv_local * HEAD_DIM
+    assert qkv_cols == q_size + kv_cols and n_dim == tp_deg * q_size
+    assert q_size <= 512 and c_k >= 128 and c_k % 128 == 0
+
+    num_q_slices = q_size // 128
+    if c_k >= 1536 and c_k % 768 == 0:
+        t_blk = 768
+    else:
+        t_blk = next(
+            t for t in range(min(1024, c_k), 0, -64) if c_k % t == 0 and t % 128 == 0
+        )
+    num_blk = c_k // t_blk
+    tm_eff = next(t for t in (256, 128) if t_blk % t == 0)
+    num_q_slots = min(max_q_slots, tp_deg)
+
+    q_eff_scale = (
+        QUERY_SCALE * SM_SCALE * k_scale * LOG2E if fold_q_scale else QUERY_SCALE
+    )
+    inv_k_scale = 1.0 / k_scale
+    inv_v_scale = 1.0 / v_scale
+
+    from sglang_tpu.envs import envs as _tpu_envs
+
+    fn_env = getattr(_tpu_envs, "SGLANG_TPU_MUSE_KERNEL_A1_FAST_NORM", None)
+    use_fast_norm = bool(fn_env is not None and fn_env.get())
+
+    def _kernel(
+        x_hbm,
+        wqkv_hbm,
+        wqkv_sc_ref,
+        wg_hbm,
+        wg_sc_ref,
+        cos_hbm,
+        sin_hbm,
+        q_out_hbm,
+        kv_out_hbm,
+        g_out_hbm,
+        x_vmem,
+        cos_vmem,
+        sin_vmem,
+        wqkv_vmem,
+        wg_vmem,
+        q_send_vmem,
+        kv_send_vmem,
+        g_vmem,
+        x_sem,
+        wq_sems,
+        wg_sems,
+        q_rsems,
+        kv_rsems,
+        q_local_sem,
+        kv_local_sem,
+        q_ssems,
+        kv_ssems,
+        g_sems,
+    ):
+        blk = pl.program_id(0)
+        me = lax.axis_index(tp_axis)
+        row0 = blk * t_blk
+
+        pltpu.make_async_copy(x_hbm.at[pl.ds(row0, t_blk), :], x_vmem, x_sem.at[0]).start()
+        pltpu.make_async_copy(cos_hbm.at[pl.ds(row0, t_blk), :], cos_vmem, x_sem.at[1]).start()
+        pltpu.make_async_copy(sin_hbm.at[pl.ds(row0, t_blk), :], sin_vmem, x_sem.at[2]).start()
+        pltpu.make_async_copy(
+            wqkv_hbm.at[pl.ds(me, 1), :, :],
+            wqkv_vmem.at[pl.ds(0, 1), :, :],
+            wq_sems.at[0],
+        ).start()
+        pltpu.make_async_copy(
+            wg_hbm.at[:, pl.ds(0, q_size)],
+            wg_vmem.at[pl.ds(0, k_dim), :],
+            wg_sems.at[0],
+        ).start()
+
+        if tp_deg > 1:
+            barrier = pltpu.get_barrier_semaphore()
+            for d in range(1, tp_deg):
+                pl.semaphore_signal(barrier, device_id={tp_axis: lax.rem(me + d, tp_deg)})
+            pl.semaphore_wait(barrier, tp_deg - 1)
+
+        pltpu.make_async_copy(x_vmem, x_hbm.at[pl.ds(0, t_blk), :], x_sem.at[0]).wait()
+        pltpu.make_async_copy(cos_vmem, cos_hbm.at[pl.ds(0, t_blk), :], x_sem.at[1]).wait()
+        pltpu.make_async_copy(sin_vmem, sin_hbm.at[pl.ds(0, t_blk), :], x_sem.at[2]).wait()
+
+        lane = lax.broadcasted_iota(jnp.int32, (tm_eff, 128), 1)
+        is_lo = lane < 64
+        mask_lo = is_lo.astype(jnp.float32)
+        mask_hi = 1.0 - mask_lo
+
+        for d in range(tp_deg):
+            wslot = d % 2
+            qslot = d % num_q_slots
+            r_cur = me if d == 0 else lax.bitwise_xor(me, d)
+            if d + 1 < tp_deg:
+                nslot = (d + 1) % 2
+                r_nxt = lax.bitwise_xor(me, d + 1)
+                pltpu.make_async_copy(
+                    wqkv_hbm.at[pl.ds(r_nxt, 1), :, :],
+                    wqkv_vmem.at[pl.ds(nslot, 1), :, :],
+                    wq_sems.at[nslot],
+                ).start()
+                pltpu.make_async_copy(
+                    wg_hbm.at[:, pl.ds((d + 1) * q_size, q_size)],
+                    wg_vmem.at[pl.ds(nslot * k_dim, k_dim), :],
+                    wg_sems.at[nslot],
+                ).start()
+
+            if d == num_q_slots and num_q_slots < tp_deg:
+                pltpu.make_async_copy(
+                    q_send_vmem.at[pl.ds(0, 1), :, :],
+                    q_out_hbm.at[pl.ds(0, 1), pl.ds(0, t_blk), :],
+                    q_local_sem.at[0],
+                ).wait()
+                pltpu.make_async_copy(
+                    kv_send_vmem.at[pl.ds(0, 1), :, :],
+                    kv_out_hbm.at[pl.ds(0, 1), pl.ds(0, t_blk), :],
+                    kv_local_sem.at[0],
+                ).wait()
+            elif d > num_q_slots and num_q_slots < tp_deg:
+                pltpu.make_async_copy(
+                    q_send_vmem.at[pl.ds(qslot, 1), :, :],
+                    q_send_vmem.at[pl.ds(qslot, 1), :, :],
+                    q_ssems.at[qslot],
+                ).wait()
+                pltpu.make_async_copy(
+                    kv_send_vmem.at[pl.ds(qslot, 1), :, :],
+                    kv_send_vmem.at[pl.ds(qslot, 1), :, :],
+                    kv_ssems.at[qslot],
+                ).wait()
+
+            pltpu.make_async_copy(
+                wqkv_vmem.at[pl.ds(wslot, 1), :, :],
+                wqkv_hbm.at[pl.ds(0, 1), :, :],
+                wq_sems.at[wslot],
+            ).wait()
+
+            w_qkv_tile = wqkv_vmem[wslot, :, :]
+            w_sc_vec = wqkv_sc_ref[r_cur, :, :]
+            for m0 in range(0, t_blk, tm_eff):
+                m1 = m0 + tm_eff
+                cos_m = cos_vmem[m0:m1, :]
+                sin_m = sin_vmem[m0:m1, :]
+                acc = (
+                    jnp.dot(
+                        x_vmem[m0:m1, :],
+                        w_qkv_tile,
+                        preferred_element_type=jnp.float32,
+                    )
+                    * w_sc_vec
+                )
+                for s in range(num_q_slices):
+                    c0, c1 = s * 128, (s + 1) * 128
+                    q_norm = _dual_head_rmsnorm_128(
+                        acc[:, c0:c1],
+                        is_lo,
+                        mask_lo,
+                        mask_hi,
+                        q_eff_scale,
+                        eps=1e-5,
+                        fast_6roll=use_fast_norm,
+                    )
+                    q_send_vmem[qslot, m0:m1, c0:c1] = _rope_128_vreg(
+                        q_norm, cos_m, sin_m, lane, rope_mode=rope_mode
+                    )
+
+                acc_kv = acc[:, q_size : q_size + kv_cols]
+                if h_kv_local == 1:
+                    cos_kv = jnp.where(is_lo, cos_m, 1.0)
+                    sin_kv = jnp.where(is_lo, sin_m, 0.0)
+                    sq_lo = jnp.sum(acc_kv * acc_kv * mask_lo, axis=1, keepdims=True) * (
+                        1.0 / 64.0
+                    )
+                    inv_rms_kv = jnp.where(is_lo, lax.rsqrt(sq_lo + 1e-5), 1.0)
+                    kv_norm = (
+                        (acc_kv * inv_rms_kv).astype(jnp.bfloat16).astype(jnp.float32)
+                    )
+                    kv_rot = _rope_128_vreg(
+                        kv_norm, cos_kv, sin_kv, lane, rope_mode=rope_mode
+                    )
+                    kv_sc = jnp.where(is_lo, inv_k_scale, inv_v_scale)
+                    kv_send_vmem[qslot, m0:m1, :] = jnp.clip(
+                        kv_rot.astype(jnp.float32) * kv_sc, -FP8_MAX, FP8_MAX
+                    ).astype(jnp.float8_e4m3fn)
+                else:
+                    k_pair = acc_kv[:, 0:128]
+                    v_pair = acc_kv[:, 128:256].astype(jnp.bfloat16)
+                    k_norm = _dual_head_rmsnorm_128(
+                        k_pair,
+                        is_lo,
+                        mask_lo,
+                        mask_hi,
+                        1.0,
+                        eps=1e-5,
+                        fast_6roll=use_fast_norm,
+                    )
+                    k_rot = _rope_128_vreg(
+                        k_norm, cos_m, sin_m, lane, rope_mode=rope_mode
+                    )
+                    kv_send_vmem[qslot, m0:m1, 0:128] = jnp.clip(
+                        k_rot.astype(jnp.float32) * inv_k_scale, -FP8_MAX, FP8_MAX
+                    ).astype(jnp.float8_e4m3fn)
+                    kv_send_vmem[qslot, m0:m1, 128:256] = jnp.clip(
+                        v_pair.astype(jnp.float32) * inv_v_scale, -FP8_MAX, FP8_MAX
+                    ).astype(jnp.float8_e4m3fn)
+
+            if d == 0:
+                pltpu.make_async_copy(
+                    q_send_vmem.at[pl.ds(0, 1), :, :],
+                    q_out_hbm.at[pl.ds(me, 1), pl.ds(row0, t_blk), :],
+                    q_local_sem.at[0],
+                ).start()
+                pltpu.make_async_copy(
+                    kv_send_vmem.at[pl.ds(0, 1), :, :],
+                    kv_out_hbm.at[pl.ds(me, 1), pl.ds(row0, t_blk), :],
+                    kv_local_sem.at[0],
+                ).start()
+            else:
+                peer = lax.bitwise_xor(me, d)
+                pltpu.make_async_remote_copy(
+                    src_ref=q_send_vmem.at[pl.ds(qslot, 1), :, :],
+                    dst_ref=q_out_hbm.at[pl.ds(me, 1), pl.ds(row0, t_blk), :],
+                    send_sem=q_ssems.at[qslot],
+                    recv_sem=q_rsems.at[me],
+                    device_id={tp_axis: peer},
+                ).start()
+                pltpu.make_async_remote_copy(
+                    src_ref=kv_send_vmem.at[pl.ds(qslot, 1), :, :],
+                    dst_ref=kv_out_hbm.at[pl.ds(me, 1), pl.ds(row0, t_blk), :],
+                    send_sem=kv_ssems.at[qslot],
+                    recv_sem=kv_rsems.at[me],
+                    device_id={tp_axis: peer},
+                ).start()
+
+            pltpu.make_async_copy(
+                wg_vmem.at[pl.ds(wslot * k_dim, k_dim), :],
+                wg_hbm.at[:, pl.ds(0, q_size)],
+                wg_sems.at[wslot],
+            ).wait()
+            if d >= 2:
+                pltpu.make_async_copy(
+                    g_vmem.at[pl.ds(wslot * t_blk, t_blk), :],
+                    g_out_hbm.at[pl.ds(0, t_blk), pl.ds(0, q_size)],
+                    g_sems.at[wslot],
+                ).wait()
+            w_g_tile = wg_vmem[pl.ds(wslot * k_dim, k_dim), :]
+            wg_sc_vec = wg_sc_ref[:, d * q_size : (d + 1) * q_size]
+            for m0 in range(0, t_blk, tm_eff):
+                m1 = m0 + tm_eff
+                g_acc = (
+                    jnp.dot(
+                        x_vmem[m0:m1, :],
+                        w_g_tile,
+                        preferred_element_type=jnp.float32,
+                    )
+                    * wg_sc_vec
+                )
+                g_vmem[pl.ds(wslot * t_blk + m0, tm_eff), :] = g_acc.astype(
+                    jnp.bfloat16
+                )
+            pltpu.make_async_copy(
+                g_vmem.at[pl.ds(wslot * t_blk, t_blk), :],
+                g_out_hbm.at[pl.ds(row0, t_blk), pl.ds(d * q_size, q_size)],
+                g_sems.at[wslot],
+            ).start()
+
+        for s in range(min(2, tp_deg)):
+            pltpu.make_async_copy(
+                g_vmem.at[pl.ds(s * t_blk, t_blk), :],
+                g_out_hbm.at[pl.ds(0, t_blk), pl.ds(0, q_size)],
+                g_sems.at[s],
+            ).wait()
+        if num_q_slots >= tp_deg:
+            pltpu.make_async_copy(
+                q_send_vmem.at[pl.ds(0, 1), :, :],
+                q_out_hbm.at[pl.ds(0, 1), pl.ds(0, t_blk), :],
+                q_local_sem.at[0],
+            ).wait()
+            pltpu.make_async_copy(
+                kv_send_vmem.at[pl.ds(0, 1), :, :],
+                kv_out_hbm.at[pl.ds(0, 1), pl.ds(0, t_blk), :],
+                kv_local_sem.at[0],
+            ).wait()
+        for s in range(num_q_slots):
+            if s != 0 or tp_deg > num_q_slots:
+                pltpu.make_async_copy(
+                    q_send_vmem.at[pl.ds(s, 1), :, :],
+                    q_send_vmem.at[pl.ds(s, 1), :, :],
+                    q_ssems.at[s],
+                ).wait()
+                pltpu.make_async_copy(
+                    kv_send_vmem.at[pl.ds(s, 1), :, :],
+                    kv_send_vmem.at[pl.ds(s, 1), :, :],
+                    kv_ssems.at[s],
+                ).wait()
+        for r in range(tp_deg):
+
+            @pl.when(r != me)
+            def _(r=r):
+                pltpu.make_async_copy(
+                    q_out_hbm.at[pl.ds(r, 1), pl.ds(row0, t_blk), :],
+                    q_out_hbm.at[pl.ds(r, 1), pl.ds(row0, t_blk), :],
+                    q_rsems.at[r],
+                ).wait()
+                pltpu.make_async_copy(
+                    kv_out_hbm.at[pl.ds(r, 1), pl.ds(row0, t_blk), :],
+                    kv_out_hbm.at[pl.ds(r, 1), pl.ds(row0, t_blk), :],
+                    kv_rsems.at[r],
+                ).wait()
+
+    any_spec = pl.BlockSpec(memory_space=getattr(pltpu, "ANY", pltpu.HBM))
+    scratches = [
+        pltpu.VMEM((t_blk, k_dim), jnp.float8_e4m3fn),
+        pltpu.VMEM((t_blk, 128), jnp.float32),
+        pltpu.VMEM((t_blk, 128), jnp.float32),
+        pltpu.VMEM((2, k_dim, qkv_cols), jnp.float8_e4m3fn),
+        pltpu.VMEM((2 * k_dim, q_size), jnp.float8_e4m3fn),
+        pltpu.VMEM((num_q_slots, t_blk, q_size), jnp.bfloat16),
+        pltpu.VMEM((num_q_slots, t_blk, kv_cols), jnp.float8_e4m3fn),
+        pltpu.VMEM((2 * t_blk, q_size), jnp.bfloat16),
+        pltpu.SemaphoreType.DMA((3,)),
+        pltpu.SemaphoreType.DMA((2,)),
+        pltpu.SemaphoreType.DMA((2,)),
+        pltpu.SemaphoreType.DMA((tp_deg,)),
+        pltpu.SemaphoreType.DMA((tp_deg,)),
+        pltpu.SemaphoreType.DMA((1,)),
+        pltpu.SemaphoreType.DMA((1,)),
+        pltpu.SemaphoreType.DMA((num_q_slots,)),
+        pltpu.SemaphoreType.DMA((num_q_slots,)),
+        pltpu.SemaphoreType.DMA((2,)),
+    ]
+    return pl.pallas_call(
+        _kernel,
+        grid=(num_blk,),
+        in_specs=[
+            any_spec,
+            any_spec,
+            pl.BlockSpec((tp_deg, 1, qkv_cols), lambda _: (0, 0, 0)),
+            any_spec,
+            pl.BlockSpec((1, n_dim), lambda _: (0, 0)),
+            any_spec,
+            any_spec,
+        ],
+        out_specs=[any_spec, any_spec, any_spec],
+        out_shape=[
+            jax.ShapeDtypeStruct((tp_deg, c_k, q_size), jnp.bfloat16),
+            jax.ShapeDtypeStruct((tp_deg, c_k, kv_cols), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((c_k, n_dim), jnp.bfloat16),
+        ],
+        scratch_shapes=scratches,
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            collective_id=7 if tp_deg > 1 else None,
+            vmem_limit_bytes=vmem_limit_mb * (1 << 20),
+        ),
+        name=f"pallas_a1_ulysses_qkvg_async_a2a_c{c_k}_q{q_size}_kv{kv_cols}_tb{t_blk}_ns{num_q_slots}"
+        + ("_fn" if use_fast_norm else ""),
+    )(
+        x_fp8_shard,
+        w_qkv_3d,
+        w_qkv_sc_3d,
+        w_gate_fp8,
+        w_gate_sc_2d,
+        cos_own,
+        sin_own,
+    )

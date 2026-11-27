@@ -1650,3 +1650,111 @@ def test_v10_sp_w22_1chunk_default_fused_ops_and_tiled_a2a():
             np.asarray(lax.bitcast_convert_type(kv2f, jnp.uint8)),
         )
         np.testing.assert_array_equal(np.asarray(ot, dtype=np.float32), np.asarray(of, dtype=np.float32))
+
+
+def test_v10_sp_a1_qkv_gate_async_a2a_interpret_and_aot():
+    """Verify default-ON `SGLANG_TPU_MUSE_KERNEL_ULYSSES_ASYNC_A2A`:
+    1. `envs.py` defaults to True.
+    2. 16-dev CPU eager+race+NaN Interpret bit-exact 0-ULP parity across `max_q_slots={8,16}`
+       and `h_kv_local={1,2}`.
+    3. `tpu7x=2x2x2` offline AOT compile + HLO op name with `ulysses_async_a2a=True` vs `False`.
+    """
+    assert bool(tpu_envs.SGLANG_TPU_MUSE_KERNEL_ULYSSES_ASYNC_A2A.get()) is True
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    torch = pytest.importorskip("torch")
+    from jax import lax
+    from jax.experimental import pallas as pl
+    from jax.experimental import topologies
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+    if len(jax.devices("cpu")) < _TP:
+        pytest.skip(f"Need {_TP} CPU devices (got {len(jax.devices('cpu'))})")
+
+    from sglang_tpu.muse_prefill_kernels import integration
+    from sglang_tpu.muse_prefill_kernels.attn_kernels import kernel_a1
+
+    # Offline TPU7x AOT check for BOTH async A2A ON (`_aa2a`) and OFF (fallback).
+    topo = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x=2x2x2")
+    mesh_aot = Mesh(np.array(topo.devices).reshape(_TP), (_AXIS,))
+    ck_aot, ql_aot = 1024, 512
+    for aa2a in (True, False):
+        integration._ops.cache_clear()
+        with mock.patch("sglang_tpu.moe.pallas.fused_moe_rs_op._get_mesh", return_value=mesh_aot):
+            ops = integration._ops(
+                8, 1, "v10_sp", "v16", True, 1e-5,
+                a1_rpa_layout=True, causal_chunk_stream=True,
+                causal_chunk_spec="le1536:1;256,512", ulysses_async_a2a=aa2a,
+            )
+        _assert_tpu7x_spmd_export_and_compile(
+            ops.a1_ulysses_full,
+            (
+                torch.empty((ck_aot, 8192), dtype=torch.float8_e4m3fn, device="meta"),
+                torch.empty((_TP, 8192, ql_aot + 128), dtype=torch.float8_e4m3fn, device="meta"),
+                torch.empty((_TP, 1, ql_aot + 128), dtype=torch.float32, device="meta"),
+                torch.empty((8192, 8192), dtype=torch.float8_e4m3fn, device="meta"),
+                torch.empty((1, 8192), dtype=torch.float32, device="meta"),
+                torch.empty((_TP * ck_aot, 128), dtype=torch.float32, device="meta"),
+                torch.empty((_TP * ck_aot, 128), dtype=torch.float32, device="meta"),
+            ),
+        )
+
+    devs = jax.devices("cpu")[:_TP]
+    mesh16 = Mesh(np.array(devs), (_AXIS,))
+    ck, hd, ql_d = 128, 256, 512
+    rng = np.random.default_rng(1428)
+
+    def _put16(arr, dt):
+        return jax.device_put(jnp.asarray(arr, dtype=dt), NamedSharding(mesh16, P(_AXIS)))
+
+    real_pallas = pl.pallas_call
+
+    def _eager_interpret(*args, **kwargs):
+        kwargs["interpret"] = pltpu.InterpretParams(
+            dma_execution_mode="eager", detect_races=True, uninitialized_memory="nan"
+        )
+        return real_pallas(*args, **kwargs)
+
+    with (
+        mock.patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+        tpu_info_for_cpu_export(),
+        mock.patch("sglang_tpu.attention.pallas.util.get_tpu_version", return_value=7),
+        mock.patch.object(pl, "pallas_call", _eager_interpret),
+        jax.default_device(jax.devices("cpu")[0]),
+    ):
+        x_d = _put16(rng.standard_normal((_TP, ck, hd)) * 0.25, jnp.float8_e4m3fn)
+        wg_d = _put16(rng.standard_normal((_TP, hd, _TP * ql_d)) * 0.15, jnp.float8_e4m3fn)
+        wgs_d = _put16(np.full((_TP, 1, _TP * ql_d), 0.02), jnp.float32)
+        co_d = _put16(np.broadcast_to(np.cos(rng.uniform(0, 1, (1, ck, 128))), (_TP, ck, 128)), jnp.float32)
+        si_d = _put16(np.broadcast_to(np.sin(rng.uniform(0, 1, (1, ck, 128))), (_TP, ck, 128)), jnp.float32)
+
+        for h_kv, max_slots in ((1, 16), (2, 8)):
+            kvl_d = 2 * h_kv * 64
+            wq_d = _put16(rng.standard_normal((_TP, _TP, hd, ql_d + kvl_d)) * 0.15, jnp.float8_e4m3fn)
+            wqs_d = _put16(np.full((_TP, _TP, 1, ql_d + kvl_d), 0.02), jnp.float32)
+
+            def _cmp(x, wq, wqs, wg, wgs, co, si, _hkv=h_kv, _ms=max_slots):
+                q3_r, kv3_r = kernel_a1.pallas_a1_ulysses_qkv_local(
+                    x[0], wq[0], wqs[0], co[0], si[0], h_q_local=8, h_kv_local=_hkv
+                )
+                q3_r = lax.all_to_all(q3_r, _AXIS, 0, 0, tiled=True)
+                kv3_r = lax.all_to_all(kv3_r, _AXIS, 0, 0, tiled=True)
+                g_r = kernel_a1.pallas_ulysses_local_gate(x[0], wg[0], wgs[0])
+                q3_f, kv3_f, g_f = kernel_a1.pallas_a1_ulysses_qkv_gate_async_a2a(
+                    x[0], wq[0], wqs[0], wg[0], wgs[0], co[0], si[0],
+                    h_q_local=8, h_kv_local=_hkv, tp_axis=_AXIS, max_q_slots=_ms,
+                )
+                return q3_r[None], q3_f[None], kv3_r[None], kv3_f[None], g_r[None], g_f[None]
+
+            q3r, q3f, kv3r, kv3f, gr, gf = jax.block_until_ready(
+                jax.shard_map(
+                    _cmp, mesh=mesh16, in_specs=(P(_AXIS),) * 7, out_specs=(P(_AXIS),) * 6, check_vma=False
+                )(x_d, wq_d, wqs_d, wg_d, wgs_d, co_d, si_d)
+            )
+            np.testing.assert_array_equal(np.asarray(q3f, dtype=np.float32), np.asarray(q3r, dtype=np.float32))
+            np.testing.assert_array_equal(
+                np.asarray(lax.bitcast_convert_type(kv3f, jnp.uint8)),
+                np.asarray(lax.bitcast_convert_type(kv3r, jnp.uint8)),
+            )
+            np.testing.assert_array_equal(np.asarray(gf, dtype=np.float32), np.asarray(gr, dtype=np.float32))

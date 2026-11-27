@@ -1163,6 +1163,9 @@ class TpuEnvs:
     SGLANG_TPU_RPA_V3_PREFILL_TOPK_K_PAIR = EnvInt(0)
     # Optional Stage-1 TOPK_FAST Q-block size override (0 = auto: 16384 for qstride=4 else kernel bq).
     SGLANG_TPU_RPA_V3_PREFILL_TOPK_K1_BQ = EnvInt(0)
+    # Optional pinned sink half-slices in bkv=0 (0 = keep full bkv=0 dense; >0 = apply top-k
+    # to bkv=0 while pinning its first N 128-token half-slices, e.g. 4 = 512 sink tokens).
+    SGLANG_TPU_RPA_V3_PREFILL_TOPK_SINK_SLICES = EnvInt(0)
     # Muse prefill kernel path with SGLANG_TPU_KV_PACK_HEADS: A1 (two-half bf16 variants)
     # writes q and kv in RPA v3's packed layout, dropping the XLA expand/repack glue.
     SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT = EnvBool(False)
@@ -1507,6 +1510,10 @@ class TpuEnvs:
     # 3 = 2 + mh_outer<=48-VREG zero-spill tiling + 32-row K-half flq LHS quant (0 FP8 VMEM RMW);
     # 8 = 1 + hoist_rhs_scale=True + K-half quantize_3d_lhs_tile_to_fp8 (m_step=256, smaller IMEM).
     SGLANG_TPU_MUSE_KERNEL_GMM_SCOPED_W4A8 = EnvInt(0)
+    # Wave-14 prefill gmm_v2_fused_rs K-chained Scaled-FP8 inside scoped W4A8 strip matmul
+    # (0 = off; 512/1024/2048/4096 = fold block-256 NVFP4 scales into FP8 via exact 64*s/s_max
+    # on unmodified HBM weights and chain MXU f32 accumulators across K_chain before 1x VPU scale).
+    SGLANG_TPU_MUSE_KERNEL_GMM_W4A8_K_CHAIN = EnvInt(0)
     # Wave-8 prefill gmm_v2_fused_rs expert-outer Scaled-FP8 expansion:
     # 0 = off; 1 = per-strip FP4->Scaled-FP8 VMEM expansion + zero-spill k_chunk=256 FP8 MXU dot
     # in m_sub=128 sub-tiles (0 inner-K VPU scale muls); 2 = pair-batched (2 consecutive same-expert
@@ -1537,6 +1544,9 @@ class TpuEnvs:
     # Wave-18 opt-in BF16 reverse all-to-all in Ulysses attention (A1_VARIANT="v10_sp"):
     # sends bf16 across rev-A2A and applies 1x final static-FP8 quant inside gate-fuse, matching v6.
     SGLANG_TPU_MUSE_KERNEL_ULYSSES_REV_BF16 = EnvBool(False)
+    # Wave-14 Ulysses attention (A1_VARIANT="v10_sp", TP>=8, q_size<=512, c_k>=128): fuse A1
+    # QKV+Norm+RoPE, local Gate, and 16-slot Pallas async P2P A2A with 1x x_fp8 read (0-ULP exact).
+    SGLANG_TPU_MUSE_KERNEL_ULYSSES_ASYNC_A2A = EnvBool(True)
     # Wave-8 prefill SP Entry: Pallas async remote-copy A2A + fused Pallas embed RMSNorm.
     SGLANG_TPU_MUSE_KERNEL_ENTRY_ASYNC_A2A = EnvBool(False)
     # Wave-8 prefill Kernel A3 (v16 opt_wo): unlock bn=2048 at T=16384 (num_t_half=2, 60 MiB VMEM).

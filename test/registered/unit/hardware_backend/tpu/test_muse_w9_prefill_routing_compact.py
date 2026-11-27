@@ -721,6 +721,17 @@ def test_macro_vec_qblock_coarse48_parity_and_tpu7x_aot():
         sortfree_prefill=True,
         topk=8,
         ep_size=8,
+        t_local=64,
+        n_loc_eff=32,
+        has_pad_sentinel=True,
+        eff_hoist_routing=True,
+        eff_cm_pipe=False,
+    )
+    assert _allow_pallas_sortfree_routing(
+        1,
+        sortfree_prefill=True,
+        topk=8,
+        ep_size=8,
         t_local=128,
         n_loc_eff=32,
         has_pad_sentinel=True,
@@ -831,6 +842,9 @@ def test_fori_part_b_ep16_and_ep8_parity_and_tpu7x_aot():
             lambda *a, **kw: orig_cp(*a, **{**kw, "disable_bounds_checks": False}),
         ):
             for topo_name, ep_size, tl, n_loc, rnp in (
+                ("tpu7x=2x2x2", 16, 128, 18, False),
+                ("tpu7x=2x2x2", 16, 128, 18, True),
+                ("tpu7x=2x2x1", 8, 128, 32, False),
                 ("tpu7x=2x2x2", 16, 256, 16, False),
                 ("tpu7x=2x2x2", 16, 256, 18, True),
                 ("tpu7x=2x2x2", 16, 512, 22, True),
@@ -873,7 +887,11 @@ def test_fori_part_b_ep16_and_ep8_parity_and_tpu7x_aot():
             1, sortfree_prefill=True, topk=8, ep_size=16, t_local=256,
             n_loc_eff=22, has_pad_sentinel=pad, eff_hoist_routing=True, eff_cm_pipe=False,
         )
-    assert not _allow_pallas_sortfree_routing(
+    assert _allow_pallas_sortfree_routing(
         1, sortfree_prefill=True, topk=8, ep_size=16, t_local=128,
+        n_loc_eff=18, has_pad_sentinel=True, eff_hoist_routing=True, eff_cm_pipe=True,
+    )
+    assert not _allow_pallas_sortfree_routing(
+        1, sortfree_prefill=True, topk=8, ep_size=16, t_local=64,
         n_loc_eff=18, has_pad_sentinel=True, eff_hoist_routing=True, eff_cm_pipe=True,
     )

@@ -2448,18 +2448,19 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
         c_d2 = SimpleNamespace(shape=(1024, 256, 1, 4, 128), dtype="float8_e4m3fn")
         c_bd4 = SimpleNamespace(shape=(1024, 128, 1, 4, 128), dtype="float8_e4m3fn")
 
-        # 1. dense2 clamps explicit bkv16384 -> 8192 on both TP=8 and TP=16, while keeping non-d2 & bd4 at 16384.
+        # 1. dense2 now unlocks explicit bkv16384 (via chunked 4096-row bnew_kv_ref) on both TP=8 and TP=16.
         c_d2_tp8 = _capture(
             q_tp8, k_any, c_d2, kl, pi_lc, cq, ckv, dist, sw=None, d2=True,
             env_over={"SGLANG_TPU_RPA_V3_PREFILL_LC_OPTS": "bq4096,bkv16384"},
         )
-        self.assertEqual(c_d2_tp8["m_block_sizes"][:2], (4096, 8192))
+        self.assertEqual(c_d2_tp8["m_block_sizes"][:2], (4096, 16384))
+        self.assertIn("gqa8", c_d2_tp8["_prefill_opts"])
 
         c_d2_tp16 = _capture(
             q_tp16, k_any, c_d2, kl, pi_lc, cq, ckv, dist, sw=None, d2=True,
             env_over={"SGLANG_TPU_RPA_V3_PREFILL_LC_OPTS": "bq8192,bkv16384"},
         )
-        self.assertEqual(c_d2_tp16["m_block_sizes"][:2], (8192, 8192))
+        self.assertEqual(c_d2_tp16["m_block_sizes"][:2], (8192, 16384))
 
         c_bd4_tp16 = _capture(
             q_tp16, k_any, c_bd4, kl, pi_lc, cq, ckv, dist, sw=None, bd4=True,
@@ -2467,7 +2468,7 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
         )
         self.assertEqual(c_bd4_tp16["m_block_sizes"][:2], (8192, 16384))
 
-        # 2. TP=8 non-d2 LC Full auto-enables gqa8 under W9, while nogqa8 / d2 / TP=16 / SWA / <=32K do not.
+        # 2. TP=8 LC Full (both non-d2 and d2) auto-enables gqa8 under W9, while nogqa8 / TP=16 / SWA / <=32K do not.
         c_tp8_lc = _capture(q_tp8, k_any, c_norm, kl, pi_lc, cq, ckv, dist, sw=None)
         self.assertEqual(c_tp8_lc["m_block_sizes"][:2], (4096, 8192))
         self.assertIn("gqa8", c_tp8_lc["_prefill_opts"])
@@ -2478,7 +2479,11 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
         )
         self.assertNotIn("gqa8", c_tp8_nogo["_prefill_opts"])
 
-        self.assertNotIn("gqa8", c_d2_tp8["_prefill_opts"])
+        c_d2_nogo = _capture(
+            q_tp8, k_any, c_d2, kl, pi_lc, cq, ckv, dist, sw=None, d2=True,
+            env_over={"SGLANG_TPU_RPA_V3_PREFILL_W7_OPTS": "nogqa8"},
+        )
+        self.assertNotIn("gqa8", c_d2_nogo["_prefill_opts"])
         c_tp16_lc = _capture(q_tp16, k_any, c_norm, kl, pi_lc, cq, ckv, dist, sw=None)
         self.assertNotIn("gqa8", c_tp16_lc["_prefill_opts"])
         c_tp8_swa = _capture(q_tp8, k_any, c_norm, kl, pi_lc, cq, ckv, dist, sw=2048)
@@ -3491,6 +3496,491 @@ class TestMuseW9RpaPrefill(unittest.TestCase):
                 mlir = exp.mlir_module()
                 self.assertIn("qs4_ik_g4_kp4_k1b16384", mlir)
                 self.assertNotIn("stablehlo.sort", mlir)
+
+    def test_w24_topk_sparse_sink_interpret_and_aot(self):
+        """Verify Wave 13 opt-in bkv=0 sparse-sink routing, Interpret parity (N=1 & N=2 drain + needle + fallback), and AOT."""
+        from jax import export as jax_export
+        from jax.experimental.pallas import tpu as pltpu
+        from sglang_tpu.envs import envs
+        from sglang_tpu.attention.pallas import ragged_paged_attention_v3 as rpa_v3_mod
+        from sglang_tpu import attention_pallas_rpa_v3 as rpa_wrap_mod
+
+        self.assertEqual(int(envs.SGLANG_TPU_RPA_V3_PREFILL_TOPK_SINK_SLICES.get()), 0)
+
+        def _capture(env_over=None):
+            captured = {}
+
+            def _fake_kernel(*args, **kwargs):
+                captured.update(kwargs)
+                return ("out", "kvc")
+
+            env = {
+                "SGLANG_TPU_RPA_V3_PREFILL_KERNEL_MODE": "m0_ring_fuse",
+                "SGLANG_TPU_RPA_V3_PREFILL_A3_LAYOUT": "1",
+                "SGLANG_TPU_RPA_V3_SKIP_EMPTY_DECODE": "1",
+                "SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT": "1",
+                "SGLANG_TPU_KV_PACK_HEADS": "2",
+                "SGLANG_TPU_RPA_V3_PREFILL_W9": "1",
+                "SGLANG_TPU_RPA_V3_PREFILL_W7_OPTS": "",
+                "SGLANG_TPU_RPA_V3_PREFILL_LC_OPTS": "",
+                "SGLANG_TPU_RPA_V3_PREFILL_TOPK_SLICES": "12",
+                "SGLANG_TPU_RPA_V3_PREFILL_TOPK_QSTRIDE": "4",
+                "SGLANG_TPU_RPA_V3_PREFILL_TOPK_FAST": "1",
+                "SGLANG_TPU_RPA_V3_PREFILL_TOPK_K_PAIR": "0",
+                "SGLANG_TPU_RPA_V3_PREFILL_TOPK_K1_BQ": "0",
+                "SGLANG_TPU_RPA_V3_PREFILL_TOPK_SINK_SLICES": "0",
+            }
+            if env_over:
+                env.update(env_over)
+            q_tp8 = SimpleNamespace(ndim=5, shape=(1, 16384, 8, 2, 128), dtype="bfloat16")
+            k_any = SimpleNamespace(ndim=4, shape=(16384, 1, 4, 128), dtype="float8_e4m3fn")
+            c_norm = SimpleNamespace(shape=(1024, 512, 1, 4, 128), dtype="float8_e4m3fn")
+            kl = SimpleNamespace(shape=(64,))
+            pi_lc = SimpleNamespace(shape=(64 * 540,))
+            cq = SimpleNamespace(shape=(65,))
+            ckv = SimpleNamespace(shape=(65,))
+            dist = SimpleNamespace(shape=(3,))
+            with patch.dict(os.environ, env, clear=False):
+                rpa_wrap_mod._invoke_v3_kernel(
+                    _fake_kernel,
+                    queries=q_tp8,
+                    keys=k_any,
+                    values=None,
+                    kv_cache_fused=c_norm,
+                    kv_lens=kl,
+                    page_indices=pi_lc,
+                    cu_q_lens=cq,
+                    cu_kv_lens=ckv,
+                    distribution=dist,
+                    attention_sink=None,
+                    sm_scale=0.125,
+                    sliding_window=None,
+                    soft_cap=None,
+                    k_scale=1.0,
+                    v_scale=1.0,
+                    prepared_inputs=True,
+                    skip_decode=True,
+                    a3_out_layout=-2,
+                )
+            return captured
+
+        # Default-OFF: omitted unless SINK_SLICES > 0 and TOPK_SLICES > 0.
+        self.assertNotIn("_prefill_topk_sink_slices", _capture())
+        self.assertNotIn(
+            "_prefill_topk_sink_slices",
+            _capture({"SGLANG_TPU_RPA_V3_PREFILL_TOPK_SLICES": "0", "SGLANG_TPU_RPA_V3_PREFILL_TOPK_SINK_SLICES": "4"}),
+        )
+        c_fast = _capture({"SGLANG_TPU_RPA_V3_PREFILL_TOPK_SINK_SLICES": "4"})
+        self.assertEqual(c_fast.get("_prefill_topk_sink_slices"), 4)
+        c_leg = _capture({"SGLANG_TPU_RPA_V3_PREFILL_TOPK_FAST": "0", "SGLANG_TPU_RPA_V3_PREFILL_TOPK_SINK_SLICES": "4"})
+        self.assertEqual(c_leg.get("_prefill_topk_sink_slices"), 4)
+
+        # Eager InterpretParams + 0x7F KV tail poison + poison_vmem_nan:
+        # 1) tail_bkv_start == 1 (N=1 bkv=0-only drain) for both TP=8 gqa8 & TP=16 tp16_sq
+        # 2) tail_bkv_start == 2 (N=2 double-buffered drain + planted sink & non-sink bkv=0 needle)
+        # 3) out-of-range sink > topk_slices falls back cleanly to dense bkv=0 (0.0 diff vs sink=0)
+        rng = np.random.default_rng(24241)
+        page_size = 512
+        interp = pltpu.InterpretParams(
+            dma_execution_mode="eager", detect_races=True, uninitialized_memory="nan",
+        )
+        base_lc = frozenset({
+            "stationary_q_m0_ring_fuse", "skip_empty_cdma", "prefix_fast",
+            "fp8_qk", "mk128", "la2", "sub8_l", "bf16_pop", "unroll_up",
+        })
+        for case_name, t_buf, bq_sz, bkv_sz, seq_q, seq_kv, k1_bq_arg, check_needle in (
+            ("tail1_single_bkv0", 512, 512, 4096, [129, 300], [4225, 4400], 0, False),
+            ("tail2_bkv0_needle", 1024, 1024, 4096, [600], [8700], 1024, True),
+        ):
+            tot_q = sum(seq_q)
+            pps = 18
+            n_slots = 4
+            kl_j = jnp.array(seq_kv + [0] * (n_slots - len(seq_kv)), dtype=jnp.int32)
+            cq_vals = [0]
+            for ql in seq_q:
+                cq_vals.append(cq_vals[-1] + ql)
+            cq_vals.extend([tot_q] * (n_slots - len(seq_q)))
+            cq_j = jnp.array(cq_vals, dtype=jnp.int32)
+            ckv_j = jnp.arange(n_slots + 1, dtype=jnp.int32) * (pps * page_size)
+            pi_arr = np.zeros((n_slots * pps,), dtype=np.int32)
+            cur_p = 0
+            for si, kvl in enumerate(seq_kv):
+                for lp in range((kvl + page_size - 1) // page_size):
+                    pi_arr[si * pps + lp] = cur_p
+                    cur_p += 1
+            pi_j = jnp.asarray(pi_arr)
+            dist_j = jnp.array([0, 0, len(seq_q)], dtype=jnp.int32)
+
+            for sq_kv_heads, opts_run in (
+                (2, base_lc | {"gqa8"}),
+                (1, base_lc | {"tp16_sq"}),
+            ):
+                qh_blk = 4 * sq_kv_heads
+                q_raw = rng.normal(0.0, 0.25, (t_buf, sq_kv_heads, 8, 64)).astype(np.float32)
+                k_raw = rng.normal(0.0, 0.14, (cur_p * page_size, sq_kv_heads, 64)).astype(np.float32)
+                v_raw = rng.normal(0.0, 0.12, (cur_p * page_size, sq_kv_heads, 64)).astype(np.float32)
+                needle_q_row = 40
+                if check_needle:
+                    q_raw[:, :, :, :8] += 1.4
+                    k_raw[:16, :, :8] += 6.0  # sink in slice 0
+                    v_raw[:16, :, :] += 0.8
+                    # Non-sink needle in bkv=0 half-slice 23 (tokens 3000..3003, outside sink [0..3]).
+                    for kvh_i in range(sq_kv_heads):
+                        k_raw[3000:3004, kvh_i, :] = q_raw[needle_q_row, kvh_i, 0, :] * 4.0
+                        v_raw[3000:3004, kvh_i, :] = 3.0 if kvh_i == 0 else -3.0
+
+                q_packed = np.zeros((1, t_buf, qh_blk, 2, 128), dtype=np.float32)
+                for kvh_i in range(sq_kv_heads):
+                    c0 = 0 if kvh_i == 0 else 64
+                    for p_i in range(4):
+                        q_packed[0, :, kvh_i * 4 + p_i, 0, c0 : c0 + 64] = q_raw[:, kvh_i, 2 * p_i, :]
+                        q_packed[0, :, kvh_i * 4 + p_i, 1, c0 : c0 + 64] = q_raw[:, kvh_i, 2 * p_i + 1, :]
+                q_jax = jnp.asarray(q_packed, dtype=jnp.bfloat16)
+                kv_jax = jnp.asarray(rng.normal(0.0, 0.2, (t_buf, 1, 4, 128)), dtype=jnp.float8_e4m3fn)
+                ku8 = np.asarray(jax.lax.bitcast_convert_type(jnp.asarray(k_raw, dtype=jnp.float8_e4m3fn), jnp.uint8))
+                vu8 = np.asarray(jax.lax.bitcast_convert_type(jnp.asarray(v_raw, dtype=jnp.float8_e4m3fn), jnp.uint8))
+                cache_u8 = np.full((cur_p + 1, page_size, 1, 4, 128), 0x7F, dtype=np.uint8)
+                cache_u8[:cur_p, :, 0, :, :] = 0
+                k_pg = ku8.reshape(cur_p, page_size, sq_kv_heads, 64)
+                v_pg = vu8.reshape(cur_p, page_size, sq_kv_heads, 64)
+                cache_u8[:cur_p, :, 0, 0, :64] = k_pg[:, :, 0, :]
+                cache_u8[:cur_p, :, 0, 1, :64] = v_pg[:, :, 0, :]
+                if sq_kv_heads > 1:
+                    cache_u8[:cur_p, :, 0, 0, 64:] = k_pg[:, :, 1, :]
+                    cache_u8[:cur_p, :, 0, 1, 64:] = v_pg[:, :, 1, :]
+                pg_off = 0
+                for kvl in seq_kv:
+                    n_pg = (kvl + page_size - 1) // page_size
+                    tail_tok = kvl % page_size
+                    if tail_tok:
+                        cache_u8[pg_off + n_pg - 1, tail_tok:, 0, :, :] = 0x7F
+                    pg_off += n_pg
+                kv_cache = _u8_to_fp8(cache_u8)
+
+                with self.subTest(case=case_name, sq_kv_heads=sq_kv_heads):
+                    with patch.object(rpa_v3_mod, "get_tpu_version", return_value=7):
+                        out_leg, _ = rpa_v3_mod.ragged_paged_attention(
+                            jnp.array(q_jax), jnp.array(kv_jax), None, jnp.array(kv_cache),
+                            kl_j, pi_j, cq_j, ckv_j, dist_j, None, None,
+                            sm_scale=0.125, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                            m_block_sizes=(bq_sz, bkv_sz, 256, 512), _prefill_opts=opts_run,
+                            _fused_out_pack=sq_kv_heads, _prepared_inputs=True,
+                            _skip_decode=True, _a3_out_layout=True, _interpret=interp,
+                            _prefill_topk_slices=8, _prefill_topk_qstride=4,
+                            _prefill_topk_sink_slices=4,
+                        )
+                        out_fast, _ = rpa_v3_mod.ragged_paged_attention(
+                            jnp.array(q_jax), jnp.array(kv_jax), None, jnp.array(kv_cache),
+                            kl_j, pi_j, cq_j, ckv_j, dist_j, None, None,
+                            sm_scale=0.125, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                            m_block_sizes=(bq_sz, bkv_sz, 256, 512),
+                            _prefill_opts=opts_run | {"poison_vmem_nan"},
+                            _fused_out_pack=sq_kv_heads, _prepared_inputs=True,
+                            _skip_decode=True, _a3_out_layout=True, _interpret=interp,
+                            _prefill_topk_slices=8, _prefill_topk_qstride=4,
+                            _prefill_topk_in_kernel=True, _prefill_topk_gqa_batch=4,
+                            _prefill_topk_k_pair=4, _prefill_topk_k1_bq=k1_bq_arg,
+                            _prefill_topk_sink_slices=4,
+                        )
+                        a = np.asarray(out_leg[:tot_q], dtype=np.float32)
+                        b = np.asarray(out_fast[:tot_q], dtype=np.float32)
+                        self.assertTrue(np.all(np.isfinite(b)))
+                        self.assertEqual(float(np.max(np.abs(a - b))), 0.0)
+
+                        if check_needle:
+                            out_dense_bkv0, _ = rpa_v3_mod.ragged_paged_attention(
+                                jnp.array(q_jax), jnp.array(kv_jax), None, jnp.array(kv_cache),
+                                kl_j, pi_j, cq_j, ckv_j, dist_j, None, None,
+                                sm_scale=0.125, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                                m_block_sizes=(bq_sz, bkv_sz, 256, 512), _prefill_opts=opts_run,
+                                _fused_out_pack=sq_kv_heads, _prepared_inputs=True,
+                                _skip_decode=True, _a3_out_layout=True, _interpret=interp,
+                                _prefill_topk_slices=8, _prefill_topk_qstride=4,
+                                _prefill_topk_in_kernel=True, _prefill_topk_gqa_batch=4,
+                                _prefill_topk_k_pair=4, _prefill_topk_k1_bq=k1_bq_arg,
+                                _prefill_topk_sink_slices=0,
+                            )
+                            out_oob_sink, _ = rpa_v3_mod.ragged_paged_attention(
+                                jnp.array(q_jax), jnp.array(kv_jax), None, jnp.array(kv_cache),
+                                kl_j, pi_j, cq_j, ckv_j, dist_j, None, None,
+                                sm_scale=0.125, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                                m_block_sizes=(bq_sz, bkv_sz, 256, 512), _prefill_opts=opts_run,
+                                _fused_out_pack=sq_kv_heads, _prepared_inputs=True,
+                                _skip_decode=True, _a3_out_layout=True, _interpret=interp,
+                                _prefill_topk_slices=8, _prefill_topk_qstride=4,
+                                _prefill_topk_in_kernel=True, _prefill_topk_gqa_batch=4,
+                                _prefill_topk_k_pair=4, _prefill_topk_k1_bq=k1_bq_arg,
+                                _prefill_topk_sink_slices=16,
+                            )
+                            d0 = np.asarray(out_dense_bkv0[:tot_q], dtype=np.float32)
+                            oob = np.asarray(out_oob_sink[:tot_q], dtype=np.float32)
+                            self.assertEqual(float(np.max(np.abs(d0 - oob))), 0.0)
+                            cos_nd = float(
+                                np.dot(d0[needle_q_row, :64], b[needle_q_row, :64])
+                                / (np.linalg.norm(d0[needle_q_row, :64]) * np.linalg.norm(b[needle_q_row, :64]) + 1e-12)
+                            )
+                            self.assertGreaterEqual(cos_nd, 0.999)
+
+        # TPU v7 AOT export verification: 24K chunk + k=12 + qs=4 + k1b=16384 + sk4, 0 stablehlo.sort.
+        try:
+            from jax._src import tpu_info as _tpu_info  # noqa: F401
+        except ImportError:
+            self.skipTest("jax._src.tpu_info not available in lightweight CPU venv")
+        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+        with (
+            patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+            tpu_info_for_cpu_export(),
+        ):
+            for qh_blk, bq_aot, extra_aot in (
+                (8, 4096, {"gqa8", "staged_qo"}),
+                (4, 8192, {"tp16_sq", "staged_qo"}),
+            ):
+                exp = jax_export.export(
+                    jax.jit(
+                        lambda q, kv, c, kl_i, pi_i, cq_i, ckv_i, d: rpa_v3_mod.ragged_paged_attention(
+                            q, kv, None, c, kl_i, pi_i, cq_i, ckv_i, d, None, None,
+                            sm_scale=0.125, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                            m_block_sizes=(bq_aot, 16384, 256, 512),
+                            _prefill_opts=base_lc | extra_aot,
+                            _fused_out_pack=(qh_blk // 4), _prepared_inputs=True,
+                            _skip_decode=True, _a3_out_layout=True,
+                            _prefill_topk_slices=12, _prefill_topk_qstride=4,
+                            _prefill_topk_in_kernel=True, _prefill_topk_gqa_batch=4,
+                            _prefill_topk_k_pair=4, _prefill_topk_k1_bq=16384,
+                            _prefill_topk_sink_slices=4,
+                        )
+                    ),
+                    platforms=["tpu"],
+                )(
+                    jax.ShapeDtypeStruct((1, 24576, qh_blk, 2, 128), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((24576, 1, 4, 128), jnp.float8_e4m3fn),
+                    jax.ShapeDtypeStruct((1024, 512, 1, 4, 128), jnp.float8_e4m3fn),
+                    jax.ShapeDtypeStruct((64,), jnp.int32),
+                    jax.ShapeDtypeStruct((64 * 540,), jnp.int32),
+                    jax.ShapeDtypeStruct((65,), jnp.int32),
+                    jax.ShapeDtypeStruct((65,), jnp.int32),
+                    jax.ShapeDtypeStruct((3,), jnp.int32),
+                )
+                mlir = exp.mlir_module()
+                self.assertIn("qs4_ik_g4_kp4_k1b16384_sk4", mlir)
+                self.assertNotIn("stablehlo.sort", mlir)
+
+    def test_w25_dense2_chunked_bkv16k_and_perbq_topk_interpret_and_aot(self):
+        """Verify Wave 14 chunked bnew_kv_ref (bkv>4096) for d2/bd4, per-bq Stage-1/Stage-2 alignment, and TPU v7 AOT."""
+        from jax import export as jax_export
+        from jax.experimental.pallas import tpu as pltpu
+        from sglang_tpu.attention.pallas import ragged_paged_attention_v3 as rpa_v3_mod
+
+        rng = np.random.default_rng(25252)
+        page_size = 512
+        interp = pltpu.InterpretParams(
+            dma_execution_mode="eager", detect_races=True, uninitialized_memory="nan",
+        )
+        base_lc = frozenset({
+            "stationary_q_m0_ring_fuse", "skip_empty_cdma", "prefix_fast",
+            "fp8_qk", "mk128", "la2", "sub8_l", "bf16_pop", "unroll_up",
+        })
+
+        # 1. Chunked bnew_kv_ref (bnew_kv_rows=4096 < bkv_sz=8192) on BOTH d2 & bd4:
+        #    kv_len=5257, q_len=5000 -> bkv_sz_frm_cache=257 (odd!), bkv_sz_frm_new=5000 (>3584, 2 chunks!).
+        q_len_c = 5000
+        kv_len_c = 5257
+        t_buf_c = 5120
+        pps_c = 12
+        kl_c = jnp.array([kv_len_c, 0], dtype=jnp.int32)
+        cq_c = jnp.array([0, q_len_c, q_len_c], dtype=jnp.int32)
+        ckv_c = jnp.array([0, pps_c * page_size, 2 * pps_c * page_size], dtype=jnp.int32)
+        pi_arr_c = np.zeros((2 * pps_c,), dtype=np.int32)
+        pi_arr_c[:pps_c] = np.arange(pps_c, dtype=np.int32)
+        pi_c = jnp.asarray(pi_arr_c)
+        dist_c = jnp.array([0, 0, 1], dtype=jnp.int32)
+
+        for sq_kv_heads, use_d2, use_bd4, opts_c in (
+            (2, True, False, base_lc | {"gqa8", "staged_qo"}),
+            (1, False, True, base_lc | {"tp16_sq", "staged_qo"}),
+        ):
+            qh_blk = 4 * sq_kv_heads
+            q_np = rng.normal(0.0, 0.25, (1, t_buf_c, qh_blk, 2, 128)).astype(np.float32)
+            kv_np = rng.normal(0.0, 0.2, (t_buf_c, 1, 4, 128)).astype(np.float32)
+            cache_u8 = np.full((pps_c + 2, page_size, 1, 4, 128), 0x7F, dtype=np.uint8)
+            cache_u8[0, :257, 0, :2, :] = rng.integers(0x28, 0x3A, size=(257, 2, 128), dtype=np.uint8)
+            cache_u8[0, 257:, 0, :, :] = 0x7F
+            kvc_stock = _u8_to_fp8(cache_u8)
+            if use_d2:
+                kvc_pk = _u8_to_fp8(
+                    _pack_stock_kv_to_dense2_u8(
+                        cache_u8.reshape(-1, 1, 4, 128)
+                    ).reshape(pps_c + 2, page_size // 2, 1, 4, 128)
+                )
+            else:
+                # Pack bd4 (page_size // 4 = 128 rows)
+                bd4_u8 = np.full((pps_c + 2, page_size // 4, 1, 4, 128), 0x7F, dtype=np.uint8)
+                src_p = cache_u8.reshape(pps_c + 2, page_size // 4, 4, 4, 128)
+                bd4_u8[:, :, 0, 0, :64] = src_p[:, :, 0, 0, :64]
+                bd4_u8[:, :, 0, 1, :64] = src_p[:, :, 0, 1, :64]
+                bd4_u8[:, :, 0, 2, :64] = src_p[:, :, 2, 0, :64]
+                bd4_u8[:, :, 0, 3, :64] = src_p[:, :, 2, 1, :64]
+                bd4_u8[:, :, 0, 0, 64:] = src_p[:, :, 1, 0, :64]
+                bd4_u8[:, :, 0, 1, 64:] = src_p[:, :, 1, 1, :64]
+                bd4_u8[:, :, 0, 2, 64:] = src_p[:, :, 3, 0, :64]
+                bd4_u8[:, :, 0, 3, 64:] = src_p[:, :, 3, 1, :64]
+                kvc_pk = _u8_to_fp8(bd4_u8)
+            q_jax = jnp.asarray(q_np, dtype=jnp.bfloat16)
+            kv_jax = jnp.asarray(kv_np, dtype=jnp.float8_e4m3fn)
+            with self.subTest(mode=("d2" if use_d2 else "bd4")):
+                with patch.object(rpa_v3_mod, "get_tpu_version", return_value=7):
+                    out_ref, kvc_ref_out = rpa_v3_mod.ragged_paged_attention(
+                        jnp.array(q_jax), jnp.array(kv_jax), None, jnp.array(kvc_stock),
+                        kl_c, pi_c, cq_c, ckv_c, dist_c, None, None,
+                        sm_scale=0.125, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                        m_block_sizes=(4096, 8192, 256, 512),
+                        _prefill_opts=(base_lc | {"gqa8"} if use_d2 else base_lc | {"tp16_sq"}),
+                        _fused_out_pack=sq_kv_heads, _prepared_inputs=True,
+                        _skip_decode=True, _a3_out_layout=True, _interpret=interp,
+                    )
+                    out_pk, kvc_pk_out = rpa_v3_mod.ragged_paged_attention(
+                        jnp.array(q_jax), jnp.array(kv_jax), None, jnp.array(kvc_pk),
+                        kl_c, pi_c, cq_c, ckv_c, dist_c, None, None,
+                        sm_scale=0.125, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                        m_block_sizes=(4096, 8192, 256, 512),
+                        _prefill_opts=opts_c | {"poison_vmem_nan"},
+                        _fused_out_pack=sq_kv_heads, _prepared_inputs=True,
+                        _skip_decode=True, _a3_out_layout=True,
+                        _kv_pack_dense2=use_d2, _kv_pack_bd4=use_bd4, _interpret=interp,
+                    )
+                a = np.asarray(out_ref[:q_len_c], dtype=np.float32)
+                b = np.asarray(out_pk[:q_len_c], dtype=np.float32)
+                self.assertTrue(np.all(np.isfinite(b)))
+                cos = float(np.dot(a.ravel(), b.ravel()) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
+                self.assertGreaterEqual(cos, 0.99999)
+                self.assertLessEqual(float(np.max(np.abs(a - b))), 1e-2)
+                # Also verify newly written cache tokens [257..5257) were persisted cleanly without NaN/mismatch.
+                ref_u8 = np.asarray(jax.lax.bitcast_convert_type(kvc_ref_out, jnp.uint8))[:10]
+                pk_u8 = np.asarray(jax.lax.bitcast_convert_type(kvc_pk_out, jnp.uint8))[:10]
+                if use_d2:
+                    exp_u8 = _pack_stock_kv_to_dense2_u8(
+                        ref_u8.reshape(-1, 1, 4, 128)
+                    ).reshape(10, page_size // 2, 1, 4, 128)
+                    self.assertTrue(np.array_equal(pk_u8, exp_u8))
+
+        # 2. Per-bq tail_bkv_start alignment: Stage-1 k1_bq=1024 vs Stage-2 bq=512 (bkv=1024).
+        #    seq_kv=2700, seq_q=1024 -> kv_q_gap=1676: bq=0 (q 1676..2187) tail=1, bq=1 (q 2188..2699) tail=2.
+        #    Needle in bkv=1 (pos=1500) queried by row 600 (inside bq=1) must be scored in Stage-1 & retrieved.
+        seq_q_p = 1024
+        seq_kv_p = 2700
+        pps_p = 6
+        kl_p = jnp.array([seq_kv_p, 0], dtype=jnp.int32)
+        cq_p = jnp.array([0, seq_q_p, seq_q_p], dtype=jnp.int32)
+        ckv_p = jnp.array([0, pps_p * page_size, 2 * pps_p * page_size], dtype=jnp.int32)
+        pi_arr_p = np.zeros((2 * pps_p,), dtype=np.int32)
+        pi_arr_p[:pps_p] = np.arange(pps_p, dtype=np.int32)
+        pi_p = jnp.asarray(pi_arr_p)
+        dist_p = jnp.array([0, 0, 1], dtype=jnp.int32)
+
+        q_raw_p = rng.normal(0.0, 0.25, (seq_q_p, 2, 8, 64)).astype(np.float32)
+        k_raw_p = rng.normal(0.0, 0.14, (pps_p * page_size, 2, 64)).astype(np.float32)
+        v_raw_p = rng.normal(0.0, 0.12, (pps_p * page_size, 2, 64)).astype(np.float32)
+        q_raw_p[:, :, :, :8] += 1.6
+        k_raw_p[:16, :, :8] += 6.5
+        v_raw_p[:16, :, :] += 0.9
+        needle_q = 600  # in bq=1 (rows 512..1023)
+        needle_k = 1500  # in bkv=1 (keys 1024..2047)
+        for kvh_i in range(2):
+            k_raw_p[needle_k : needle_k + 4, kvh_i, :] = q_raw_p[needle_q, kvh_i, 0, :] * 3.8
+            v_raw_p[needle_k : needle_k + 4, kvh_i, :] = 3.0 if kvh_i == 0 else -3.0
+        q_pk_p = np.zeros((1, seq_q_p, 8, 2, 128), dtype=np.float32)
+        for kvh_i in range(2):
+            c0 = 0 if kvh_i == 0 else 64
+            for p_i in range(4):
+                q_pk_p[0, :, kvh_i * 4 + p_i, 0, c0 : c0 + 64] = q_raw_p[:, kvh_i, 2 * p_i, :]
+                q_pk_p[0, :, kvh_i * 4 + p_i, 1, c0 : c0 + 64] = q_raw_p[:, kvh_i, 2 * p_i + 1, :]
+        q_jax_p = jnp.asarray(q_pk_p, dtype=jnp.bfloat16)
+        kv_jax_p = jnp.asarray(rng.normal(0.0, 0.2, (seq_q_p, 1, 4, 128)), dtype=jnp.float8_e4m3fn)
+        ku8_p = np.asarray(jax.lax.bitcast_convert_type(jnp.asarray(k_raw_p, dtype=jnp.float8_e4m3fn), jnp.uint8))
+        vu8_p = np.asarray(jax.lax.bitcast_convert_type(jnp.asarray(v_raw_p, dtype=jnp.float8_e4m3fn), jnp.uint8))
+        c_u8_p = np.full((pps_p + 1, page_size, 1, 4, 128), 0x7F, dtype=np.uint8)
+        c_u8_p[:pps_p, :, 0, :, :] = 0
+        k_pg_p = ku8_p.reshape(pps_p, page_size, 2, 64)
+        v_pg_p = vu8_p.reshape(pps_p, page_size, 2, 64)
+        c_u8_p[:pps_p, :, 0, 0, :64] = k_pg_p[:, :, 0, :]
+        c_u8_p[:pps_p, :, 0, 1, :64] = v_pg_p[:, :, 0, :]
+        c_u8_p[:pps_p, :, 0, 0, 64:] = k_pg_p[:, :, 1, :]
+        c_u8_p[:pps_p, :, 0, 1, 64:] = v_pg_p[:, :, 1, :]
+        c_u8_p[5, seq_kv_p % page_size :, 0, :, :] = 0x7F
+        kvc_p = _u8_to_fp8(c_u8_p)
+
+        with patch.object(rpa_v3_mod, "get_tpu_version", return_value=7):
+            out_dense_p, _ = rpa_v3_mod.ragged_paged_attention(
+                jnp.array(q_jax_p), jnp.array(kv_jax_p), None, jnp.array(kvc_p),
+                kl_p, pi_p, cq_p, ckv_p, dist_p, None, None,
+                sm_scale=0.125, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                m_block_sizes=(512, 1024, 256, 512), _prefill_opts=base_lc | {"gqa8"},
+                _fused_out_pack=2, _prepared_inputs=True,
+                _skip_decode=True, _a3_out_layout=True, _interpret=interp,
+            )
+            out_pbq, _ = rpa_v3_mod.ragged_paged_attention(
+                jnp.array(q_jax_p), jnp.array(kv_jax_p), None, jnp.array(kvc_p),
+                kl_p, pi_p, cq_p, ckv_p, dist_p, None, None,
+                sm_scale=0.125, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                m_block_sizes=(512, 1024, 256, 512),
+                _prefill_opts=base_lc | {"gqa8", "poison_vmem_nan"},
+                _fused_out_pack=2, _prepared_inputs=True,
+                _skip_decode=True, _a3_out_layout=True, _interpret=interp,
+                _prefill_topk_slices=4, _prefill_topk_qstride=4,
+                _prefill_topk_in_kernel=True, _prefill_topk_gqa_batch=4,
+                _prefill_topk_k_pair=4, _prefill_topk_k1_bq=1024,
+                _prefill_topk_sink_slices=4,
+            )
+        dp = np.asarray(out_dense_p[:seq_q_p], dtype=np.float32)
+        pp = np.asarray(out_pbq[:seq_q_p], dtype=np.float32)
+        self.assertTrue(np.all(np.isfinite(pp)))
+        cos_p = float(np.dot(dp[needle_q, :64], pp[needle_q, :64]) / (np.linalg.norm(dp[needle_q, :64]) * np.linalg.norm(pp[needle_q, :64]) + 1e-12))
+        self.assertGreaterEqual(cos_p, 0.999)
+
+        # 3. TPU v7 AOT export verification for TP=8 dense2 bkv=16384 + gqa8 + sk4 (0 stablehlo.sort).
+        try:
+            from jax._src import tpu_info as _tpu_info  # noqa: F401
+        except ImportError:
+            self.skipTest("jax._src.tpu_info not available in lightweight CPU venv")
+        from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+        with (
+            patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+            tpu_info_for_cpu_export(),
+        ):
+            exp = jax_export.export(
+                jax.jit(
+                    lambda q, kv, c, kl_i, pi_i, cq_i, ckv_i, d: rpa_v3_mod.ragged_paged_attention(
+                        q, kv, None, c, kl_i, pi_i, cq_i, ckv_i, d, None, None,
+                        sm_scale=0.125, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                        m_block_sizes=(4096, 16384, 256, 512),
+                        _prefill_opts=base_lc | {"gqa8", "staged_qo"},
+                        _fused_out_pack=2, _prepared_inputs=True,
+                        _skip_decode=True, _a3_out_layout=True,
+                        _kv_pack_dense2=True,
+                        _prefill_topk_slices=12, _prefill_topk_qstride=4,
+                        _prefill_topk_in_kernel=True, _prefill_topk_gqa_batch=4,
+                        _prefill_topk_k_pair=4, _prefill_topk_k1_bq=16384,
+                        _prefill_topk_sink_slices=4,
+                    )
+                ),
+                platforms=["tpu"],
+            )(
+                jax.ShapeDtypeStruct((1, 24576, 8, 2, 128), jnp.bfloat16),
+                jax.ShapeDtypeStruct((24576, 1, 4, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((1024, 256, 1, 4, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((64,), jnp.int32),
+                jax.ShapeDtypeStruct((64 * 540,), jnp.int32),
+                jax.ShapeDtypeStruct((65,), jnp.int32),
+                jax.ShapeDtypeStruct((65,), jnp.int32),
+                jax.ShapeDtypeStruct((3,), jnp.int32),
+            )
+            mlir = exp.mlir_module()
+            self.assertIn("bkv_16384_512", mlir)
+            self.assertIn("gqa8", mlir)
+            self.assertIn("qs4_ik_g4_kp4_k1b16384_sk4", mlir)
+            self.assertNotIn("stablehlo.sort", mlir)
 
 
 if __name__ == "__main__":

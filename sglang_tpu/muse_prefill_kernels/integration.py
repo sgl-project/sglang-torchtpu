@@ -1086,6 +1086,7 @@ def _ops(
     overlap_deq0_routing_ag: bool = False,
     carb_tag: str = "",
     ulysses_rev_bf16: bool = False,
+    ulysses_async_a2a: bool = True,
 ) -> _Ops:
     """Per-rank torch ops: every tensor is this rank's block (P("model") on dim 0)."""
     import jax
@@ -1675,6 +1676,44 @@ def _ops(
         def a1_ul_full_body(
             attn_in_k, wqkvg, wqkvg_sc3d, w_gate, w_gate_sc, cos_k, sin_k
         ):
+            c_k = attn_in_k.shape[0]
+            if (
+                ulysses_async_a2a
+                and tp_d_ul >= 8
+                and h_q_local * 64 <= 512
+                and h_kv_local in (1, 2)
+                and c_k >= 128
+                and c_k % 128 == 0
+            ):
+                me = kernel_a1.pallas_axis_index_1d(_AXIS)[0]
+                x_fp8_k = _prep_ul_fp8_slice(attn_in_k)
+                cos_own = lax.dynamic_index_in_dim(
+                    cos_k.reshape(tp_d_ul, c_k, 128), me, axis=0, keepdims=False
+                )
+                sin_own = lax.dynamic_index_in_dim(
+                    sin_k.reshape(tp_d_ul, c_k, 128), me, axis=0, keepdims=False
+                )
+                q_3d, kv_3d, gate_k = kernel_a1.pallas_a1_ulysses_qkv_gate_async_a2a(
+                    x_fp8_k,
+                    wqkvg,
+                    wqkvg_sc3d * kernel_a1.STATIC_A1_ACT_SCALE,
+                    w_gate,
+                    w_gate_sc * kernel_a1.STATIC_A1_ACT_SCALE,
+                    cos_own,
+                    sin_own,
+                    h_q_local=h_q_local,
+                    h_kv_local=h_kv_local,
+                    tp_axis=_AXIS,
+                )
+                c_tok = tp_d_ul * c_k
+                q_k, kv_k = kernel_a1.pallas_pack_ulysses_qkv_for_rpa(
+                    q_3d.reshape(c_tok, q_3d.shape[-1]),
+                    kv_3d.reshape(c_tok, kv_3d.shape[-1]),
+                    h_q_local=h_q_local,
+                    h_kv_local=h_kv_local,
+                    tm=512,
+                )
+                return q_k, kv_k, gate_k
             q_3d, kv_3d, x_fp8_k = a1_ul_qkv_body(
                 attn_in_k, wqkvg, wqkvg_sc3d, cos_k, sin_k
             )
@@ -1779,7 +1818,12 @@ def _ops(
             "a3_ulysses_wo_2chunk", a3_ul_wo_2chunk, 4, 1
         )
         a1_ulysses_full_op = export(
-            "a1_ulysses_full" + a1_w8_tag, a1_ul_full, 7, 3
+            "a1_ulysses_full"
+            + a1_w8_tag
+            + ("_aa2a" if ulysses_async_a2a else ""),
+            a1_ul_full,
+            7,
+            3,
         )
         a3_ulysses_full_op = export(
             "a3_ulysses_full_e" + eps_sfx + rev_bf16_sfx, a3_ul_full, 4, 1
@@ -2829,6 +2873,7 @@ class MusePrefillKernels(torch.nn.Module):
             tpu_envs.SGLANG_TPU_MUSE_KERNEL_OVERLAP_DEQ0_ROUTING_AG.get(),
             _w8_carb_cache_tag(),
             tpu_envs.SGLANG_TPU_MUSE_KERNEL_ULYSSES_REV_BF16.get(),
+            tpu_envs.SGLANG_TPU_MUSE_KERNEL_ULYSSES_ASYNC_A2A.get(),
         )
         self.a3_kdeep_wo = int(
             tpu_envs.SGLANG_TPU_MUSE_KERNEL_A3_KDEEP_WO.get() or 0

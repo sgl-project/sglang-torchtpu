@@ -1506,7 +1506,6 @@ def b1_moe_b2_rpad_replicated_b16_jax(
     skip_kv_write: bool = False,
 ):
     """Fused replicated ``B=8/16`` Step (c) superkernel: ``[rep_b1 + muse_sparse + rep_b2 + RPAd]``."""
-    from jax import lax
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
     from sglang_tpu.attention.pallas.rpa_v3_decode_fast import align_to, cdiv
@@ -1564,7 +1563,13 @@ def b1_moe_b2_rpad_replicated_b16_jax(
     max_num_seqs = kv_lens.shape[0]
     pages_per_seq = eff_page_indices.shape[0] // max_num_seqs
     phys_page_rows = kv_cache_flat.shape[1]
-    has_shared_prefix = int(distribution.shape[0]) > 3
+    dist_len = int(distribution.shape[0])
+    has_shared_prefix = dist_len > 3
+    shared_group_size = (
+        max_num_seqs // (dist_len - 3)
+        if (has_shared_prefix and (max_num_seqs % (dist_len - 3)) == 0)
+        else 0
+    )
     cfg_rpa, one_block_per_seq, bkv_slot_pages, use_grp_vec, is_ok = resolve_step_c_rpa_plan(
         rpa_mode_str,
         sliding_window=eff_sw,
@@ -1574,13 +1579,14 @@ def b1_moe_b2_rpad_replicated_b16_jax(
         kv_pack_bd4=kv_pack_bd4,
         b_tokens=rows,
         max_num_seqs=max_num_seqs,
+        shared_group_size=shared_group_size,
         has_shared_prefix=has_shared_prefix,
     )
     if not is_ok:
         raise ValueError(
-            "Replicated Step (c) requires RPAd bkv <= 80*512 rows (20 MiB) and non-shared loop_kind; "
+            "Replicated Step (c) requires RPAd bkv within VMEM budget and compatible shared_group; "
             f"got num_slots={cfg_rpa.num_slots}, max_ring_pages={cfg_rpa.max_ring_pages}, "
-            f"phys_page_rows={phys_page_rows}, loop_kind={cfg_rpa.loop_kind!r}"
+            f"phys_page_rows={phys_page_rows}, loop_kind={cfg_rpa.loop_kind!r}, B={rows}"
         )
     if world_size == 16 and cfg_rpa.num_slots > 4:
         raise ValueError(
@@ -1633,13 +1639,25 @@ def b1_moe_b2_rpad_replicated_b16_jax(
     out_specs = (h_sp, v_sp, kv_out_spec)
     pack_tag = "_bd4" if kv_pack_bd4 else ("_d2" if kv_pack_dense2 else "")
 
-    def _invoke_step_c(run_cfg, run_one_blk: bool, run_slot_pg: int, run_grp_vec: bool, suffix: str = ""):
+    def _invoke_step_c(run_cfg, run_one_blk: bool, run_slot_pg: int, run_grp_vec: bool):
         max_blks_4k = (
             cdiv(max(pages_per_seq, 1), run_cfg.max_ring_pages)
             if run_cfg.loop_kind == "ring4k"
             else 0
         )
-        smem_words = 2 + run_cfg.num_slots + 4 * max(max_num_seqs * max_blks_4k, 0)
+        sh_grp = run_cfg.shared_group_size or (16 if run_cfg.loop_kind == "shared16" else 0)
+        max_blks_sh = (
+            cdiv(max(pages_per_seq, 1), run_cfg.max_ring_pages) if sh_grp > 0 else 0
+        )
+        sh_smem_words = 4 * max(sh_grp * max_blks_sh, 0)
+        if (max_num_seqs * pages_per_seq + 2 + run_cfg.num_slots + sh_smem_words) * 4 > 960 * 1024:
+            sh_smem_words = 0
+        smem_words = (
+            2
+            + run_cfg.num_slots
+            + max(4 * max(max_num_seqs * max_blks_4k, 0), sh_smem_words)
+        )
+        state_rows = q_heads * sh_grp if sh_grp > 0 else q_heads
         scope2_vmem = (
             vmem((rows, qkv_cols), jnp.bfloat16),  # qkv_vmem_slice
             vmem((rows, 16, 128), jnp.bfloat16),  # rpad_q_vmem
@@ -1653,7 +1671,7 @@ def b1_moe_b2_rpad_replicated_b16_jax(
                 (run_cfg.num_slots, run_slot_pg, phys_page_rows, 1, 4, 128),
                 kv_cache_flat.dtype,
             ),
-            vmem((3, q_heads, 128), jnp.float32),
+            vmem((3, state_rows, 128), jnp.float32),
             vmem((rows, q_heads, 128), jnp.bfloat16),
             *(
                 (vmem((max(rows, 8), 8, 1, 4, 128), kv_cache_flat.dtype),)
@@ -1744,46 +1762,14 @@ def b1_moe_b2_rpad_replicated_b16_jax(
                 f"muse_w9_b1_moe_b2_rep_rpad_b{rows}_tp{world_size}_k{st['scale_block']}"
                 f"_r{st['num_replicas']}_{'r16' if st['is_r16'] else 'r32'}"
                 f"{'_dfp' if st['has_free_params_arg'] else ''}"
-                f"{pack_tag}{suffix}"
+                f"{pack_tag}"
                 f"_{'rope' if st['has_rope'] else 'nope'}"
             ),
         )(*call_args)
 
-    page_size = (
-        phys_page_rows * 4
-        if kv_pack_bd4
-        else (phys_page_rows * 2 if kv_pack_dense2 else phys_page_rows)
-    )
-    use_adaptive_1k = (
-        eff_sw is None
-        and skip_kv_write
-        and cfg_rpa.loop_kind in ("w7auto", "ring4k")
-        and (1024 % page_size == 0)
-        and pages_per_seq > (1024 // page_size)
-    )
-    if use_adaptive_1k:
-        short_cfg, short_one_blk, short_slot_pg, short_grp_vec, short_ok = resolve_step_c_rpa_plan(
-            rpa_mode_str,
-            sliding_window=1024,
-            pages_per_seq=1024 // page_size,
-            phys_page_rows=phys_page_rows,
-            kv_pack_dense2=kv_pack_dense2,
-            kv_pack_bd4=kv_pack_bd4,
-            b_tokens=rows,
-            max_num_seqs=max_num_seqs,
-            has_shared_prefix=False,
-        )
-        if short_ok and (world_size != 16 or short_cfg.num_slots <= 4):
-            n_act_s = jnp.clip(distribution[2], 0, max_num_seqs)
-            act_kvl = jnp.where(jnp.arange(max_num_seqs) < n_act_s, kv_lens, jnp.int32(0))
-            is_short_1k = jnp.max(act_kvl) <= jnp.int32(1024)
-            st_out, next_gated, kv_out = lax.cond(
-                is_short_1k,
-                lambda: _invoke_step_c(short_cfg, short_one_blk, short_slot_pg, short_grp_vec, "_c1024"),
-                lambda: _invoke_step_c(cfg_rpa, one_block_per_seq, bkv_slot_pages, use_grp_vec),
-            )
-            return st_out, next_gated, kv_out
-
+    # Adaptive 1K (lax.cond) is disabled: wrapping the 16 Full-Attn Step (c)
+    # calls in HLO conditionals shatters XLA code deduplication across the 45
+    # SWA rope calls into 4 separate IMEM binaries (+17..20 us/L cold reload).
     st_out, next_gated, kv_out = _invoke_step_c(
         cfg_rpa, one_block_per_seq, bkv_slot_pages, use_grp_vec
     )

@@ -379,6 +379,7 @@ def _stationary_q_v2_process(
     cu_qgrps_ref=None,
     prefix_topk_ref=None,
     prefix_topk_slices: int = 0,
+    prefix_topk_sink_slices: int = 0,
     prefix_q_grp_sz: int = 1024,
     prefix_max_bkv: int = 16,
 ):
@@ -3252,7 +3253,7 @@ def _stationary_q_v2_process(
                 and use_causal_mask
             )
             tail_bkv_start = (
-                jnp.clip(kv_q_gap // bkv_sz, start_bkv_idx, end_bkv_idx)
+                jnp.clip(processed_q_len // bkv_sz, start_bkv_idx, end_bkv_idx)
                 if use_prefix_fast
                 else start_bkv_idx
             )
@@ -3416,7 +3417,10 @@ def _stationary_q_v2_process(
 
                             @pl.when(is_first_bkv)
                             def _exec_prefix_dense_sink():
-                                _exec_prefix_pass(static_first=True, with_topk=False)
+                                _exec_prefix_pass(
+                                    static_first=True,
+                                    with_topk=(prefix_topk_sink_slices > 0),
+                                )
 
                             @pl.when(jnp.logical_not(is_first_bkv))
                             def _exec_prefix_topk_sparse():
@@ -3577,6 +3581,7 @@ def _prefix_score_kernel(
     topk_in_kernel: bool = False,
     topk_gqa_batch: int = 1,
     topk_k_pair: int = 1,
+    topk_sink_slices: int = 0,
 ):
     """Stage-1 prefix All-QK scorer (read-only on Q and KV cache)."""
     start_seq_idx, end_seq_idx = case.get_range(distribution_ref)
@@ -3760,6 +3765,12 @@ def _prefix_score_kernel(
     col_iota_64w = lax.broadcasted_iota(jnp.int32, (64, w_q), 1)
     tk_iota_128 = lax.broadcasted_iota(jnp.int32, (8, 128), 1)
     tk_valid_mask = tk_iota_128 < num_h_per_bkv
+    bkv_start_k1 = 0 if topk_sink_slices > 0 else 1
+    if topk_sink_slices > 0:
+        sink_pin_vals = (
+            jnp.float32(1e30)
+            - tk_iota_128.astype(jnp.float32) * jnp.float32(1e25)
+        )
 
     @pl.loop(start_seq_idx, end_seq_idx)
     def _k1_seq(seq_idx):
@@ -3780,11 +3791,14 @@ def _prefix_score_kernel(
             processed_q_len = kv_q_gap + bq_idx * actual_bq_sz
             effective_kv_len = jnp.minimum(kv_len, processed_q_len + actual_bq_sz)
             end_bkv_idx = cdiv(effective_kv_len, bkv_sz)
-            tail_bkv_start = jnp.clip(kv_q_gap // bkv_sz, 0, end_bkv_idx)
             valid_bq_rows = jnp.clip(q_len - bq_idx * actual_bq_sz, 0, actual_bq_sz)
             valid_qgrps = cdiv(valid_bq_rows, q_grp_sz)
+            last_qgrp_start = (
+                processed_q_len + jnp.maximum(valid_qgrps - 1, 0) * q_grp_sz
+            )
+            tail_bkv_start = jnp.clip(last_qgrp_start // bkv_sz, 0, end_bkv_idx)
 
-            @pl.when((tail_bkv_start > 1) & (valid_qgrps > 0))
+            @pl.when((tail_bkv_start > bkv_start_k1) & (valid_qgrps > 0))
             def _k1_run_bq():
                 q_row_base = q_start + bq_idx * actual_bq_sz
                 if qstride == 4:
@@ -4101,11 +4115,11 @@ def _prefix_score_kernel(
                             wait,
                         )
 
-                _fetch_bkv_k1(seq_idx, 1, 0, wait=False)
+                _fetch_bkv_k1(seq_idx, bkv_start_k1, 0, wait=False)
 
-                @pl.loop(1, tail_bkv_start, unroll=False)
+                @pl.loop(bkv_start_k1, tail_bkv_start, unroll=False)
                 def _k1_bkv(bkv_idx):
-                    bkv_slot = (bkv_idx - 1) & 1
+                    bkv_slot = (bkv_idx - bkv_start_k1) & 1
                     nxt_bkv = bkv_idx + 1
 
                     @pl.when(nxt_bkv < tail_bkv_start)
@@ -4115,15 +4129,20 @@ def _prefix_score_kernel(
                     _fetch_bkv_k1(seq_idx, bkv_idx, bkv_slot, wait=True)
                     _unpack_k_only(bkv_slot)
 
-                    sc_slot = (bkv_idx - 1) & 1
+                    sc_slot = (bkv_idx - bkv_start_k1) & 1
 
-                    @pl.when(bkv_idx >= 3)
+                    @pl.when(bkv_idx >= bkv_start_k1 + 2)
                     def _wait_prev_sc():
                         _sc_dma(bkv_idx - 2, sc_slot, wait=True)
 
                     neg_col = jnp.bfloat16(-1e4)
 
-                    @pl.loop(0, valid_qgrps, unroll=False)
+                    min_qgrp = jnp.maximum(
+                        cdiv((bkv_idx + 1) * bkv_sz - processed_q_len, q_grp_sz),
+                        0,
+                    )
+
+                    @pl.loop(min_qgrp, valid_qgrps, unroll=False)
                     def _score_grp(g_idx):
                         valid_g_rows = jnp.clip(
                             valid_bq_rows - g_idx * q_grp_sz, 0, q_grp_sz
@@ -4189,13 +4208,10 @@ def _prefix_score_kernel(
                                                     mh = m_kq[
                                                         :, hi * w_q : (hi + 1) * w_q
                                                     ]
-                                                    mh_m = jnp.where(
-                                                        col_ok_1w, mh, neg_col
-                                                    )
                                                     for kk in range(topk_k_pair):
                                                         m_sub[
                                                             bi * topk_gqa_batch + hi
-                                                        ].append(mh_m[kk : kk + 1])
+                                                        ].append(mh[kk : kk + 1])
                                     else:
                                         for sub_s in range(8):
                                             k_1h = k_k1_ref[kv_h, g_c * 8 + sub_s][
@@ -4228,7 +4244,11 @@ def _prefix_score_kernel(
                                                         jnp.where(col_ok_1w, mh, neg_col)
                                                     )
                                     for qh in range(8):
-                                        m_8w = jnp.concatenate(m_sub[qh], axis=0)
+                                        m_8w = jnp.where(
+                                            col_ok_1w,
+                                            jnp.concatenate(m_sub[qh], axis=0),
+                                            neg_col,
+                                        )
                                         if w_q == 512:
                                             m_8w = jnp.maximum(
                                                 m_8w[:, :256], m_8w[:, 256:]
@@ -4256,14 +4276,9 @@ def _prefix_score_kernel(
                                     m_8, axis=1, keepdims=True
                                 ) * jnp.float32(1.0 / float(num_h_per_bkv))
                                 s_vec = jnp.max(m_8 - mean_8, axis=0)
-                                if topk_in_kernel:
-                                    sc_pair_f32 = jnp.where(
-                                        q_h_iota == kv_h, s_vec[None, :], sc_pair_f32
-                                    )
-                                else:
-                                    sc_out_vmem[
-                                        sc_slot, g_idx, kv_h : kv_h + 1, :
-                                    ] = s_vec[None, :]
+                                sc_pair_f32 = jnp.where(
+                                    q_h_iota == kv_h, s_vec[None, :], sc_pair_f32
+                                )
                         else:
                             for kv_h in range(sq_kv_heads):
 
@@ -4325,14 +4340,17 @@ def _prefix_score_kernel(
                                     m_8, axis=1, keepdims=True
                                 ) * jnp.float32(1.0 / float(num_h_per_bkv))
                                 s_vec = jnp.max(m_8 - mean_8, axis=0)
-                                if topk_in_kernel:
-                                    sc_pair_f32 = jnp.where(
-                                        q_h_iota == kv_h, s_vec[None, :], sc_pair_f32
-                                    )
-                                else:
-                                    sc_out_vmem[
-                                        sc_slot, g_idx, kv_h : kv_h + 1, :
-                                    ] = s_vec[None, :]
+                                sc_pair_f32 = jnp.where(
+                                    q_h_iota == kv_h, s_vec[None, :], sc_pair_f32
+                                )
+                        if topk_sink_slices > 0:
+                            sc_pair_f32 = jnp.where(
+                                jnp.logical_and(
+                                    bkv_idx == 0, tk_iota_128 < topk_sink_slices
+                                ),
+                                sink_pin_vals,
+                                sc_pair_f32,
+                            )
                         if topk_in_kernel:
                             x_tk = jnp.where(
                                 tk_valid_mask, sc_pair_f32, jnp.float32(-1e30)
@@ -4373,17 +4391,23 @@ def _prefix_score_kernel(
                                 unroll=False,
                             )
                             sc_out_vmem[sc_slot, g_idx] = out_tk
+                        else:
+                            sc_out_vmem[sc_slot, g_idx] = sc_pair_f32
 
                     _sc_dma(bkv_idx, sc_slot, wait=False)
 
                 _sc_dma(
-                    tail_bkv_start - 1, (tail_bkv_start - 2) & 1, wait=True
+                    tail_bkv_start - 1,
+                    (tail_bkv_start - 1 - bkv_start_k1) & 1,
+                    wait=True,
                 )
 
-                @pl.when(tail_bkv_start > 2)
+                @pl.when(tail_bkv_start > bkv_start_k1 + 1)
                 def _wait_sc_penult():
                     _sc_dma(
-                        tail_bkv_start - 2, (tail_bkv_start - 3) & 1, wait=True
+                        tail_bkv_start - 2,
+                        (tail_bkv_start - 2 - bkv_start_k1) & 1,
+                        wait=True,
                     )
 
 
@@ -4518,6 +4542,7 @@ def _ragged_paged_attention_kernel_loop(
     cu_qgrps_ref=None,
     prefix_topk_ref=None,
     prefix_topk_slices: int = 0,
+    prefix_topk_sink_slices: int = 0,
     prefix_q_grp_sz: int = 1024,
     prefix_max_bkv: int = 16,
     causal: bool = True,
@@ -4882,7 +4907,11 @@ def _ragged_paged_attention_kernel_loop(
         if kv_pack_dense2 or kv_pack_bd4:
             pack_toks = 4 if kv_pack_bd4 else 2
             assert bnew_kv_ref is not None and bkv_stride == 1
+            bnew_kv_rows = bnew_kv_ref.shape[1]
+            pack_align_tok = 512 if kv_pack_bd4 else 256
+            bnew_step_tok = 3584
             sem_new = sems.at[5, bkv_sem_idx]
+            new_kv_len_start = q_end - kv_left_frm_new
             if not wait:
                 wait_update_kv_cache(bkv_sem_idx)
                 if probe != "nodma":
@@ -4921,15 +4950,24 @@ def _ragged_paged_attention_kernel_loop(
 
                 @pl.when(bkv_sz_frm_new > 0)
                 def _do_new_dma_pk():
-                    new_kv_len_start = q_end - kv_left_frm_new
-                    _async_copy(
-                        kv_hbm_ref.at[pl.ds(new_kv_len_start, bkv_sz_frm_new)],
-                        bnew_kv_ref.at[
-                            bkv_sem_idx, pl.ds(bkv_sz_frm_cache, bkv_sz_frm_new)
-                        ],
-                        sem_new,
-                        wait=False,
-                    )
+                    if bnew_kv_rows == bkv_sz:
+                        _async_copy(
+                            kv_hbm_ref.at[pl.ds(new_kv_len_start, bkv_sz_frm_new)],
+                            bnew_kv_ref.at[
+                                bkv_sem_idx, pl.ds(bkv_sz_frm_cache, bkv_sz_frm_new)
+                            ],
+                            sem_new,
+                            wait=False,
+                        )
+                    else:
+                        lead_0 = bkv_sz_frm_cache & (pack_align_tok - 1)
+                        sz_0 = jnp.minimum(bnew_step_tok, bkv_sz_frm_new)
+                        _async_copy(
+                            kv_hbm_ref.at[pl.ds(new_kv_len_start, sz_0)],
+                            bnew_kv_ref.at[bkv_sem_idx, pl.ds(lead_0, sz_0)],
+                            sem_new,
+                            wait=False,
+                        )
 
             else:
                 if probe != "nodma":
@@ -4947,52 +4985,162 @@ def _ragged_paged_attention_kernel_loop(
 
                 @pl.when(bkv_sz_frm_new > 0)
                 def _wait_and_pack_new_pk():
-                    n_dst = bnew_kv_ref.at[
-                        bkv_sem_idx, pl.ds(bkv_sz_frm_cache, bkv_sz_frm_new)
-                    ]
-                    _async_copy(
-                        src=n_dst,
-                        dst=n_dst,
-                        sem=sem_new,
-                        wait=True,
-                    )
-                    if not debug_mode:
-                        total_valid = bkv_sz_frm_cache + bkv_sz_frm_new
-                        if kv_pack_bd4:
-                            if interpret:
+                    if bnew_kv_rows == bkv_sz:
+                        n_dst = bnew_kv_ref.at[
+                            bkv_sem_idx, pl.ds(bkv_sz_frm_cache, bkv_sz_frm_new)
+                        ]
+                        _async_copy(
+                            src=n_dst,
+                            dst=n_dst,
+                            sem=sem_new,
+                            wait=True,
+                        )
+                        if not debug_mode:
+                            total_valid = bkv_sz_frm_cache + bkv_sz_frm_new
+                            if kv_pack_bd4:
+                                if interpret:
+                                    b_u8 = lax.bitcast_convert_type(
+                                        bnew_kv_ref[bkv_sem_idx, :, 0, :, :], jnp.uint8
+                                    )
+                                    old_u8 = lax.bitcast_convert_type(
+                                        bkv_x2_ref[bkv_sem_idx, :, 0, :, :], jnp.uint8
+                                    )
+                                    lo_h = (
+                                        lax.broadcasted_iota(
+                                            jnp.int32, (bkv_sz // 4, head_dim), 1
+                                        )
+                                        < 64
+                                    )
+                                    r_all = lax.broadcasted_iota(
+                                        jnp.int32, (bkv_sz // 4, head_dim), 0
+                                    )
+                                    t0 = 4 * r_all + jnp.where(lo_h, 0, 1)
+                                    t1 = 4 * r_all + jnp.where(lo_h, 2, 3)
+
+                                    def _kv16_i(sl_u8):
+                                        return sl_u8[:, 0, :].astype(jnp.uint32) | (
+                                            sl_u8[:, 1, :].astype(jnp.uint32)
+                                            << jnp.uint32(8)
+                                        )
+
+                                    n_lo = jnp.where(
+                                        lo_h,
+                                        _kv16_i(b_u8[0::4]),
+                                        jnp.roll(_kv16_i(b_u8[1::4]), 64, axis=1),
+                                    )
+                                    n_hi = jnp.where(
+                                        lo_h,
+                                        _kv16_i(b_u8[2::4]),
+                                        jnp.roll(_kv16_i(b_u8[3::4]), 64, axis=1),
+                                    )
+                                    o_lo = old_u8[:, 0, :].astype(jnp.uint32) | (
+                                        old_u8[:, 1, :].astype(jnp.uint32) << jnp.uint32(8)
+                                    )
+                                    o_hi = old_u8[:, 2, :].astype(jnp.uint32) | (
+                                        old_u8[:, 3, :].astype(jnp.uint32) << jnp.uint32(8)
+                                    )
+                                    lo_m = jnp.where(
+                                        t0 < bkv_sz_frm_cache,
+                                        o_lo,
+                                        jnp.where(t0 < total_valid, n_lo, jnp.uint32(0)),
+                                    )
+                                    hi_m = jnp.where(
+                                        t1 < bkv_sz_frm_cache,
+                                        o_hi,
+                                        jnp.where(t1 < total_valid, n_hi, jnp.uint32(0)),
+                                    )
+                                    out_u8 = jnp.stack(
+                                        [
+                                            (lo_m & jnp.uint32(0xFF)).astype(jnp.uint8),
+                                            ((lo_m >> jnp.uint32(8)) & jnp.uint32(0xFF)).astype(
+                                                jnp.uint8
+                                            ),
+                                            (hi_m & jnp.uint32(0xFF)).astype(jnp.uint8),
+                                            ((hi_m >> jnp.uint32(8)) & jnp.uint32(0xFF)).astype(
+                                                jnp.uint8
+                                            ),
+                                        ],
+                                        axis=1,
+                                    )
+                                    bkv_x2_ref[bkv_sem_idx, :, 0, :, :] = (
+                                        lax.bitcast_convert_type(out_u8, bkv_x2_ref.dtype)
+                                    )
+                                else:
+                                    bnew_u32 = (
+                                        bnew_kv_ref.bitcast(jnp.uint32)
+                                        .at[bkv_sem_idx]
+                                        .reshape(bkv_sz, head_dim)
+                                    )
+                                    dst_u32 = (
+                                        bkv_x2_ref.bitcast(jnp.uint32)
+                                        .at[bkv_sem_idx, :, :1]
+                                        .reshape(bkv_sz // 4, head_dim)
+                                    )
+                                    row_chunk = 128 if (bkv_sz // 4) >= 128 else 64
+                                    n_row_chunks = (bkv_sz // 4) // row_chunk
+                                    r_iota = lax.broadcasted_iota(
+                                        jnp.int32, (row_chunk, head_dim), 0
+                                    )
+                                    lo_h = (
+                                        lax.broadcasted_iota(
+                                            jnp.int32, (row_chunk, head_dim), 1
+                                        )
+                                        < 64
+                                    )
+                                    for c_idx in range(n_row_chunks):
+                                        tok_base = c_idx * (4 * row_chunk)
+                                        row_base = c_idx * row_chunk
+                                        t0 = tok_base + 4 * r_iota + jnp.where(lo_h, 0, 1)
+                                        t1 = tok_base + 4 * r_iota + jnp.where(lo_h, 2, 3)
+                                        old_p = dst_u32[pl.ds(row_base, row_chunk)]
+                                        n0 = bnew_u32[pl.ds(tok_base, row_chunk, 4)] & jnp.uint32(0xFFFF)
+                                        n1 = pltpu.roll(
+                                            bnew_u32[pl.ds(tok_base + 1, row_chunk, 4)] & jnp.uint32(0xFFFF),
+                                            shift=64,
+                                            axis=1,
+                                        )
+                                        n2 = bnew_u32[pl.ds(tok_base + 2, row_chunk, 4)] & jnp.uint32(0xFFFF)
+                                        n3 = pltpu.roll(
+                                            bnew_u32[pl.ds(tok_base + 3, row_chunk, 4)] & jnp.uint32(0xFFFF),
+                                            shift=64,
+                                            axis=1,
+                                        )
+                                        new_lo = jnp.where(lo_h, n0, n1)
+                                        new_hi = jnp.where(lo_h, n2, n3)
+                                        lo = jnp.where(
+                                            t0 < bkv_sz_frm_cache,
+                                            old_p & jnp.uint32(0xFFFF),
+                                            jnp.where(
+                                                t0 < total_valid, new_lo, jnp.uint32(0)
+                                            ),
+                                        )
+                                        hi = jnp.where(
+                                            t1 < bkv_sz_frm_cache,
+                                            (old_p >> jnp.uint32(16)) & jnp.uint32(0xFFFF),
+                                            jnp.where(
+                                                t1 < total_valid, new_hi, jnp.uint32(0)
+                                            ),
+                                        )
+                                        dst_u32[pl.ds(row_base, row_chunk)] = lo | (
+                                            hi << jnp.uint32(16)
+                                        )
+                            elif interpret:
                                 b_u8 = lax.bitcast_convert_type(
                                     bnew_kv_ref[bkv_sem_idx, :, 0, :, :], jnp.uint8
                                 )
                                 old_u8 = lax.bitcast_convert_type(
                                     bkv_x2_ref[bkv_sem_idx, :, 0, :, :], jnp.uint8
                                 )
-                                lo_h = (
-                                    lax.broadcasted_iota(
-                                        jnp.int32, (bkv_sz // 4, head_dim), 1
-                                    )
-                                    < 64
-                                )
                                 r_all = lax.broadcasted_iota(
-                                    jnp.int32, (bkv_sz // 4, head_dim), 0
+                                    jnp.int32, (bkv_sz // 2, head_dim), 0
                                 )
-                                t0 = 4 * r_all + jnp.where(lo_h, 0, 1)
-                                t1 = 4 * r_all + jnp.where(lo_h, 2, 3)
-
-                                def _kv16_i(sl_u8):
-                                    return sl_u8[:, 0, :].astype(jnp.uint32) | (
-                                        sl_u8[:, 1, :].astype(jnp.uint32)
-                                        << jnp.uint32(8)
-                                    )
-
-                                n_lo = jnp.where(
-                                    lo_h,
-                                    _kv16_i(b_u8[0::4]),
-                                    jnp.roll(_kv16_i(b_u8[1::4]), 64, axis=1),
+                                te = 2 * r_all
+                                to = te + 1
+                                n_lo = b_u8[0::2, 0, :].astype(jnp.uint32) | (
+                                    b_u8[0::2, 1, :].astype(jnp.uint32) << jnp.uint32(8)
                                 )
-                                n_hi = jnp.where(
-                                    lo_h,
-                                    _kv16_i(b_u8[2::4]),
-                                    jnp.roll(_kv16_i(b_u8[3::4]), 64, axis=1),
+                                n_hi = b_u8[1::2, 0, :].astype(jnp.uint32) | (
+                                    b_u8[1::2, 1, :].astype(jnp.uint32) << jnp.uint32(8)
                                 )
                                 o_lo = old_u8[:, 0, :].astype(jnp.uint32) | (
                                     old_u8[:, 1, :].astype(jnp.uint32) << jnp.uint32(8)
@@ -5001,14 +5149,14 @@ def _ragged_paged_attention_kernel_loop(
                                     old_u8[:, 3, :].astype(jnp.uint32) << jnp.uint32(8)
                                 )
                                 lo_m = jnp.where(
-                                    t0 < bkv_sz_frm_cache,
+                                    te < bkv_sz_frm_cache,
                                     o_lo,
-                                    jnp.where(t0 < total_valid, n_lo, jnp.uint32(0)),
+                                    jnp.where(te < total_valid, n_lo, jnp.uint32(0)),
                                 )
                                 hi_m = jnp.where(
-                                    t1 < bkv_sz_frm_cache,
+                                    to < bkv_sz_frm_cache,
                                     o_hi,
-                                    jnp.where(t1 < total_valid, n_hi, jnp.uint32(0)),
+                                    jnp.where(to < total_valid, n_hi, jnp.uint32(0)),
                                 )
                                 out_u8 = jnp.stack(
                                     [
@@ -5035,151 +5183,314 @@ def _ragged_paged_attention_kernel_loop(
                                 dst_u32 = (
                                     bkv_x2_ref.bitcast(jnp.uint32)
                                     .at[bkv_sem_idx, :, :1]
+                                    .reshape(bkv_sz // 2, head_dim)
+                                )
+                                pair_chunk = 128 if (bkv_sz // 2) >= 128 else 64
+                                n_pair_chunks = (bkv_sz // 2) // pair_chunk
+                                r_iota = lax.broadcasted_iota(
+                                    jnp.int32, (pair_chunk, head_dim), 0
+                                )
+                                for c_idx in range(n_pair_chunks):
+                                    tok_base = c_idx * (2 * pair_chunk)
+                                    pair_base = c_idx * pair_chunk
+                                    t_even = tok_base + 2 * r_iota
+                                    t_odd = t_even + 1
+                                    old_p = dst_u32[pl.ds(pair_base, pair_chunk)]
+                                    new_lo = bnew_u32[
+                                        pl.ds(tok_base, pair_chunk, 2)
+                                    ] & jnp.uint32(0xFFFF)
+                                    new_hi = bnew_u32[
+                                        pl.ds(tok_base + 1, pair_chunk, 2)
+                                    ] & jnp.uint32(0xFFFF)
+                                    lo = jnp.where(
+                                        t_even < bkv_sz_frm_cache,
+                                        old_p & jnp.uint32(0xFFFF),
+                                        jnp.where(
+                                            t_even < total_valid, new_lo, jnp.uint32(0)
+                                        ),
+                                    )
+                                    hi = jnp.where(
+                                        t_odd < bkv_sz_frm_cache,
+                                        (old_p >> jnp.uint32(16)) & jnp.uint32(0xFFFF),
+                                        jnp.where(
+                                            t_odd < total_valid, new_hi, jnp.uint32(0)
+                                        ),
+                                    )
+                                    dst_u32[pl.ds(pair_base, pair_chunk)] = lo | (
+                                        hi << jnp.uint32(16)
+                                    )
+                        return
+
+                    def _pack_new_chunk(cur_tok_start, cur_sz):
+                        if debug_mode:
+                            return
+                        lead_c = cur_tok_start & (pack_align_tok - 1)
+                        cur_blk_base = cur_tok_start // pack_align_tok
+                        n_blks = cdiv(lead_c + cur_sz, pack_align_tok)
+                        cur_tok_end = cur_tok_start + cur_sz
+                        blk_rows_dst = pack_align_tok // pack_toks
+                        if kv_pack_bd4:
+                            if interpret:
+
+                                @pl.loop(0, n_blks, unroll=False)
+                                def _pk_bd4_i(b_loc):
+                                    row_base = (cur_blk_base + b_loc) * 128
+                                    tok_base = (cur_blk_base + b_loc) * 512
+                                    bnew_base = b_loc * 512
+                                    b_u8 = lax.bitcast_convert_type(
+                                        bnew_kv_ref[
+                                            bkv_sem_idx, pl.ds(bnew_base, 512), 0, :, :
+                                        ],
+                                        jnp.uint8,
+                                    )
+                                    old_u8 = lax.bitcast_convert_type(
+                                        bkv_x2_ref[
+                                            bkv_sem_idx, pl.ds(row_base, 128), 0, :, :
+                                        ],
+                                        jnp.uint8,
+                                    )
+                                    lo_h = (
+                                        lax.broadcasted_iota(
+                                            jnp.int32, (128, head_dim), 1
+                                        )
+                                        < 64
+                                    )
+                                    r_all = lax.broadcasted_iota(
+                                        jnp.int32, (128, head_dim), 0
+                                    )
+                                    t0 = tok_base + 4 * r_all + jnp.where(lo_h, 0, 1)
+                                    t1 = tok_base + 4 * r_all + jnp.where(lo_h, 2, 3)
+
+                                    def _kv16_i(sl_u8):
+                                        return sl_u8[:, 0, :].astype(jnp.uint32) | (
+                                            sl_u8[:, 1, :].astype(jnp.uint32)
+                                            << jnp.uint32(8)
+                                        )
+
+                                    n_lo = jnp.where(
+                                        lo_h,
+                                        _kv16_i(b_u8[0::4]),
+                                        jnp.roll(_kv16_i(b_u8[1::4]), 64, axis=1),
+                                    )
+                                    n_hi = jnp.where(
+                                        lo_h,
+                                        _kv16_i(b_u8[2::4]),
+                                        jnp.roll(_kv16_i(b_u8[3::4]), 64, axis=1),
+                                    )
+                                    o_lo = old_u8[:, 0, :].astype(jnp.uint32) | (
+                                        old_u8[:, 1, :].astype(jnp.uint32) << jnp.uint32(8)
+                                    )
+                                    o_hi = old_u8[:, 2, :].astype(jnp.uint32) | (
+                                        old_u8[:, 3, :].astype(jnp.uint32) << jnp.uint32(8)
+                                    )
+                                    lo_m = jnp.where(
+                                        t0 < cur_tok_start,
+                                        o_lo,
+                                        jnp.where(t0 < cur_tok_end, n_lo, jnp.uint32(0)),
+                                    )
+                                    hi_m = jnp.where(
+                                        t1 < cur_tok_start,
+                                        o_hi,
+                                        jnp.where(t1 < cur_tok_end, n_hi, jnp.uint32(0)),
+                                    )
+                                    out_u8 = jnp.stack(
+                                        [
+                                            (lo_m & jnp.uint32(0xFF)).astype(jnp.uint8),
+                                            ((lo_m >> jnp.uint32(8)) & jnp.uint32(0xFF)).astype(
+                                                jnp.uint8
+                                            ),
+                                            (hi_m & jnp.uint32(0xFF)).astype(jnp.uint8),
+                                            ((hi_m >> jnp.uint32(8)) & jnp.uint32(0xFF)).astype(
+                                                jnp.uint8
+                                            ),
+                                        ],
+                                        axis=1,
+                                    )
+                                    bkv_x2_ref[
+                                        bkv_sem_idx, pl.ds(row_base, 128), 0, :, :
+                                    ] = lax.bitcast_convert_type(
+                                        out_u8, bkv_x2_ref.dtype
+                                    )
+                            else:
+                                bnew_u32 = (
+                                    bnew_kv_ref.bitcast(jnp.uint32)
+                                    .at[bkv_sem_idx]
+                                    .reshape(bnew_kv_rows, head_dim)
+                                )
+                                dst_u32 = (
+                                    bkv_x2_ref.bitcast(jnp.uint32)
+                                    .at[bkv_sem_idx, :, :1]
                                     .reshape(bkv_sz // 4, head_dim)
                                 )
-                                row_chunk = 128 if (bkv_sz // 4) >= 128 else 64
-                                n_row_chunks = (bkv_sz // 4) // row_chunk
                                 r_iota = lax.broadcasted_iota(
-                                    jnp.int32, (row_chunk, head_dim), 0
+                                    jnp.int32, (128, head_dim), 0
                                 )
                                 lo_h = (
-                                    lax.broadcasted_iota(
-                                        jnp.int32, (row_chunk, head_dim), 1
-                                    )
+                                    lax.broadcasted_iota(jnp.int32, (128, head_dim), 1)
                                     < 64
                                 )
-                                for c_idx in range(n_row_chunks):
-                                    tok_base = c_idx * (4 * row_chunk)
-                                    row_base = c_idx * row_chunk
+
+                                @pl.loop(0, n_blks, unroll=False)
+                                def _pk_bd4(b_loc):
+                                    row_base = (cur_blk_base + b_loc) * 128
+                                    tok_base = (cur_blk_base + b_loc) * 512
+                                    bnew_base = b_loc * 512
                                     t0 = tok_base + 4 * r_iota + jnp.where(lo_h, 0, 1)
                                     t1 = tok_base + 4 * r_iota + jnp.where(lo_h, 2, 3)
-                                    old_p = dst_u32[pl.ds(row_base, row_chunk)]
-                                    n0 = bnew_u32[pl.ds(tok_base, row_chunk, 4)] & jnp.uint32(0xFFFF)
+                                    old_p = dst_u32[pl.ds(row_base, 128)]
+                                    n0 = bnew_u32[pl.ds(bnew_base, 128, 4)] & jnp.uint32(0xFFFF)
                                     n1 = pltpu.roll(
-                                        bnew_u32[pl.ds(tok_base + 1, row_chunk, 4)] & jnp.uint32(0xFFFF),
+                                        bnew_u32[pl.ds(bnew_base + 1, 128, 4)] & jnp.uint32(0xFFFF),
                                         shift=64,
                                         axis=1,
                                     )
-                                    n2 = bnew_u32[pl.ds(tok_base + 2, row_chunk, 4)] & jnp.uint32(0xFFFF)
+                                    n2 = bnew_u32[pl.ds(bnew_base + 2, 128, 4)] & jnp.uint32(0xFFFF)
                                     n3 = pltpu.roll(
-                                        bnew_u32[pl.ds(tok_base + 3, row_chunk, 4)] & jnp.uint32(0xFFFF),
+                                        bnew_u32[pl.ds(bnew_base + 3, 128, 4)] & jnp.uint32(0xFFFF),
                                         shift=64,
                                         axis=1,
                                     )
                                     new_lo = jnp.where(lo_h, n0, n1)
                                     new_hi = jnp.where(lo_h, n2, n3)
                                     lo = jnp.where(
-                                        t0 < bkv_sz_frm_cache,
+                                        t0 < cur_tok_start,
                                         old_p & jnp.uint32(0xFFFF),
                                         jnp.where(
-                                            t0 < total_valid, new_lo, jnp.uint32(0)
+                                            t0 < cur_tok_end, new_lo, jnp.uint32(0)
                                         ),
                                     )
                                     hi = jnp.where(
-                                        t1 < bkv_sz_frm_cache,
+                                        t1 < cur_tok_start,
                                         (old_p >> jnp.uint32(16)) & jnp.uint32(0xFFFF),
                                         jnp.where(
-                                            t1 < total_valid, new_hi, jnp.uint32(0)
+                                            t1 < cur_tok_end, new_hi, jnp.uint32(0)
                                         ),
                                     )
-                                    dst_u32[pl.ds(row_base, row_chunk)] = lo | (
+                                    dst_u32[pl.ds(row_base, 128)] = lo | (
                                         hi << jnp.uint32(16)
                                     )
                         elif interpret:
-                            b_u8 = lax.bitcast_convert_type(
-                                bnew_kv_ref[bkv_sem_idx, :, 0, :, :], jnp.uint8
-                            )
-                            old_u8 = lax.bitcast_convert_type(
-                                bkv_x2_ref[bkv_sem_idx, :, 0, :, :], jnp.uint8
-                            )
-                            r_all = lax.broadcasted_iota(
-                                jnp.int32, (bkv_sz // 2, head_dim), 0
-                            )
-                            te = 2 * r_all
-                            to = te + 1
-                            n_lo = b_u8[0::2, 0, :].astype(jnp.uint32) | (
-                                b_u8[0::2, 1, :].astype(jnp.uint32) << jnp.uint32(8)
-                            )
-                            n_hi = b_u8[1::2, 0, :].astype(jnp.uint32) | (
-                                b_u8[1::2, 1, :].astype(jnp.uint32) << jnp.uint32(8)
-                            )
-                            o_lo = old_u8[:, 0, :].astype(jnp.uint32) | (
-                                old_u8[:, 1, :].astype(jnp.uint32) << jnp.uint32(8)
-                            )
-                            o_hi = old_u8[:, 2, :].astype(jnp.uint32) | (
-                                old_u8[:, 3, :].astype(jnp.uint32) << jnp.uint32(8)
-                            )
-                            lo_m = jnp.where(
-                                te < bkv_sz_frm_cache,
-                                o_lo,
-                                jnp.where(te < total_valid, n_lo, jnp.uint32(0)),
-                            )
-                            hi_m = jnp.where(
-                                to < bkv_sz_frm_cache,
-                                o_hi,
-                                jnp.where(to < total_valid, n_hi, jnp.uint32(0)),
-                            )
-                            out_u8 = jnp.stack(
-                                [
-                                    (lo_m & jnp.uint32(0xFF)).astype(jnp.uint8),
-                                    ((lo_m >> jnp.uint32(8)) & jnp.uint32(0xFF)).astype(
-                                        jnp.uint8
-                                    ),
-                                    (hi_m & jnp.uint32(0xFF)).astype(jnp.uint8),
-                                    ((hi_m >> jnp.uint32(8)) & jnp.uint32(0xFF)).astype(
-                                        jnp.uint8
-                                    ),
-                                ],
-                                axis=1,
-                            )
-                            bkv_x2_ref[bkv_sem_idx, :, 0, :, :] = (
-                                lax.bitcast_convert_type(out_u8, bkv_x2_ref.dtype)
-                            )
+
+                            @pl.loop(0, n_blks, unroll=False)
+                            def _pk_d2_i(b_loc):
+                                pair_base = (cur_blk_base + b_loc) * blk_rows_dst
+                                tok_base = 2 * pair_base
+                                bnew_base = b_loc * 256
+                                b_u8 = lax.bitcast_convert_type(
+                                    bnew_kv_ref[
+                                        bkv_sem_idx, pl.ds(bnew_base, 256), 0, :, :
+                                    ],
+                                    jnp.uint8,
+                                )
+                                old_u8 = lax.bitcast_convert_type(
+                                    bkv_x2_ref[
+                                        bkv_sem_idx, pl.ds(pair_base, 128), 0, :, :
+                                    ],
+                                    jnp.uint8,
+                                )
+                                r_all = lax.broadcasted_iota(
+                                    jnp.int32, (128, head_dim), 0
+                                )
+                                te = tok_base + 2 * r_all
+                                to = te + 1
+                                n_lo = b_u8[0::2, 0, :].astype(jnp.uint32) | (
+                                    b_u8[0::2, 1, :].astype(jnp.uint32) << jnp.uint32(8)
+                                )
+                                n_hi = b_u8[1::2, 0, :].astype(jnp.uint32) | (
+                                    b_u8[1::2, 1, :].astype(jnp.uint32) << jnp.uint32(8)
+                                )
+                                o_lo = old_u8[:, 0, :].astype(jnp.uint32) | (
+                                    old_u8[:, 1, :].astype(jnp.uint32) << jnp.uint32(8)
+                                )
+                                o_hi = old_u8[:, 2, :].astype(jnp.uint32) | (
+                                    old_u8[:, 3, :].astype(jnp.uint32) << jnp.uint32(8)
+                                )
+                                lo_m = jnp.where(
+                                    te < cur_tok_start,
+                                    o_lo,
+                                    jnp.where(te < cur_tok_end, n_lo, jnp.uint32(0)),
+                                )
+                                hi_m = jnp.where(
+                                    to < cur_tok_start,
+                                    o_hi,
+                                    jnp.where(to < cur_tok_end, n_hi, jnp.uint32(0)),
+                                )
+                                out_u8 = jnp.stack(
+                                    [
+                                        (lo_m & jnp.uint32(0xFF)).astype(jnp.uint8),
+                                        ((lo_m >> jnp.uint32(8)) & jnp.uint32(0xFF)).astype(
+                                            jnp.uint8
+                                        ),
+                                        (hi_m & jnp.uint32(0xFF)).astype(jnp.uint8),
+                                        ((hi_m >> jnp.uint32(8)) & jnp.uint32(0xFF)).astype(
+                                            jnp.uint8
+                                        ),
+                                    ],
+                                    axis=1,
+                                )
+                                bkv_x2_ref[
+                                    bkv_sem_idx, pl.ds(pair_base, 128), 0, :, :
+                                ] = lax.bitcast_convert_type(out_u8, bkv_x2_ref.dtype)
                         else:
                             bnew_u32 = (
                                 bnew_kv_ref.bitcast(jnp.uint32)
                                 .at[bkv_sem_idx]
-                                .reshape(bkv_sz, head_dim)
+                                .reshape(bnew_kv_rows, head_dim)
                             )
                             dst_u32 = (
                                 bkv_x2_ref.bitcast(jnp.uint32)
                                 .at[bkv_sem_idx, :, :1]
                                 .reshape(bkv_sz // 2, head_dim)
                             )
-                            pair_chunk = 128 if (bkv_sz // 2) >= 128 else 64
-                            n_pair_chunks = (bkv_sz // 2) // pair_chunk
-                            r_iota = lax.broadcasted_iota(
-                                jnp.int32, (pair_chunk, head_dim), 0
-                            )
-                            for c_idx in range(n_pair_chunks):
-                                tok_base = c_idx * (2 * pair_chunk)
-                                pair_base = c_idx * pair_chunk
+                            r_iota = lax.broadcasted_iota(jnp.int32, (128, head_dim), 0)
+
+                            @pl.loop(0, n_blks, unroll=False)
+                            def _pk_d2(b_loc):
+                                pair_base = (cur_blk_base + b_loc) * 128
+                                tok_base = 2 * pair_base
+                                bnew_base = b_loc * 256
                                 t_even = tok_base + 2 * r_iota
                                 t_odd = t_even + 1
-                                old_p = dst_u32[pl.ds(pair_base, pair_chunk)]
-                                new_lo = bnew_u32[
-                                    pl.ds(tok_base, pair_chunk, 2)
-                                ] & jnp.uint32(0xFFFF)
-                                new_hi = bnew_u32[
-                                    pl.ds(tok_base + 1, pair_chunk, 2)
-                                ] & jnp.uint32(0xFFFF)
+                                old_p = dst_u32[pl.ds(pair_base, 128)]
+                                new_lo = bnew_u32[pl.ds(bnew_base, 128, 2)] & jnp.uint32(0xFFFF)
+                                new_hi = bnew_u32[pl.ds(bnew_base + 1, 128, 2)] & jnp.uint32(0xFFFF)
                                 lo = jnp.where(
-                                    t_even < bkv_sz_frm_cache,
+                                    t_even < cur_tok_start,
                                     old_p & jnp.uint32(0xFFFF),
-                                    jnp.where(
-                                        t_even < total_valid, new_lo, jnp.uint32(0)
-                                    ),
+                                    jnp.where(t_even < cur_tok_end, new_lo, jnp.uint32(0)),
                                 )
                                 hi = jnp.where(
-                                    t_odd < bkv_sz_frm_cache,
+                                    t_odd < cur_tok_start,
                                     (old_p >> jnp.uint32(16)) & jnp.uint32(0xFFFF),
-                                    jnp.where(
-                                        t_odd < total_valid, new_hi, jnp.uint32(0)
-                                    ),
+                                    jnp.where(t_odd < cur_tok_end, new_hi, jnp.uint32(0)),
                                 )
-                                dst_u32[pl.ds(pair_base, pair_chunk)] = lo | (
+                                dst_u32[pl.ds(pair_base, 128)] = lo | (
                                     hi << jnp.uint32(16)
                                 )
+
+                    lead_0 = bkv_sz_frm_cache & (pack_align_tok - 1)
+                    sz_0 = jnp.minimum(bnew_step_tok, bkv_sz_frm_new)
+                    n_dst0 = bnew_kv_ref.at[bkv_sem_idx, pl.ds(lead_0, sz_0)]
+                    _async_copy(src=n_dst0, dst=n_dst0, sem=sem_new, wait=True)
+                    _pack_new_chunk(bkv_sz_frm_cache, sz_0)
+
+                    n_new_chunks = cdiv(bkv_sz_frm_new, bnew_step_tok)
+
+                    @pl.loop(1, n_new_chunks, unroll=False)
+                    def _pack_more_new_chunks(c_idx):
+                        c_off = c_idx * bnew_step_tok
+                        cur_tok_start = bkv_sz_frm_cache + c_off
+                        cur_sz = jnp.minimum(bnew_step_tok, bkv_sz_frm_new - c_off)
+                        lead_c = cur_tok_start & (pack_align_tok - 1)
+                        c_dst = bnew_kv_ref.at[bkv_sem_idx, pl.ds(lead_c, cur_sz)]
+                        _async_copy(
+                            kv_hbm_ref.at[pl.ds(new_kv_len_start + c_off, cur_sz)],
+                            c_dst,
+                            sem_new,
+                            wait=False,
+                        )
+                        _async_copy(src=c_dst, dst=c_dst, sem=sem_new, wait=True)
+                        _pack_new_chunk(cur_tok_start, cur_sz)
 
             return kv_len_start + bkv_sz_frm_cache, bkv_sz_frm_new
 
@@ -5964,6 +6275,7 @@ def _ragged_paged_attention_kernel_loop(
                 cu_qgrps_ref=cu_qgrps_ref,
                 prefix_topk_ref=prefix_topk_ref,
                 prefix_topk_slices=prefix_topk_slices,
+                prefix_topk_sink_slices=prefix_topk_sink_slices,
                 prefix_q_grp_sz=prefix_q_grp_sz,
                 prefix_max_bkv=prefix_max_bkv,
             )
@@ -8067,6 +8379,7 @@ def get_vmem_limit():
         "_prefill_topk_gqa_batch",
         "_prefill_topk_k_pair",
         "_prefill_topk_k1_bq",
+        "_prefill_topk_sink_slices",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache_fused"),
 )
@@ -8159,6 +8472,7 @@ def ragged_paged_attention(
     _prefill_topk_gqa_batch: int = 1,
     _prefill_topk_k_pair: int = 1,
     _prefill_topk_k1_bq: int = 0,
+    _prefill_topk_sink_slices: int = 0,
 ):
     """Ragged paged attention with fused KV cache.
 
@@ -8727,7 +9041,7 @@ def ragged_paged_attention(
                 )
             extra_scratches.append(
                 pltpu.VMEM(
-                    (num_slots, bkv_sz, 1, *kv_cache.shape[3:]),
+                    (num_slots, min(bkv_sz, 4096), 1, *kv_cache.shape[3:]),
                     kv_cache.dtype,
                 )
             )
@@ -8849,7 +9163,13 @@ def ragged_paged_attention(
 
         extra_sp_count = 0
         prefix_topk_slices_eff = 0
+        prefix_topk_sink_slices_eff = 0
         if use_prefix_topk:
+            topk_sink_slices_eff = (
+                _prefill_topk_sink_slices
+                if (0 < _prefill_topk_sink_slices <= _prefill_topk_slices)
+                else 0
+            )
             q_lens_topk = cu_q_lens[1:] - cu_q_lens[:-1]
             qgrps_per_seq = (q_lens_topk + q_grp_sz_topk - 1) // q_grp_sz_topk
             cu_qgrps = jnp.concatenate(
@@ -8908,6 +9228,7 @@ def ragged_paged_attention(
                     topk_in_kernel=topk_in_kernel_eff,
                     topk_gqa_batch=_prefill_topk_gqa_batch,
                     topk_k_pair=_prefill_topk_k_pair,
+                    topk_sink_slices=topk_sink_slices_eff,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=6,
@@ -8980,12 +9301,18 @@ def ragged_paged_attention(
             scalar_prefetches = scalar_prefetches + (cu_qgrps, prefix_topk_packed)
             extra_sp_count = 2
             prefix_topk_slices_eff = _prefill_topk_slices
+            prefix_topk_sink_slices_eff = topk_sink_slices_eff
             scope_name += (
                 f"-ptk{_prefill_topk_slices}_qs{_prefill_topk_qstride}"
                 + (
                     f"_ik_g{_prefill_topk_gqa_batch}_kp{_prefill_topk_k_pair}"
                     + (f"_k1b{bq_sz_k1}" if _prefill_topk_k1_bq > 0 else "")
                     if topk_in_kernel_eff
+                    else ""
+                )
+                + (
+                    f"_sk{topk_sink_slices_eff}"
+                    if topk_sink_slices_eff > 0
                     else ""
                 )
             )
@@ -9045,6 +9372,7 @@ def ragged_paged_attention(
                 valid_lane_dim=valid_lane_dim,
                 extra_sp_count=extra_sp_count,
                 prefix_topk_slices=prefix_topk_slices_eff,
+                prefix_topk_sink_slices=prefix_topk_sink_slices_eff,
                 prefix_q_grp_sz=q_grp_sz_topk,
                 prefix_max_bkv=max_bkv_topk,
             ),

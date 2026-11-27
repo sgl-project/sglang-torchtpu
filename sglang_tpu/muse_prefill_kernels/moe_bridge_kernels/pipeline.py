@@ -1670,7 +1670,9 @@ def _resolve_b2_pipe_chunks(
         if t_local == 1536:
             return (512, 512, 512)
         if t_local == 2048:
-            return (512, 512, 512, 512)
+            return (512, 1024, 512)
+        if t_local == 3072 and ep_size <= 8:
+            return (1024, 1024, 1024)
         if t_local >= 2560 and t_local % 512 == 0:
             rem = t_local - 1024
             mid = (1024,) * (rem // 1024) + ((512,) if (rem % 1024) else ())
@@ -1727,7 +1729,7 @@ def _allow_pallas_sortfree_routing(
         and sortfree_prefill
         and (topk & (topk - 1)) == 0
         and (ep_size * t_local) >= 256
-        and (t_local >= 256)
+        and (t_local >= 128)
         and (t_local % 128 == 0)
         and ((t_local * topk) % 128 == 0)
         and (n_loc_eff <= 120)

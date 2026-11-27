@@ -5148,11 +5148,22 @@ def gmm_v2_fused_rs(
         and rhs2_quant_block_size < lhs2_quant_block_size
         and (tile_k2 // cfgs2.lhs_cfgs.quant_block_size) % 8 == 0
     )
+    from .prefill_gmm_opts import (
+        resolve_static_fp8_gmm2_scale,
+        resolve_static_fp8_rs_scale,
+        resolve_w4a8_k_chain,
+    )
+
+    _w4a8_kc_raw = resolve_w4a8_k_chain(
+        envs.SGLANG_TPU_MUSE_KERNEL_GMM_W4A8_K_CHAIN.get()
+    )
+    _w4a8_kc_val = _w4a8_kc_raw if size_m > _BLOCKDIAG_MAX_SIZE_M else 0
     use_dedicated_w2_fp8_cache = (
         int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_W2_FP8_CACHE.get() or 0) >= 1
         and is_quantized
         and not fp8_direct_write
         and not use_w2_prequant_cache
+        and _w4a8_kc_val == 0
         and size_m >= _PREFILL_TILES_MIN_SIZE_M
         and jnp.dtype(w2.dtype) == jnp.float4_e2m1fn
         and rhs2_quant_block_size >= 256
@@ -5188,6 +5199,7 @@ def gmm_v2_fused_rs(
             or envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_STRIP_N.get() > 0
             or int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_SCOPED_W4A8.get() or 0) > 0
             or int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_EXPERT_OUTER_FP8.get() or 0) > 0
+            or _w4a8_kc_val > 0
         )
         and cfgs1.lhs_cfgs.quant_dtype is not None
         and cfgs2.lhs_cfgs.quant_dtype is not None
@@ -5238,11 +5250,6 @@ def gmm_v2_fused_rs(
         (post_expert_norm_weight is not None) and (not expert_tp) and (not has_bias)
     )
     in_kernel_pn_size = int(post_expert_norm_weight.shape[0]) if use_in_kernel_pn else 0
-    from .prefill_gmm_opts import (
-        resolve_static_fp8_gmm2_scale,
-        resolve_static_fp8_rs_scale,
-    )
-
     raw_static_fp8_rs, keep_static_fp8_out = (
         resolve_static_fp8_rs_scale(
             envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_RS.get()
@@ -5272,26 +5279,16 @@ def gmm_v2_fused_rs(
         if size_m > _BLOCKDIAG_MAX_SIZE_M
         else 0
     )
-    _k256_pre_g2 = (
-        is_quantized
-        and jnp.dtype(w1.dtype) == jnp.dtype(w2.dtype) == jnp.float4_e2m1fn
-        and rhs1_quant_block_size == 256
-        and rhs2_quant_block_size == 256
-        and (
-            envs.SGLANG_TPU_MUSE_KERNEL_BLOCK256_SCALES.get()
-            or envs.SGLANG_TPU_MUSE_KERNEL_K256_PREFILL_TILES.get()
-        )
-    )
     eff_static_fp8_gmm2 = (
         _raw_static_fp8_gmm2
         if (
             _raw_static_fp8_gmm2 > 0.0
             and size_m > _BLOCKDIAG_MAX_SIZE_M
             and is_quantized
+            and not has_bias
             and not fp8_direct_write
             and not fp4_w4a16_eff
             and not fp8_w8a16
-            and not _k256_pre_g2
             and _eo_raw_g2 == 0
             and act_fn == "silu"
             and not use_w2_prequant_cache
@@ -5942,6 +5939,35 @@ def gmm_v2_fused_rs(
         if eff_static_fp8_gmm2 > 0.0
         else ""
     )
+    _w4a8_kc_eff = (
+        _w4a8_kc_val
+        if (
+            _w4a8_kc_val > 0
+            and size_m > _BLOCKDIAG_MAX_SIZE_M
+            and is_quantized
+            and not fp4_w4a16_eff
+            and not fp8_w8a16
+            and jnp.dtype(w1.dtype) == jnp.float4_e2m1fn
+            and rhs1_quant_block_size >= 256
+            and _sw_val >= 4
+            and _eo_raw == 0
+            and cfgs1.lhs_cfgs.quant_dtype is not None
+            and (
+                (
+                    _w4a8_kc_val > rhs1_quant_block_size
+                    and total_scale_blocks1 >= 8
+                    and total_scale_blocks1 % 8 == 0
+                )
+                or (
+                    _w4a8_kc_val > rhs2_quant_block_size
+                    and total_scale_blocks2 >= 8
+                    and total_scale_blocks2 % 8 == 0
+                )
+            )
+        )
+        else 0
+    )
+    _kc_tag = f"-kc{_w4a8_kc_eff}" if _w4a8_kc_eff > 0 else ""
     pallas_name = (
         f"gmm_v2_fused_rs-E_{size_group}-M_{size_m}"
         f"-K1_{size_k1}-N1_{size_n1}-K2_{size_k2}-N2_{size_n2}"
@@ -5974,6 +6000,7 @@ def gmm_v2_fused_rs(
         f"{f'-tlp{_tlp_val}k{_tlp_kstep}' if _tlp_val > 0 else ''}"
         f"{f'-sw{_sw_val}' if _sw_val > 0 else ''}"
         f"{f'-eo{eff_eo_mode}' if eff_eo_mode > 0 else ''}"
+        f"{_kc_tag}"
         f"{_sfp8_tag}"
     )
     kernel_kwargs = dict(

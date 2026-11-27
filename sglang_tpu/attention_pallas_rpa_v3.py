@@ -545,7 +545,6 @@ def _invoke_v3_kernel(
                 eff_lc_toks.add("staged_qo")
             if (
                 not is_tp16_sq_target
-                and not use_dense2
                 and "nogqa8" not in eff_lc_toks
                 and "nogqa8" not in raw_all_toks
             ):
@@ -628,8 +627,6 @@ def _invoke_v3_kernel(
                 bkv_sz = 2048
             bkv_csz = max(256, logical_page_size)
             bkv_sz = max(bkv_sz, bkv_csz)
-            if use_dense2:
-                bkv_sz = min(bkv_sz, max(8192, bkv_csz))
             if is_lc_full and not is_tp16_sq_target and bq_sz >= 8192 and bkv_sz >= 8192:
                 raise ValueError(
                     f"TP=8 LC RPAm (bq_sz={bq_sz}, bkv_sz={bkv_sz}) exceeds 64 MiB VMEM; "
@@ -807,6 +804,9 @@ def _invoke_v3_kernel(
         topk_k1_bq_env = getattr(
             envs, "SGLANG_TPU_RPA_V3_PREFILL_TOPK_K1_BQ", None
         )
+        topk_sink_env = getattr(
+            envs, "SGLANG_TPU_RPA_V3_PREFILL_TOPK_SINK_SLICES", None
+        )
         if (
             topk_slices > 0
             and is_lc_full
@@ -814,6 +814,11 @@ def _invoke_v3_kernel(
         ):
             extra["_prefill_topk_slices"] = topk_slices
             extra["_prefill_topk_qstride"] = topk_qstride
+            topk_sink_val = (
+                int(topk_sink_env.get()) if topk_sink_env is not None else 0
+            )
+            if topk_sink_val > 0:
+                extra["_prefill_topk_sink_slices"] = topk_sink_val
             if topk_fast_env is not None and topk_fast_env.get():
                 k_pair_val = (
                     int(topk_k_pair_env.get())

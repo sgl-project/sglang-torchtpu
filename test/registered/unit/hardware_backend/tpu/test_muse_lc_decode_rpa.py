@@ -4889,6 +4889,140 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
             self.assertNotIn("-b4", hlo_b16)
             self.assertNotIn("-b2", hlo_b16)
 
+    def test_shared_tight_private_tail_widths_and_0x7f_poison_parity(self):
+        """Verify tight 512/1024/2048/4096 private-tail dispatch + noshsplit under 0x7F poison & TPU7x AOT."""
+        import gc
+        from jax.experimental import topologies
+        from jax.experimental.pallas import tpu as pltpu
+        from jax.sharding import Mesh, PartitionSpec as P
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import run_decode_fast_rpa
+
+        ip_race = pltpu.InterpretParams(
+            dma_execution_mode="eager",
+            detect_races=True,
+            uninitialized_memory="nan",
+        )
+        rng = np.random.default_rng(20262500)
+        # 16 seqs sharing 8 pages (4096 tokens -> 1 full shared block) with diverse private tails
+        # spanning every tight width tier: 0 (shared-only), 120 (<=512), 700 (<=1024), 1500 (<=2048), 2600 (<=4096).
+        B, group, pps, sh_pgs = 16, 16, 16, 8
+        priv_lens = [0, 120, 512, 700, 1024, 1500, 2048, 2600] * 2
+        for dense2, bd4 in ((True, False), (False, True)):
+            pack_factor = 4 if bd4 else 2
+            phys_rows = 512 // pack_factor
+            priv_pgs = pps - sh_pgs
+            nb = sh_pgs + B * priv_pgs + 4
+            kvc_u8 = np.full((nb, phys_rows, 1, 4, 128), 0x7F, dtype=np.uint8)
+            pg_mat = np.zeros((B, pps), dtype=np.int32)
+            pg_mat[:, :sh_pgs] = np.arange(sh_pgs, dtype=np.int32)
+            # Fill shared pages cleanly.
+            kvc_u8[:sh_pgs] = rng.integers(0x30, 0x3D, size=(sh_pgs, phys_rows, 1, 4, 128), dtype=np.uint8)
+            nxt = sh_pgs
+            for i in range(B):
+                pg_mat[i, sh_pgs:] = np.arange(nxt, nxt + priv_pgs, dtype=np.int32)
+                n_valid_priv_pgs = (priv_lens[i] + 511) // 512
+                if n_valid_priv_pgs > 0:
+                    # Leave unused tokens beyond priv_lens[i] as 0x7F poison to prove valid_tokens masking holds.
+                    for p_rel in range(n_valid_priv_pgs):
+                        pg_id = nxt + p_rel
+                        toks_in_pg = min(512, priv_lens[i] - p_rel * 512)
+                        n_full_phys = toks_in_pg // pack_factor
+                        if n_full_phys > 0:
+                            kvc_u8[pg_id, :n_full_phys] = rng.integers(
+                                0x30, 0x3D, size=(n_full_phys, 1, 4, 128), dtype=np.uint8
+                            )
+                        rem = toks_in_pg % pack_factor
+                        if rem > 0:
+                            for s_i in range(rem):
+                                if bd4:
+                                    c0 = 0 if s_i < 2 else 2
+                                    l0, l1 = (0, 64) if (s_i & 1) == 0 else (64, 128)
+                                    kvc_u8[pg_id, n_full_phys, 0, c0 : c0 + 2, l0:l1] = rng.integers(
+                                        0x30, 0x3D, size=(2, 64), dtype=np.uint8
+                                    )
+                                else:
+                                    c0 = 0 if s_i == 0 else 2
+                                    kvc_u8[pg_id, n_full_phys, 0, c0 : c0 + 2, :] = rng.integers(
+                                        0x30, 0x3D, size=(2, 128), dtype=np.uint8
+                                    )
+                nxt += priv_pgs
+
+            kvc = jax.lax.bitcast_convert_type(jnp.asarray(kvc_u8, jnp.uint8), jnp.float8_e4m3fn)
+            q_5d = jnp.asarray(rng.standard_normal((1, B, 8, 2, 128)) * 0.1, jnp.bfloat16)
+            kvm = jax.lax.bitcast_convert_type(
+                jnp.asarray(rng.integers(0x30, 0x3D, size=(B, 1, 4, 128), dtype=np.uint8), jnp.uint8),
+                jnp.float8_e4m3fn,
+            )
+            gate = jnp.asarray(rng.standard_normal((B, 512 if bd4 else 1024)) * 0.1, jnp.bfloat16)
+            # Add +1 for the newly written decode token at kv_len - 1.
+            kvl_np = np.array([sh_pgs * 512 + p + 1 for p in priv_lens], dtype=np.int32)
+            kvl = jnp.asarray(kvl_np, jnp.int32)
+            pg = jnp.asarray(pg_mat.reshape(-1), jnp.int32)
+            cuq = jnp.arange(B + 1, dtype=jnp.int32)
+            cukv = jnp.arange(B + 1, dtype=jnp.int32) * (pps * 512)
+            dist = jnp.asarray([B, B, B], jnp.int32)
+            sh_p = jnp.asarray([sh_pgs], dtype=jnp.int32)
+
+            ref_out, _ = run_decode_fast_rpa(
+                q_5d, kvm, None, kvc, kvl, pg, cuq, cukv, dist,
+                sm_scale=64.0 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                mode_str=f"w8,s4,c4096,shared{group},coal,noz,pbf16,q1024,batchfull,foldcol",
+                decode_query_size=1, fused_out_pack=2, prepared_inputs=True,
+                gate=gate, out_norm_eps=1e-5, kv_pack_dense2=dense2, kv_pack_bd4=bd4,
+                shared_pages=sh_p, interpret=True,
+            )
+            fast_out, _ = run_decode_fast_rpa(
+                q_5d, kvm, None, kvc, kvl, pg, cuq, cukv, dist,
+                sm_scale=64.0 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                mode_str=f"w8,s4,c4096,shared{group},coal,noz,pbf16,q1024,shsplit,shfp8,batchfull,foldcol",
+                decode_query_size=1, fused_out_pack=2, prepared_inputs=True,
+                gate=gate, out_norm_eps=1e-5, kv_pack_dense2=dense2, kv_pack_bd4=bd4,
+                shared_pages=sh_p, interpret=ip_race,
+            )
+            r_np = np.asarray(ref_out, dtype=np.float64).ravel()
+            f_np = np.asarray(fast_out, dtype=np.float64).ravel()
+            self.assertTrue(np.all(np.isfinite(f_np)))
+            cos = float(np.dot(r_np, f_np) / (np.linalg.norm(r_np) * np.linalg.norm(f_np) + 1e-12))
+            self.assertGreater(cos, 0.9985, f"dense2={dense2} bd4={bd4} cos={cos}")
+
+            # Verify TPU7x AOT compile < 63 MiB VMEM for full shared64 c4096 DENSE2 & BD4.
+            tpu_devs = topologies.get_topology_desc("tpu7x:2x2x2" if bd4 else "tpu7x:2x2x1", platform="tpu").devices
+            mesh = Mesh(np.array(tpu_devs[:1]), ("x",))
+            s = lambda sh, dt: jax.ShapeDtypeStruct(sh, dt)
+            abs_in = (
+                s((1, 64, 8, 2, 128), jnp.bfloat16),
+                s((64, 1, 4, 128), jnp.float8_e4m3fn),
+                s((64, 512 if bd4 else 1024), jnp.bfloat16),
+                s((64 * 512 + 8, phys_rows, 1, 4, 128), jnp.float8_e4m3fn),
+                s((64,), jnp.int32),
+                s((64 * 512,), jnp.int32),
+                s((65,), jnp.int32),
+                s((65,), jnp.int32),
+                s((3,), jnp.int32),
+                s((1,), jnp.int32),
+            )
+            with patch("sglang_tpu.attention.pallas.util.get_torch_tpu_device_kind", return_value="TPU v7"):
+                comp = jax.jit(
+                    jax.shard_map(
+                        lambda q_, km_, gt_, c_, kl_, pi_, cq_, ckv_, dt_, sp_: run_decode_fast_rpa(
+                            q_, km_, None, c_, kl_, pi_, cq_, ckv_, dt_,
+                            sm_scale=64.0 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                            mode_str="w8,s4,c4096,shared64,coal,noz,pbf16,q1024,shsplit,shfp8,batchfull,foldcol",
+                            decode_query_size=1, fused_out_pack=2, prepared_inputs=True,
+                            gate=gt_, out_norm_eps=1e-5, kv_pack_dense2=dense2, kv_pack_bd4=bd4,
+                            shared_pages=sp_,
+                        ),
+                        mesh=mesh,
+                        in_specs=(P(),) * 10,
+                        out_specs=(P(), P()),
+                        check_vma=False,
+                    )
+                ).lower(*abs_in).compile()
+            self.assertIsNotNone(comp)
+            del comp
+            jax.clear_caches()
+            gc.collect()
+
 
 if __name__ == "__main__":
     unittest.main()
