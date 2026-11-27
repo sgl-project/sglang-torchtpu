@@ -3903,3 +3903,313 @@ def test_tp16_b256_and_l61_b64_rep_tpu7x_aot():
         jax.clear_caches()
         gc.collect()
 
+
+def test_w14_b128_2scope_step_c_uncompressed_plan_parity_and_aot():
+    """Verify B=128 2-scope Step (c) plan (40*512 uncompressed), eager race/NaN Interpret parity, and R=8/R=4 AOT."""
+    import gc
+    from unittest import mock
+
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import topologies
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh
+    from jax.sharding import PartitionSpec as P
+
+    if len(jax.devices("cpu")) < 8:
+        pytest.skip("Requires XLA_FLAGS=--xla_force_host_platform_device_count=8")
+
+    from sglang_tpu.attention.pallas.rpa_v3_decode_fast import run_decode_fast_rpa
+    from sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_sparse import (
+        default_sparse_decode_config,
+    )
+    from sglang_tpu.muse_megakernel.decode.b1_moe_b2_kernel import (
+        b1_moe_b2_chip_sharded_jax,
+        b1_moe_b2_rpad_chip_sharded_jax,
+        resolve_step_c_rpa_plan,
+        write_decode_kv_merged_jax,
+    )
+
+    # 1. Plan resolver: B=128 uncompressed (512B) SWA b2 mp=5 (40*512) & Full unlock; DENSE2 & B=256 512B unchanged.
+    cfg_1k_swa, _, slot_1k_swa, grp_1k_swa, ok_1k_swa = resolve_step_c_rpa_plan(
+        "w8,s4,swabatch,pbf16,batchfull,b2,noz,g4k,foldcol",
+        sliding_window=2049,
+        pages_per_seq=8,
+        phys_page_rows=512,
+        b_tokens=128,
+        max_num_seqs=128,
+    )
+    assert ok_1k_swa is True and grp_1k_swa is True
+    assert cfg_1k_swa.swabatch_group_size == 2 and slot_1k_swa == 10
+
+    cfg_1k_full, _, _, grp_1k_full, ok_1k_full = resolve_step_c_rpa_plan(
+        "w8,s4,swabatch,pbf16,batchfull,b2,noz,g4k,foldcol",
+        sliding_window=None,
+        pages_per_seq=2,
+        phys_page_rows=512,
+        b_tokens=128,
+        max_num_seqs=128,
+    )
+    assert ok_1k_full is True and grp_1k_full is True and cfg_1k_full.swabatch_group_size == 2
+
+    _, _, _, _, ok_256_512 = resolve_step_c_rpa_plan(
+        "w8,s4,swabatch,pbf16,batchfull,b2,noz,g4k,foldcol",
+        sliding_window=2049,
+        pages_per_seq=8,
+        phys_page_rows=512,
+        b_tokens=256,
+        max_num_seqs=256,
+    )
+    assert ok_256_512 is False
+
+    _, _, _, grp_128_d2, _ = resolve_step_c_rpa_plan(
+        "w8,s4,swabatch,pbf16,batchfull,b4,noz,g4k,foldcol",
+        sliding_window=2049,
+        pages_per_seq=32,
+        phys_page_rows=256,
+        kv_pack_dense2=True,
+        b_tokens=128,
+        max_num_seqs=128,
+    )
+    assert grp_128_d2 is False
+
+    # 2. Eager race/NaN + 0x7F KV poison Interpret parity on TP=8 B=128 2-Scope SWA 512B (40*512).
+    world_size, B = 8, 128
+    hidden, h_pre, scale_block, qkv_cols, gate_cols = 8192, 4096, 512, 1280, 1024
+    r_pair = B // (world_size // 2)
+    rng = np.random.default_rng(20261401)
+    mesh = Mesh(np.array(jax.devices("cpu")[:world_size]), ("model",))
+    cfg = dataclasses.replace(
+        default_sparse_decode_config(B, world_size, scale_block),
+        weight_mode="half_n",
+        pair_rs=True,
+        bridge_ag=False,
+        m_buckets=(32, 64),
+        route_chunk_rows=32,
+        static_holder_mask=True,
+        route_fast=True,
+        fast_plan=2,
+        unroll_strips=True,
+        fast_gs=True,
+        spec_prime_parts=0,
+    )
+    _rf8 = lambda sh: jnp.asarray((rng.standard_normal(sh) * 0.15).astype(np.float32), jnp.float8_e4m3fn)
+    ranks = jnp.arange(world_size, dtype=jnp.int32)
+    stream_chip = jnp.asarray((rng.standard_normal((world_size * r_pair, hidden)) * 0.1).astype(np.float32))
+    gated = jnp.asarray((rng.standard_normal((B, world_size * gate_cols)) * 0.1).astype(np.float32), jnp.bfloat16)
+    wo, wos = _rf8((world_size * gate_cols, hidden)), jnp.ones((hidden,), jnp.float32) * 0.05
+    ones_h = jnp.ones((hidden,), jnp.float32)
+    w_pre, s_pre = _rf8((hidden, world_size * (h_pre // 2))), jnp.ones((world_size * (h_pre // 2),), jnp.float32) * 0.05
+    w_router = jnp.asarray((rng.standard_normal((hidden, 256)) * 0.02).astype(np.float32), jnp.bfloat16)
+    bias_np = np.zeros((1, 256), np.float32)
+    bias_np[0, 0:256:32] = 12.0
+    pre_exp, bias = jnp.ones((h_pre,), jnp.float32), jnp.asarray(bias_np)
+    w1_u = np.zeros((world_size * 32, 512, 8192), dtype=np.uint32)
+    w2_u = np.zeros((world_size * 32, 512, 4096), dtype=np.uint32)
+    w1_u[::32] = rng.integers(0, 0x11111111, size=(world_size, 512, 8192), dtype=np.uint32)
+    w2_u[::32] = rng.integers(0, 0x11111111, size=(world_size, 512, 4096), dtype=np.uint32)
+    w1, s1 = jnp.asarray(w1_u, jnp.uint32), jnp.ones((world_size * 32, 8, 8192), jnp.bfloat16) * 0.02
+    w2, s2 = jnp.asarray(w2_u, jnp.uint32), jnp.ones((world_size * 32, 8, 4096), jnp.bfloat16) * 0.02
+    del w1_u, w2_u, bias_np
+    gc.collect()
+    post_exp = jnp.ones((h_pre,), jnp.float32)
+    w_post, s_post = _rf8((world_size * h_pre, h_pre)), jnp.ones((h_pre,), jnp.float32) * 0.05
+    w_qkv, s_qkv = _rf8((world_size * hidden, qkv_cols)), jnp.ones((qkv_cols,), jnp.float32) * 0.05
+    w_gate, s_gate = _rf8((world_size * hidden, gate_cols)), jnp.ones((gate_cols,), jnp.float32) * 0.05
+    fp = jnp.asarray([0.84, 2.0, 0.20, 1.0], jnp.float32)
+
+    pps, phys_rows = 5, 512
+    nb = B * pps + 4
+    kv_u8 = np.full((nb, phys_rows, 1, 4, 128), 0x7F, dtype=np.uint8)
+    perm = rng.permutation(nb)
+    valid_pgs = perm[: B * pps].astype(np.int32)
+    kv_u8[valid_pgs] = 0x38
+    kvc_base = jax.lax.bitcast_convert_type(jnp.asarray(kv_u8, jnp.uint8), jnp.float8_e4m3fn)
+    kvl_np = np.array([150 + (i & 63) + 512 * (i % 4) for i in range(B)], dtype=np.int32)
+    kvl_j = jnp.asarray(kvl_np, jnp.int32)
+    pg_j = jnp.asarray(valid_pgs, jnp.int32)
+    cuq = jnp.arange(B + 1, dtype=jnp.int32)
+    cukv = jnp.arange(B + 1, dtype=jnp.int32) * (pps * phys_rows)
+    dist = jnp.asarray([B, B, B], jnp.int32)
+    mode_1k = "w8,s4,swabatch,pbf16,batchfull,b2,noz,g4k,foldcol"
+    sw = 2049
+
+    base_args = (
+        ranks, stream_chip, gated, wo, wos, ones_h, ones_h, ones_h, w_pre, s_pre, w_router, pre_exp, bias,
+        w1, s1, w2, s2, post_exp, w_post, s_post, ones_h, ones_h, ones_h, ones_h, w_qkv, s_qkv, w_gate, s_gate,
+        kvc_base, kvl_j, pg_j, cuq, cukv, dist, fp,
+    )
+    in_specs = (
+        P("model"), P("model", None), P(None, "model"),
+        P("model", None), P(), P(), P(), P(),
+        P(None, "model"), P("model"), P(), P(), P(),
+        P("model", None, None), P("model", None, None), P("model", None, None), P("model", None, None),
+        P(), P("model", None), P(), P(), P(), P(), P(),
+        P("model", None), P(), P("model", None), P(),
+        P(), P(), P(), P(), P(), P(), P(),
+    )
+
+    def _ref_b(*args):
+        rk, st, gt, wo_, wos_, pa, pb, pfg, wp, sp, wr, pe, bs, w1_, s1_, w2_, s2_, nm, wpt, spt, pff, pfa, pfb, nig, wqk, sqk, wg_, sg_, kvc_, kvl_, pi_, cq_, ckv_, dt_, fp_ = args
+        st_o, q_5d, kvm, gt_o = b1_moe_b2_chip_sharded_jax(
+            rk, st, gt, wo_, wos_, pa, pb, pfg, wp, sp, wr, pe, bs, w1_, s1_, w2_, s2_, nm,
+            wpt, spt, pff, pfa, pfb, nig, wqk, sqk, wg_, sg_, cos_sin_step=None, free_params=fp_,
+            world_size=world_size, fuse_qkv_epi=True, replica_cost_mode="tiles", config=cfg, interpret=True,
+        )
+        out_g, kvc_o = run_decode_fast_rpa(
+            q_5d, kvm, None, kvc_, kvl_, pi_, cq_, ckv_, dt_,
+            sm_scale=64.0**-0.5, sliding_window=sw,
+            k_scale=1.0, v_scale=1.0, mode_str=mode_1k, decode_query_size=1,
+            fused_out_pack=2, prepared_inputs=True, gate=gt_o, out_norm_eps=1e-5,
+            kv_pack_dense2=False, interpret=True,
+        )
+        return st_o, out_g, kvc_o
+
+    ip_race = pltpu.InterpretParams(
+        dma_execution_mode="eager",
+        detect_races=True,
+        uninitialized_memory="nan",
+    )
+
+    def _fast_c(*args):
+        rk, st, gt, wo_, wos_, pa, pb, pfg, wp, sp, wr, pe, bs, w1_, s1_, w2_, s2_, nm, wpt, spt, pff, pfa, pfb, nig, wqk, sqk, wg_, sg_, kvc_, kvl_, pi_, cq_, ckv_, dt_, fp_ = args
+        st_o, out_g, kvm = b1_moe_b2_rpad_chip_sharded_jax(
+            rk, st, gt, wo_, wos_, pa, pb, pfg, wp, sp, wr, pe, bs, w1_, s1_, w2_, s2_, nm,
+            wpt, spt, pff, pfa, pfb, nig, wqk, sqk, wg_, sg_, kvc_, kvl_, pi_, cq_, ckv_, dt_,
+            cos_sin_step=None, free_params=fp_, world_size=world_size,
+            rpa_sm_scale=64.0**-0.5, rpa_sliding_window=sw,
+            rpa_mode_str=mode_1k, kv_pack_dense2=False, replica_cost_mode="tiles",
+            config=cfg, skip_kv_write=True, interpret=ip_race,
+        )
+        kvc_o = write_decode_kv_merged_jax(
+            kvm, kvc_, kvl_, pi_, cq_, ckv_, dt_, kv_pack_dense2=False, interpret=ip_race,
+        )
+        return st_o, out_g, kvc_o
+
+    ref_res = jax.jit(
+        jax.shard_map(_ref_b, mesh=mesh, in_specs=in_specs, out_specs=(P("model", None), P(), P()), check_vma=False)
+    )(*base_args)
+    ref_st_np = np.asarray(ref_res[0], dtype=np.float64).ravel()
+    ref_g_np = np.asarray(ref_res[1], dtype=np.float64).ravel()
+    ref_kv_u8 = np.asarray(ref_res[2]).view(np.uint8).copy()
+    del ref_res
+    jax.clear_caches()
+    gc.collect()
+
+    fast_res = jax.jit(
+        jax.shard_map(_fast_c, mesh=mesh, in_specs=in_specs, out_specs=(P("model", None), P(), P()), check_vma=False)
+    )(*base_args)
+    fast_st_np = np.asarray(fast_res[0], dtype=np.float64).ravel()
+    fast_g_np = np.asarray(fast_res[1], dtype=np.float64).ravel()
+    fast_kv_u8 = np.asarray(fast_res[2]).view(np.uint8).copy()
+    del fast_res, base_args, w1, w2, s1, s2, kvc_base
+    jax.clear_caches()
+    gc.collect()
+
+    assert _cosine_sim(ref_st_np, fast_st_np) > 0.9999
+    assert _cosine_sim(ref_g_np, fast_g_np) > 0.9999
+    assert np.array_equal(ref_kv_u8, fast_kv_u8)
+
+    # 3. Full TPU7x <63 MiB VMEM AOT w/ realistic R=8/R=4 + free_params + rope + zero conditional().
+    aot_cases = [
+        (8, "tpu7x:2x2x1", 2049, 5, 512, False, 8, "w8,s4,swabatch,pbf16,batchfull,b2,noz,g4k,foldcol"),
+        (8, "tpu7x:2x2x1", None, 2, 512, False, 8, "w8,s4,swabatch,pbf16,batchfull,b2,noz,g4k,foldcol"),
+        (16, "tpu7x:2x2x2", 2049, 4, 128, True, 4, "w8,s4,batchfull,g4k,foldcol"),
+        (16, "tpu7x:2x2x2", None, 32, 128, True, 4, "w8,s4,batchfull,g4k,foldcol"),
+    ]
+    for ws_aot, topo_name, sw_aot, pps_aot, phys_aot, bd4_aot, nrep_aot, mode_aot in aot_cases:
+        tpu_devs = topologies.get_topology_desc(topo_name, platform="tpu").devices
+        mesh_aot = Mesh(
+            np.array(sorted(tpu_devs, key=lambda dv: (dv.coords[1], dv.coords[0], dv.core_on_chip))),
+            ("model",),
+        )
+        r_p = 128 // (ws_aot // 2)
+        e_loc = 256 // ws_aot
+        o_in = hidden // ws_aot
+        qc_a = 1280 if ws_aot == 8 else 640
+        gc_a = 1024 if ws_aot == 8 else 512
+        nb_aot = 128 * pps_aot + 4
+        sds_aot = (
+            jax.ShapeDtypeStruct((1,), jnp.int32),
+            jax.ShapeDtypeStruct((r_p, hidden), jnp.float32),
+            jax.ShapeDtypeStruct((128, o_in), jnp.bfloat16),
+            jax.ShapeDtypeStruct((o_in, hidden), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, hidden), jnp.float32),
+            jax.ShapeDtypeStruct((1, hidden), jnp.float32),
+            jax.ShapeDtypeStruct((1, hidden), jnp.float32),
+            jax.ShapeDtypeStruct((1, hidden), jnp.float32),
+            jax.ShapeDtypeStruct((hidden, h_pre // 2), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, h_pre // 2), jnp.float32),
+            jax.ShapeDtypeStruct((hidden, 256), jnp.bfloat16),
+            jax.ShapeDtypeStruct((1, h_pre), jnp.float32),
+            jax.ShapeDtypeStruct((1, 256), jnp.float32),
+            jax.ShapeDtypeStruct((e_loc, h_pre, 8192), jnp.float4_e2m1fn),
+            jax.ShapeDtypeStruct((e_loc, 8, 8192), jnp.bfloat16),
+            jax.ShapeDtypeStruct((e_loc, 4096, h_pre), jnp.float4_e2m1fn),
+            jax.ShapeDtypeStruct((e_loc, 8, h_pre), jnp.bfloat16),
+            jax.ShapeDtypeStruct((1, h_pre), jnp.bfloat16),
+            jax.ShapeDtypeStruct((h_pre, h_pre), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, h_pre), jnp.float32),
+            jax.ShapeDtypeStruct((1, hidden), jnp.float32),
+            jax.ShapeDtypeStruct((1, hidden), jnp.float32),
+            jax.ShapeDtypeStruct((1, hidden), jnp.float32),
+            jax.ShapeDtypeStruct((1, hidden), jnp.float32),
+            jax.ShapeDtypeStruct((hidden, qc_a), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, qc_a), jnp.float32),
+            jax.ShapeDtypeStruct((hidden, gc_a), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, gc_a), jnp.float32),
+            jax.ShapeDtypeStruct((nb_aot, phys_aot, 1, 4, 128), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((128,), jnp.int32),
+            jax.ShapeDtypeStruct((128 * pps_aot,), jnp.int32),
+            jax.ShapeDtypeStruct((129,), jnp.int32),
+            jax.ShapeDtypeStruct((129,), jnp.int32),
+            jax.ShapeDtypeStruct((3,), jnp.int32),
+            jax.ShapeDtypeStruct((128, 2, 128), jnp.float32),
+            jax.ShapeDtypeStruct((nrep_aot, h_pre, 8192), jnp.float4_e2m1fn),
+            jax.ShapeDtypeStruct((nrep_aot, 8, 8192), jnp.bfloat16),
+            jax.ShapeDtypeStruct((nrep_aot, 4096, h_pre), jnp.float4_e2m1fn),
+            jax.ShapeDtypeStruct((nrep_aot, 8, h_pre), jnp.bfloat16),
+            jax.ShapeDtypeStruct((4, ws_aot * 8), jnp.int32),
+            jax.ShapeDtypeStruct((4,), jnp.float32),
+        )
+
+        def _aot_c(*a, _ws=ws_aot, _sw=sw_aot, _bd4=bd4_aot, _m=mode_aot):
+            return b1_moe_b2_rpad_chip_sharded_jax(
+                *a[:34],
+                cos_sin_step=a[34],
+                rep_w1=a[35],
+                rep_s1=a[36],
+                rep_w2=a[37],
+                rep_s2=a[38],
+                replica_meta=a[39],
+                free_params=a[40],
+                world_size=_ws,
+                rpa_sliding_window=_sw,
+                rpa_mode_str=_m,
+                kv_pack_bd4=_bd4,
+                skip_kv_write=True,
+            )
+
+        with mock.patch("sglang_tpu.attention.pallas.util.get_tpu_version", return_value=7):
+            low = (
+                jax.jit(
+                    jax.shard_map(
+                        _aot_c,
+                        mesh=mesh_aot,
+                        in_specs=(P(),) * len(sds_aot),
+                        out_specs=(P(), P(), P()),
+                        check_vma=False,
+                    )
+                )
+                .trace(*sds_aot)
+                .lower(lowering_platforms=("tpu",))
+            )
+            hlo_txt = low.as_text()
+            assert f"muse_w9_b1_moe_b2_rpad_b128_tp{ws_aot}_" in hlo_txt
+            assert "_c1024_" not in hlo_txt
+            comp = low.compile()
+            assert comp.memory_analysis().generated_code_size_in_bytes > 0
+            del low, comp
+            jax.clear_caches()
+            gc.collect()
+

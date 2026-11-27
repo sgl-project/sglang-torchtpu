@@ -924,7 +924,7 @@ def _b1_moe_b2_chip_sharded_impl(
         return
 
     if use_3scope:
-        # 3-Scope Step (b) for rows > 128 and 3-Scope Step (c) for rows > 64:
+        # 3-Scope Step (b) and Step (c) for rows > 128:
         # w_pre_pair stays in Scope 1 (-16 MiB outer/Scope 2) and w_qkv+w_gate live in
         # Scope 3 (alongside RPAd when has_rpad=True), keeping peak VMEM < 63.94 MiB.
         moe_outer_refs = [next(it) for _ in range(step_b3_n_moe_outer)]
@@ -1601,7 +1601,7 @@ def _prepare_chip_b1_moe_b2_setup(
         config=config,
     )
     use_3d_x = config.row_mode != "dense"
-    use_3scope = (rows > 128) or (has_rpad and rows > 64)
+    use_3scope = rows > 128
     if use_3scope and not sharded_moe_in:
         raise ValueError(
             f"3-scope decode superkernel requires sharded_moe_in=True, got B={rows}, world_size={world_size}"
@@ -2123,6 +2123,15 @@ def b1_moe_b2_chip_sharded_jax(
 _STEP_C_BASE_MAX_BKV_ROWS = 80 * 512
 _STEP_C_GROUP_MAX_BKV_ROWS = 80 * 512
 _STEP_C_LARGE_B_MAX_BKV_ROWS = 16 * 512
+_STEP_C_B128_UNCOMPRESSED_MAX_BKV_ROWS = 40 * 512
+
+
+def _step_c_max_bkv_rows(
+    eff_b: int, *, kv_pack_dense2: bool, kv_pack_bd4: bool, base_rows: int
+) -> int:
+    if eff_b == 128 and not kv_pack_dense2 and not kv_pack_bd4:
+        return _STEP_C_B128_UNCOMPRESSED_MAX_BKV_ROWS
+    return _STEP_C_LARGE_B_MAX_BKV_ROWS if eff_b > 64 else base_rows
 
 
 def resolve_step_c_rpa_plan(
@@ -2194,6 +2203,12 @@ def resolve_step_c_rpa_plan(
         or (sh_grp > 0 and (shared_group_size <= 0 or eff_b < eff_seqs or (eff_seqs % sh_grp) != 0))
         or (sh_grp == 0 and cfg_rpa.loop_kind.startswith("shared"))
     )
+    max_bkv_rows = _step_c_max_bkv_rows(
+        eff_b,
+        kv_pack_dense2=kv_pack_dense2,
+        kv_pack_bd4=kv_pack_bd4,
+        base_rows=_STEP_C_BASE_MAX_BKV_ROWS,
+    )
     if (
         (not shared_bad)
         and sliding_window is None
@@ -2244,7 +2259,12 @@ def resolve_step_c_rpa_plan(
     eff_grp = 1
     use_grp_vec = False
     if cfg_rpa.swabatch_group_size > 1 and eff_b == eff_seqs and sh_grp == 0:
-        grp_limit = _STEP_C_LARGE_B_MAX_BKV_ROWS if eff_b > 64 else _STEP_C_GROUP_MAX_BKV_ROWS
+        grp_limit = _step_c_max_bkv_rows(
+            eff_b,
+            kv_pack_dense2=kv_pack_dense2,
+            kv_pack_bd4=kv_pack_bd4,
+            base_rows=_STEP_C_GROUP_MAX_BKV_ROWS,
+        )
         for cand_grp in (4, 2):
             if cand_grp > cfg_rpa.swabatch_group_size or (eff_b % cand_grp) != 0:
                 continue
