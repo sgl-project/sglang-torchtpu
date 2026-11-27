@@ -1445,22 +1445,21 @@ def pallas_fused_b1_b2_wpool_quant(
     t_local, h_dim = attn_out_shard.shape
     w_k, he_dim = wpool_fp8.shape
     num_experts = wrouter.shape[1]
-    bm = LANE
     if row_range is not None:
         row_start, row_end = int(row_range[0]), int(row_range[1])
         if row_start < 0 or row_end <= row_start or row_end > t_local:
             raise ValueError(f"Invalid row_range={row_range} for t_local={t_local}")
         out_rows = row_end - row_start
-        if row_start % bm != 0 or out_rows % bm != 0:
-            raise ValueError(f"row_range={row_range} must align to bm={bm}")
-        m_offset = row_start // bm
+        if row_start % LANE != 0 or out_rows % LANE != 0:
+            raise ValueError(f"row_range={row_range} must align to bm={LANE}")
+        row_start_eff = row_start
         tag_half = f"_r{row_start}_{row_end}"
     else:
         out_rows = (t_local // 2) if half_idx is not None else t_local
-        m_offset = (half_idx * (out_rows // bm)) if half_idx is not None else 0
+        row_start_eff = (half_idx * out_rows) if half_idx is not None else 0
         tag_half = f"_h{half_idx}" if half_idx is not None else "_full"
     assert h_dim == w_k == 8192 and he_dim == 4096
-    assert out_rows % bm == 0 and num_experts % 8 == 0
+    assert out_rows % LANE == 0 and num_experts % 8 == 0
 
     b12_fast_env = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_B1_B2_FAST", None)
     use_b12_fast = bool(b12_fast_env is not None and b12_fast_env.get())
@@ -1497,6 +1496,17 @@ def pallas_fused_b1_b2_wpool_quant(
                 f"static_fp8_scale must be in [0, 32], got {static_fp8_val}"
             )
     use_static_fp8 = bool(emit_fp8_gmm and static_fp8_val > 0.0)
+    use_bm256 = bool(
+        use_b12_fast
+        and use_static_fp8
+        and fp8_wpool
+        and row_start_eff % 256 == 0
+        and out_rows % 256 == 0
+    )
+    bm = 256 if use_bm256 else LANE
+    m_offset = row_start_eff // bm
+    use_hbm_out = use_bm256
+    use_2d_out = bool(use_b12_fast and use_static_fp8)
 
     b2_vecs = (
         wpool_scale.swapaxes(0, 1).reshape(8, he_dim)
@@ -1512,10 +1522,21 @@ def pallas_fused_b1_b2_wpool_quant(
 
     num_steps = out_rows // bm
     b2_dbl_env = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_B2_DBL_STREAM", None)
-    use_dbl_stream = bool(b2_dbl_env is not None and b2_dbl_env.get()) and num_steps >= 2
-    strip_w = 256 if use_b12_fast else 2048
+    use_dbl_stream = (
+        False
+        if use_bm256
+        else (bool(b2_dbl_env is not None and b2_dbl_env.get()) and num_steps >= 2)
+    )
+    if use_bm256:
+        strip_w = 512
+        sub_n = 512
+    elif use_2d_out:
+        strip_w = 1024
+        sub_n = 512
+    else:
+        strip_w = 256 if use_b12_fast else 2048
+        sub_n = 256
     num_strips = h_dim // strip_w
-    sub_n = 256
     ep_sub_n = 256 if use_b12_fast else 1024
     f256_sfx = "_f256" if use_b12_fast else ""
     dbl_sfx = "_dbl" if use_dbl_stream else ""
@@ -1687,6 +1708,18 @@ def pallas_fused_b1_b2_wpool_quant(
             r_inv_sc = None
 
         # Pass 3: Materialize router_in into VMEM r_scratch_ref + accumulate router logits
+        if use_hbm_out:
+
+            @pl.when(step > 0)
+            def _wait_prev_xmoe():
+                pltpu.make_async_copy(
+                    src_ref=r_scratch_ref.at[:, 0:he_dim],
+                    dst_ref=x_moe_fp8_out_ref.at[
+                        pl.ds(jnp.maximum(step - 1, 0) * bm, bm), :
+                    ],
+                    sem=dma_sems.at[2],
+                ).wait()
+
         logits = jnp.zeros((bm, num_experts), dtype=jnp.float32)
         for s in range(num_strips):
             c0, c1 = s * strip_w, (s + 1) * strip_w
@@ -1746,7 +1779,12 @@ def pallas_fused_b1_b2_wpool_quant(
         # In-VMEM router sigmoid + top-8
         sc = jax.nn.sigmoid(logits * jnp.float32(router_multiplier))
         sc_t = jnp.swapaxes(sc, 0, 1)
-        cur = sc_t + bias_t_ref[:, :]
+        bias_b = (
+            bias_t_ref[:, :]
+            if bm == LANE
+            else jnp.concatenate([bias_t_ref[:, :]] * (bm // LANE), axis=1)
+        )
+        cur = sc_t + bias_b
         iota = jax.lax.broadcasted_iota(jnp.int32, (num_experts, bm), 0)
         ids_list = []
         ws_list = []
@@ -1801,7 +1839,39 @@ def pallas_fused_b1_b2_wpool_quant(
             jnp.sum(sq_pe_128, axis=1, keepdims=True) * jnp.float32(inv_he)
             + jnp.float32(rms_eps)
         )
-        if use_static_fp8:
+        if use_hbm_out:
+            for kh in range(0, he_dim, 2048):
+                r_scratch_ref[:, kh : kh + 2048] = jnp.clip(
+                    u_scratch_ref[:, kh : kh + 2048].astype(jnp.float32)
+                    * inv_rms_pe
+                    * b2_vecs_ref[1:2, kh : kh + 2048],
+                    -448.0,
+                    448.0,
+                ).astype(jnp.float8_e4m3fn)
+            pltpu.make_async_copy(
+                src_ref=r_scratch_ref.at[:, 0:he_dim],
+                dst_ref=x_moe_fp8_out_ref.at[pl.ds(step * bm, bm), :],
+                sem=dma_sems.at[2],
+            ).start()
+
+            @pl.when(step == num_steps - 1)
+            def _wait_last_xmoe():
+                pltpu.make_async_copy(
+                    src_ref=r_scratch_ref.at[:, 0:he_dim],
+                    dst_ref=x_moe_fp8_out_ref.at[pl.ds(step * bm, bm), :],
+                    sem=dma_sems.at[2],
+                ).wait()
+
+        elif use_2d_out:
+            for kh in range(0, he_dim, 2048):
+                x_moe_fp8_out_ref[:, kh : kh + 2048] = jnp.clip(
+                    u_scratch_ref[:, kh : kh + 2048].astype(jnp.float32)
+                    * inv_rms_pe
+                    * b2_vecs_ref[1:2, kh : kh + 2048],
+                    -448.0,
+                    448.0,
+                ).astype(jnp.float8_e4m3fn)
+        elif use_static_fp8:
             if use_dbl_stream:
                 for k_c in range(he_dim // LANE):
                     nc0, nc1 = k_c * LANE, (k_c + 1) * LANE
@@ -1964,14 +2034,25 @@ def pallas_fused_b1_b2_wpool_quant(
         if use_static_fp8:
             out_shape_b12: tuple[Any, ...] = (
                 jax.ShapeDtypeStruct(
-                    (out_rows, he_dim // LANE, LANE), jnp.float8_e4m3fn
+                    (out_rows, he_dim)
+                    if use_2d_out
+                    else (out_rows, he_dim // LANE, LANE),
+                    jnp.float8_e4m3fn,
                 ),
                 jax.ShapeDtypeStruct((smid_rows, h_dim), jnp.float32),
                 jax.ShapeDtypeStruct((out_rows, LANE), jnp.int32),
                 jax.ShapeDtypeStruct((out_rows, LANE), jnp.bfloat16),
             )
             out_specs_b12 = [
-                pl.BlockSpec((bm, he_dim // LANE, LANE), lambda i: (i, 0, 0)),
+                (
+                    pl.BlockSpec(memory_space=pltpu.HBM)
+                    if use_hbm_out
+                    else (
+                        pl.BlockSpec((bm, he_dim), lambda i: (i, 0))
+                        if use_2d_out
+                        else pl.BlockSpec((bm, he_dim // LANE, LANE), lambda i: (i, 0, 0))
+                    )
+                ),
                 pl.BlockSpec(memory_space=pltpu.HBM),
                 pl.BlockSpec((bm, LANE), lambda i: (i, 0)),
                 pl.BlockSpec((bm, LANE), lambda i: (i, 0)),
@@ -2031,7 +2112,9 @@ def pallas_fused_b1_b2_wpool_quant(
                 ),
                 pltpu.VMEM((bm, h_dim), r_dtype),
                 pltpu.VMEM((bm, he_dim), jnp.bfloat16),
-                pltpu.SemaphoreType.DMA((4 if use_dbl_stream else 2,)),
+                pltpu.SemaphoreType.DMA(
+                    (4 if use_dbl_stream else (3 if use_hbm_out else 2),)
+                ),
             ],
         ),
         compiler_params=pltpu.CompilerParams(
@@ -2057,6 +2140,8 @@ def pallas_fused_b1_b2_wpool_quant(
     if emit_fp8_gmm:
         if use_static_fp8:
             x_moe_fp8, stream_mid, ids_pad_out, ws_pad_out = res_b12
+            if use_2d_out:
+                x_moe_fp8 = x_moe_fp8.reshape(out_rows, he_dim // LANE, LANE)
             sc_out = None
         else:
             x_moe_fp8, x_moe_sc_pad, stream_mid, ids_pad_out, ws_pad_out = res_b12
