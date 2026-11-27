@@ -665,9 +665,7 @@ class TestDSV4TPUPatches(CustomTestCase):
         self.assertFalse(torch.equal(plain[1], x[1]))
 
     def test_encoder_replay_hook_keeps_decoder_replay_off(self):
-        """The validator runs with get_platform reporting CUDA, where it turns
-        decoder SWA bounded replay on by default; the TPU attention backend has
-        none, so an unset flag is declared off first and an explicit one kept."""
+        """TPU replay remains opt-in when validation runs with CUDA semantics."""
         from unittest import mock
 
         from sglang.srt.arg_groups import deepseek_v4_hook as validator
@@ -694,7 +692,16 @@ class TestDSV4TPUPatches(CustomTestCase):
                 args = SimpleNamespace(
                     enable_encoder_swa_bounded_replay=True,
                     enable_decoder_swa_bounded_replay=decoder,
+                    disaggregation_mode="null",
+                    enable_multimodal=False,
+                    enable_return_routed_experts=False,
+                    enable_torch_compile=True,
+                    tpu_compile_tracer="direct",
+                    speculative_algorithm=None,
                 )
+                allow_tpu_dsv41_encoder_replay(original, args)
+            args.enable_return_routed_experts = True
+            with self.assertRaisesRegex(ValueError, "routed expert capture"):
                 allow_tpu_dsv41_encoder_replay(original, args)
         self.assertEqual(seen, [(True, False), (True, True)])
 
@@ -716,14 +723,19 @@ class TestDSV4TPUPatches(CustomTestCase):
         for g, w in zip(got, want):
             self.assertTrue(torch.equal(g, w))
 
-    def test_v41_backend_has_no_decoder_replay_tail(self):
-        """TpModelWorker reads attn_backend.tail_forward_metadata after a folded
-        encoder replay; the TPU backend has no decoder replay, so it is None."""
+    def test_v41_backend_exposes_only_prepared_decoder_replay_tail(self):
+        """TpModelWorker reads this after a folded encoder replay."""
         from sglang_tpu.models.deepseek_v41.attention_backend import (
             DSV41TPUAttnBackend,
         )
 
-        self.assertIsNone(DSV41TPUAttnBackend.tail_forward_metadata)
+        backend = DSV41TPUAttnBackend.__new__(DSV41TPUAttnBackend)
+        backend.forward_metadata = None
+        self.assertIsNone(backend.tail_forward_metadata)
+        backend.forward_metadata = SimpleNamespace(late_layer_tail=None)
+        self.assertIsNone(backend.tail_forward_metadata)
+        backend.forward_metadata.late_layer_tail = object()
+        self.assertIs(backend.tail_forward_metadata, backend.forward_metadata)
 
     def test_hc_sublayers_read_through_the_layer(self):
         """attn_hc rebuilds from the layer's current attributes on every read, so
