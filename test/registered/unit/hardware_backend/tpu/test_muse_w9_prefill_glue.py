@@ -1179,7 +1179,12 @@ def test_xor1_callsite_split_moe_and_chunk_b2_lowering():
                 .as_text("stablehlo")
             )
 
-    hlo_off = _trace_moe_b2({"SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG": "0"})
+    hlo_off = _trace_moe_b2(
+        {
+            "SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG": "0",
+            "SGLANG_TPU_MUSE_KERNEL_XOR1_AG_MOE": "0",
+        }
+    )
     assert "all_gather" in hlo_off and "xor1_" not in hlo_off
 
     hlo_xag4 = _trace_moe_b2({"SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG": "4"})
@@ -2068,6 +2073,15 @@ def test_b2_row_range_and_pow2_dus_parity_and_aot():
                 jax.ShapeDtypeStruct((8192,), jnp.float32),
                 jax.ShapeDtypeStruct((8192,), jnp.float32),
             ).lower(lowering_platforms=("tpu",)).compile()
+            hlo_txt = c_aot.as_text()
+            if t_loc_aot == 3072:
+                i0 = hlo_txt.find("r0_2048")
+                i1 = hlo_txt.find("r2048_3072")
+                assert 0 <= i0 < i1, "Expected larger-first pow2 B2 chunk order (2048, 1024)"
+            else:
+                i0 = hlo_txt.find("r0_1024")
+                i1 = hlo_txt.find("r1024_1536")
+                assert 0 <= i0 < i1, "Expected larger-first pow2 B2 chunk order (1024, 512)"
 
 
 def test_b2_pipe_chunks_resolver_0ulp_parity_and_aot():
@@ -3482,3 +3496,137 @@ def test_w16_l61_moe_spmd_entry_exit_and_pruned_layer_routing():
     assert seen["moe"] == [((128, hidden), (128, hidden))]
     assert seen["sum"] == 2
     assert out_256.shape == (bs, hidden)
+
+
+def test_w17_xor1_ag_moe_auto_gating():
+    """Verify default `XOR1_AG_MOE=0` keeps SparseCore `lax.all_gather`, while opt-in `-1` routes
+    `_moe_b2_all_gather` to wave-pipelined `xy_torus` when `TP=8` (`nbytes <= 1024*4352`) or
+    `TP=16` (`nbytes <= 512*4352`), stays on `lax.all_gather` for larger transfers or `allow_auto=False`.
+    """
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.pipeline import (
+        _moe_b2_all_gather,
+    )
+
+    devs = jax.devices()
+    if len(devs) < 16:
+        pytest.skip("Requires >=16 JAX devices")
+
+    def _trace(tp_sz: int, rows: int, cols: int, env_dict: dict[str, str], allow_auto: bool = True) -> str:
+        mesh = Mesh(np.array(devs[:tp_sz]), ("model",))
+        with (
+            mock.patch(
+                "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+            ),
+            tpu_info_for_cpu_export(),
+            mock.patch.dict(os.environ, env_dict),
+        ):
+            fn = jax.jit(
+                jax.shard_map(
+                    lambda x: _moe_b2_all_gather(
+                        x[0], axis_name="model", allow_auto=allow_auto
+                    )[None],
+                    mesh=mesh,
+                    in_specs=(P("model", None, None),),
+                    out_specs=P("model", None, None, None),
+                    check_vma=False,
+                )
+            )
+            return (
+                fn.trace(jax.ShapeDtypeStruct((tp_sz, rows, cols), jnp.int8))
+                .lower(lowering_platforms=("tpu",))
+                .as_text("stablehlo")
+            )
+
+    # Default XOR1_AG_MOE=0 keeps SparseCore lax.all_gather on both TP=8 and TP=16.
+    hlo_def8 = _trace(8, 512 * 32, 128, {})
+    assert "all_gather" in hlo_def8 and "xor1_" not in hlo_def8
+    hlo_def16 = _trace(16, 256 * 32, 128, {})
+    assert "all_gather" in hlo_def16 and "xor1_" not in hlo_def16
+
+    auto_env = {"SGLANG_TPU_MUSE_KERNEL_XOR1_AG_MOE": "-1"}
+    # Opt-in TP=8: <= 1024*4352 uses xy_torus; > 1024*4352 uses lax.all_gather.
+    assert "xor1_xytorus_ag_tp8" in _trace(8, 1024 * 32, 128, auto_env)
+    assert "xor1_xytorus_ag_tp8" in _trace(8, 1024, 4224, auto_env)
+    hlo_tp8_lg = _trace(8, 1536 * 32, 128, auto_env)
+    assert "all_gather" in hlo_tp8_lg and "xor1_" not in hlo_tp8_lg
+
+    # Opt-in TP=16: <= 512*4352 uses xyz_torus; >= 1024 tokens uses lax.all_gather.
+    assert "xor1_xyztorus_ag_tp16" in _trace(16, 256 * 32, 128, auto_env)
+    assert "xor1_xyztorus_ag_tp16" in _trace(16, 512, 4224, auto_env)
+    hlo_tp16_lg = _trace(16, 1024 * 32, 128, auto_env)
+    assert "all_gather" in hlo_tp16_lg and "xor1_" not in hlo_tp16_lg
+
+    # allow_auto=False (e.g. ep_tp2) stays on lax.all_gather even with -1.
+    hlo_noauto = _trace(8, 256 * 32, 128, auto_env, allow_auto=False)
+    assert "all_gather" in hlo_noauto and "xor1_" not in hlo_noauto
+
+
+def test_w17_xor1_ag_chunk_auto_tp8_gating():
+    """Verify default `XOR1_AG_CHUNK=0` keeps SparseCore `lax.all_gather`, while opt-in `-1`
+    enables `xor1_xytorus_ag_tp8` on TP=8 CCS `ag_chunk` when `c_k >= 64` (and stays off on `TP=16`).
+    """
+    jax = pytest.importorskip("jax")
+    torch = pytest.importorskip("torch")
+    from jax.experimental import topologies
+    from jax.sharding import Mesh
+
+    from sglang_tpu.muse_prefill_kernels import integration
+
+    if len(jax.devices("cpu")) < 8:
+        pytest.skip("Requires >=8 CPU devices")
+
+    topo8 = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x=2x2x1")
+    mesh8 = Mesh(np.array(topo8.devices).reshape(8), ("model",))
+    topo16 = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x=2x2x2")
+    mesh16 = Mesh(np.array(topo16.devices).reshape(16), ("model",))
+
+    def _op_name(mesh, env_dict):
+        integration._ops.cache_clear()
+        with (
+            mock.patch.dict(os.environ, env_dict),
+            mock.patch("sglang_tpu.moe.pallas.fused_moe_rs_op._get_mesh", return_value=mesh),
+            mock.patch(
+                "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+            ),
+            tpu_info_for_cpu_export(),
+        ):
+            ops = integration._ops(
+                16, 2, "v6", "v16", True, 1e-5, a1_rpa_layout=True, causal_chunk_stream=True
+            ) if mesh.size == 8 else integration._ops(
+                8, 1, "v6", "v16", True, 1e-5, a1_rpa_layout=True, causal_chunk_stream=True
+            )
+            return ops.ag_chunk._name
+
+    assert "_xag" not in _op_name(mesh8, {})
+    assert "_xagca" in _op_name(mesh8, {"SGLANG_TPU_MUSE_KERNEL_XOR1_AG_CHUNK": "-1"})
+    assert "_xagca" not in _op_name(mesh16, {"SGLANG_TPU_MUSE_KERNEL_XOR1_AG_CHUNK": "-1"})
+    assert torch is not None
+
+
+def test_w17_causal_chunk_spec_le1536_guard_non_v10_sp():
+    """Verify #5422: single-chunk bypass clauses (``le1536:1``) stay restricted to ``v10_sp``
+    so non-``v10_sp`` variants (e.g. ``v6``) never drop ``chunk_metas`` at ``t_shard <= 1536``.
+    """
+    from sglang_tpu.muse_prefill_kernels.causal_chunk_stream import (
+        resolve_causal_chunks,
+    )
+    from sglang_tpu.muse_prefill_kernels.integration import _sanitize_causal_chunk_spec
+
+    assert _sanitize_causal_chunk_spec("", "v10_sp") == "le1536:1;256,512"
+    assert _sanitize_causal_chunk_spec("le1536:1;256,512", "v10_sp") == "le1536:1;256,512"
+
+    assert _sanitize_causal_chunk_spec("", "v6") == ""
+    assert _sanitize_causal_chunk_spec("le1536:1;256,512", "v6") == "256,512"
+    assert _sanitize_causal_chunk_spec("le1536:1", "v6") == ""
+    assert _sanitize_causal_chunk_spec("1chunk", "v6") == ""
+    assert _sanitize_causal_chunk_spec("512:512;256,512", "v6") == "256,512"
+    assert _sanitize_causal_chunk_spec("768,1280", "v6") == "768,1280"
+
+    for ts in (256, 512, 1024, 1536):
+        sanitized = _sanitize_causal_chunk_spec("le1536:1;256,512", "v6")
+        chunks = resolve_causal_chunks(ts, sanitized)
+        assert len(chunks) >= 2 and sum(chunks) == ts

@@ -1693,18 +1693,26 @@ def _resolve_b2_pipe_chunks(
     return chunks
 
 
-def _moe_b2_all_gather(arr, *, axis_name: str):
-    """MoE-internal B2 ag_i8 all-gather controlled by XOR1_AG_MOE or XOR1_BRIDGE_AG >= 2."""
+def _moe_b2_all_gather(arr, *, axis_name: str, allow_auto: bool = True):
+    """MoE-internal B2 ag_i8 all-gather controlled by XOR1_AG_MOE (-1=auto) or XOR1_BRIDGE_AG >= 2."""
     bridge_mode = envs.SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG.get()
     moe_mode = envs.SGLANG_TPU_MUSE_KERNEL_XOR1_AG_MOE.get()
-    eff_mode = (
-        moe_mode if moe_mode > 0 else (bridge_mode if bridge_mode >= 2 else 0)
-    )
-    if eff_mode >= 2 or moe_mode >= 1:
+    eff_mode = moe_mode if moe_mode > 0 else (bridge_mode if bridge_mode >= 2 else 0)
+    use_xor = (moe_mode >= 1) or (eff_mode >= 2)
+    xy_torus = eff_mode >= 3
+    if not use_xor and moe_mode < 0 and allow_auto:
+        ep_sz = int(jax.lax.axis_size(axis_name))
+        nbytes = int(arr.size) * (jax.dtypes.itemsize_bits(arr.dtype) // 8)
+        if (ep_sz == 8 and nbytes <= 1024 * 4352) or (
+            ep_sz == 16 and nbytes <= 512 * 4352
+        ):
+            use_xor = True
+            xy_torus = True
+    if use_xor:
         from sglang_tpu.kernels.xor1_bridge_all_gather import xor1_bridge_all_gather
 
         return xor1_bridge_all_gather(
-            arr, axis_name=axis_name, tiled=False, xy_torus=(eff_mode >= 3)
+            arr, axis_name=axis_name, tiled=False, xy_torus=xy_torus
         )
     return jax.lax.all_gather(
         arr[None, ...], axis_name=axis_name, axis=0, tiled=True
@@ -2239,7 +2247,9 @@ def fused_moe_full_bridge_and_ffn(
         )
 
         def _moe_b2_all_gather_local(arr):
-            return _moe_b2_all_gather(arr, axis_name=expert_axis)
+            return _moe_b2_all_gather(
+                arr, axis_name=expert_axis, allow_auto=(not ep_tp2_mode)
+            )
 
         def _finish_stage2_routing(tk_u8_loc, tk_u8_glob, tk_w_loc, hs_4d_in=None):
             eff_n_loc_rt = num_local_experts + eff_cm_slots_pipe
@@ -2400,17 +2410,22 @@ def fused_moe_full_bridge_and_ffn(
                 ) = _finish_stage2_routing(
                     local_topk_ids_u8_b, global_topk_u8_b, local_topk_weights, None
                 )
-                hs_buf = jnp.empty(
-                    (ep_size, t_local * k_grp, 128),
-                    dtype=ag_chunks[0][2].dtype,
-                )
-                for off_c, ck_c, ag_c, _ in ag_chunks:
-                    hs_buf = jax.lax.dynamic_update_slice(
-                        hs_buf,
-                        ag_c.reshape(ep_size, ck_c * k_grp, 128),
-                        (0, off_c * k_grp, 0),
+                if len(ag_chunks) == 1:
+                    hidden_states = ag_chunks[0][2].reshape(
+                        ep_size * t_local, k_grp, 128
                     )
-                hidden_states = hs_buf.reshape(ep_size * t_local, k_grp, 128)
+                else:
+                    hs_buf = jnp.empty(
+                        (ep_size, t_local * k_grp, 128),
+                        dtype=ag_chunks[0][2].dtype,
+                    )
+                    for off_c, ck_c, ag_c, _ in ag_chunks:
+                        hs_buf = jax.lax.dynamic_update_slice(
+                            hs_buf,
+                            ag_c.reshape(ep_size, ck_c * k_grp, 128),
+                            (0, off_c * k_grp, 0),
+                        )
+                    hidden_states = hs_buf.reshape(ep_size * t_local, k_grp, 128)
             elif (
                 (fused_b1_b2_mode in (1, 2) and (t_local % 128 == 0))
                 or (
@@ -2561,11 +2576,11 @@ def fused_moe_full_bridge_and_ffn(
             elif fused_b1_b2_mode in (3, 4) and (t_local % 256 == 0):
                 if _use_b2_pow2 and (t_local & (t_local - 1)) != 0 and t_local >= 384:
                     if t_local % 384 == 0 and ((t_local // 3) & (t_local // 3 - 1)) == 0:
-                        c0_tok = t_local // 3
+                        c0_tok = t_local - (t_local // 3)
                     else:
                         pow2_c0 = 1 << ((t_local // 2).bit_length() - 1)
                         c0_tok = (
-                            pow2_c0
+                            t_local - pow2_c0
                             if (pow2_c0 % 128 == 0 and (t_local - pow2_c0) >= 128)
                             else (t_local // 2)
                         )
