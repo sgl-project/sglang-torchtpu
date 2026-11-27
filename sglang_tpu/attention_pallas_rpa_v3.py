@@ -807,6 +807,9 @@ def _invoke_v3_kernel(
         topk_k1_bq_env = getattr(
             envs, "SGLANG_TPU_RPA_V3_PREFILL_TOPK_K1_BQ", None
         )
+        topk_sink_env = getattr(
+            envs, "SGLANG_TPU_RPA_V3_PREFILL_TOPK_SINK_SLICES", None
+        )
         if (
             topk_slices > 0
             and is_lc_full
@@ -814,6 +817,11 @@ def _invoke_v3_kernel(
         ):
             extra["_prefill_topk_slices"] = topk_slices
             extra["_prefill_topk_qstride"] = topk_qstride
+            topk_sink_val = (
+                int(topk_sink_env.get()) if topk_sink_env is not None else 0
+            )
+            if topk_sink_val > 0:
+                extra["_prefill_topk_sink_slices"] = topk_sink_val
             if topk_fast_env is not None and topk_fast_env.get():
                 k_pair_val = (
                     int(topk_k_pair_env.get())

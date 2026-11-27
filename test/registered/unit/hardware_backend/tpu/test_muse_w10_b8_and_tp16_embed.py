@@ -1219,6 +1219,62 @@ def test_w10_muse_spark_b8_step_b_and_tp16_embed_dispatch_and_prewarm():
                 )
             assert len(out_fb) == 4 and out_fb[2] is not None and b_fallback_calls == [16]
 
+            # With MK_STEP_C_LC_FULL=1, replicated B=8 LC Full enters Step (c) and queues KV write.
+            lc_full_dist = torch.tensor([8, 8, 8, 2], dtype=torch.int32)
+            backend_c.forward_metadata.full_decode_distribution = lc_full_dist
+            backend_c.token_to_kv_pool.full_kv_pool = types.SimpleNamespace(
+                kv_pack_dense2=False, kv_pack_bd4=True
+            )
+            backend_c._layer_distribution = lambda is_swa_layer=False: (
+                torch.tensor([8, 8, 8], dtype=torch.int32) if is_swa_layer else lc_full_dist
+            )
+            lc_c_calls = []
+            pending_lc = []
+
+            def _fake_c16_lc(ws_arg, **kw):
+                def _fn(_rk, st, *_rest):
+                    lc_c_calls.append((ws_arg, int(st.shape[0]), bool(kw.get("kv_pack_bd4")), bool(kw.get("has_layer_idx"))))
+                    return (
+                        st + 3.0,
+                        torch.zeros((int(st.shape[0]), 512), dtype=torch.bfloat16),
+                        torch.zeros((int(st.shape[0]), 1, 4, 128), dtype=torch.float8_e4m3fn),
+                    )
+
+                return _fn
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "WORLD_SIZE": str(tp_c),
+                        "SGLANG_TPU_MUSE_DECODE_TP16_QKV_EPI": "1",
+                        "SGLANG_TPU_MUSE_DECODE_STEP_C_SUPERKERNEL": "1",
+                        "SGLANG_TPU_MUSE_MK_STEP_C_LC_FULL": "1",
+                        "SGLANG_TPU_RPA_V3_DECODE_FAST": "w8,s4,c4096,shared16,coal,noz,pbf16,q1024,shfp8,batchfull,foldcol",
+                    },
+                ),
+                mock.patch("sglang.srt.runtime_context.get_forward", return_value=types.SimpleNamespace(sp_active=False)),
+                mock.patch("sglang_tpu.decode_qkv_epilogue_tpu._resolve_decode_attn_backend", return_value=backend_c),
+                mock.patch(
+                    "sglang_tpu.attention_pallas_rpa_base._fused_kv_operands",
+                    return_value=(torch.zeros((8, 2, 128, 1, 4, 128), dtype=torch.float8_e4m3fn), torch.zeros((), dtype=torch.int32)),
+                ),
+                mock.patch.object(b1_moe_ops, "get_b1_moe_b2_rpad_replicated_b16_op", side_effect=_fake_c16_lc),
+            ):
+                out_lc = lyr_c.forward(
+                    positions=torch.zeros((tok_c,), dtype=torch.int32),
+                    stream=torch.zeros((tok_c, h_dim), dtype=torch.float32),
+                    forward_batch=fb_stepc,
+                    next_input_layernorm=_make_norm(h_dim),
+                    cos_sin_step=torch.zeros((tok_c, 2, 128), dtype=torch.float32),
+                    precomputed_gated=torch.ones((tok_c, h_dim // tp_c), dtype=torch.bfloat16),
+                    next_layer_attn=na_c,
+                    pending_step_c_kv_writes=pending_lc,
+                )
+            assert len(out_lc) == 5 and out_lc[2] is None and out_lc[3] is None and out_lc[4] is None
+            assert lc_c_calls == [(16, 8, True, True)]
+            assert len(pending_lc) == 1 and pending_lc[0][10] == (True, False, -1, False, True)
+
     # Verify lock-free prewarm for get_b1_moe_b2_rpad_replicated_b16_op + multi KV write.
     class _ExplodingB1Lock:
         def __enter__(self):
@@ -1738,10 +1794,429 @@ def test_b1_moe_b2_rpad_replicated_b8_b16_tpu7x_aot():
                 skip_kv_write=True,
             )
 
-        comp = (
+        lowered = (
             jax.jit(
                 jax.shard_map(
                     _aot_c,
+                    mesh=mesh_aot,
+                    in_specs=(P(),) * len(abs_in),
+                    out_specs=(P(), P(), P()),
+                    check_vma=False,
+                )
+            )
+            .trace(*abs_in)
+            .lower(lowering_platforms=("tpu",))
+        )
+        hlo_txt = lowered.as_text()
+        assert "_c1024_" not in hlo_txt, (
+            f"Adaptive 1K _c1024 branch must stay disabled on replicated Step (c): "
+            f"ws={ws_aot} B={b_tok} mode={rpa_mode}"
+        )
+        assert "conditional(" not in hlo_txt, (
+            f"HLO conditional shatters SWA rope IMEM dedup on replicated Step (c): "
+            f"ws={ws_aot} B={b_tok} mode={rpa_mode}"
+        )
+        comp = lowered.compile()
+        assert comp.memory_analysis().generated_code_size_in_bytes > 0
+        del lowered, comp
+        jax.clear_caches()
+        gc.collect()
+
+
+@pytest.mark.parametrize(
+    "world_size,batch_size,pack_mode,live_seqs",
+    [
+        (8, 8, "dense2", 5),
+        (16, 16, "bd4", 16),
+    ],
+)
+def test_b1_moe_b2_rpad_replicated_b8_b16_lc_shared_interpret(
+    world_size: int,
+    batch_size: int,
+    pack_mode: str,
+    live_seqs: int,
+):
+    """Verify replicated B=8/16 LC Full shared8/shared16 Step (c) Interpret parity + 0x7F poison."""
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh
+    from jax.sharding import PartitionSpec as P
+
+    if len(jax.devices("cpu")) < world_size:
+        pytest.skip(
+            f"Requires XLA_FLAGS=--xla_force_host_platform_device_count={world_size}"
+        )
+
+    from sglang_tpu.attention.pallas.rpa_v3_decode_fast import run_decode_fast_rpa
+    from sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_sparse import (
+        default_sparse_decode_config,
+    )
+    from sglang_tpu.muse_megakernel.decode.b1_moe_b2_b16_kernel import (
+        b1_moe_b2_replicated_b16_jax,
+        b1_moe_b2_rpad_replicated_b16_jax,
+    )
+    from sglang_tpu.muse_megakernel.decode.b1_moe_b2_kernel import (
+        write_decode_kv_merged_jax,
+        write_decode_kv_multi_layer_jax,
+    )
+    from test.registered.unit.hardware_backend.tpu.test_muse_w9_b1_moe_superkernel import (
+        _build_b1_moe_inputs,
+    )
+
+    hidden, h_pre, scale_block = 8192, 4096, 512
+    qkv_cols = 640 if world_size == 16 else 1280
+    gate_cols = 512 if world_size == 16 else 1024
+    kv_dense2 = pack_mode == "dense2"
+    kv_bd4 = pack_mode == "bd4"
+    phys_rows = 128 if kv_bd4 else 256
+    page_size = 512
+    rpa_mode = (
+        "w8,s4,c4096,shared16,coal,noz,pbf16,q1024,shfp8,batchfull,foldcol"
+        if kv_bd4
+        else "w8,s4,c4096,shared8,coal,noz,pbf16,shsplit,shfp8,batchfull,foldcol"
+    )
+    ip_race = pltpu.InterpretParams(
+        dma_execution_mode="eager",
+        detect_races=True,
+        uninitialized_memory="nan",
+    )
+
+    rng = np.random.default_rng(20262400 + world_size * 10 + batch_size)
+    d = _build_b1_moe_inputs(
+        rng,
+        world_size=world_size,
+        batch_size=batch_size,
+        scale_block=scale_block,
+        num_replicas=0,
+        bf16_router=True,
+        sparse_heavy=True,
+    )
+    stream_rep = jnp.asarray(
+        (rng.standard_normal((batch_size, hidden)) * 0.25).astype(np.float32)
+    )
+    w_pre_rep = jnp.asarray(
+        rng.standard_normal((hidden, h_pre)).astype(np.float32) * 0.04,
+        dtype=jnp.float8_e4m3fn,
+    )
+    s_pre_rep = jnp.asarray(
+        (np.abs(rng.standard_normal((h_pre,))) * 0.02 + 1e-3).astype(np.float32)
+    )
+    w_post_rep = jnp.asarray(
+        rng.standard_normal((h_pre, hidden)).astype(np.float32) * 0.04,
+        dtype=jnp.float8_e4m3fn,
+    )
+    s_post_rep = jnp.asarray(
+        (np.abs(rng.standard_normal((hidden,))) * 0.02 + 1e-3).astype(np.float32)
+    )
+    post_ff_gain = jnp.asarray(
+        (rng.standard_normal((hidden,)) * 0.1 + 1.0).astype(np.float32)
+    )
+    pf_alpha = jnp.asarray((rng.standard_normal((hidden,)) * 0.2 + 0.8).astype(np.float32))
+    pf_beta = jnp.asarray((rng.standard_normal((hidden,)) * 0.2 + 0.3).astype(np.float32))
+    next_in_gain = jnp.asarray(
+        (rng.standard_normal((hidden,)) * 0.1 + 1.0).astype(np.float32)
+    )
+    next_w_qkv = jnp.asarray(
+        rng.standard_normal((world_size * hidden, qkv_cols)).astype(np.float32) * 0.04,
+        dtype=jnp.float8_e4m3fn,
+    )
+    next_s_qkv = jnp.asarray(
+        (np.abs(rng.standard_normal((qkv_cols,))) * 0.02 + 1e-3).astype(np.float32)
+    )
+    next_w_gate = jnp.asarray(
+        rng.standard_normal((world_size * hidden, gate_cols)).astype(np.float32) * 0.04,
+        dtype=jnp.float8_e4m3fn,
+    )
+    next_s_gate = jnp.asarray(
+        (np.abs(rng.standard_normal((gate_cols,))) * 0.02 + 1e-3).astype(np.float32)
+    )
+    free_params = jnp.asarray([0.84, 1.0, 0.20, 2.0], dtype=jnp.float32)
+
+    sh_pgs = 2
+    priv_pgs = 2
+    pages_per_seq = sh_pgs + priv_pgs
+    num_layers_kv = 2 if kv_bd4 else 1
+    pg_mat = np.zeros((batch_size, pages_per_seq), dtype=np.int32)
+    sh_ids = np.arange(0, sh_pgs, dtype=np.int32)
+    nxt_pg = sh_pgs
+    for i in range(batch_size):
+        pg_mat[i, :sh_pgs] = sh_ids
+        pg_mat[i, sh_pgs:] = np.arange(nxt_pg, nxt_pg + priv_pgs, dtype=np.int32)
+        nxt_pg += priv_pgs
+    total_pages = nxt_pg + 4
+    kv_u8 = np.full(
+        (total_pages, num_layers_kv, phys_rows, 1, 4, 128), 0x7F, dtype=np.uint8
+    )
+    kv_vals = (
+        rng.standard_normal((nxt_pg, phys_rows, 1, 4, 128)) * 0.4
+    ).astype(np.float32)
+    kv_fp8_valid = jnp.asarray(kv_vals, dtype=jnp.float8_e4m3fn).view(jnp.uint8)
+    kv_u8[:nxt_pg, 0] = np.asarray(kv_fp8_valid)
+    kv_cache_init = jnp.asarray(kv_u8).view(jnp.float8_e4m3fn)
+    if num_layers_kv == 1:
+        kv_cache_init = kv_cache_init[:, 0]
+
+    kvl_np = np.array(
+        [
+            (sh_pgs * page_size + 40 + (i * 29) % 400) if i < live_seqs else 0
+            for i in range(batch_size)
+        ],
+        dtype=np.int32,
+    )
+    kv_lens = jnp.asarray(kvl_np, dtype=jnp.int32)
+    page_indices = jnp.asarray(pg_mat.reshape(-1), dtype=jnp.int32)
+    cu_q_lens = jnp.arange(batch_size + 1, dtype=jnp.int32)
+    cu_kv_lens = jnp.arange(batch_size + 1, dtype=jnp.int32) * (pages_per_seq * page_size)
+    shared_p = jnp.asarray([sh_pgs], dtype=jnp.int32)
+    distribution = jnp.asarray([live_seqs, live_seqs, live_seqs, sh_pgs], dtype=jnp.int32)
+
+    cfg = dataclasses.replace(
+        default_sparse_decode_config(batch_size, world_size, scale_block),
+        row_mode="sparse",
+        weight_mode="stream3",
+        tile_m=16,
+        m_buckets=(8,) if batch_size == 8 else (8, 16),
+        route_chunk_rows=batch_size,
+        static_holder_mask=True,
+        route_fast=True,
+        fast_plan=2,
+        unroll_strips=True,
+        fast_gs=True,
+        pair_rs=(world_size == 8),
+        bridge_ag=False,
+        fast_b64_epi_pro=False,
+        spec_prime_parts=0,
+        k256_strip_mode="wide",
+        nc_split512=False,
+    )
+
+    def _run_standalone(
+        rank, stream_r, gated_attn, wo, wo_scale, pa_alpha, pa_beta, pre_ff_gain,
+        w_pre, s_pre, w_router, pre_exp_gain,
+        bias, w1, s1, w2, s2, norm,
+        w_post, s_post, post_ff_g, pf_a, pf_b, next_in_g, w_qkv, s_qkv, w_gate, s_gate,
+        kv_c, kvl, pg, cq, ckv, dist, fp,
+    ):
+        st2, q_5d, kv_m, gate_2d = b1_moe_b2_replicated_b16_jax(
+            rank, stream_r, gated_attn, wo, wo_scale, pa_alpha, pa_beta, pre_ff_gain,
+            w_pre, s_pre, w_router, pre_exp_gain,
+            bias, w1, s1, w2, s2, norm,
+            w_post, s_post, post_ff_g, pf_a, pf_b, next_in_g, w_qkv, s_qkv, w_gate, s_gate,
+            cos_sin_step=None, free_params=fp,
+            world_size=world_size, pa_eps=1e-6, pre_ff_eps=1e-5, pre_ff_scale_input=False,
+            router_multiplier=0.17677669529663687, pre_exp_eps=1e-5, pre_exp_scale_input=False,
+            replica_cost_mode="tiles", config=cfg, interpret=ip_race,
+        )
+        kv_ref_in = kv_c[:, 0] if kv_c.ndim == 6 else kv_c
+        gated_out, updated_kv = run_decode_fast_rpa(
+            q_5d, kv_m, kv_m, kv_ref_in, kvl, pg, cq, ckv, dist[:3],
+            gate=gate_2d, sm_scale=0.125, sliding_window=None,
+            k_scale=0.9, v_scale=1.1, mode_str=rpa_mode,
+            prepared_inputs=True, fused_out_pack=2, out_norm_eps=1e-5,
+            kv_pack_dense2=kv_dense2, kv_pack_bd4=kv_bd4,
+            shared_pages=shared_p, interpret=True,
+            force_native_tp16=(world_size == 16),
+        )
+        return st2, gated_out.reshape(batch_size, gate_cols), updated_kv
+
+    def _run_fused(
+        rank, stream_r, gated_attn, wo, wo_scale, pa_alpha, pa_beta, pre_ff_gain,
+        w_pre, s_pre, w_router, pre_exp_gain,
+        bias, w1, s1, w2, s2, norm,
+        w_post, s_post, post_ff_g, pf_a, pf_b, next_in_g, w_qkv, s_qkv, w_gate, s_gate,
+        kv_c, kvl, pg, cq, ckv, dist, fp,
+    ):
+        lidx = jnp.int32(0) if kv_c.ndim == 6 else None
+        st2, ng, kv_out = b1_moe_b2_rpad_replicated_b16_jax(
+            rank, stream_r, gated_attn, wo, wo_scale, pa_alpha, pa_beta, pre_ff_gain,
+            w_pre, s_pre, w_router, pre_exp_gain,
+            bias, w1, s1, w2, s2, norm,
+            w_post, s_post, post_ff_g, pf_a, pf_b, next_in_g, w_qkv, s_qkv, w_gate, s_gate,
+            kv_c, kvl, pg, cq, ckv, dist,
+            cos_sin_step=None, free_params=fp, layer_idx=lidx,
+            world_size=world_size, pa_eps=1e-6, pre_ff_eps=1e-5, pre_ff_scale_input=False,
+            router_multiplier=0.17677669529663687, pre_exp_eps=1e-5, pre_exp_scale_input=False,
+            rpa_sm_scale=0.125, rpa_sliding_window=None,
+            rpa_k_scale=0.9, rpa_v_scale=1.1, rpa_out_norm_eps=1e-5,
+            rpa_mode_str=rpa_mode, kv_pack_dense2=kv_dense2, kv_pack_bd4=kv_bd4,
+            replica_cost_mode="tiles", config=cfg, interpret=ip_race,
+            skip_kv_write=True,
+        )
+        if kv_c.ndim == 6:
+            kv_out = write_decode_kv_multi_layer_jax(
+                kv_out[None], kv_c, kvl, pg, cq, ckv, dist,
+                layer_ids=jnp.asarray([0], dtype=jnp.int32),
+                kv_pack_dense2=kv_dense2, kv_pack_bd4=kv_bd4, interpret=ip_race,
+            )[:, 0]
+        else:
+            kv_out = write_decode_kv_merged_jax(
+                kv_out, kv_c, kvl, pg, cq, ckv, dist,
+                kv_pack_dense2=kv_dense2, kv_pack_bd4=kv_bd4, interpret=ip_race,
+            )
+        return st2, ng, kv_out
+
+    mesh = Mesh(np.array(jax.devices("cpu")[:world_size]), ("model",))
+    call_args = (
+        d["ranks"], stream_rep, d["gated_full"], d["wo_sharded"], d["wo_scale"],
+        d["pa_alpha"], d["pa_beta"], d["pre_ff_gain"],
+        w_pre_rep, s_pre_rep, d["w_router"], d["pre_exp_gain"],
+        d["bias"], d["w1_all"], d["s1_all"], d["w2_all"], d["s2_all"], d["post_exp_norm"],
+        w_post_rep, s_post_rep, post_ff_gain, pf_alpha, pf_beta, next_in_gain,
+        next_w_qkv, next_s_qkv, next_w_gate, next_s_gate,
+        kv_cache_init, kv_lens, page_indices, cu_q_lens, cu_kv_lens, distribution,
+        free_params,
+    )
+    in_specs = (
+        P("model"), P(), P(None, "model"), P("model", None), P(),
+        P(), P(), P(),
+        P(None, "model"), P("model"), P(), P(),
+        P(), P("model", None, None), P("model", None, None), P("model", None, None), P("model", None, None), P(),
+        P(None, "model"), P("model"), P(), P(), P(), P(),
+        P("model", None), P(), P("model", None), P(),
+        P(), P(), P(), P(), P(), P(), P(),
+    )
+    out_specs = (P("model"), P("model"), P("model"))
+
+    ref_outs = jax.jit(
+        jax.shard_map(_run_standalone, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False)
+    )(*call_args)
+    ref_np = [np.asarray(x) for x in ref_outs]
+    del ref_outs
+    jax.clear_caches()
+    gc.collect()
+
+    fused_outs = jax.jit(
+        jax.shard_map(_run_fused, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False)
+    )(*call_args)
+    fused_np = [np.asarray(x) for x in fused_outs]
+    del fused_outs, call_args, d
+    jax.clear_caches()
+    gc.collect()
+
+    for idx, name in enumerate(("stream", "next_gated", "updated_kv")):
+        r_raw = ref_np[idx]
+        f_raw = fused_np[idx]
+        if idx == 2:
+            r_u8 = r_raw.view(np.uint8)
+            f_u8 = f_raw.view(np.uint8)
+            assert np.array_equal(r_u8 == 0x7F, f_u8 == 0x7F), f"{pack_mode} 0x7F NaN poison mask changed"
+            valid_mask = r_u8 != 0x7F
+            r_vals = r_raw.astype(np.float32)[valid_mask]
+            f_vals = f_raw.astype(np.float32)[valid_mask]
+        elif idx == 1:
+            r_vals = r_raw[:, :live_seqs].astype(np.float32) if r_raw.ndim == 3 else r_raw[:live_seqs].astype(np.float32)
+            f_vals = f_raw[:, :live_seqs].astype(np.float32) if f_raw.ndim == 3 else f_raw[:live_seqs].astype(np.float32)
+        else:
+            r_vals = r_raw.astype(np.float32)
+            f_vals = f_raw.astype(np.float32)
+        assert np.all(np.isfinite(f_vals)), f"{name} non-finite"
+        cos = _cosine_sim(r_vals, f_vals)
+        assert cos > 0.9999, f"{pack_mode} {name} cosine mismatch: {cos}"
+
+
+def test_b1_moe_b2_rpad_replicated_b8_b16_lc_shared_tpu7x_aot():
+    """Verify TPU7x AOT (<63 MiB VMEM) for 256K LC shared8/shared16 replicated B=8/16 Step (c)."""
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import topologies
+    from jax.sharding import Mesh
+    from jax.sharding import PartitionSpec as P
+
+    from sglang_tpu.muse_megakernel.decode.b1_moe_b2_b16_kernel import (
+        b1_moe_b2_rpad_replicated_b16_jax,
+    )
+
+    hidden, h_pre, scale_block = 8192, 4096, 512
+    nq = h_pre // scale_block
+
+    cases = [
+        (8, "tpu7x:2x2x1", 8, 512, 256, True, False, "w8,s4,c4096,shared8,coal,noz,pbf16,shsplit,shfp8,batchfull,foldcol"),
+        (8, "tpu7x:2x2x1", 16, 512, 256, True, False, "w8,s4,c4096,shared16,coal,noz,pbf16,shsplit,shfp8,batchfull,foldcol"),
+        (16, "tpu7x:2x2x2", 8, 512, 128, False, True, "w8,s4,c4096,shared16,coal,noz,pbf16,q1024,shfp8,batchfull,foldcol"),
+        (16, "tpu7x:2x2x2", 16, 512, 128, False, True, "w8,s4,c4096,shared16,coal,noz,pbf16,q1024,shfp8,batchfull,foldcol"),
+    ]
+    for ws_aot, topo_name, b_tok, pgs, phys_r, d2, bd4, rpa_mode in cases:
+        tpu_devs = topologies.get_topology_desc(topo_name, platform="tpu").devices
+        mesh_aot = Mesh(
+            np.array(
+                sorted(tpu_devs, key=lambda dv: (dv.coords[1], dv.coords[0], dv.core_on_chip))
+            ),
+            ("model",),
+        )
+        o_in = hidden // ws_aot
+        pre_c = h_pre // ws_aot
+        post_c = hidden // ws_aot
+        qc = 1280 if ws_aot == 8 else 640
+        gc_w = 1024 if ws_aot == 8 else 512
+        e_loc = 256 // ws_aot
+        abs_in = (
+            jax.ShapeDtypeStruct((1,), jnp.int32),
+            jax.ShapeDtypeStruct((b_tok, hidden), jnp.float32),
+            jax.ShapeDtypeStruct((b_tok, o_in), jnp.bfloat16),
+            jax.ShapeDtypeStruct((o_in, hidden), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, hidden), jnp.float32),
+            jax.ShapeDtypeStruct((1, hidden), jnp.float32),
+            jax.ShapeDtypeStruct((1, hidden), jnp.float32),
+            jax.ShapeDtypeStruct((1, hidden), jnp.float32),
+            jax.ShapeDtypeStruct((hidden, pre_c), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, pre_c), jnp.float32),
+            jax.ShapeDtypeStruct((hidden, 256), jnp.bfloat16),
+            jax.ShapeDtypeStruct((1, h_pre), jnp.float32),
+            jax.ShapeDtypeStruct((1, 256), jnp.float32),
+            jax.ShapeDtypeStruct((e_loc, h_pre, 8192), jnp.float4_e2m1fn),
+            jax.ShapeDtypeStruct((e_loc, nq, 8192), jnp.bfloat16),
+            jax.ShapeDtypeStruct((e_loc, 4096, h_pre), jnp.float4_e2m1fn),
+            jax.ShapeDtypeStruct((e_loc, nq, h_pre), jnp.bfloat16),
+            jax.ShapeDtypeStruct((1, h_pre), jnp.bfloat16),
+            jax.ShapeDtypeStruct((h_pre, post_c), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, post_c), jnp.float32),
+            jax.ShapeDtypeStruct((1, hidden), jnp.float32),
+            jax.ShapeDtypeStruct((1, hidden), jnp.float32),
+            jax.ShapeDtypeStruct((1, hidden), jnp.float32),
+            jax.ShapeDtypeStruct((1, hidden), jnp.float32),
+            jax.ShapeDtypeStruct((hidden, qc), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, qc), jnp.float32),
+            jax.ShapeDtypeStruct((hidden, gc_w), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, gc_w), jnp.float32),
+            jax.ShapeDtypeStruct((pgs + b_tok * 4, 2, phys_r, 1, 4, 128), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((b_tok,), jnp.int32),
+            jax.ShapeDtypeStruct((b_tok * pgs,), jnp.int32),
+            jax.ShapeDtypeStruct((b_tok + 1,), jnp.int32),
+            jax.ShapeDtypeStruct((b_tok + 1,), jnp.int32),
+            jax.ShapeDtypeStruct((4,), jnp.int32),
+            jax.ShapeDtypeStruct((8, h_pre, 8192), jnp.float4_e2m1fn),
+            jax.ShapeDtypeStruct((8, nq, 8192), jnp.bfloat16),
+            jax.ShapeDtypeStruct((8, 4096, h_pre), jnp.float4_e2m1fn),
+            jax.ShapeDtypeStruct((8, nq, h_pre), jnp.bfloat16),
+            jax.ShapeDtypeStruct((4, ws_aot * 8), jnp.int32),
+            jax.ShapeDtypeStruct((4,), jnp.float32),
+            jax.ShapeDtypeStruct((), jnp.int32),
+        )
+
+        def _aot_lc(*args, _ws=ws_aot, _d2=d2, _bd4=bd4, _mode=rpa_mode):
+            return b1_moe_b2_rpad_replicated_b16_jax(
+                *args[:34],
+                cos_sin_step=None,
+                rep_w1=args[34],
+                rep_s1=args[35],
+                rep_w2=args[36],
+                rep_s2=args[37],
+                replica_meta=args[38],
+                free_params=args[39],
+                layer_idx=args[40],
+                world_size=_ws,
+                rpa_sliding_window=None,
+                rpa_mode_str=_mode,
+                kv_pack_dense2=_d2,
+                kv_pack_bd4=_bd4,
+                skip_kv_write=True,
+            )
+
+        comp = (
+            jax.jit(
+                jax.shard_map(
+                    _aot_lc,
                     mesh=mesh_aot,
                     in_specs=(P(),) * len(abs_in),
                     out_specs=(P(), P(), P()),

@@ -1160,6 +1160,9 @@ class TpuEnvs:
     SGLANG_TPU_RPA_V3_PREFILL_TOPK_K_PAIR = EnvInt(0)
     # Optional Stage-1 TOPK_FAST Q-block size override (0 = auto: 16384 for qstride=4 else kernel bq).
     SGLANG_TPU_RPA_V3_PREFILL_TOPK_K1_BQ = EnvInt(0)
+    # Optional pinned sink half-slices in bkv=0 (0 = keep full bkv=0 dense; >0 = apply top-k
+    # to bkv=0 while pinning its first N 128-token half-slices, e.g. 4 = 512 sink tokens).
+    SGLANG_TPU_RPA_V3_PREFILL_TOPK_SINK_SLICES = EnvInt(0)
     # Muse prefill kernel path with SGLANG_TPU_KV_PACK_HEADS: A1 (two-half bf16 variants)
     # writes q and kv in RPA v3's packed layout, dropping the XLA expand/repack glue.
     SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT = EnvBool(False)

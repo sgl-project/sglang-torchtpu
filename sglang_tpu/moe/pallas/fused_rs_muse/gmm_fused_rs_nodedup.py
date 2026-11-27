@@ -5272,26 +5272,16 @@ def gmm_v2_fused_rs(
         if size_m > _BLOCKDIAG_MAX_SIZE_M
         else 0
     )
-    _k256_pre_g2 = (
-        is_quantized
-        and jnp.dtype(w1.dtype) == jnp.dtype(w2.dtype) == jnp.float4_e2m1fn
-        and rhs1_quant_block_size == 256
-        and rhs2_quant_block_size == 256
-        and (
-            envs.SGLANG_TPU_MUSE_KERNEL_BLOCK256_SCALES.get()
-            or envs.SGLANG_TPU_MUSE_KERNEL_K256_PREFILL_TILES.get()
-        )
-    )
     eff_static_fp8_gmm2 = (
         _raw_static_fp8_gmm2
         if (
             _raw_static_fp8_gmm2 > 0.0
             and size_m > _BLOCKDIAG_MAX_SIZE_M
             and is_quantized
+            and not has_bias
             and not fp8_direct_write
             and not fp4_w4a16_eff
             and not fp8_w8a16
-            and not _k256_pre_g2
             and _eo_raw_g2 == 0
             and act_fn == "silu"
             and not use_w2_prequant_cache
