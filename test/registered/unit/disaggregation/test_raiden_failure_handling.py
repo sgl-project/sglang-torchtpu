@@ -76,6 +76,7 @@ def _prefill_manager():
     """A prefill-mode RaidenKVManager with its room tables, no sockets or engine."""
     mgr = RaidenKVManager.__new__(RaidenKVManager)
     mgr.attn_tp_rank = 0
+    mgr.pp_size = 1
     mgr._prefill = PrefillState(announce_pages=1)
     mgr._decode = None
     mgr.disaggregation_mode = DisaggregationMode.PREFILL
@@ -596,6 +597,9 @@ class TestSenderBootstrapTimeout(unittest.TestCase):
         )
         mgr.finish_bootstrap_if_decode_requested = types.MethodType(
             RaidenKVManager.finish_bootstrap_if_decode_requested, mgr
+        )
+        mgr._finish_bootstrap_locked = types.MethodType(
+            RaidenKVManager._finish_bootstrap_locked, mgr
         )
         mgr.dram_offload_channel = None
         mgr.fail_decode_silence = types.MethodType(
