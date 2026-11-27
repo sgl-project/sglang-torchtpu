@@ -7,7 +7,9 @@ that turns a device pool into the per-namespace tensor lists raiden registers.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional, Sequence
 
@@ -41,6 +43,92 @@ from sglang_tpu.kv_pool import (
 )
 from sglang_tpu.mamba_pool import TpuMambaPool
 from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool, _DraftSwaSidecar
+
+_METADATA_DELIMITER_RE = re.compile(r"[,#=\s]+")
+_NULL_CONTEXT = contextlib.nullcontext()
+
+
+def is_profiler_enabled() -> bool:
+    """Whether PyTorch profiling is active anywhere in this process.
+
+    Checks PyTorch's process-wide ``_is_profiler_enabled`` flag alongside the
+    thread-local ``_profiler_enabled()`` check so spans emitted from Raiden's
+    background threads (ZMQ listener, reshard push, pipeline coordinator) are
+    recorded while a ``torch.profiler.profile`` session is active.
+    """
+    return bool(
+        getattr(torch.autograd.profiler, "_is_profiler_enabled", False)
+    ) or bool(torch.autograd._profiler_enabled())
+
+
+def clean_req_id(req_id: Any) -> str:
+    """Sanitize a request or transfer ID for ``name#k=v,...#`` span metadata."""
+    text = str(req_id).strip()
+    return _METADATA_DELIMITER_RE.sub("_", text) if text else ""
+
+
+def _trace_num_tokens(manager: Any, req_id: str, num_blocks: int) -> int:
+    # State transfers move recurrent-state rows rather than KV token pages.
+    if req_id.removeprefix("resharded_transfer_").startswith("state:"):
+        return 0
+    # Block-aligned KV token capacity (num_blocks * page_size).
+    page_size = int(getattr(getattr(manager, "kv_args", None), "page_size", 0) or 0)
+    return num_blocks * page_size
+
+
+def record_trace_meta_locked(
+    manager: Any, req_id: str, uuid: int, num_blocks: int
+) -> None:
+    """Record ``(uuid, num_tokens)`` for completion spans (caller holds ``_state_lock``)."""
+    meta = getattr(manager, "_transfer_trace_meta", None)
+    if meta is None:
+        meta = {}
+        manager._transfer_trace_meta = meta
+    key = req_id.removeprefix("resharded_transfer_")
+    meta[key] = (uuid, _trace_num_tokens(manager, key, num_blocks))
+
+
+def record_trace_meta(manager: Any, req_id: str, uuid: int, num_blocks: int) -> None:
+    """Record completion trace metadata under ``_state_lock`` when profiling is active."""
+    if not is_profiler_enabled():
+        return
+    lock = getattr(manager, "_state_lock", None)
+    if lock is None:
+        return
+    with lock:
+        record_trace_meta_locked(manager, req_id, uuid, num_blocks)
+
+
+def discard_trace_meta_locked(manager: Any, req_id: str) -> None:
+    meta = getattr(manager, "_transfer_trace_meta", None)
+    if meta:
+        meta.pop(req_id.removeprefix("resharded_transfer_"), None)
+
+
+def trace_transfer_span(
+    manager: Any,
+    name: str,
+    *,
+    room: Optional[int],
+    req_id: str,
+    uuid: int,
+    num_blocks: Optional[int] = None,
+    num_tokens: Optional[int] = None,
+    emit_blocks: bool = True,
+) -> contextlib.AbstractContextManager[Any]:
+    """Return a ``record_function`` span when profiling is active, else a no-op."""
+    if not is_profiler_enabled():
+        return _NULL_CONTEXT
+    room_ids = getattr(manager, "_room_request_ids", None)
+    raw_rid = room_ids.get(room) if (room is not None and room_ids) else None
+    resolved_rid = clean_req_id(raw_rid if raw_rid is not None else req_id)
+    if num_tokens is None:
+        num_tokens = _trace_num_tokens(manager, req_id, num_blocks or 0)
+    meta = f"uuid={uuid},request_id={resolved_rid},num_tokens={num_tokens}"
+    if num_blocks is not None and emit_blocks:
+        meta = f"{meta},num_blocks={num_blocks}"
+    return torch.profiler.record_function(f"{name}#{meta}#")
+
 
 # One logger for the whole package, deliberately keeping the name of the module
 # this code used to live in: emitted record names and the existing test

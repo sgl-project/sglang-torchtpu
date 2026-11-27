@@ -27,7 +27,14 @@ from sglang_tpu.disaggregation.raiden.chunk_plan import (
     chunk_pull_window,
     whole_pull_registration,
 )
-from sglang_tpu.disaggregation.raiden.common import _tcp_endpoint, logger
+from sglang_tpu.disaggregation.raiden.common import (
+    _tcp_endpoint,
+    discard_trace_meta_locked,
+    is_profiler_enabled,
+    logger,
+    record_trace_meta_locked,
+    trace_transfer_span,
+)
 from sglang_tpu.disaggregation.raiden.serde import (
     Blocks,
     Chunk,
@@ -584,8 +591,18 @@ class RaidenSenderMixin:
             if room in self._aborted:
                 return
             self._send_reads.setdefault(room, set()).add(req_id)
+            if is_profiler_enabled():
+                record_trace_meta_locked(self, req_id, uuid, len(block_ids))
         try:
-            accepted = bool(engine.register_read(req_id, uuid, block_ids))
+            with trace_transfer_span(
+                self,
+                "KV_Cache_Prefill_Register_Blocks",
+                room=room,
+                req_id=req_id,
+                uuid=uuid,
+                num_blocks=len(block_ids),
+            ):
+                accepted = bool(engine.register_read(req_id, uuid, block_ids))
         except Exception as exc:
             with self._state_lock:
                 self._discard_sender_read_locked(room, req_id)
@@ -611,6 +628,7 @@ class RaidenSenderMixin:
         )
 
     def _discard_sender_read_locked(self, room: int, req_id: str) -> None:
+        discard_trace_meta_locked(self, req_id)
         reads = self._send_reads.get(room)
         if reads is None:
             return
@@ -1164,7 +1182,15 @@ class RaidenSenderMixin:
                 dst_block_ids=decode_swa_blocks,
                 live_tokens=[self.kv_args.page_size] * n,
             )
-            engine.register_active_plan(room, req, is_sender=True)
+            with trace_transfer_span(
+                self,
+                "KV_Cache_Prefill_Register_Blocks",
+                room=room,
+                req_id=swa_req_id,
+                uuid=room,
+                num_blocks=len(swa_blocks),
+            ):
+                engine.register_active_plan(room, req, is_sender=True)
             host_blocks = engine.plan_host_blocks(room, swa_blocks)
             fut = engine.d2h(swa_blocks, host_blocks, [1] * len(swa_blocks))
             deadline = self._monotonic() + self._timeout_s
@@ -1189,6 +1215,16 @@ class RaidenSenderMixin:
                         layer_idx,
                         parallelism=self._transfer_parallelism,
                     )
+            with trace_transfer_span(
+                self,
+                "KV_Cache_Prefill_Send_Complete",
+                room=room,
+                req_id=swa_req_id,
+                uuid=room,
+                num_blocks=len(swa_blocks),
+                emit_blocks=False,
+            ):
+                pass
             # INFO, not debug: this is the only evidence the window actually
             # crossed. Everything else about a hybrid reshard looks identical
             # whether or not it did, and the integration test greps for it.
@@ -1338,7 +1374,15 @@ class RaidenSenderMixin:
         # receiver matches on src_block_id (the prefill device blocks it
         # learned via RESHARD_BLOCKS), which is unaffected by where the bytes
         # are staged.
-        engine.register_active_plan(uuid, req, is_sender=True)
+        with trace_transfer_span(
+            self,
+            "KV_Cache_Prefill_Register_Blocks",
+            room=room,
+            req_id=req_id,
+            uuid=uuid,
+            num_blocks=len(prefill_blocks),
+        ):
+            engine.register_active_plan(uuid, req, is_sender=True)
         fut = None
         try:
             host_blocks = engine.plan_host_blocks(uuid, prefill_blocks)
@@ -1374,6 +1418,16 @@ class RaidenSenderMixin:
                         layer_idx,
                         parallelism=self._transfer_parallelism,
                     )
+            with trace_transfer_span(
+                self,
+                "KV_Cache_Prefill_Send_Complete",
+                room=room,
+                req_id=req_id,
+                uuid=uuid,
+                num_blocks=len(prefill_blocks),
+                emit_blocks=False,
+            ):
+                pass
         finally:
             # Frees the plan's staging on the sender; the receiver's is freed
             # when its upload completes. A copy that timed out but is still

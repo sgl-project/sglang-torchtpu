@@ -21,7 +21,15 @@ from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVReceiver, KVTransferError
 from sglang.srt.environ import envs
 from sglang_tpu.disaggregation.raiden.chunk_plan import chunk_pull_window
-from sglang_tpu.disaggregation.raiden.common import _tcp_endpoint, logger
+from sglang_tpu.disaggregation.raiden.common import (
+    _tcp_endpoint,
+    discard_trace_meta_locked,
+    is_profiler_enabled,
+    logger,
+    record_trace_meta,
+    record_trace_meta_locked,
+    trace_transfer_span,
+)
 from sglang_tpu.disaggregation.raiden.serde import (
     Blocks,
     Chunk,
@@ -475,12 +483,22 @@ class RaidenReceiverMixin:
         keeps from being issued. They are settled here so the admission is
         released, and the room concludes once its other reads settle.
         """
+        record_trace_meta(self, req_id, uuid, len(local))
         try:
-            engine.start_read(req_id, uuid, endpoint, remote, local)
+            with trace_transfer_span(
+                self,
+                "KV_Cache_Decode_Submit_Load",
+                room=room,
+                req_id=req_id,
+                uuid=uuid,
+                num_blocks=len(local),
+            ):
+                engine.start_read(req_id, uuid, endpoint, remote, local)
         except Exception as e:
             reason = f"Raiden receive failed: start_read {req_id} raised: {e}"
             logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
             with self._state_lock:
+                discard_trace_meta_locked(self, req_id)
                 self._native_failed.update((req_id, *unissued))
                 self._fail_room_locked(room, reason)
                 self._release_pull_slots_locked()
@@ -1311,8 +1329,17 @@ class RaidenReceiverMixin:
         plan registered for a cleared room is dropped again.
         """
         engine = self._ensure_engine()
+        num_blocks = len(getattr(req, "dst_block_ids", ()))
         try:
-            engine.register_active_plan(uuid, req, is_sender=False)
+            with trace_transfer_span(
+                self,
+                "KV_Cache_Decode_Submit_Load",
+                room=room,
+                req_id=req_id,
+                uuid=uuid,
+                num_blocks=num_blocks,
+            ):
+                engine.register_active_plan(uuid, req, is_sender=False)
         except Exception as e:
             reason = f"Raiden receive failed: cannot stage plan {req_id}: {e}"
             logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
@@ -1332,6 +1359,8 @@ class RaidenReceiverMixin:
                 if record_read:
                     self._decode.chunk_reads.setdefault(room, []).append(req_id)
                 self._reshard_plans.setdefault(room, {})[req_id] = uuid
+                if is_profiler_enabled():
+                    record_trace_meta_locked(self, req_id, uuid, num_blocks)
                 # Sent under the lock: after a clear wins it, no push can be
                 # requested for the pages the room gave back.
                 for endpoint in ready_endpoints:
@@ -1397,12 +1426,13 @@ class RaidenReceiverMixin:
                 return False
             sources.append((p_rank, pages[-n:]))
 
+        swa_req_id = self._swa_req_id(room)
         try:
             geom = self._make_geometry(src_attn_tp, self.attn_tp_size, swa=True)
             req = build_receiver_request(
                 pb2,
                 uuid=room,
-                req_id=self._swa_req_id(room),
+                req_id=swa_req_id,
                 peer=self._swa_engine.transfer_address,
                 decode_rank=self.attn_tp_rank,
                 geom=geom,
@@ -1410,7 +1440,15 @@ class RaidenReceiverMixin:
                 dst_block_ids=local_swa_blocks,
                 live_tokens=[self.kv_args.page_size] * n,
             )
-            self._swa_engine.register_active_plan(room, req, is_sender=False)
+            with trace_transfer_span(
+                self,
+                "KV_Cache_Decode_Submit_Load",
+                room=room,
+                req_id=swa_req_id,
+                uuid=room,
+                num_blocks=len(local_swa_blocks),
+            ):
+                self._swa_engine.register_active_plan(room, req, is_sender=False)
         except Exception as e:
             reason = f"Raiden reshard SWA receive: cannot stage plan {room}: {e}"
             logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
@@ -1424,7 +1462,9 @@ class RaidenReceiverMixin:
                 # cannot be written under their next owner.
                 self._unregister_plan(room)
                 return False
-            self._reshard_plans.setdefault(room, {})[self._swa_req_id(room)] = room
+            self._reshard_plans.setdefault(room, {})[swa_req_id] = room
+            if is_profiler_enabled():
+                record_trace_meta_locked(self, swa_req_id, room, len(local_swa_blocks))
         # INFO for the same reason as the push: without it a skipped window and
         # a transferred one produce identical logs.
         logger.info(
