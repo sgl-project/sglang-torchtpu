@@ -88,6 +88,22 @@ def resolve_static_fp8_gmm2_scale(raw_scale: float | int | None) -> float:
     return val
 
 
+_VALID_W4A8_K_CHAINS = (512, 1024, 2048, 4096)
+
+
+def resolve_w4a8_k_chain(raw_k_chain: int | None) -> int:
+    """Validate ``SGLANG_TPU_MUSE_KERNEL_GMM_W4A8_K_CHAIN``."""
+    val = 0 if raw_k_chain is None else int(raw_k_chain)
+    if val == 0:
+        return 0
+    if val not in _VALID_W4A8_K_CHAINS:
+        raise ValueError(
+            "SGLANG_TPU_MUSE_KERNEL_GMM_W4A8_K_CHAIN must be 0 or one of "
+            f"{_VALID_W4A8_K_CHAINS}, got {val}"
+        )
+    return val
+
+
 # =============================================================================
 # Pure-NumPy Reference Models (for fast deterministic CPU numerical tests)
 # =============================================================================
@@ -760,6 +776,195 @@ def scoped_two_level_pow2_strip_acc(
     return acc_halves[0] if num_m_halves == 1 else jnp.concatenate(acc_halves, axis=0)
 
 
+def _scaled_fp8_pow2_col_scales(s_chk_f32: Any) -> tuple[Any, Any]:
+    """Normalize NVFP4 block scales by per-col max using exact ``64.0`` (``2^6``).
+
+    Since ``max(|E2M1|) == 6.0``, scaling by ``64.0 / max(|s|)`` guarantees every
+    rescaled FP8 weight stays within ``384.0 <= 448.0`` with zero clipping, zero
+    overflow, zero NaNs on dead/zero columns, and zero mantissa rounding loss on
+    the peak-scale block.
+    """
+    import jax.numpy as jnp
+
+    s_max = jnp.max(jnp.abs(s_chk_f32), axis=0, keepdims=True)
+    s_pos = s_max > jnp.float32(0.0)
+    s_safe = jnp.where(s_pos, s_max, jnp.float32(1.0))
+    inv_c = jnp.where(s_pos, jnp.float32(64.0) / s_safe, jnp.float32(0.0))
+    rel_bf16 = (s_chk_f32 * inv_c).astype(jnp.bfloat16)
+    col_c = s_max * jnp.float32(1.0 / 64.0)
+    return rel_bf16, col_c
+
+
+def _scoped_w4a8_kchain_strip_acc(
+    *,
+    w_weight_ref: Any,
+    w_scale_ref: Any,
+    start_n: int,
+    col_size: int,
+    tile_m: int,
+    tile_k: int,
+    q_block_size: int,
+    rhs_qbs: int,
+    packing: int,
+    rhs_quant_dtype: Any,
+    lhs_quant_dtype: Any,
+    acc_dtype: Any,
+    quant_otf: bool,
+    otf_inv_scale_bf16: Any,
+    lhs_2d_vmem_ref: Any,
+    prequant_lhs_fp8_ref: Any,
+    prequant_lhs_3d_fp8_ref: Any,
+    has_prequant_lhs: bool,
+    hoisted_lq_blocks: list[Any],
+    load_lhs_scale_strip_fn: Any,
+    eff_kc: int,
+    skip_lhs_scale_mul: bool,
+) -> Any:
+    """K-chained Scaled-FP8 strip matmul over unmodified compact NVFP4 weights."""
+    import jax.experimental.pallas as pl
+    import jax.numpy as jnp
+    from jax.experimental.pallas import tpu as pltpu
+
+    m_step = 128 if (tile_m >= 256 and tile_m % 128 == 0) else tile_m
+    num_m_halves = tile_m // m_step
+    num_r_blocks = tile_k // rhs_qbs
+    scale_is_2d = len(w_scale_ref.shape) == 2
+    s_all_f32 = (
+        w_scale_ref[:, pl.ds(start_n, col_size)].astype(jnp.float32)
+        if scale_is_2d
+        else w_scale_ref[:, :, pl.ds(start_n, col_size)]
+        .reshape(num_r_blocks, col_size)
+        .astype(jnp.float32)
+    )
+
+    def _unpack_scaled_fp8_block(rk0: int, rel_row_bf16: Any) -> Any:
+        parts: list[Any] = []
+        for sub_k in range(0, rhs_qbs, 128):
+            raw_h = w_weight_ref[
+                pl.ds((rk0 + sub_k) // packing, 128 // packing),
+                pl.ds(start_n, col_size),
+            ]
+            w_h = pltpu.bitcast(raw_h, rhs_quant_dtype).astype(jnp.bfloat16)
+            parts.append((w_h * rel_row_bf16).astype(jnp.float8_e4m3fn))
+        return parts[0] if len(parts) == 1 else jnp.concatenate(parts, axis=0)
+
+    def _read_kchain_lhs(
+        lhs_full_blk: Any, l_bid: int, l_k0: int, m0: int, rk0: int
+    ) -> Any:
+        if lhs_full_blk is not None:
+            return lhs_full_blk[m0 : m0 + m_step, :]
+        if has_prequant_lhs or quant_otf:
+            return _slice_pq_lhs_sub(
+                prequant_lhs_fp8_ref,
+                prequant_lhs_3d_fp8_ref,
+                m0,
+                m_step,
+                rk0,
+                rhs_qbs,
+            )
+        return hoisted_lq_blocks[l_bid][
+            m0 : m0 + m_step, rk0 - l_k0 : rk0 + rhs_qbs - l_k0
+        ]
+
+    # Single-chunk hot path (e.g. eff_kc == tile_k == 4096 with skip_lhs_scale_mul or
+    # q_block_size >= tile_k): mh-inner unpacks each 256-K weight block once (sub_k=128 -> <=58 VREGs).
+    if eff_kc == tile_k and (skip_lhs_scale_mul or q_block_size >= tile_k):
+        rel_bf16, col_c = _scaled_fp8_pow2_col_scales(s_all_f32)
+        col_c_acc = col_c.astype(acc_dtype)
+        acc_halves: list[Any] = [None] * num_m_halves
+        for rk0 in range(0, tile_k, rhs_qbs):
+            r_bid = rk0 // rhs_qbs
+            w_fp8 = _unpack_scaled_fp8_block(rk0, rel_bf16[r_bid : r_bid + 1, :])
+            if quant_otf:
+                lhs_full_blk = (
+                    lhs_2d_vmem_ref[:, rk0 : rk0 + rhs_qbs].astype(jnp.bfloat16)
+                    * otf_inv_scale_bf16
+                ).astype(lhs_quant_dtype)
+                prequant_lhs_fp8_ref[:, rk0 : rk0 + rhs_qbs] = lhs_full_blk
+            else:
+                lhs_full_blk = None
+            for mh in range(num_m_halves):
+                m0 = mh * m_step
+                lhs_sub = _read_kchain_lhs(lhs_full_blk, 0, 0, m0, rk0)
+                p = jnp.matmul(lhs_sub, w_fp8, preferred_element_type=jnp.float32)
+                acc_halves[mh] = p if acc_halves[mh] is None else acc_halves[mh] + p
+        if skip_lhs_scale_mul:
+            for mh in range(num_m_halves):
+                acc_halves[mh] = acc_halves[mh].astype(acc_dtype) * col_c_acc
+        else:
+            lhs_s_full = load_lhs_scale_strip_fn(0, col_size)
+            for mh in range(num_m_halves):
+                m0 = mh * m_step
+                m1 = m0 + m_step
+                acc_halves[mh] = acc_halves[mh].astype(acc_dtype) * (
+                    lhs_s_full[m0:m1, :] * col_c_acc
+                )
+        return (
+            acc_halves[0]
+            if num_m_halves == 1
+            else jnp.concatenate(acc_halves, axis=0)
+        )
+
+    # Multi-chunk or per-l_bid LHS-scale path: run mh-outer so only <=58 VREGs are live.
+    if quant_otf:
+        for qk0 in range(0, tile_k, 256):
+            qk_len = min(256, tile_k - qk0)
+            prequant_lhs_fp8_ref[pl.ds(0, tile_m), pl.ds(qk0, qk_len)] = (
+                lhs_2d_vmem_ref[pl.ds(0, tile_m), pl.ds(qk0, qk_len)].astype(
+                    jnp.bfloat16
+                )
+                * otf_inv_scale_bf16
+            ).astype(lhs_quant_dtype)
+
+    outer_k_step = tile_k if skip_lhs_scale_mul else q_block_size
+    bpc = eff_kc // rhs_qbs
+    acc_out_halves: list[Any] = []
+    for mh in range(num_m_halves):
+        m0 = mh * m_step
+        m1 = m0 + m_step
+        acc_h = None
+        for l_k0 in range(0, tile_k, outer_k_step):
+            l_k1 = min(tile_k, l_k0 + outer_k_step)
+            l_bid = l_k0 // q_block_size
+            single_span_chunk = (l_k1 - l_k0) == eff_kc
+            span_h = None
+            for ck0 in range(l_k0, l_k1, eff_kc):
+                ck1 = ck0 + eff_kc
+                b0 = ck0 // rhs_qbs
+                rel_bf16, col_c = _scaled_fp8_pow2_col_scales(
+                    s_all_f32[b0 : b0 + bpc, :]
+                )
+                col_c_acc = col_c.astype(acc_dtype)
+                sub_f32 = None
+                for rk0 in range(ck0, ck1, rhs_qbs):
+                    r_local = (rk0 - ck0) // rhs_qbs
+                    w_fp8 = _unpack_scaled_fp8_block(
+                        rk0, rel_bf16[r_local : r_local + 1, :]
+                    )
+                    lhs_sub = _read_kchain_lhs(None, l_bid, l_k0, m0, rk0)
+                    p = jnp.matmul(lhs_sub, w_fp8, preferred_element_type=jnp.float32)
+                    sub_f32 = p if sub_f32 is None else sub_f32 + p
+                if not skip_lhs_scale_mul and single_span_chunk:
+                    lhs_s_full = load_lhs_scale_strip_fn(l_bid, col_size)
+                    term = sub_f32.astype(acc_dtype) * (lhs_s_full[m0:m1, :] * col_c_acc)
+                    acc_h = term if acc_h is None else acc_h + term
+                else:
+                    scaled_sub = sub_f32.astype(acc_dtype) * col_c_acc
+                    span_h = scaled_sub if span_h is None else span_h + scaled_sub
+            if skip_lhs_scale_mul:
+                acc_h = span_h if acc_h is None else acc_h + span_h
+            elif not single_span_chunk:
+                lhs_s_full = load_lhs_scale_strip_fn(l_bid, col_size)
+                term = span_h * lhs_s_full[m0:m1, :]
+                acc_h = term if acc_h is None else acc_h + term
+        acc_out_halves.append(acc_h)
+    return (
+        acc_out_halves[0]
+        if num_m_halves == 1
+        else jnp.concatenate(acc_out_halves, axis=0)
+    )
+
+
 def scoped_w4a8_strip_acc(
     *,
     w_weight_ref: Any,
@@ -791,6 +996,7 @@ def scoped_w4a8_strip_acc(
     prequant_lhs_scale_ref: Any = None,
     pair_k512_unpack: bool = False,
     skip_lhs_scale_mul: bool = False,
+    k_chain: int = 0,
 ):
     """Scoped VMEM W4A8 strip matmul (`GMM_SCOPED_W4A8` modes 1, 2, 3).
 
@@ -830,6 +1036,53 @@ def scoped_w4a8_strip_acc(
         and (num_r_blocks % 8 == 0)
         and (w_scale_ref.shape[0] == num_r_blocks)
     )
+    _use_w_cache = w_fp8_cache_ref is not None and (
+        not isinstance(start_n, int) or start_n + col_size <= w_fp8_cache_ref.shape[-1]
+    )
+    _k_chain = resolve_w4a8_k_chain(k_chain)
+    _eff_kc = (
+        min(_k_chain, tile_k)
+        if skip_lhs_scale_mul
+        else min(_k_chain, tile_k, q_block_size)
+    )
+    if (
+        _eff_kc > rhs_qbs
+        and can_hoist_rs
+        and not _use_w_cache
+        and packing == 8
+        and rhs_quant_dtype == jnp.float4_e2m1fn
+        and rhs_qbs >= 256
+        and rhs_qbs % 128 == 0
+        and tile_k % _eff_kc == 0
+        and _eff_kc % rhs_qbs == 0
+        and (skip_lhs_scale_mul or q_block_size % _eff_kc == 0)
+        and (has_prequant_lhs or quant_otf or bool(hoisted_lq_blocks))
+    ):
+        return _scoped_w4a8_kchain_strip_acc(
+            w_weight_ref=w_weight_ref,
+            w_scale_ref=w_scale_ref,
+            start_n=start_n,
+            col_size=col_size,
+            tile_m=tile_m,
+            tile_k=tile_k,
+            q_block_size=q_block_size,
+            rhs_qbs=rhs_qbs,
+            packing=packing,
+            rhs_quant_dtype=rhs_quant_dtype,
+            lhs_quant_dtype=lhs_quant_dtype,
+            acc_dtype=acc_dtype,
+            quant_otf=quant_otf,
+            otf_inv_scale_bf16=otf_inv_scale_bf16,
+            lhs_2d_vmem_ref=lhs_2d_vmem_ref,
+            prequant_lhs_fp8_ref=prequant_lhs_fp8_ref,
+            prequant_lhs_3d_fp8_ref=prequant_lhs_3d_fp8_ref,
+            has_prequant_lhs=has_prequant_lhs,
+            hoisted_lq_blocks=hoisted_lq_blocks,
+            load_lhs_scale_strip_fn=load_lhs_scale_strip_fn,
+            eff_kc=_eff_kc,
+            skip_lhs_scale_mul=skip_lhs_scale_mul,
+        )
+
     if can_hoist_rs:
         hoisted_rhs_s_bf16 = (
             w_scale_ref[:, pl.ds(start_n, col_size)].astype(jnp.bfloat16)
@@ -840,10 +1093,6 @@ def scoped_w4a8_strip_acc(
         )
     else:
         hoisted_rhs_s_bf16 = None
-
-    _use_w_cache = w_fp8_cache_ref is not None and (
-        not isinstance(start_n, int) or start_n + col_size <= w_fp8_cache_ref.shape[-1]
-    )
 
     def _load_w_slice_fp8(k0: int, k_len: int):
         if _use_w_cache:
@@ -1100,6 +1349,7 @@ def scoped_w4a8_dual_strip_acc(
     hoist_rhs_scale: bool = False,
     prequant_lhs_3d_fp8_ref: Any = None,
     skip_lhs_scale_mul: bool = False,
+    k_chain: int = 0,
 ):
     """Scoped VMEM dual gate+up strip matmul (`GMM_SCOPED_W4A8` modes 1..5)."""
     import jax.experimental.pallas as pl
@@ -1134,6 +1384,7 @@ def scoped_w4a8_dual_strip_acc(
             mh_outer=_dual_mh_outer,
             hoist_rhs_scale=hoist_rhs_scale,
             skip_lhs_scale_mul=skip_lhs_scale_mul,
+            k_chain=k_chain,
         )
         acc_u = scoped_w4a8_strip_acc(
             w_weight_ref=w_weight_ref,
@@ -1161,6 +1412,7 @@ def scoped_w4a8_dual_strip_acc(
             mh_outer=_dual_mh_outer,
             hoist_rhs_scale=hoist_rhs_scale,
             skip_lhs_scale_mul=skip_lhs_scale_mul,
+            k_chain=k_chain,
         )
         return acc_g, acc_u
 

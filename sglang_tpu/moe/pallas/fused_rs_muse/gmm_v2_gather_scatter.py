@@ -460,6 +460,13 @@ def inner_kernel(
             if cfgs.dims.size_m > 4096
             else 0
         )
+        w4a8_k_chain = 0
+        if cfgs.dims.size_m > 4096:
+            from .prefill_gmm_opts import resolve_w4a8_k_chain
+
+            w4a8_k_chain = resolve_w4a8_k_chain(
+                envs.SGLANG_TPU_MUSE_KERNEL_GMM_W4A8_K_CHAIN.get()
+            )
         eo_fp8_mode = (
             int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_EXPERT_OUTER_FP8.get() or 0)
             if cfgs.dims.size_m > 4096
@@ -480,6 +487,7 @@ def inner_kernel(
                 envs.SGLANG_TPU_MUSE_KERNEL_FP4_LHS_QBS.get() > 0
                 or fp4_acc_mode > 0
                 or envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_STRIP_N.get() > 0
+                or w4a8_k_chain > 0
             )
         )
         _has_ext_pq_lhs_3d = prequant_lhs_3d_fp8_ref is not None
@@ -1142,6 +1150,7 @@ def inner_kernel(
                         prequant_lhs_scale_ref=prequant_lhs_scale_ref,
                         pair_k512_unpack=(scoped_w4a8_mode == 7),
                         skip_lhs_scale_mul=_skip_lhs_sc,
+                        k_chain=w4a8_k_chain,
                     )
                 if use_scoped_w4a8_refs:
                     if _two_level_pow2 >= 1:
@@ -1554,6 +1563,7 @@ def inner_kernel(
                         mh_outer=scoped_w4a8_mode in (3, 4, 5, 6),
                         hoist_rhs_scale=scoped_w4a8_mode >= 4,
                         skip_lhs_scale_mul=_skip_lhs_sc,
+                        k_chain=w4a8_k_chain,
                     )
                 col_size = g_e - g_s
                 use_bf16_inner = fp4_acc_mode == 3

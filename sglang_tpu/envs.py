@@ -1507,6 +1507,10 @@ class TpuEnvs:
     # 3 = 2 + mh_outer<=48-VREG zero-spill tiling + 32-row K-half flq LHS quant (0 FP8 VMEM RMW);
     # 8 = 1 + hoist_rhs_scale=True + K-half quantize_3d_lhs_tile_to_fp8 (m_step=256, smaller IMEM).
     SGLANG_TPU_MUSE_KERNEL_GMM_SCOPED_W4A8 = EnvInt(0)
+    # Wave-14 prefill gmm_v2_fused_rs K-chained Scaled-FP8 inside scoped W4A8 strip matmul
+    # (0 = off; 512/1024/2048/4096 = fold block-256 NVFP4 scales into FP8 via exact 64*s/s_max
+    # on unmodified HBM weights and chain MXU f32 accumulators across K_chain before 1x VPU scale).
+    SGLANG_TPU_MUSE_KERNEL_GMM_W4A8_K_CHAIN = EnvInt(0)
     # Wave-8 prefill gmm_v2_fused_rs expert-outer Scaled-FP8 expansion:
     # 0 = off; 1 = per-strip FP4->Scaled-FP8 VMEM expansion + zero-spill k_chunk=256 FP8 MXU dot
     # in m_sub=128 sub-tiles (0 inner-K VPU scale muls); 2 = pair-batched (2 consecutive same-expert
