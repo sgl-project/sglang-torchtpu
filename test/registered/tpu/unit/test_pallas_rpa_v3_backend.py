@@ -350,7 +350,11 @@ class TestSharedPrefixDecodeMetadata(CustomTestCase):
         self.assertEqual(shared_decode_distribution(pages, lengths, 15, 128)[3], 112)
         pages[14, 11] += 1
         self.assertIsNone(shared_decode_distribution(pages, lengths, 15, 128))
-        self.assertIsNone(shared_decode_distribution(pages, lengths, 7, 128))
+        self.assertEqual(
+            shared_decode_distribution(pages, lengths, 7, 128).tolist(),
+            [7, 7, 7, 160],
+        )
+        self.assertIsNone(shared_decode_distribution(pages, lengths, 1, 128))
 
     def test_multiple_groups_and_a_short_active_tail(self):
         from sglang_tpu.attention_shared_prefix import shared_decode_distribution
@@ -360,7 +364,9 @@ class TestSharedPrefixDecodeMetadata(CustomTestCase):
         lengths = torch.full((48,), 160 * page_size + 1)
         page_ids[19, 120] += 1
         plan = shared_decode_distribution(page_ids.numpy(), lengths, 34, page_size)
-        self.assertEqual(plan.tolist(), [34, 34, 34, 160, 112, 0])
+        self.assertEqual(plan.tolist(), [34, 34, 34, 160, 112, 160])
+        plan_tail1 = shared_decode_distribution(page_ids.numpy(), lengths, 33, page_size)
+        self.assertEqual(plan_tail1.tolist(), [33, 33, 33, 160, 112, 0])
         # Too little physical sharing to amortize grouped private tails.
         page_ids[3, 0] += 1
         self.assertIsNone(
@@ -404,6 +410,130 @@ class TestSharedPrefixDecodeMetadata(CustomTestCase):
             lens[0] = 91 * page_size + 1
             third = _build_meta(backend, fb)
             self.assertEqual(third.full_decode_distribution.tolist(), [16, 16, 16, 80])
+
+    def test_live_2_to_7_shared_prefix_distribution_and_interpret_parity(self):
+        import jax
+        import jax.numpy as jnp
+        import numpy as np
+        from jax.experimental.pallas import tpu as pltpu
+
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
+            run_decode_fast_rpa,
+        )
+        from sglang_tpu.attention_shared_prefix import shared_decode_distribution
+
+        # 1. Distribution & backend metadata for padded bs=8 with live in 1..7.
+        rows, width, page_size = 8, 160, 256
+        req = torch.arange(width * page_size).expand(rows, -1).clone()
+        pages_np = (req[:, ::page_size] // page_size).numpy().astype(np.int32)
+        pages_np[:, 132:] += np.arange(rows, dtype=np.int32)[:, None] * 100
+        lens_np = np.full((rows,), 140 * page_size + 7, dtype=np.int32)
+        self.assertIsNone(
+            shared_decode_distribution(pages_np, lens_np, 1, page_size, group_size=8)
+        )
+        for live in (2, 5, 7):
+            plan = shared_decode_distribution(
+                pages_np, lens_np, live, page_size, group_size=8
+            )
+            self.assertIsNotNone(plan)
+            self.assertEqual(plan.tolist(), [live, live, live, 128])
+        # Insufficient sharing (<50% at live=2) returns None cleanly.
+        low_pages = pages_np.copy()
+        low_pages[1, 10:] += 1000
+        self.assertIsNone(
+            shared_decode_distribution(low_pages, lens_np, 2, page_size, group_size=8)
+        )
+
+        backend = _BackendUnderTest(page_size, req)
+        lens_partial = torch.tensor(
+            [128 * page_size + 1] * 5 + [0, 0, 0], dtype=torch.int32
+        )
+        fb = _make_forward_batch(
+            lens_partial, torch.arange(rows), ForwardMode.DECODE, seq_lens_cpu=lens_partial
+        )
+        with (
+            patch(
+                "sglang_tpu.attention_pallas_rpa_base.get_parallel",
+                return_value=types.SimpleNamespace(attn_dp_size=1),
+            ),
+            envs.SGLANG_TPU_RPA_V3_DECODE_FAST.override("shared64"),
+            envs.SGLANG_TPU_RPA_V3_SKIP_EMPTY_MIXED.override(True),
+            envs.SGLANG_TPU_RPA_SHARED_BS8.override(True),
+        ):
+            meta = backend.forward_metadata = _build_meta(backend, fb)
+            self.assertIsNotNone(meta.full_decode_distribution)
+            self.assertEqual(meta.full_decode_distribution.tolist(), [5, 5, 5, 128])
+
+        # 2. Eager race/NaN InterpretParams parity on live=2 & live=5 (bs=8, DENSE2 & BD4).
+        rng = np.random.default_rng(20262307)
+        ip_race = pltpu.InterpretParams(
+            dma_execution_mode="eager",
+            detect_races=True,
+            uninitialized_memory="nan",
+        )
+        for use_bd4, live in ((False, 2), (True, 5)):
+            with self.subTest(use_bd4=use_bd4, live=live):
+                ps = 512
+                sh_pgs = 4
+                pps = 6
+                phys_rows = 128 if use_bd4 else 256
+                nb = rows * pps + 8
+                pg_mat = np.zeros((rows, pps), dtype=np.int32)
+                pg_mat[:, :sh_pgs] = np.arange(sh_pgs, dtype=np.int32)
+                nxt = sh_pgs
+                for i in range(rows):
+                    pg_mat[i, sh_pgs:] = nxt + np.arange(pps - sh_pgs, dtype=np.int32)
+                    nxt += pps - sh_pgs
+
+                kv_u8 = np.full((nb, phys_rows, 1, 4, 128), 0x7F, dtype=np.uint8)
+                kv_u8[: nxt + 2, :, 0, :, :] = rng.integers(
+                    0x30, 0x3D, size=(nxt + 2, phys_rows, 4, 128), dtype=np.uint8
+                )
+                cache = jax.lax.bitcast_convert_type(
+                    jnp.asarray(kv_u8, dtype=jnp.uint8), jnp.float8_e4m3fn
+                )
+                q_heads = 8 if use_bd4 else 16
+                gate_cols = 512 if use_bd4 else 1024
+                kv_lens_arr = np.zeros((rows,), dtype=np.int32)
+                kv_lens_arr[:live] = sh_pgs * ps + 19 + np.arange(live, dtype=np.int32) * 17
+                q = jnp.asarray((rng.standard_normal((rows, q_heads, 128)) * 0.25).astype(np.float32), jnp.bfloat16)
+                k_new = jax.lax.bitcast_convert_type(
+                    jnp.asarray(rng.integers(0x30, 0x3D, size=(rows, 1, 128), dtype=np.uint8), jnp.uint8),
+                    jnp.float8_e4m3fn,
+                )
+                v_new = jax.lax.bitcast_convert_type(
+                    jnp.asarray(rng.integers(0x30, 0x3D, size=(rows, 1, 128), dtype=np.uint8), jnp.uint8),
+                    jnp.float8_e4m3fn,
+                )
+                gate = jnp.asarray((rng.standard_normal((rows, gate_cols)) * 0.25).astype(np.float32), jnp.bfloat16)
+                cu_q = jnp.arange(rows + 1, dtype=jnp.int32)
+                cu_kv = jnp.arange(rows + 1, dtype=jnp.int32) * (pps * ps)
+
+                ref_out, ref_kv = run_decode_fast_rpa(
+                    q, k_new, v_new, cache, jnp.asarray(kv_lens_arr), jnp.asarray(pg_mat.reshape(-1)),
+                    cu_q, cu_kv, jnp.asarray([live, live, live], dtype=jnp.int32),
+                    sm_scale=0.125, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                    mode_str="w8,s4,ring4k,c2048", decode_query_size=1, fused_out_pack=2,
+                    gate=gate, out_norm_eps=1e-5, kv_pack_dense2=(not use_bd4), kv_pack_bd4=use_bd4,
+                    interpret=True,
+                )
+                sh_out, sh_kv = run_decode_fast_rpa(
+                    q, k_new, v_new, cache, jnp.asarray(kv_lens_arr), jnp.asarray(pg_mat.reshape(-1)),
+                    cu_q, cu_kv, jnp.asarray([live, live, live], dtype=jnp.int32),
+                    sm_scale=0.125, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                    mode_str="w8,s4,c2048,shared8,coal,noz,pbf16,q512,shfp8,foldcol",
+                    decode_query_size=1, fused_out_pack=2,
+                    gate=gate, out_norm_eps=1e-5, kv_pack_dense2=(not use_bd4), kv_pack_bd4=use_bd4,
+                    shared_pages=jnp.asarray([sh_pgs], dtype=jnp.int32), interpret=ip_race,
+                )
+                a = np.asarray(ref_out[:live], dtype=np.float64).ravel()
+                b = np.asarray(sh_out[:live], dtype=np.float64).ravel()
+                cos = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
+                self.assertGreater(cos, 0.9999)
+                self.assertEqual(np.asarray(sh_out[live:], dtype=np.float32).max(), 0.0)
+                self.assertTrue(
+                    np.array_equal(np.asarray(ref_kv).view(np.uint8), np.asarray(sh_kv).view(np.uint8))
+                )
 
 
 class TestPallasRpaV3MetadataExtend(CustomTestCase):

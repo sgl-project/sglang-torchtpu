@@ -1095,7 +1095,7 @@ class TpuEnvs:
     SGLANG_TPU_RPA_V3_DECODE_ADAPTIVE = EnvBool(False)
     # Unlock shared-prefix decode batches down to bs=8 (group_size=8 -> 128-row
     # MXU tile) for Long-Context c=8 workloads.
-    SGLANG_TPU_RPA_SHARED_BS8 = EnvBool(False)
+    SGLANG_TPU_RPA_SHARED_BS8 = EnvBool(True)
     # Optional RPAd_fast / RPAm diagnostic probe mode ("", "dense_kv", "nodma", "nocompute", "nokvwrite").
     SGLANG_TPU_RPA_V3_DECODE_PROBE = EnvStr("")
     # Wave-7 RPAm Stationary-Q prefill options (comma/underscore tokens: fp8_kv, fp8_qk,

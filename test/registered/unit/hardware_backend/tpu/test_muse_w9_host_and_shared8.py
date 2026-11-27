@@ -54,7 +54,7 @@ def test_w9_syntax_and_default_off_flags():
         py_compile.compile(rel, doraise=True)
 
     assert tpu_envs.SGLANG_TPU_DECODE_FAST_HOST.get() is False
-    assert tpu_envs.SGLANG_TPU_RPA_SHARED_BS8.get() is False
+    assert tpu_envs.SGLANG_TPU_RPA_SHARED_BS8.get() is True
 
 
 def test_shared8_gating_and_distribution():
@@ -94,9 +94,14 @@ def test_shared8_gating_and_distribution():
             SGLANG_TPU_RPA_V3_SKIP_EMPTY_MIXED="1",
         ),
     ):
-        assert backend.shared_decode_group_size(8) == 0
-        assert backend.supports_shared_decode_batch(8) is False
+        assert backend.shared_decode_group_size(8) == 8
+        assert backend.supports_shared_decode_batch(8) is True
         assert backend.supports_shared_decode_batch(16) is True
+
+        with _temp_env(SGLANG_TPU_RPA_SHARED_BS8="0"):
+            assert backend.shared_decode_group_size(8) == 0
+            assert backend.supports_shared_decode_batch(8) is False
+            assert backend.supports_shared_decode_batch(16) is True
 
         with _temp_env(SGLANG_TPU_RPA_SHARED_BS8="1"):
             assert backend.shared_decode_group_size(4) == 0
