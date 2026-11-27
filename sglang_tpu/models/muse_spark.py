@@ -7305,7 +7305,7 @@ class MuseSparkForConditionalGeneration(nn.Module):
             and emb_w is not None
             and emb_w.ndim == 2
             and emb_w.shape[0] >= 16
-            and emb_w.shape[0] % 8 == 0
+            and emb_w.shape[0] % 2 == 0
             and emb_w.shape[1] % 512 == 0
             and emb_w.dtype == torch.bfloat16
             and emb_si.num_added_elements_padded == 0

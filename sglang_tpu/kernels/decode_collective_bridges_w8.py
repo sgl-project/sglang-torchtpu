@@ -1278,7 +1278,12 @@ def _lookup_local_vocab_rows_in_kernel(
     me,
     actual_rows: int,
 ) -> None:
-    """T(16, 128)-aligned owner-only HBM vocab gather inside Pallas (fixes #1494 & #1531 e2003!)."""
+    """Owner-only HBM vocab gather inside Pallas supporting ``v_shard % 2 == 0`` & skipping empty 16-row groups.
+
+    Uses ``tail_r0 = v_shard & ~7`` so ``tail_len = v_shard - tail_r0`` is strictly in ``{0, 2, 4, 6}``
+    (never 8, which stalls TPU7x DMA, while avoiding tail-8 zeroing on ``v_shard % 8 == 0``) with
+    ``pl.ds(kk * 16, ...)`` 16-row VMEM slot alignment and ``pl.multiple_of(..., 8)`` HBM alignment.
+    """
     import jax.numpy as jnp
     from jax import lax
     from jax.experimental import pallas as pl
@@ -1288,68 +1293,139 @@ def _lookup_local_vocab_rows_in_kernel(
     v_shard, hidden = embed_hbm.shape
     v_start = me * jnp.int32(v_shard)
     v_end = v_start + jnp.int32(v_shard)
-    max_r0 = jnp.int32((v_shard - 16) & ~15)
+    tail_r0 = v_shard & ~7
+    tail_len = v_shard - tail_r0
+    max_r0 = tail_r0 - 16
     row_iota_16 = lax.broadcasted_iota(jnp.int32, (16, _COL_STRIP), 0)
 
     def _grp_body(g0):
-        for k in range(16):
-            valid_k = (g0 + k) < actual_rows
-            safe_idx = jnp.minimum(g0 + k, actual_rows - 1)
-            tid = input_ids_smem[safe_idx]
-            in_r = valid_k & (tid >= v_start) & (tid < v_end)
-            loc_id = jnp.where(in_r, tid - v_start, jnp.int32(0))
-            b_r0 = pl.multiple_of(
-                jnp.minimum((loc_id >> jnp.int32(4)) << jnp.int32(4), max_r0), 16
-            )
-            lax.cond(
-                in_r,
-                lambda br=b_r0, kk=k: pltpu.make_async_copy(
-                    embed_hbm.at[pl.ds(br, 16), :],
-                    slot_2d_buf.at[pl.ds(kk * 16, 16), :],
-                    row_sems.at[kk],
-                ).start(),
-                lambda: None,
+        def _zero_grp():
+            _fori_strips(
+                hidden,
+                _COL_STRIP,
+                lambda c0: partial_emb_buf.__setitem__(
+                    (pl.ds(g0, 16), pl.ds(c0, _COL_STRIP)),
+                    jnp.zeros((16, _COL_STRIP), dtype=jnp.bfloat16),
+                ),
             )
 
-        for k in range(16):
-            valid_k = (g0 + k) < actual_rows
-            safe_idx = jnp.minimum(g0 + k, actual_rows - 1)
-            tid = input_ids_smem[safe_idx]
-            in_r = valid_k & (tid >= v_start) & (tid < v_end)
-            lax.cond(
-                in_r,
-                lambda kk=k: pltpu.make_async_copy(
-                    slot_2d_buf.at[pl.ds(kk * 16, 16), :],
-                    slot_2d_buf.at[pl.ds(kk * 16, 16), :],
-                    row_sems.at[kk],
-                ).wait(),
-                lambda: None,
-            )
-
-        def _col_body(c0):
-            c_sl = pl.ds(c0, _COL_STRIP)
-            acc = jnp.zeros((16, _COL_STRIP), dtype=jnp.float32)
+        def _run_grp():
             for k in range(16):
                 valid_k = (g0 + k) < actual_rows
                 safe_idx = jnp.minimum(g0 + k, actual_rows - 1)
                 tid = input_ids_smem[safe_idx]
                 in_r = valid_k & (tid >= v_start) & (tid < v_end)
                 loc_id = jnp.where(in_r, tid - v_start, jnp.int32(0))
-                b_r0 = jnp.minimum((loc_id >> jnp.int32(4)) << jnp.int32(4), max_r0)
-                sub_r = loc_id - b_r0
-                blk = slot_2d_buf[pl.ds(k * 16, 16), c_sl].astype(jnp.float32)
-                row_b = jnp.broadcast_to(
-                    jnp.sum(
-                        jnp.where(row_iota_16 == sub_r, blk, 0.0),
-                        axis=0,
-                        keepdims=True,
-                    ),
-                    (16, _COL_STRIP),
-                )
-                acc = jnp.where((row_iota_16 == k) & in_r, row_b, acc)
-            partial_emb_buf[pl.ds(g0, 16), c_sl] = acc.astype(jnp.bfloat16)
+                if tail_len == 0:
+                    b_r0 = pl.multiple_of(
+                        jnp.minimum((loc_id >> jnp.int32(4)) << jnp.int32(4), max_r0), 8
+                    )
+                    lax.cond(
+                        in_r,
+                        lambda br=b_r0, kk=k: pltpu.make_async_copy(
+                            embed_hbm.at[pl.ds(br, 16), :],
+                            slot_2d_buf.at[pl.ds(kk * 16, 16), :],
+                            row_sems.at[kk],
+                        ).start(),
+                        lambda: None,
+                    )
+                else:
 
-        _fori_strips(hidden, _COL_STRIP, _col_body)
+                    def _issue(lid=loc_id, kk=k):
+                        in_tail = lid >= jnp.int32(tail_r0)
+
+                        def _t():
+                            pltpu.make_async_copy(
+                                embed_hbm.at[pl.ds(tail_r0, tail_len), :],
+                                slot_2d_buf.at[pl.ds(kk * 16, tail_len), :],
+                                row_sems.at[kk],
+                            ).start()
+
+                        def _b():
+                            br = pl.multiple_of(
+                                jnp.minimum((lid >> jnp.int32(4)) << jnp.int32(4), max_r0), 8
+                            )
+                            pltpu.make_async_copy(
+                                embed_hbm.at[pl.ds(br, 16), :],
+                                slot_2d_buf.at[pl.ds(kk * 16, 16), :],
+                                row_sems.at[kk],
+                            ).start()
+
+                        lax.cond(in_tail, _t, _b)
+
+                    lax.cond(in_r, _issue, lambda: None)
+
+            for k in range(16):
+                valid_k = (g0 + k) < actual_rows
+                safe_idx = jnp.minimum(g0 + k, actual_rows - 1)
+                tid = input_ids_smem[safe_idx]
+                in_r = valid_k & (tid >= v_start) & (tid < v_end)
+                if tail_len == 0:
+                    lax.cond(
+                        in_r,
+                        lambda kk=k: pltpu.make_async_copy(
+                            slot_2d_buf.at[pl.ds(kk * 16, 16), :],
+                            slot_2d_buf.at[pl.ds(kk * 16, 16), :],
+                            row_sems.at[kk],
+                        ).wait(),
+                        lambda: None,
+                    )
+                else:
+                    loc_id = jnp.where(in_r, tid - v_start, jnp.int32(0))
+
+                    def _wait_k(lid=loc_id, kk=k):
+                        in_tail = lid >= jnp.int32(tail_r0)
+                        lax.cond(
+                            in_tail,
+                            lambda: pltpu.make_async_copy(
+                                slot_2d_buf.at[pl.ds(kk * 16, tail_len), :],
+                                slot_2d_buf.at[pl.ds(kk * 16, tail_len), :],
+                                row_sems.at[kk],
+                            ).wait(),
+                            lambda: pltpu.make_async_copy(
+                                slot_2d_buf.at[pl.ds(kk * 16, 16), :],
+                                slot_2d_buf.at[pl.ds(kk * 16, 16), :],
+                                row_sems.at[kk],
+                            ).wait(),
+                        )
+
+                    lax.cond(in_r, _wait_k, lambda: None)
+
+            def _col_body(c0):
+                c_sl = pl.ds(c0, _COL_STRIP)
+                acc = jnp.zeros((16, _COL_STRIP), dtype=jnp.float32)
+                for k in range(16):
+                    valid_k = (g0 + k) < actual_rows
+                    safe_idx = jnp.minimum(g0 + k, actual_rows - 1)
+                    tid = input_ids_smem[safe_idx]
+                    in_r = valid_k & (tid >= v_start) & (tid < v_end)
+                    loc_id = jnp.where(in_r, tid - v_start, jnp.int32(0))
+                    eff_r0 = jnp.where(
+                        (loc_id >= jnp.int32(tail_r0)) if tail_len != 0 else jnp.bool_(False),
+                        jnp.int32(tail_r0),
+                        jnp.minimum((loc_id >> jnp.int32(4)) << jnp.int32(4), jnp.int32(max_r0)),
+                    )
+                    sub_r = loc_id - eff_r0
+                    blk = slot_2d_buf[pl.ds(k * 16, 16), c_sl].astype(jnp.float32)
+                    row_b = jnp.broadcast_to(
+                        jnp.sum(
+                            jnp.where(row_iota_16 == sub_r, blk, 0.0),
+                            axis=0,
+                            keepdims=True,
+                        ),
+                        (16, _COL_STRIP),
+                    )
+                    acc = jnp.where((row_iota_16 == k) & in_r, row_b, acc)
+                partial_emb_buf[pl.ds(g0, 16), c_sl] = acc.astype(jnp.bfloat16)
+
+            _fori_strips(hidden, _COL_STRIP, _col_body)
+
+        any_hit = jnp.bool_(False)
+        for k in range(16):
+            valid_k = (g0 + k) < actual_rows
+            tid = input_ids_smem[jnp.minimum(g0 + k, actual_rows - 1)]
+            any_hit = any_hit | (valid_k & (tid >= v_start) & (tid < v_end))
+        lax.cond(any_hit, _run_grp, _zero_grp)
 
     _fori_strips(pad_rows, 16, _grp_body)
 
@@ -1483,7 +1559,7 @@ def decode_vocab_embed_norm_jax(
     if (
         not (rows == 8 or (16 <= rows <= 384 and rows % 16 == 0))
         or v_shard < 16
-        or v_shard % 8 != 0
+        or v_shard % 2 != 0
         or hidden % _COL_STRIP != 0
     ):
         raise ValueError("Unsupported decode_vocab_embed_norm shapes")
@@ -1722,7 +1798,7 @@ def decode_vocab_embed_tok_sharded_jax(
         world_size != 8
         or rows not in (64, 128, 256, 384)
         or v_shard < 16
-        or v_shard % 8 != 0
+        or v_shard % 2 != 0
         or hidden % 512 != 0
     ):
         raise ValueError("Unsupported decode_vocab_embed_tok_sharded shapes")
@@ -4923,9 +4999,8 @@ def _tp8_parallel_xy_ag(
     slab_y = out_full_ref.at[:, pl.ds(pl.multiple_of(other_c0 + w_x, 128), w_y)]
 
     bm = _pick_strip(r_pair, 32)
-    max_step = 1024 if r_pair <= 16 else 512
-    spans_x = _tile_spans(w_x, max_step)
-    spans_y = _tile_spans(w_y, max_step)
+    spans_x = _tile_spans(w_x, 1024)
+    spans_y = _tile_spans(w_y, 1024)
 
     if copy_local_from_pair:
         assert pair_ref is not None
@@ -5438,7 +5513,7 @@ def decode_vocab_embed_chip_sharded_jax(
         world_size not in SUPPORTED_WORLD_SIZES
         or rows not in valid_rows
         or v_shard < 16
-        or v_shard % 8 != 0
+        or v_shard % 2 != 0
         or hidden % 1024 != 0
     ):
         raise ValueError("Unsupported decode_vocab_embed_chip_sharded shapes")
@@ -5510,10 +5585,9 @@ def _tp16_parallel_rs_enabled(*, r_pair: int | None = None) -> bool:
     ov = _tp16_parallel_rs_override()
     if ov is not None:
         return ov
-    # Default ON for TP=16 r_pair >= 16 (multiple of 16 for bm=16 strips: B=128/256/384),
-    # where 2x2x2 silicon wins -10.8..-34.5 us/L on chip_b1 and -12.8..-20.8 us/L on Step (b);
-    # r_pair == 8 (B=64) stays opt-in.
-    return r_pair is not None and r_pair >= 16 and r_pair % 16 == 0
+    # Default ON for TP=16 r_pair == 8 (B=64: -8.53 us/L on Step(c) SWA_BD4, -6.35 us/L on ChipB1 w/ bc1s)
+    # and r_pair >= 16 multiples of 16 (B=128/256/384: -10.8..-34.5 us/L on ChipB1, -12.8..-20.8 us/L on Step(b)).
+    return r_pair is not None and (r_pair == 8 or (r_pair >= 16 and r_pair % 16 == 0))
 
 
 def _bug_c_oneshot_enabled() -> bool:
