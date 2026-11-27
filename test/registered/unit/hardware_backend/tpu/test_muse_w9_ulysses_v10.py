@@ -1867,3 +1867,248 @@ def test_v10_sp_a3_2chunk_norm_range_rev_a2a_interpret_and_aot():
             )(ra_d, gk_d, wo_d, wos_d)
         )
         np.testing.assert_array_equal(np.asarray(out_2, dtype=np.float32), np.asarray(out_r, dtype=np.float32))
+
+
+def test_w16_v10_sp_multi_chunk_a1_ulysses_full_routing_and_fallbacks():
+    """Verify multi-chunk CCS (`eff_chunks >= 2`) uses `a1_ulysses_full` (`_aa2a`) in both
+    `_forward_ulysses_v10` and `_l61_pruned_ulysses_v10_attn_inputs` when every chunk satisfies
+    `c_k >= 128 and c_k % 128 == 0`, while cleanly falling back to the 3-op path when
+    `c_k < 128`, `ulysses_async_a2a=False`, or `trap_ctx` is active.
+    """
+    torch = pytest.importorskip("torch")
+    from types import SimpleNamespace
+    from sglang_tpu.muse_prefill_kernels.integration import MusePrefillKernels
+
+    h_dim, q_loc, kv_loc = 256, 512, 64
+
+    class _FakeA1Full:
+        _name = "sglang_tpu_pallas::muse_prefill_a1_v10_sp_aa2a_q8_kv1"
+
+        def __init__(self, calls):
+            self._calls = calls
+
+        def __call__(self, x_k, wq, wqs, wg, wgs, c_k, s_k):
+            self._calls.append(x_k.shape[0])
+            c_tok = _TP * x_k.shape[0]
+            return (
+                torch.ones((1, c_tok, 4, 2, 128), dtype=torch.bfloat16),
+                torch.ones((c_tok, 1, 4, 128), dtype=torch.float8_e4m3fn),
+                torch.zeros((x_k.shape[0], _TP * q_loc), dtype=torch.bfloat16),
+            )
+
+    class _FakeOps:
+        def __init__(self):
+            self.full_calls = []
+            self.qkv_calls = []
+            self.wo2_calls = []
+            self.a1_ulysses_full = _FakeA1Full(self.full_calls)
+            self.a3_ulysses_full = None
+
+        def a1_ulysses_qkv_chunk(self, x_k, wq, sc, c_k, s_k):
+            self.qkv_calls.append(x_k.shape[0])
+            return (
+                torch.zeros((_TP, x_k.shape[0], q_loc), dtype=torch.bfloat16),
+                torch.zeros((_TP, x_k.shape[0], kv_loc), dtype=torch.float8_e4m3fn),
+                torch.zeros((x_k.shape[0], h_dim), dtype=torch.bfloat16),
+            )
+
+        def a1_ulysses_a2a_pack_chunk(self, q3, kv3):
+            c_tok = _TP * q3.shape[1]
+            return (
+                torch.ones((1, c_tok, 4, 2, 128), dtype=torch.bfloat16),
+                torch.ones((c_tok, 1, 4, 128), dtype=torch.float8_e4m3fn),
+            )
+
+        def a1_ulysses_gate_chunk(self, x_k, wg, wgs):
+            return torch.zeros((x_k.shape[0], _TP * q_loc), dtype=torch.bfloat16)
+
+        def a3_ulysses_rev_a2a_chunk(self, out_tok):
+            c_k = out_tok.shape[0] // _TP
+            return torch.zeros((_TP, c_k, q_loc), dtype=torch.float8_e4m3fn)
+
+        def a3_ulysses_gate_fuse_chunk(self, attn_fp8, gate_k):
+            return torch.zeros((gate_k.shape[0], h_dim), dtype=torch.float8_e4m3fn)
+
+        def a3_ulysses_wo_2chunk(self, q0, q1, wo, wo_sc):
+            self.wo2_calls.append((q0.shape[0], q1.shape[0]))
+            return torch.zeros((q0.shape[0] + q1.shape[0], h_dim), dtype=torch.bfloat16)
+
+        def a3_ulysses_wo(self, q_all, wo, wo_sc):
+            return torch.zeros((q_all.shape[0], h_dim), dtype=torch.bfloat16)
+
+        def sum_stream(self, rows):
+            return rows
+
+    class _FakeBe:
+        def __init__(self):
+            self.kv_writes = 0
+            self.fwd_chunks = []
+
+        def forward_prepared(self, q_k, kv_k, attn_l, fb, chunk_meta=None):
+            self.fwd_chunks.append(kv_k.shape[0] // _TP)
+            return torch.zeros((1, kv_k.shape[0], q_loc), dtype=torch.bfloat16)
+
+        def write_kv_only(self, kv_k, attn_l, fb, chunk_meta=None):
+            self.kv_writes += 1
+
+    weights = SimpleNamespace(
+        wqkvg=torch.zeros((_TP, h_dim, q_loc + 2 * kv_loc), dtype=torch.bfloat16),
+        wqkvg_scale_3d=torch.ones((_TP, 1, q_loc + 2 * kv_loc), dtype=torch.float32),
+        w_gate=torch.zeros((h_dim, _TP * q_loc), dtype=torch.bfloat16),
+        w_gate_scale_2d=torch.ones((1, _TP * q_loc), dtype=torch.float32),
+    )
+    wo = torch.zeros((_TP * q_loc, h_dim), dtype=torch.float8_e4m3fn)
+    wo_sc = torch.ones((1, h_dim), dtype=torch.float32)
+
+    def _run_fwd(chunks, aa2a: bool, with_trap: bool = False):
+        ops = _FakeOps()
+        pk = MusePrefillKernels.__new__(MusePrefillKernels)
+        pk.ops = ops
+        pk.tp_size = _TP
+        pk.tp_rank = 1
+        pk.ulysses_async_a2a = aa2a
+        be = _FakeBe()
+        t_sh = sum(chunks)
+        rope_chunks = tuple(
+            (torch.zeros((_TP * c, 128)), torch.zeros((_TP * c, 128))) for c in chunks
+        )
+        trap_ctx = (
+            {
+                "t_total": _TP * t_sh,
+                "full_real": torch.ones((_TP * t_sh,), dtype=torch.bool),
+                "orig_full": torch.arange(_TP * t_sh, dtype=torch.int32),
+                "records": [],
+            }
+            if with_trap
+            else None
+        )
+        with mock.patch(
+            "sglang_tpu.muse_prefill_kernels.integration.get_attn_backend",
+            return_value=be,
+        ):
+            out = pk._forward_ulysses_v10(
+                attn=SimpleNamespace(attn="mock"),
+                weights=weights,
+                wo=wo,
+                wo_scale=wo_sc,
+                attn_in=torch.zeros((t_sh, h_dim), dtype=torch.bfloat16),
+                rope=None,
+                chunks=chunks,
+                rope_chunks=rope_chunks,
+                chunk_metas=tuple(f"m{i}" for i in range(len(chunks))),
+                forward_batch="fb",
+                trap_ctx=trap_ctx,
+                layer_idx=0,
+            )
+        return out, ops, be
+
+    # Eligible 2-chunk (256, 512): uses a1_ulysses_full twice and 0 calls to 3-op.
+    out_aa2a, ops_aa2a, be_aa2a = _run_fwd((256, 512), aa2a=True)
+    assert out_aa2a.shape == (768, h_dim)
+    assert ops_aa2a.full_calls == [256, 512]
+    assert ops_aa2a.qkv_calls == []
+    assert ops_aa2a.wo2_calls == [(256, 512)]
+    assert be_aa2a.fwd_chunks == [256, 512]
+
+    # Fallbacks: ulysses_async_a2a=False, non-128 chunk (256, 64), and active trap_ctx.
+    for ch, aa2a, trap in (
+        ((256, 512), False, False),
+        ((256, 64), True, False),
+        ((256, 512), True, True),
+    ):
+        _, ops_fb, _ = _run_fwd(ch, aa2a=aa2a, with_trap=trap)
+        assert ops_fb.full_calls == []
+        assert ops_fb.qkv_calls == list(ch)
+
+    # L61 pruned multi-chunk (256, 512) uses a1_ulysses_full vs (256, 64) fallback.
+    for ch, exp_full, exp_qkv in (
+        ((256, 512), [256, 512], []),
+        ((256, 64), [], [256, 64]),
+    ):
+        ops_l61 = _FakeOps()
+        pk_l61 = MusePrefillKernels.__new__(MusePrefillKernels)
+        pk_l61.ops = ops_l61
+        pk_l61.tp_size = _TP
+        pk_l61.tp_rank = 2
+        pk_l61.ulysses_async_a2a = True
+        be_l61 = _FakeBe()
+        t_sh = sum(ch)
+        qp, gp, kvp = pk_l61._l61_pruned_ulysses_v10_attn_inputs(
+            weights=weights,
+            attn_in=torch.zeros((t_sh, h_dim), dtype=torch.bfloat16),
+            rope=None,
+            chunks=ch,
+            rope_chunks=tuple(
+                (torch.zeros((_TP * c, 128)), torch.zeros((_TP * c, 128))) for c in ch
+            ),
+            chunk_metas=("m0", "m1"),
+            forward_batch="fb",
+            attn=SimpleNamespace(attn="mock"),
+            be=be_l61,
+            idx_128=torch.zeros((128,), dtype=torch.long),
+            eff_idx=torch.tensor([0, 0], dtype=torch.long),
+            active=torch.tensor([True, False]),
+            bs=2,
+            q_size=q_loc,
+            t_shard=t_sh,
+            inv_cm_perm=torch.arange(_TP * t_sh, dtype=torch.long),
+        )
+        assert ops_l61.full_calls == exp_full
+        assert ops_l61.qkv_calls == exp_qkv
+        assert be_l61.kv_writes == 2
+        assert qp.shape == (1, 128, 4, 2, 128)
+        assert gp.shape == (128, q_loc)
+        assert kvp.shape == (128, 1, 4, 128)
+
+
+def test_w16_v10_sp_multi_chunk_a1_ulysses_full_aa2a_aot():
+    """Verify `ops.a1_ulysses_full` (`_aa2a`) AOT exports & compiles on `tpu7x=2x2x2`
+    for CCS multi-chunk sizes `c_k in (256, 512, 1280)`.
+    """
+    jax = pytest.importorskip("jax")
+    torch = pytest.importorskip("torch")
+    from jax.experimental import topologies
+    from jax.sharding import Mesh
+
+    if len(jax.devices("cpu")) < _TP:
+        pytest.skip(f"Need {_TP} CPU devices (got {len(jax.devices('cpu'))})")
+
+    from sglang_tpu.muse_prefill_kernels import integration
+
+    topo = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x=2x2x2")
+    mesh_aot = Mesh(np.array(topo.devices).reshape(_TP), (_AXIS,))
+    integration._ops.cache_clear()
+    with mock.patch(
+        "sglang_tpu.moe.pallas.fused_moe_rs_op._get_mesh", return_value=mesh_aot
+    ):
+        ops = integration._ops(
+            8,
+            1,
+            "v10_sp",
+            "v16",
+            True,
+            1e-5,
+            a1_rpa_layout=True,
+            causal_chunk_stream=True,
+            causal_chunk_spec="le1536:1;256,512",
+            ulysses_async_a2a=True,
+        )
+    assert "_aa2a" in ops.a1_ulysses_full._name
+    wqkvg_t = torch.empty((_TP, 8192, 640), dtype=torch.float8_e4m3fn, device="meta")
+    wqkvg_sc_t = torch.empty((_TP, 1, 640), dtype=torch.float32, device="meta")
+    wgate_t = torch.empty((8192, 8192), dtype=torch.float8_e4m3fn, device="meta")
+    wgate_sc_t = torch.empty((1, 8192), dtype=torch.float32, device="meta")
+    for c_k in (256, 512, 1280):
+        c_tok = _TP * c_k
+        _assert_tpu7x_spmd_export_and_compile(
+            ops.a1_ulysses_full,
+            (
+                torch.empty((c_k, 8192), dtype=torch.bfloat16, device="meta"),
+                wqkvg_t,
+                wqkvg_sc_t,
+                wgate_t,
+                wgate_sc_t,
+                torch.empty((c_tok, 128), dtype=torch.float32, device="meta"),
+                torch.empty((c_tok, 128), dtype=torch.float32, device="meta"),
+            ),
+        )
