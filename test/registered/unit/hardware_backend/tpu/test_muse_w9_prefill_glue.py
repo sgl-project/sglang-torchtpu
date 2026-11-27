@@ -2889,3 +2889,252 @@ def test_a3_wo_3chunk_zero_concat_parity_and_aot():
     assert "len(q_parts) == 3" in integ_src
     assert hasattr(integration._Ops, "_fields")
     assert "a3_wo_3chunk" in integration._Ops._fields
+
+
+def test_a3_wo_ring2_tm1024_parity_and_aot():
+    """Verify 2-slot ring recv_vmem (tm_half=1024, out_sub_r=512) 0-ULP parity, DMA race freedom, and TPU7x AOT."""
+    import jax
+    import jax.numpy as jnp
+    from jax._src.pallas.mosaic.interpret import interpret_pallas_call as _interp_mod
+    from jax.experimental import pallas as pl
+    from jax.experimental import topologies
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    from sglang_tpu.muse_prefill_kernels.attn_kernels import kernel_a3
+
+    cpus = jax.devices("cpu")
+    tp = 8
+    if len(cpus) < tp:
+        pytest.skip(f"Requires {tp} CPU devices for TP={tp} shard_map (have {len(cpus)})")
+    mesh = Mesh(np.array(cpus[:tp]), ("model",))
+
+    real_pc = pl.pallas_call
+
+    def _race_nan_interp(*args, **kwargs):
+        kwargs["interpret"] = pltpu.InterpretParams(
+            detect_races=True, uninitialized_memory="nan"
+        )
+        return real_pc(*args, **kwargs)
+
+    # 1. Exact 0-ULP parity + zero DMA/VMEM data races on 2-slot ring (num_t_half=3 & 4)
+    #    across 1-chunk (with and without valid_tokens skip), 2-chunk, and 3-chunk straddling splits.
+    k_loc = 128
+    n_dim = 512
+    rng = np.random.default_rng(4891)
+    with (
+        mock.patch(
+            "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+        ),
+        tpu_info_for_cpu_export(),
+        mock.patch.object(pl, "pallas_call", _race_nan_interp),
+        jax.default_device(cpus[0]),
+    ):
+        wo_np = (rng.standard_normal((tp, tp, k_loc, n_dim)) * 0.1).astype(np.float32)
+        wsc_np = rng.uniform(0.5, 1.5, (tp, 1, n_dim)).astype(np.float32)
+        wo_j = jnp.asarray(wo_np, dtype=jnp.float8_e4m3fn)
+        wsc_j = jnp.asarray(wsc_np, dtype=jnp.float32)
+        wo_f8 = np.asarray(wo_j.astype(jnp.float32))
+
+        interp_cases = [
+            ((3072,), 0, None),
+            ((3072,), 1, None),
+            ((3072,), 2, None),
+            ((3072,), 1, 7168),  # partial valid_tokens skip across ranks & ring tiles
+            ((1024, 2048), 0, None),
+            ((1024, 2048), 1, None),
+            ((1024, 2048), 2, None),
+            ((768, 1024, 1280), 1, None),
+            ((768, 1024, 1280), 2, None),
+            ((1024, 3072), 1, None),  # num_t_half=4 (32K)
+            ((4096,), 1, None),  # 1-chunk num_t_half=4 (32K)
+        ]
+
+        for chunks, stage_mode, vtok_val in interp_cases:
+            t_shard = sum(chunks)
+            q_js = [
+                jnp.asarray(
+                    (rng.standard_normal((tp, tp, ck, k_loc)) * 0.2).astype(np.float32),
+                    dtype=jnp.float8_e4m3fn,
+                )
+                for ck in chunks
+            ]
+            q_cat_f8 = np.concatenate(
+                [np.asarray(q.astype(jnp.float32)) for q in q_js], axis=2
+            )
+            use_ps = stage_mode in (1, 2)
+            ref_shards = []
+            for me in range(tp):
+                acc = np.zeros((t_shard, n_dim), dtype=np.float32)
+                for step in range(tp):
+                    peer = (
+                        me
+                        if step == 0
+                        else int(
+                            kernel_a3._a3_v16_step_peer_jax(
+                                jnp.int32(me),
+                                step,
+                                tp,
+                                step_xors=tuple(range(tp)),
+                                parity_stagger=use_ps,
+                            )
+                        )
+                    )
+                    acc = acc + (q_cat_f8[peer, me] @ wo_f8[me, step]).astype(np.float32)
+                scaled = acc * (wsc_np[me] * kernel_a3.STATIC_A3_ACT_SCALE)
+                shard_bf = np.array(
+                    jnp.asarray(scaled).astype(jnp.bfloat16).astype(jnp.float32),
+                    copy=True,
+                )
+                if vtok_val is not None:
+                    for th in range(t_shard // 1024):
+                        if me * t_shard + th * 1024 >= vtok_val:
+                            shard_bf[th * 1024 : (th + 1) * 1024, :] = 0.0
+                ref_shards.append(shard_bf)
+            out_ref = np.concatenate(ref_shards, axis=0)
+
+            n_p = len(chunks)
+            if vtok_val is not None:
+                vt_arr = jnp.array([vtok_val], dtype=jnp.int32)
+                got_fn = jax.shard_map(
+                    lambda q0, w, s, vt, sm=stage_mode: (
+                        kernel_a3.pallas_option3d_zero_copy9_persrc_async_a2a_wo_3d_static_fp8(
+                            q0.squeeze(0),
+                            w.squeeze(0),
+                            s.squeeze(0),
+                            tp_axis="model",
+                            bn=256,
+                            opt_wo=True,
+                            valid_tokens_1d=vt,
+                            stage_sends_mode=sm,
+                        )
+                    ),
+                    mesh=mesh,
+                    in_specs=(P("model"), P("model"), P("model"), P()),
+                    out_specs=P("model", None),
+                    check_vma=False,
+                )
+                out_got = np.asarray(got_fn(q_js[0], wo_j, wsc_j, vt_arr).astype(jnp.float32))
+            else:
+                got_fn = jax.shard_map(
+                    lambda *a, sm=stage_mode, np_=n_p: (
+                        kernel_a3.pallas_option3d_nchunk_async_a2a_wo_3d_static_fp8(
+                            [x.squeeze(0) for x in a[:np_]],
+                            a[np_].squeeze(0),
+                            a[np_ + 1].squeeze(0),
+                            tp_axis="model",
+                            bn=256,
+                            stage_sends_mode=sm,
+                        )
+                    ),
+                    mesh=mesh,
+                    in_specs=(P("model"),) * (n_p + 2),
+                    out_specs=P("model", None),
+                    check_vma=False,
+                )
+                out_got = np.asarray(got_fn(*q_js, wo_j, wsc_j).astype(jnp.float32))
+            races = getattr(_interp_mod, "races", None)
+            if races is not None and hasattr(races, "races_found"):
+                assert not races.races_found, (
+                    f"DMA/VMEM data race detected for chunks={chunks}, ss={stage_mode}, vt={vtok_val}"
+                )
+            np.testing.assert_array_equal(out_got, out_ref)
+
+    # 2. Full-shape TPU7x AOT .compile() (<63 MiB VMEM) on TP=8 (2x2x1) and TP=16 (2x2x2)
+    #    verifying _r2 suffix, bn2048 + tm_half=1024 fit, and zero pad_maximum_fusion.
+    with (
+        mock.patch(
+            "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+        ),
+        tpu_info_for_cpu_export(),
+    ):
+        topo_221 = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x=2x2x1")
+        mesh_221 = Mesh(np.array(topo_221.devices).reshape(8), ("model",))
+        topo_222 = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x=2x2x2")
+        mesh_222 = Mesh(np.array(topo_222.devices).reshape(16), ("model",))
+
+        aot_cases = [
+            (mesh_221, 8, 1024, (3072,), 1, False),
+            (mesh_221, 8, 1024, (3072,), 1, True),
+            (mesh_221, 8, 1024, (1024, 2048), 0, False),
+            (mesh_221, 8, 1024, (1024, 2048), 1, False),
+            (mesh_221, 8, 1024, (1024, 2048), 2, False),
+            (mesh_221, 8, 1024, (768, 1024, 1280), 1, False),
+            (mesh_221, 8, 1024, (1024, 3072), 1, False),
+            (mesh_221, 8, 1024, (4096,), 1, False),
+            (mesh_222, 16, 512, (1024, 2048), 1, False),
+        ]
+        for aot_mesh, tp_d, k_l, chunks, stage_mode, with_skip in aot_cases:
+            jax.clear_caches()
+            n_p = len(chunks)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "SGLANG_TPU_MUSE_KERNEL_A3_STAGE_SENDS": str(stage_mode),
+                    "SGLANG_TPU_MUSE_KERNEL_A3_BN2048": "1",
+                },
+            ):
+                if with_skip:
+                    sm_aot = jax.shard_map(
+                        lambda q0, w, s, vt, sm=stage_mode: (
+                            kernel_a3.pallas_option3d_zero_copy9_persrc_async_a2a_wo_3d_static_fp8(
+                                q0.squeeze(0),
+                                w.squeeze(0),
+                                s.squeeze(0),
+                                tp_axis="model",
+                                opt_wo=True,
+                                valid_tokens_1d=vt,
+                                vmem_limit_mb=63,
+                                stage_sends_mode=sm,
+                            )
+                        ),
+                        mesh=aot_mesh,
+                        in_specs=(P("model"), P("model"), P("model"), P()),
+                        out_specs=P("model", None),
+                        check_vma=False,
+                    )
+                    compiled = (
+                        jax.jit(sm_aot)
+                        .trace(
+                            jax.ShapeDtypeStruct((tp_d, tp_d, chunks[0], k_l), jnp.float8_e4m3fn),
+                            jax.ShapeDtypeStruct((tp_d, tp_d, k_l, 8192), jnp.float8_e4m3fn),
+                            jax.ShapeDtypeStruct((tp_d, 1, 8192), jnp.float32),
+                            jax.ShapeDtypeStruct((1,), jnp.int32),
+                        )
+                        .lower(lowering_platforms=("tpu",))
+                        .compile()
+                    )
+                else:
+                    sm_aot = jax.shard_map(
+                        lambda *a, sm=stage_mode, np_=n_p: (
+                            kernel_a3.pallas_option3d_nchunk_async_a2a_wo_3d_static_fp8(
+                                [x.squeeze(0) for x in a[:np_]],
+                                a[np_].squeeze(0),
+                                a[np_ + 1].squeeze(0),
+                                tp_axis="model",
+                                vmem_limit_mb=63,
+                                stage_sends_mode=sm,
+                            )
+                        ),
+                        mesh=aot_mesh,
+                        in_specs=(P("model"),) * (n_p + 2),
+                        out_specs=P("model", None),
+                        check_vma=False,
+                    )
+                    compiled = (
+                        jax.jit(sm_aot)
+                        .trace(
+                            *(
+                                jax.ShapeDtypeStruct((tp_d, tp_d, ck, k_l), jnp.float8_e4m3fn)
+                                for ck in chunks
+                            ),
+                            jax.ShapeDtypeStruct((tp_d, tp_d, k_l, 8192), jnp.float8_e4m3fn),
+                            jax.ShapeDtypeStruct((tp_d, 1, 8192), jnp.float32),
+                        )
+                        .lower(lowering_platforms=("tpu",))
+                        .compile()
+                    )
+                hlo_txt = compiled.as_text()
+                assert "pad_maximum_fusion" not in hlo_txt
+                assert "_bn2048" in hlo_txt
+                assert "_r2" in hlo_txt
