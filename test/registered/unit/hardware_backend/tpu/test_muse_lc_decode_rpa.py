@@ -4740,7 +4740,7 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
         self.assertTrue(np.array_equal(np.asarray(o_sh_hk).view(np.uint16), np.asarray(o_sh_no).view(np.uint16)))
         self.assertTrue(np.array_equal(np.asarray(c_sh_hk).view(np.uint8), np.asarray(c_sh_no).view(np.uint8)))
 
-        # 5. LC SWA Step (c) plan check (sw=2049 allowed, Full disallowed)
+        # 5. LC SWA Step (c) plan check (sw=2049 allowed; shared Full without group disallowed; non-shared Full clamps to ring4k)
         lc_swa_mode = "s4,c4096,shared16,q256,shsplit,pbf16,batchfull,foldcol,batch4,d2grp"
         _, _, _, grp_u, ok_u = resolve_step_c_rpa_plan(
             lc_swa_mode, sliding_window=2049, pages_per_seq=5, phys_page_rows=512,
@@ -4752,11 +4752,16 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
             kv_pack_dense2=True, b_tokens=64, max_num_seqs=64,
         )
         self.assertTrue(ok_d and grp_d)
-        _, _, _, _, ok_full = resolve_step_c_rpa_plan(
+        _, _, _, _, ok_full_sh = resolve_step_c_rpa_plan(
+            lc_swa_mode, sliding_window=None, pages_per_seq=64, phys_page_rows=512,
+            kv_pack_dense2=False, b_tokens=64, max_num_seqs=64, has_shared_prefix=True,
+        )
+        self.assertFalse(ok_full_sh)
+        cfg_full, _, _, _, ok_full = resolve_step_c_rpa_plan(
             lc_swa_mode, sliding_window=None, pages_per_seq=64, phys_page_rows=512,
             kv_pack_dense2=False, b_tokens=64, max_num_seqs=64,
         )
-        self.assertFalse(ok_full)
+        self.assertTrue(ok_full and cfg_full.loop_kind == "ring4k")
 
         # 6. TPU v7 AOT exports for c256 (bs=128 d2+b4, bs=256 bd4+b4) & shared64+hoistkv
         try:
@@ -5014,6 +5019,161 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
                         ),
                         mesh=mesh,
                         in_specs=(P(),) * 10,
+                        out_specs=(P(), P()),
+                        check_vma=False,
+                    )
+                ).lower(*abs_in).compile()
+            self.assertIsNotNone(comp)
+            del comp
+            jax.clear_caches()
+            gc.collect()
+
+    def test_wave15_ring8k_tail4k_and_w7auto_oneshot8k_0x7f_poison_and_aot(self):
+        """Verify ring8k 4096 tight tail, direct ring4k DMA, w7auto g4k 8K one-shot, 0x7F poison, & TPU7x AOT."""
+        import gc
+        from jax.experimental import topologies
+        from jax.experimental.pallas import tpu as pltpu
+        from jax.sharding import Mesh, PartitionSpec as P
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import run_decode_fast_rpa
+
+        ip_race = pltpu.InterpretParams(
+            dma_execution_mode="eager",
+            detect_races=True,
+            uninitialized_memory="nan",
+        )
+        rng = np.random.default_rng(20262600)
+        # 8 seqs spanning ring8k tight tiers (<=512, <=1024, <=2048, <=4096, 4096..8192, 8192, >8192) & w7auto 8K.
+        B, pps = 8, 22
+        kvl_list = [350, 1500, 3500, 5500, 7500, 8100, 8193, 9500]
+        for dense2, bd4 in ((False, True), (True, False)):
+            pack_factor = 4 if bd4 else 2
+            phys_rows = 512 // pack_factor
+            nb = B * pps + 4
+            kvc_u8 = np.full((nb, phys_rows, 1, 4, 128), 0x7F, dtype=np.uint8)
+            pg_mat = np.zeros((B, pps), dtype=np.int32)
+            nxt = 0
+            for i, kvl_v in enumerate(kvl_list):
+                pg_mat[i] = np.arange(nxt, nxt + pps, dtype=np.int32)
+                old_toks = kvl_v - 1
+                n_pg = (old_toks + 511) // 512
+                for p_rel in range(n_pg):
+                    pg_id = nxt + p_rel
+                    toks_in_pg = min(512, old_toks - p_rel * 512)
+                    n_full = toks_in_pg // pack_factor
+                    if n_full > 0:
+                        kvc_u8[pg_id, :n_full] = rng.integers(
+                            0x30, 0x3D, size=(n_full, 1, 4, 128), dtype=np.uint8
+                        )
+                    rem = toks_in_pg % pack_factor
+                    if rem > 0:
+                        for s_i in range(rem):
+                            if bd4:
+                                c0 = 0 if s_i < 2 else 2
+                                l0, l1 = (0, 64) if (s_i & 1) == 0 else (64, 128)
+                                kvc_u8[pg_id, n_full, 0, c0 : c0 + 2, l0:l1] = rng.integers(
+                                    0x30, 0x3D, size=(2, 64), dtype=np.uint8
+                                )
+                            else:
+                                c0 = 0 if s_i == 0 else 2
+                                kvc_u8[pg_id, n_full, 0, c0 : c0 + 2, :] = rng.integers(
+                                    0x30, 0x3D, size=(2, 128), dtype=np.uint8
+                                )
+                nxt += pps
+
+            kvc = jax.lax.bitcast_convert_type(jnp.asarray(kvc_u8, jnp.uint8), jnp.float8_e4m3fn)
+            q_5d = jnp.asarray(rng.standard_normal((1, B, 8, 2, 128)) * 0.1, jnp.bfloat16)
+            kvm = jax.lax.bitcast_convert_type(
+                jnp.asarray(rng.integers(0x30, 0x3D, size=(B, 1, 4, 128), dtype=np.uint8), jnp.uint8),
+                jnp.float8_e4m3fn,
+            )
+            gate = jnp.asarray(rng.standard_normal((B, 512 if bd4 else 1024)) * 0.1, jnp.bfloat16)
+            kvl = jnp.asarray(kvl_list, dtype=jnp.int32)
+            pg = jnp.asarray(pg_mat.reshape(-1), jnp.int32)
+            cuq = jnp.arange(B + 1, dtype=jnp.int32)
+            cukv = jnp.arange(B + 1, dtype=jnp.int32) * (pps * 512)
+            dist = jnp.asarray([B, B, B], jnp.int32)
+
+            ref_r4k, _ = run_decode_fast_rpa(
+                q_5d, kvm, None, kvc, kvl, pg, cuq, cukv, dist,
+                sm_scale=64.0 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                mode_str="w8,s3,ring4k,c4096,pbf16,batchfull,g4k,foldcol",
+                decode_query_size=1, fused_out_pack=2, prepared_inputs=True,
+                gate=gate, out_norm_eps=1e-5, kv_pack_dense2=dense2, kv_pack_bd4=bd4,
+                interpret=ip_race,
+            )
+            out_r8k, _ = run_decode_fast_rpa(
+                q_5d, kvm, None, kvc, kvl, pg, cuq, cukv, dist,
+                sm_scale=64.0 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                mode_str="w8,s4,ring8k,nocoal,pbf16,batchfull,g4k,foldcol",
+                decode_query_size=1, fused_out_pack=2, prepared_inputs=True,
+                gate=gate, out_norm_eps=1e-5, kv_pack_dense2=dense2, kv_pack_bd4=bd4,
+                interpret=ip_race,
+            )
+            r_np = np.asarray(ref_r4k, dtype=np.float64).ravel()
+            f_np = np.asarray(out_r8k, dtype=np.float64).ravel()
+            self.assertTrue(np.all(np.isfinite(f_np)))
+            cos_r8 = float(np.dot(r_np, f_np) / (np.linalg.norm(r_np) * np.linalg.norm(f_np) + 1e-12))
+            self.assertGreater(cos_r8, 0.9999, f"ring8k bd4={bd4} cos={cos_r8}")
+
+            # Verify w7auto g4k 8K one-shot (5120 < rel_end <= 8192) vs dyn2ku under 0x7F poison.
+            kvl_w7 = jnp.asarray([350, 1000, 3500, 5500, 7500, 8100, 8193, 9500], dtype=jnp.int32)
+            # Seq 1 has 1500 valid tokens populated, so kvl_w7[1]=1000 cleanly tests the <=1K gear under 0x7F poison.
+            ref_d2k, _ = run_decode_fast_rpa(
+                q_5d, kvm, None, kvc, kvl_w7, pg, cuq, cukv, dist,
+                sm_scale=64.0 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                mode_str="w8,s4,c1024,pbf16,batchfull,dyn2ku",
+                decode_query_size=1, fused_out_pack=2, prepared_inputs=True,
+                gate=gate, out_norm_eps=1e-5, kv_pack_dense2=dense2, kv_pack_bd4=bd4,
+                interpret=ip_race,
+            )
+            out_g4k, _ = run_decode_fast_rpa(
+                q_5d, kvm, None, kvc, kvl_w7, pg, cuq, cukv, dist,
+                sm_scale=64.0 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                mode_str="w8,s4,c1024,pbf16,batchfull,g4k,foldcol",
+                decode_query_size=1, fused_out_pack=2, prepared_inputs=True,
+                gate=gate, out_norm_eps=1e-5, kv_pack_dense2=dense2, kv_pack_bd4=bd4,
+                interpret=ip_race,
+            )
+            rd_np = np.asarray(ref_d2k, dtype=np.float64).ravel()
+            fg_np = np.asarray(out_g4k, dtype=np.float64).ravel()
+            self.assertTrue(np.all(np.isfinite(fg_np)))
+            cos_w7 = float(np.dot(rd_np, fg_np) / (np.linalg.norm(rd_np) * np.linalg.norm(fg_np) + 1e-12))
+            self.assertGreater(cos_w7, 0.9999, f"w7_oneshot8k bd4={bd4} cos={cos_w7}")
+
+        # Verify TPU7x AOT compile < 63 MiB VMEM for ring8k (BD4 B=256) & w7auto g4k 8K (BD4 B=256, DENSE2 B=128, 512B B=64).
+        for topo, bs_a, d2_a, bd4_a, mode_a in (
+            ("tpu7x:2x2x2", 256, False, True, "w8,s4,ring8k,nocoal,pbf16,batchfull,g4k,foldcol"),
+            ("tpu7x:2x2x2", 256, False, True, "w8,s4,c1024,pbf16,batchfull,g4k,foldcol"),
+            ("tpu7x:2x2x1", 128, True, False, "w8,c1024,pbf16,batchfull,g4k,foldcol"),
+            ("tpu7x:2x2x1", 64, False, False, "w8,c1024,pbf16,batchfull,g4k,foldcol"),
+        ):
+            phys_r = 128 if bd4_a else (256 if d2_a else 512)
+            tpu_devs = topologies.get_topology_desc(topo, platform="tpu").devices
+            mesh = Mesh(np.array(tpu_devs[:1]), ("x",))
+            s = lambda sh, dt: jax.ShapeDtypeStruct(sh, dt)
+            abs_in = (
+                s((1, bs_a, 8, 2, 128), jnp.bfloat16),
+                s((bs_a, 1, 4, 128), jnp.float8_e4m3fn),
+                s((bs_a, 512 if bd4_a else 1024), jnp.bfloat16),
+                s((bs_a * 32 + 8, phys_r, 1, 4, 128), jnp.float8_e4m3fn),
+                s((bs_a,), jnp.int32),
+                s((bs_a * 32,), jnp.int32),
+                s((bs_a + 1,), jnp.int32),
+                s((bs_a + 1,), jnp.int32),
+                s((3,), jnp.int32),
+            )
+            with patch("sglang_tpu.attention.pallas.util.get_torch_tpu_device_kind", return_value="TPU v7"):
+                comp = jax.jit(
+                    jax.shard_map(
+                        lambda q_, km_, gt_, c_, kl_, pi_, cq_, ckv_, dt_: run_decode_fast_rpa(
+                            q_, km_, None, c_, kl_, pi_, cq_, ckv_, dt_,
+                            sm_scale=64.0 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                            mode_str=mode_a, decode_query_size=1, fused_out_pack=2,
+                            prepared_inputs=True, gate=gt_, out_norm_eps=1e-5,
+                            kv_pack_dense2=d2_a, kv_pack_bd4=bd4_a,
+                        ),
+                        mesh=mesh,
+                        in_specs=(P(),) * 9,
                         out_specs=(P(), P()),
                         check_vma=False,
                     )

@@ -1051,8 +1051,7 @@ def scoped_w4a8_strip_acc(
         and not _use_w_cache
         and packing == 8
         and rhs_quant_dtype == jnp.float4_e2m1fn
-        and rhs_qbs >= 256
-        and rhs_qbs % 128 == 0
+        and rhs_qbs == 256
         and tile_k % _eff_kc == 0
         and _eff_kc % rhs_qbs == 0
         and (skip_lhs_scale_mul or q_block_size % _eff_kc == 0)

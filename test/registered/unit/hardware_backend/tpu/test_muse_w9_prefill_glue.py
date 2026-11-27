@@ -2564,6 +2564,8 @@ def test_d_mxu_combine_unwritten_nan_padding_and_l61_active_mask():
                         emit_static_fp8_attn_in=True,
                     )
 
+            assert np.all(np.isfinite(np.asarray(ns_ref)))
+            assert np.all(np.isfinite(np.asarray(ni_ref.astype(jnp.float32))))
             assert np.all(np.isfinite(np.asarray(ns_mxu)))
             assert np.all(np.isfinite(np.asarray(ni_mxu.astype(jnp.float32))))
             np.testing.assert_array_equal(np.asarray(ns_mxu)[:n_act], np.asarray(ns_ref)[:n_act])
@@ -2572,23 +2574,115 @@ def test_d_mxu_combine_unwritten_nan_padding_and_l61_active_mask():
                 np.asarray(ni_ref[:n_act].astype(jnp.float32)),
             )
 
-        # Also check bf16 out_buf with NaN and +/-Inf in unwritten padding rows.
+        # Also check bf16 out_buf with NaN and +/-Inf in unwritten padding rows across MXU + SALU paths.
         ob_bf16 = np.full((32 * 8, 32, 128), np.nan, dtype=np.float32)
         ob_bf16[48:128] = np.inf
         ob_bf16[128:192] = -np.inf
         ob_bf16[:48] = rng.standard_normal((48, 32, 128)).astype(np.float32) * 0.25
         ob_bf16_j = jnp.array(ob_bf16).astype(jnp.bfloat16)
-        with (
-            mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_FP8_UNPOOL, "get", return_value=4096),
-            mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_MXU_COMBINE, "get", return_value=True),
+        ob_bf16_128 = np.full((128 * 8, 32, 128), np.nan, dtype=np.float32)
+        ob_bf16_128[48:512] = np.inf
+        ob_bf16_128[512:] = -np.inf
+        ob_bf16_128[:48] = ob_bf16[:48]
+        ob_bf16_128_j = jnp.array(ob_bf16_128).astype(jnp.bfloat16)
+        for mxu_on, ob_use, c_sz, qbs_u, sf8_u, c16_u in (
+            (True, ob_bf16_j, 32, 4096, True, True),
+            (False, ob_bf16_j, 32, 4096, True, True),
+            (False, ob_bf16_128_j, 128, 512, False, True),
+            (False, ob_bf16_128_j, 128, 512, False, False),
         ):
-            ns_bf, ni_bf = kernel_d.pallas_combine_unpool_residual_nextnorm_4slab(
-                ob_bf16_j, ip[:32], tw[:32], sm[:32], wu, ws, wv, wv, wv, wv,
-                tok_tile=64, fp8_unpool=True, fp8_unpool_qbs=4096,
-                emit_static_fp8_attn_in=True,
-            )
-            assert np.all(np.isfinite(np.asarray(ns_bf)))
-            assert np.all(np.isfinite(np.asarray(ni_bf.astype(jnp.float32))))
+            with (
+                mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_FP8_UNPOOL, "get", return_value=qbs_u),
+                mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_MXU_COMBINE, "get", return_value=mxu_on),
+                mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_T64_C16, "get", return_value=c16_u),
+            ):
+                ns_bf, ni_bf = kernel_d.pallas_combine_unpool_residual_nextnorm_4slab(
+                    ob_use, ip[:c_sz], tw[:c_sz], sm[:c_sz], wu, ws, wv, wv, wv, wv,
+                    tok_tile=64, fp8_unpool=True, fp8_unpool_qbs=qbs_u,
+                    emit_static_fp8_attn_in=sf8_u,
+                )
+                assert np.all(np.isfinite(np.asarray(ns_bf)))
+                assert np.all(np.isfinite(np.asarray(ni_bf.astype(jnp.float32))))
+
+        # Verify pipeline skips _zero_unwritten_head on 4slab when t_local < 256 (scrub_mxu_nan=True),
+        # while preserving it when t_local >= 256 or when radical 4slab kernels are enabled.
+        import re
+        from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels import pipeline
+
+        hlo_mesh = Mesh(np.array(jax.devices("cpu")[:8]), ("model",))
+
+        def _zero_head_present(t_loc: int, coal_on: bool) -> bool:
+            def _fake_gmm(*_a, **_k):
+                return jnp.zeros((t_loc * 8, 32, 128), dtype=jnp.float8_e4m3fn)
+
+            with (
+                mock.patch.object(pipeline, "moe_gmm_local_rs_nodedup", side_effect=_fake_gmm),
+                mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_COAL_GATHER, "get", return_value=coal_on),
+                mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_FUSED_B1_B2, "get", return_value=4),
+                mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8, "get", return_value=5),
+            ):
+                sm_p = jax.jit(
+                    jax.shard_map(
+                        lambda *a: pipeline.fused_moe_full_bridge_and_ffn(
+                            *a[:22], valid_tokens=a[22], mesh=hlo_mesh, router_mode="bf16_hilo",
+                            b2_layout="nstream", b2_two_half=True, hoist_routing=True,
+                            d_layout="4slab", d_tok_tile=64, d_fp8_unpool=True,
+                            d_emit_static_fp8_attn_in=True, in_shard_map=True,
+                        ),
+                        mesh=hlo_mesh,
+                        in_specs=(
+                            P("model", None), P("model", None),
+                            P(), P(), P(), P(), P(), P(), P(), P(),
+                            P("model"), P("model"), P("model"), P("model"),
+                            P(), P("model"), P(), P(), P(), P(), P(), P(), P(),
+                        ),
+                        out_specs=(P("model", None),) * 4,
+                        check_vma=False,
+                    )
+                )
+                if coal_on:
+                    mock_rad = mock.patch(
+                        "sglang_tpu.muse_prefill_kernels.prefill_w8_radicals.pallas_d_radical_4slab",
+                        side_effect=lambda *ka, **_kk: (ka[3], jnp.zeros((t_loc, 8192), dtype=jnp.float8_e4m3fn)),
+                    )
+                else:
+                    mock_rad = mock.patch.object(
+                        pipeline, "pallas_combine_unpool_residual_nextnorm_4slab",
+                        side_effect=lambda *ka, **_kk: (ka[3], jnp.zeros((t_loc, 8192), dtype=jnp.float8_e4m3fn)),
+                    )
+                with mock_rad:
+                    jtxt = str(
+                        sm_p.trace(
+                            jax.ShapeDtypeStruct((8 * t_loc, 8192), jnp.bfloat16),
+                            jax.ShapeDtypeStruct((8 * t_loc, 8192), jnp.float32),
+                            jax.ShapeDtypeStruct((8192,), jnp.float32),
+                            jax.ShapeDtypeStruct((8192,), jnp.float32),
+                            jax.ShapeDtypeStruct((8192,), jnp.float32),
+                            jax.ShapeDtypeStruct((8192, 256), jnp.bfloat16),
+                            jax.ShapeDtypeStruct((256,), jnp.float32),
+                            jax.ShapeDtypeStruct((8192, 4096), jnp.float8_e4m3fn),
+                            jax.ShapeDtypeStruct((4096,), jnp.float32),
+                            jax.ShapeDtypeStruct((4096,), jnp.float32),
+                            jax.ShapeDtypeStruct((256, 4096, 8192), jnp.float8_e4m3fn),
+                            jax.ShapeDtypeStruct((256, 4096, 4096), jnp.float8_e4m3fn),
+                            jax.ShapeDtypeStruct((256, 1, 8192), jnp.float32),
+                            jax.ShapeDtypeStruct((256, 1, 4096), jnp.float32),
+                            jax.ShapeDtypeStruct((4096,), jnp.bfloat16),
+                            jax.ShapeDtypeStruct((8,), jnp.int32),
+                            jax.ShapeDtypeStruct((4096, 8192), jnp.float8_e4m3fn),
+                            jax.ShapeDtypeStruct((8192,), jnp.float32),
+                            jax.ShapeDtypeStruct((8192,), jnp.float32),
+                            jax.ShapeDtypeStruct((8192,), jnp.float32),
+                            jax.ShapeDtypeStruct((8192,), jnp.float32),
+                            jax.ShapeDtypeStruct((8192,), jnp.float32),
+                            jax.ShapeDtypeStruct((), jnp.int32),
+                        ).jaxpr
+                    )
+                return bool(re.search(rf"f8_e4m3fn\[{t_loc * 8},32,128\] = cond\[", jtxt))
+
+        assert _zero_head_present(128, False) is False
+        assert _zero_head_present(256, False) is True
+        assert _zero_head_present(128, True) is True
 
         # Verify scrub_mxu_nan=False matches scrub_mxu_nan=True on finite inputs (pipeline L0..60 path).
         fin_only = jax.lax.bitcast_convert_type(

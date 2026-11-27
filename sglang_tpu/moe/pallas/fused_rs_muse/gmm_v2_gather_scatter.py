@@ -401,6 +401,7 @@ def inner_kernel(
     w_strip_fp8_ref=None,
     prequant_lhs_ready: bool = False,
     skip_lhs_scale_mul: bool = False,
+    w4a8_k_chain_override: int | None = None,
 ):
     """Inner kernel invoked by emit_pipeline to perform matmul.
 
@@ -464,8 +465,12 @@ def inner_kernel(
         if cfgs.dims.size_m > 4096:
             from .prefill_gmm_opts import resolve_w4a8_k_chain
 
-            w4a8_k_chain = resolve_w4a8_k_chain(
-                envs.SGLANG_TPU_MUSE_KERNEL_GMM_W4A8_K_CHAIN.get()
+            w4a8_k_chain = (
+                resolve_w4a8_k_chain(w4a8_k_chain_override)
+                if w4a8_k_chain_override is not None
+                else resolve_w4a8_k_chain(
+                    envs.SGLANG_TPU_MUSE_KERNEL_GMM_W4A8_K_CHAIN.get()
+                )
             )
         eo_fp8_mode = (
             int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_EXPERT_OUTER_FP8.get() or 0)

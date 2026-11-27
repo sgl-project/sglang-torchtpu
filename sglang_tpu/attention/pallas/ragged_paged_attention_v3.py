@@ -3280,6 +3280,41 @@ def _stationary_q_v2_process(
                     @pl.when(bkv_idx == start_bkv_idx)
                     def _wait_up_bq_prefix():
                         _wait_and_unpack_cur_bq(bq_sem_idx)
+                        if (
+                            use_mk128
+                            and "gqa8" in prefill_opts
+                            and not use_fp8_qk_dyn
+                            and probe != "nocompute"
+                        ):
+                            n_tq_p = cdiv(valid_bq_rows, 256)
+
+                            @pl.loop(0, n_tq_p, unroll=False)
+                            def _pack_q_gqa8(i256):
+                                t_sl_p = pl.ds(pl.multiple_of(i256 * 256, 256), 256)
+                                sl_lo = pl.ds(pl.multiple_of(i256 * 256, 256), 128)
+                                sl_hi = pl.ds(
+                                    pl.multiple_of(i256 * 256 + 128, 128), 128
+                                )
+                                for kv_h in range(sq_kv_heads):
+                                    h_sl = slice(kv_h * 8, (kv_h + 1) * 8)
+                                    qh8_lo = q_t_ref[h_sl, :, sl_lo]
+                                    qh8_hi = q_t_ref[h_sl, :, sl_hi]
+                                    slots_p = []
+                                    for q_half in (qh8_lo, qh8_hi):
+                                        for sub_c in range(4):
+                                            c0 = sub_c * 32
+                                            slots_p.append(
+                                                jnp.concatenate(
+                                                    [
+                                                        q_half[g_i, :, c0 : c0 + 32]
+                                                        for g_i in range(8)
+                                                    ],
+                                                    axis=1,
+                                                )
+                                            )
+                                    q_t_ref[h_sl, :, t_sl_p] = jnp.stack(
+                                        slots_p, axis=0
+                                    )
 
                     wait_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx)
 
@@ -3313,71 +3348,90 @@ def _stationary_q_v2_process(
 
                         def _exec_prefix_pass(static_first: bool, with_topk: bool):
                             if use_mk128 and "gqa8" in prefill_opts and not use_fp8_qk_dyn:
-                                n_q128 = cdiv(valid_bq_rows, 128)
+                                n_tq_p = cdiv(valid_bq_rows, 256)
 
-                                @pl.loop(0, n_q128, unroll=False)
-                                def _exec_prefix_gqa8(i128):
-                                    q128_start = pl.multiple_of(i128 * 128, 128)
-                                    sl128 = pl.ds(q128_start, 128)
+                                @pl.loop(0, n_tq_p, unroll=False)
+                                def _exec_prefix_gqa8(i256):
+                                    t_sl_p = pl.ds(
+                                        pl.multiple_of(i256 * 256, 256), 256
+                                    )
                                     for kv_h in range(sq_kv_heads):
-                                        h_ind = (
-                                            _load_topk_indices(kv_h, q128_start)
-                                            if with_topk
-                                            else None
-                                        )
-                                        h_sl = slice(kv_h * 8, (kv_h + 1) * 8)
-                                        q_h8 = q_t_ref[h_sl, :, sl128]
-                                        acc_subs = []
-                                        l_subs = []
-                                        for sub_c in range(4):
-                                            c0 = sub_c * 32
-                                            c1 = c0 + 32
-                                            qt_8h = jnp.concatenate(
-                                                [q_h8[g_i, :, c0:c1] for g_i in range(8)],
-                                                axis=1,
-                                            )[None, :, :]
-                                            acc_8h, l_8h = _eval_mk128_head(
-                                                kv_h,
-                                                qt_8h,
-                                                None,
-                                                0,
-                                                num_s,
-                                                ("none",) * num_s,
-                                                h_indices=h_ind,
-                                            )
-                                            acc_subs.append(
-                                                jnp.swapaxes(
-                                                    acc_8h[0].reshape(64, 8, 32), 0, 1
+                                        for half_i in range(2):
+                                            q128_start = i256 * 256 + half_i * 128
+
+                                            @pl.when(q128_start < valid_bq_rows)
+                                            def _run_half_g8():
+                                                h_ind = (
+                                                    _load_topk_indices(
+                                                        kv_h, q128_start
+                                                    )
+                                                    if with_topk
+                                                    else None
                                                 )
-                                            )
-                                            l_subs.append(
-                                                jnp.swapaxes(
-                                                    l_8h[0].reshape(8, 8, 32), 0, 1
-                                                )
-                                            )
-                                        acc_128 = jnp.concatenate(acc_subs, axis=2)
-                                        l_128 = jnp.concatenate(l_subs, axis=2)
-                                        if static_first:
-                                            l_ref[h_sl, :, sl128] = l_128
-                                            acc_ref[h_sl, :, sl128] = acc_128
-                                        elif with_topk:
-                                            l_ref[h_sl, :, sl128] = (
-                                                l_ref[h_sl, :, sl128] + l_128
-                                            )
-                                            acc_ref[h_sl, :, sl128] = (
-                                                acc_ref[h_sl, :, sl128] + acc_128
-                                            )
-                                        else:
-                                            l_ref[h_sl, :, sl128] = jnp.where(
-                                                is_first_bkv,
-                                                l_128,
-                                                l_ref[h_sl, :, sl128] + l_128,
-                                            )
-                                            acc_ref[h_sl, :, sl128] = jnp.where(
-                                                is_first_bkv,
-                                                acc_128,
-                                                acc_ref[h_sl, :, sl128] + acc_128,
-                                            )
+                                                for sub_c in range(4):
+                                                    r_idx = (
+                                                        kv_h * 8
+                                                        + half_i * 4
+                                                        + sub_c
+                                                    )
+                                                    r_sl = slice(r_idx, r_idx + 1)
+                                                    qt_8h = q_t_ref[
+                                                        r_sl, :, t_sl_p
+                                                    ]
+                                                    acc_8h, l_8h = _eval_mk128_head(
+                                                        kv_h,
+                                                        qt_8h,
+                                                        None,
+                                                        0,
+                                                        num_s,
+                                                        ("none",) * num_s,
+                                                        h_indices=h_ind,
+                                                    )
+                                                    if static_first:
+                                                        l_ref[
+                                                            r_sl, :, t_sl_p
+                                                        ] = l_8h
+                                                        acc_ref[
+                                                            r_sl, :, t_sl_p
+                                                        ] = acc_8h
+                                                    elif with_topk:
+                                                        l_ref[r_sl, :, t_sl_p] = (
+                                                            l_ref[
+                                                                r_sl, :, t_sl_p
+                                                            ]
+                                                            + l_8h
+                                                        )
+                                                        acc_ref[
+                                                            r_sl, :, t_sl_p
+                                                        ] = (
+                                                            acc_ref[
+                                                                r_sl, :, t_sl_p
+                                                            ]
+                                                            + acc_8h
+                                                        )
+                                                    else:
+                                                        l_ref[r_sl, :, t_sl_p] = (
+                                                            jnp.where(
+                                                                is_first_bkv,
+                                                                l_8h,
+                                                                l_ref[
+                                                                    r_sl,
+                                                                    :,
+                                                                    t_sl_p,
+                                                                ]
+                                                                + l_8h,
+                                                            )
+                                                        )
+                                                        acc_ref[
+                                                            r_sl, :, t_sl_p
+                                                        ] = jnp.where(
+                                                            is_first_bkv,
+                                                            acc_8h,
+                                                            acc_ref[
+                                                                r_sl, :, t_sl_p
+                                                            ]
+                                                            + acc_8h,
+                                                        )
 
                             else:
 
@@ -3428,6 +3482,119 @@ def _stationary_q_v2_process(
 
                         else:
                             _exec_prefix_pass(static_first=False, with_topk=False)
+
+                if (
+                    use_mk128
+                    and "gqa8" in prefill_opts
+                    and not use_fp8_qk_dyn
+                    and probe != "nocompute"
+                ):
+
+                    @pl.when(tail_bkv_start > start_bkv_idx)
+                    def _unpack_prefix_gqa8():
+                        n_tq_p = cdiv(valid_bq_rows, 256)
+
+                        @pl.loop(0, n_tq_p, unroll=False)
+                        def _up_acc_l_g8(i256):
+                            t_sl_p = pl.ds(pl.multiple_of(i256 * 256, 256), 256)
+                            sl_lo = pl.ds(pl.multiple_of(i256 * 256, 256), 128)
+                            sl_hi = pl.ds(pl.multiple_of(i256 * 256 + 128, 128), 128)
+                            has_hi = (i256 * 256 + 128) < valid_bq_rows
+                            for kv_h in range(sq_kv_heads):
+                                h_sl = slice(kv_h * 8, (kv_h + 1) * 8)
+                                a_blk = acc_ref[h_sl, :, t_sl_p]
+                                l_blk = l_ref[h_sl, :, t_sl_p]
+                                acc_ref[h_sl, :, sl_lo] = jnp.concatenate(
+                                    [
+                                        jnp.swapaxes(
+                                            a_blk[sc].reshape(64, 8, 32), 0, 1
+                                        )
+                                        for sc in range(4)
+                                    ],
+                                    axis=2,
+                                )
+                                l_ref[h_sl, :, sl_lo] = jnp.concatenate(
+                                    [
+                                        jnp.swapaxes(
+                                            l_blk[sc].reshape(8, 8, 32), 0, 1
+                                        )
+                                        for sc in range(4)
+                                    ],
+                                    axis=2,
+                                )
+
+                                @pl.when(has_hi)
+                                def _up_acc_l_hi():
+                                    acc_ref[h_sl, :, sl_hi] = jnp.concatenate(
+                                        [
+                                            jnp.swapaxes(
+                                                a_blk[4 + sc].reshape(64, 8, 32),
+                                                0,
+                                                1,
+                                            )
+                                            for sc in range(4)
+                                        ],
+                                        axis=2,
+                                    )
+                                    l_ref[h_sl, :, sl_hi] = jnp.concatenate(
+                                        [
+                                            jnp.swapaxes(
+                                                l_blk[4 + sc].reshape(8, 8, 32),
+                                                0,
+                                                1,
+                                            )
+                                            for sc in range(4)
+                                        ],
+                                        axis=2,
+                                    )
+
+                        @pl.when(end_bkv_idx > tail_bkv_start)
+                        def _up_q_tail_g8():
+
+                            @pl.loop(0, n_tq_p, unroll=False)
+                            def _up_q_g8_loop(i256):
+                                t_sl_p = pl.ds(
+                                    pl.multiple_of(i256 * 256, 256), 256
+                                )
+                                sl_lo = pl.ds(
+                                    pl.multiple_of(i256 * 256, 256), 128
+                                )
+                                sl_hi = pl.ds(
+                                    pl.multiple_of(i256 * 256 + 128, 128), 128
+                                )
+                                has_hi = (i256 * 256 + 128) < valid_bq_rows
+                                for kv_h in range(sq_kv_heads):
+                                    h_sl = slice(kv_h * 8, (kv_h + 1) * 8)
+                                    q_blk = q_t_ref[h_sl, :, t_sl_p]
+                                    q_t_ref[h_sl, :, sl_lo] = jnp.concatenate(
+                                        [
+                                            jnp.swapaxes(
+                                                q_blk[sc].reshape(64, 8, 32),
+                                                0,
+                                                1,
+                                            )
+                                            for sc in range(4)
+                                        ],
+                                        axis=2,
+                                    )
+
+                                    @pl.when(has_hi)
+                                    def _up_q_hi():
+                                        q_t_ref[h_sl, :, sl_hi] = (
+                                            jnp.concatenate(
+                                                [
+                                                    jnp.swapaxes(
+                                                        q_blk[4 + sc].reshape(
+                                                            64, 8, 32
+                                                        ),
+                                                        0,
+                                                        1,
+                                                    )
+                                                    for sc in range(4)
+                                                ],
+                                                axis=2,
+                                            )
+                                        )
 
             @pl.loop(tail_bkv_start, end_bkv_idx, unroll=False)
             def _stream_bkv(bkv_idx):
@@ -3801,13 +3968,15 @@ def _prefix_score_kernel(
             @pl.when((tail_bkv_start > bkv_start_k1) & (valid_qgrps > 0))
             def _k1_run_bq():
                 q_row_base = q_start + bq_idx * actual_bq_sz
-                if qstride == 4:
-                    n_stages = cdiv(valid_bq_rows, 512)
-                    stages_per_qgrp = max(1, q_grp_sz // 512)
+                if qstride in (4, 8, 16):
+                    stage_q_rows = 128 * qstride
+                    n_stages = cdiv(valid_bq_rows, stage_q_rows)
+                    stages_per_qgrp = max(1, q_grp_sz // stage_q_rows)
+                    inv_qstride = jnp.float32(1.0 / float(qstride))
 
                     @pl.when(n_stages > 0)
-                    def _k1_load_q4():
-                        sz0 = jnp.minimum(512, valid_bq_rows)
+                    def _k1_load_q_wide():
+                        sz0 = jnp.minimum(stage_q_rows, valid_bq_rows)
                         _async_copy(
                             q_hbm_ref.at[:, pl.ds(q_row_base, sz0)],
                             bq_stage_ref.at[0, :, pl.ds(0, sz0)],
@@ -3816,26 +3985,36 @@ def _prefix_score_kernel(
                         )
 
                         @pl.loop(0, n_stages, unroll=False)
-                        def _k1_q_stage4(st_idx):
+                        def _k1_q_stage_wide(st_idx):
                             st_slot = st_idx & 1
-                            st_q_start = st_idx * 512
-                            st_sz = jnp.minimum(512, valid_bq_rows - st_q_start)
+                            st_q_start = st_idx * stage_q_rows
+                            st_sz = jnp.minimum(
+                                stage_q_rows, valid_bq_rows - st_q_start
+                            )
                             next_st = st_idx + 1
 
                             @pl.when(next_st < n_stages)
-                            def _k1_pf_q4():
+                            def _k1_pf_q_wide():
                                 nxt_slot = next_st & 1
-                                nxt_q = next_st * 512
-                                nxt_sz = jnp.minimum(512, valid_bq_rows - nxt_q)
+                                nxt_q = next_st * stage_q_rows
+                                nxt_sz = jnp.minimum(
+                                    stage_q_rows, valid_bq_rows - nxt_q
+                                )
                                 _async_copy(
-                                    q_hbm_ref.at[:, pl.ds(q_row_base + nxt_q, nxt_sz)],
-                                    bq_stage_ref.at[nxt_slot, :, pl.ds(0, nxt_sz)],
+                                    q_hbm_ref.at[
+                                        :, pl.ds(q_row_base + nxt_q, nxt_sz)
+                                    ],
+                                    bq_stage_ref.at[
+                                        nxt_slot, :, pl.ds(0, nxt_sz)
+                                    ],
                                     sems.at[1, nxt_slot],
                                     False,
                                 )
 
                             _async_copy(
-                                q_hbm_ref.at[:, pl.ds(q_row_base + st_q_start, st_sz)],
+                                q_hbm_ref.at[
+                                    :, pl.ds(q_row_base + st_q_start, st_sz)
+                                ],
                                 bq_stage_ref.at[st_slot, :, pl.ds(0, st_sz)],
                                 sems.at[1, st_slot],
                                 True,
@@ -3846,76 +4025,100 @@ def _prefix_score_kernel(
                                 if interpret
                                 else bq_stage_ref.bitcast(jnp.uint32)
                                 .at[st_slot, 0]
-                                .reshape(512 * sq_pairs, 128)
+                                .reshape(stage_q_rows * sq_pairs, 128)
                             )
-                            sub_c0 = pl.multiple_of((st_q_start % q_grp_sz) // 4, 128)
-                            ok0 = (4 * r_128_io) < st_sz
-                            ok1 = (4 * r_128_io + 1) < st_sz
-                            ok2 = (4 * r_128_io + 2) < st_sz
-                            ok3 = (4 * r_128_io + 3) < st_sz
+                            sub_c0 = pl.multiple_of(
+                                (st_q_start % q_grp_sz) // qstride, 128
+                            )
 
-                            def _read_u32_strided4(off_q, s_p):
+                            def _read_u32_strided_q(off_q, s_p):
                                 if interpret:
                                     u16 = lax.bitcast_convert_type(
-                                        bq_stage_ref[st_slot, 0, pl.ds(off_q, 128, 4), s_p],
+                                        bq_stage_ref[
+                                            st_slot,
+                                            0,
+                                            pl.ds(off_q, 128, qstride),
+                                            s_p,
+                                        ],
                                         jnp.uint16,
                                     ).astype(jnp.uint32)
-                                    return u16[:, 0, :] | (u16[:, 1, :] << jnp.uint32(16))
+                                    return u16[:, 0, :] | (
+                                        u16[:, 1, :] << jnp.uint32(16)
+                                    )
                                 return q_u32_stage[
-                                    pl.ds(off_q * sq_pairs + s_p, 128, 4 * sq_pairs)
+                                    pl.ds(
+                                        off_q * sq_pairs + s_p,
+                                        128,
+                                        qstride * sq_pairs,
+                                    )
                                 ]
 
                             for s_p in range(sq_pairs):
-                                def _dec_128_4(u_r, s_idx_p=s_p):
-                                    ef = pltpu.bitcast(u_r << jnp.uint32(16), jnp.float32)
-                                    of = pltpu.bitcast(u_r & jnp.uint32(0xFFFF0000), jnp.float32)
-                                    if s_idx_p < 4:
-                                        return jnp.where(lane_is_lo_128, ef, _roll64(of))
-                                    return jnp.where(lane_is_lo_128, _roll64(ef), of)
 
-                                u0 = jnp.where(ok0, _read_u32_strided4(0, s_p), jnp.uint32(0))
-                                u1 = jnp.where(ok1, _read_u32_strided4(1, s_p), jnp.uint32(0))
-                                u2 = jnp.where(ok2, _read_u32_strided4(2, s_p), jnp.uint32(0))
-                                u3 = jnp.where(ok3, _read_u32_strided4(3, s_p), jnp.uint32(0))
-                                pooled_t = jnp.swapaxes(
-                                    (
-                                        0.25
-                                        * (
-                                            _dec_128_4(u0)
-                                            + _dec_128_4(u1)
-                                            + _dec_128_4(u2)
-                                            + _dec_128_4(u3)
+                                def _dec_128_q(u_r, s_idx_p=s_p):
+                                    ef = pltpu.bitcast(
+                                        u_r << jnp.uint32(16), jnp.float32
+                                    )
+                                    of = pltpu.bitcast(
+                                        u_r & jnp.uint32(0xFFFF0000),
+                                        jnp.float32,
+                                    )
+                                    if s_idx_p < 4:
+                                        return jnp.where(
+                                            lane_is_lo_128, ef, _roll64(of)
                                         )
-                                    ).astype(jnp.bfloat16),
+                                    return jnp.where(
+                                        lane_is_lo_128, _roll64(ef), of
+                                    )
+
+                                acc_pq = jnp.zeros((128, 128), jnp.float32)
+                                for off_q in range(qstride):
+                                    ok_q = (qstride * r_128_io + off_q) < st_sz
+                                    u_q = jnp.where(
+                                        ok_q,
+                                        _read_u32_strided_q(off_q, s_p),
+                                        jnp.uint32(0),
+                                    )
+                                    acc_pq = acc_pq + _dec_128_q(u_q)
+                                pooled_t = jnp.swapaxes(
+                                    (inv_qstride * acc_pq).astype(jnp.bfloat16),
                                     0,
                                     1,
                                 )
-                                q_k1_bf16_ref[0, 2 * s_p, :, pl.ds(sub_c0, 128)] = pooled_t[:64, :]
-                                q_k1_bf16_ref[0, 2 * s_p + 1, :, pl.ds(sub_c0, 128)] = pooled_t[64:, :]
+                                q_k1_bf16_ref[
+                                    0, 2 * s_p, :, pl.ds(sub_c0, 128)
+                                ] = pooled_t[:64, :]
+                                q_k1_bf16_ref[
+                                    0, 2 * s_p + 1, :, pl.ds(sub_c0, 128)
+                                ] = pooled_t[64:, :]
 
                             quant_now = (
                                 jnp.bool_(True)
                                 if stages_per_qgrp == 1
                                 else jnp.logical_or(
-                                    (st_idx & 1) == 1, st_idx == (n_stages - 1)
+                                    (st_idx % stages_per_qgrp)
+                                    == (stages_per_qgrp - 1),
+                                    st_idx == (n_stages - 1),
                                 )
                             )
 
                             @pl.when(quant_now)
                             def _quant_grp_now():
                                 valid_g_rows = jnp.clip(
-                                    valid_bq_rows - g_idx * q_grp_sz, 0, q_grp_sz
+                                    valid_bq_rows - g_idx * q_grp_sz,
+                                    0,
+                                    q_grp_sz,
                                 )
-                                valid_cols = cdiv(valid_g_rows, 4)
+                                valid_cols = cdiv(valid_g_rows, qstride)
                                 col_ok_64w = col_iota_64w < valid_cols
                                 for kv_h in range(sq_kv_heads):
 
                                     def _quant_qh4(q_h, sc_acc):
                                         qf = jnp.where(
                                             col_ok_64w,
-                                            q_k1_bf16_ref[0, kv_h * 8 + q_h].astype(
-                                                jnp.float32
-                                            ),
+                                            q_k1_bf16_ref[
+                                                0, kv_h * 8 + q_h
+                                            ].astype(jnp.float32),
                                             jnp.float32(0.0),
                                         )
                                         amax = _tile_amax_f32(qf)
@@ -3923,11 +4126,15 @@ def _prefix_score_kernel(
                                             amax == 0.0,
                                             jnp.float32(0.0),
                                             jnp.float32(448.0)
-                                            / jnp.maximum(amax, jnp.float32(1e-12)),
+                                            / jnp.maximum(
+                                                amax, jnp.float32(1e-12)
+                                            ),
                                         )
-                                        q_k1_f8_ref[g_idx, kv_h * 8 + q_h] = jnp.clip(
-                                            qf * q_inv, -448.0, 448.0
-                                        ).astype(jnp.float8_e4m3fn)
+                                        q_k1_f8_ref[g_idx, kv_h * 8 + q_h] = (
+                                            jnp.clip(
+                                                qf * q_inv, -448.0, 448.0
+                                            ).astype(jnp.float8_e4m3fn)
+                                        )
                                         return jnp.where(
                                             q_h_iota == q_h,
                                             amax * jnp.float32(exp_scale / 448.0),
@@ -9120,11 +9327,15 @@ def ragged_paged_attention(
 
         eff_bq_topk = bq_sz if static_q_len is None else min(bq_sz, static_q_len)
         num_h_per_bkv = 2 * (bkv_sz // 256)
-        w_q_cap = 256 if _prefill_topk_qstride == 4 else 512
+        w_q_cap = (
+            128
+            if _prefill_topk_qstride == 16
+            else (256 if _prefill_topk_qstride in (4, 8) else 512)
+        )
         w_q_topk = (
             min(w_q_cap, eff_bq_topk // _prefill_topk_qstride)
             if (
-                _prefill_topk_qstride in (1, 2, 4)
+                _prefill_topk_qstride in (1, 2, 4, 8, 16)
                 and eff_bq_topk >= 256
                 and eff_bq_topk % 256 == 0
             )
@@ -9155,7 +9366,7 @@ def ragged_paged_attention(
             and _prefill_topk_slices > 0
             and _prefill_topk_slices < num_h_per_bkv
             and _prefill_topk_slices % 4 == 0
-            and _prefill_topk_qstride in (1, 2, 4)
+            and _prefill_topk_qstride in (1, 2, 4, 8, 16)
             and w_q_topk in (128, 256, 512)
             and probe is None
             and smem_ints_topk <= 131072
@@ -9189,8 +9400,14 @@ def ragged_paged_attention(
             k1_n_qgrps_per_bq = max(1, eff_bq_k1 // q_grp_sz_topk)
             topk_in_kernel_eff = bool(_prefill_topk_in_kernel)
             sc_out_dtype_k1 = jnp.int32 if topk_in_kernel_eff else jnp.float32
-            k1_q_stage_rows = 512 if _prefill_topk_qstride == 4 else 256
-            q_k1_bf16_n = 1 if _prefill_topk_qstride == 4 else k1_n_qgrps_per_bq
+            k1_q_stage_rows = (
+                128 * _prefill_topk_qstride
+                if _prefill_topk_qstride in (4, 8, 16)
+                else 256
+            )
+            q_k1_bf16_n = (
+                1 if _prefill_topk_qstride in (4, 8, 16) else k1_n_qgrps_per_bq
+            )
             k1_scratches = [
                 pltpu.VMEM((2, 1, k1_q_stage_rows, *q.shape[2:]), q.dtype),
                 pltpu.VMEM(

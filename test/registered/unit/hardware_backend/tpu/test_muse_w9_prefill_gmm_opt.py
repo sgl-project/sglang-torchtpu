@@ -2471,6 +2471,7 @@ def test_w4a8_k_chain_scaled_fp8_interpret_and_aot() -> None:
     from jax.experimental.pallas import tpu as pltpu
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
     from sglang_tpu.moe.pallas.fused_rs_muse.gmm_fused_rs_nodedup import (
+        _select_fused_rs_block_sizes,
         gmm_v2_fused_rs,
     )
     from sglang_tpu.moe.pallas.fused_rs_muse.gmm_v2_gather_scatter import (
@@ -2527,7 +2528,7 @@ def test_w4a8_k_chain_scaled_fp8_interpret_and_aot() -> None:
     gs_up = jnp.asarray([0.95], jnp.float32)
     gs_w2 = jnp.asarray([1.1], jnp.float32)
 
-    def _mk_cfgs(qbs_lhs: int, with_g1: bool):
+    def _mk_cfgs(qbs_lhs: int, with_g1: bool, *, rhs_qbs: int = 256):
         n_cols = tile_n1_g if with_g1 else n2
         return GmmConfigs(
             dims=Dimensions(
@@ -2546,12 +2547,12 @@ def test_w4a8_k_chain_scaled_fp8_interpret_and_aot() -> None:
             ),
             rhs_cfgs=InputConfigs(
                 quant_dtype=jnp.float4_e2m1fn.dtype,
-                quant_block_size=256,
+                quant_block_size=rhs_qbs,
                 dtype=jnp.float4_e2m1fn,
                 has_bias=False,
                 has_scale=True,
                 packing=8,
-                num_quant_blocks=(k1 if with_g1 else k2) // 256,
+                num_quant_blocks=(k1 if with_g1 else k2) // rhs_qbs,
             ),
             out_dtype=jnp.bfloat16,
             acc_dtype=jnp.float32,
@@ -2565,9 +2566,16 @@ def test_w4a8_k_chain_scaled_fp8_interpret_and_aot() -> None:
         uninitialized_memory="nan",
     )
 
-    def _run_e2e_inner(kc_str: str, *, g2s_ready: bool, skip_mask: bool) -> np.ndarray:
-        c1 = _mk_cfgs(k1, True)
-        c2 = _mk_cfgs(k2 if g2s_ready else 1024, False)
+    def _run_e2e_inner(
+        kc_str: str,
+        *,
+        g2s_ready: bool,
+        skip_mask: bool,
+        rhs_qbs: int = 256,
+        kc_override: int | None = None,
+    ) -> np.ndarray:
+        c1 = _mk_cfgs(k1, True, rhs_qbs=rhs_qbs)
+        c2 = _mk_cfgs(k2 if g2s_ready else 1024, False, rhs_qbs=rhs_qbs)
 
         def _ker(x3d_r, w1_r, s1_r, w2_r, s2_r, gs_g_r, gs_u_r, gs_w2_r, out_r, g1_r, pq_fp8_r, pq_sc_r, p1_r, acc_r, gid_r, moff_r):
             gid_r[0] = 0
@@ -2580,6 +2588,7 @@ def test_w4a8_k_chain_scaled_fp8_interpret_and_aot() -> None:
                 _k_id=0, _num_k=1, _gm_id=0, _n_id=0, _num_n=1,
                 fused_g2_amax_slot=None, prequant_lhs_fp8_ref=pq_fp8_r,
                 prequant_lhs_scale_ref=pq_sc_r, skip_row_mask=skip_mask, lhs_3d_vmem_ref=x3d_r,
+                w4a8_k_chain_override=kc_override,
             )
             inner_kernel(
                 None, WeightsRef(weight=w2_r, scale=s2_r, bias=None), out_r, p1_r, acc_r, meta,
@@ -2591,6 +2600,7 @@ def test_w4a8_k_chain_scaled_fp8_interpret_and_aot() -> None:
                 lhs_2d_vmem_ref=None if g2s_ready else g1_r,
                 prequant_lhs_ready=g2s_ready,
                 skip_lhs_scale_mul=g2s_ready,
+                w4a8_k_chain_override=kc_override,
             )
 
         with (
@@ -2611,6 +2621,8 @@ def test_w4a8_k_chain_scaled_fp8_interpret_and_aot() -> None:
             ),
         ):
             n_g2_lhs_b = max(1, k2 // c2.lhs_cfgs.quant_block_size)
+            s1_in = s1_bf16 if rhs_qbs == 256 else s1_bf16[:: (rhs_qbs // 256)]
+            s2_in = s2_bf16 if rhs_qbs == 256 else s2_bf16[:: (rhs_qbs // 256)]
             call = pl.pallas_call(
                 _ker,
                 out_shape=jax.ShapeDtypeStruct((m_rows, n2), jnp.bfloat16),
@@ -2627,10 +2639,12 @@ def test_w4a8_k_chain_scaled_fp8_interpret_and_aot() -> None:
                 ],
                 interpret=eager_interp,
             )
-            return np.asarray(call(lhs_3d, w1_u32, s1_bf16, w2_u32, s2_bf16, gs_gate, gs_up, gs_w2), np.float32)
+            return np.asarray(call(lhs_3d, w1_u32, s1_in, w2_u32, s2_in, gs_gate, gs_up, gs_w2), np.float32)
 
-    # 1) Hot path: skip_lhs_scale_mul=True, full k_chain=4096 (clamps to 2048) & multi-chunk k_chain=1024
+    # 1) Hot path: skip_lhs_scale_mul=True, full k_chain=4096 (clamps to 2048), multi-chunk 1024, override=0
     y_ref = _run_e2e_inner("0", g2s_ready=True, skip_mask=True)
+    y_ov0 = _run_e2e_inner("4096", g2s_ready=True, skip_mask=True, kc_override=0)
+    np.testing.assert_array_equal(y_ov0, y_ref)
     y_kc4096 = _run_e2e_inner("4096", g2s_ready=True, skip_mask=True)
     y_kc1024 = _run_e2e_inner("1024", g2s_ready=True, skip_mask=True)
     for y_k in (y_kc4096, y_kc1024):
@@ -2638,6 +2652,11 @@ def test_w4a8_k_chain_scaled_fp8_interpret_and_aot() -> None:
         assert np.all(y_k[:, :16] == 0.0)
         cos_v = float(np.dot(y_ref.ravel(), y_k.ravel()) / (np.linalg.norm(y_ref.ravel()) * np.linalg.norm(y_k.ravel())))
         assert cos_v > 0.997, f"k_chain cos={cos_v}"
+
+    # 1b) qbs=512 (nb=8) cleanly bypasses k_chain even if env is "4096"
+    y_q512_ref = _run_e2e_inner("0", g2s_ready=True, skip_mask=True, rhs_qbs=512)
+    y_q512_kc = _run_e2e_inner("4096", g2s_ready=True, skip_mask=True, rhs_qbs=512)
+    np.testing.assert_array_equal(y_q512_kc, y_q512_ref)
 
     # 2) Dynamic-LHS & row-mask path: skip_lhs_scale_mul=False, qbs_lhs=1024, tail mask [5:192]
     y_dyn_ref = _run_e2e_inner("0", g2s_ready=False, skip_mask=False)
@@ -2743,6 +2762,34 @@ def test_w4a8_k_chain_scaled_fp8_interpret_and_aot() -> None:
             assert "-kc4096" in hlo_kc8 and "-w2c1" not in hlo_kc8
             assert 0 < code_kc8 < code_base8
 
+            # Wave-15: nb=8 (qbs=512) cleanly suppresses k_chain, preserves W2_FP8_CACHE,
+            # and PREFILL_GMM_TILES="" + SLH8 + WLA=2 auto-selects full out-N (256, 4096..2, 1).
+            code_nb8, hlo_nb8 = _compile_topo(
+                "tpu7x=2x2x1",
+                8,
+                36,
+                {
+                    "SGLANG_TPU_MUSE_KERNEL_PREFILL_GMM_TILES": "",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_W4A8_K_CHAIN": "4096",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_W2_FP8_CACHE": "1",
+                },
+                nb=8,
+            )
+            assert "-wla2" in hlo_nb8 and "-w2c1" in hlo_nb8 and "-kc" not in hlo_nb8
+            assert 0 < code_nb8 <= 3_385_344
+
+            # Wave-15: half-N n2048 (2,2) on nb=16 cleanly suppresses k_chain (no 4.84 MiB IMEM bloat).
+            code_n2048, hlo_n2048 = _compile_topo(
+                "tpu7x=2x2x1",
+                8,
+                36,
+                {
+                    "SGLANG_TPU_MUSE_KERNEL_PREFILL_GMM_TILES": "256,4096,2048,4096,2048,2,2",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_W4A8_K_CHAIN": "4096",
+                },
+            )
+            assert "-kc" not in hlo_n2048 and code_n2048 > 0
+
             code_nb2, hlo_nb2 = _compile_topo(
                 "tpu7x=2x2x1", 8, 36,
                 {"SGLANG_TPU_MUSE_KERNEL_GMM_W4A8_K_CHAIN": "4096"},
@@ -2751,10 +2798,99 @@ def test_w4a8_k_chain_scaled_fp8_interpret_and_aot() -> None:
             assert "-kc" not in hlo_nb2 and 0 < code_nb2 <= 3_385_344
 
             code_kc16, hlo_kc16 = _compile_topo(
-                "tpu7x=2x2x2", 16, 20,
-                {"SGLANG_TPU_MUSE_KERNEL_GMM_W4A8_K_CHAIN": "4096"},
+                "tpu7x=2x2x2",
+                16,
+                20,
+                {
+                    "SGLANG_TPU_MUSE_KERNEL_PREFILL_GMM_TILES": "",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_W4A8_K_CHAIN": "4096",
+                },
             )
-            assert "-kc4096" in hlo_kc16 and "-g2s4" in hlo_kc16
+            assert "-wla2" in hlo_kc16 and "-kc4096" in hlo_kc16 and "-g2s4" in hlo_kc16
             assert code_kc16 > 0
+
+            # Direct block-size selector guard checks across M / SLH / WLA / EO / qbs.
+            base_bs_kw = dict(
+                size_k1=4096,
+                size_n1=8192,
+                size_k2=4096,
+                size_n2=4096,
+                size_group=36,
+                size_lhs_group=288,
+                ep_size=8,
+                out_dtype=jnp.bfloat16,
+                w1_dtype=jnp.float4_e2m1fn,
+                w2_dtype=jnp.float4_e2m1fn,
+                is_quantized=True,
+                act_fn="silu",
+            )
+            slh_wla2_env = {
+                "SGLANG_TPU_MUSE_KERNEL_PREFILL_GMM_TILES": "",
+                "SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8": "6",
+                "SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_LHS": "8.0",
+                "SGLANG_TPU_MUSE_KERNEL_GMM_WEIGHT_LOOKAHEAD": "2",
+                "SGLANG_TPU_MUSE_KERNEL_GMM_EXPERT_OUTER_FP8": "0",
+                "SGLANG_TPU_MUSE_KERNEL_K256_PREFILL_TILES": "0",
+            }
+            with patch.dict(os.environ, slh_wla2_env):
+                for m_tok in (65536, 131072, 196608):
+                    bs_auto = _select_fused_rs_block_sizes(
+                        size_m=m_tok, quant_block_size=512, **base_bs_kw
+                    )
+                    assert (
+                        bs_auto.tile_m,
+                        bs_auto.tile_k1,
+                        bs_auto.tile_n1,
+                        bs_auto.tile_k2,
+                        bs_auto.tile_n2,
+                        bs_auto.num_w1_bufs,
+                        bs_auto.num_w2_bufs,
+                    ) == (256, 4096, 4096, 4096, 4096, 2, 1)
+                assert (
+                    _select_fused_rs_block_sizes(
+                        size_m=32768, quant_block_size=512, **base_bs_kw
+                    ).tile_m
+                    == 128
+                )
+                assert (
+                    _select_fused_rs_block_sizes(
+                        size_m=65536, quant_block_size=16, **base_bs_kw
+                    ).tile_n1
+                    != 4096
+                )
+            with patch.dict(
+                os.environ,
+                {
+                    **slh_wla2_env,
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8": "4",
+                    "SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_LHS": "0",
+                },
+            ):
+                assert (
+                    _select_fused_rs_block_sizes(
+                        size_m=65536, quant_block_size=512, **base_bs_kw
+                    ).tile_n1
+                    != 4096
+                )
+            with patch.dict(
+                os.environ,
+                {**slh_wla2_env, "SGLANG_TPU_MUSE_KERNEL_GMM_WEIGHT_LOOKAHEAD": "0"},
+            ):
+                assert (
+                    _select_fused_rs_block_sizes(
+                        size_m=65536, quant_block_size=512, **base_bs_kw
+                    ).tile_n1
+                    != 4096
+                )
+            with patch.dict(
+                os.environ,
+                {**slh_wla2_env, "SGLANG_TPU_MUSE_KERNEL_GMM_EXPERT_OUTER_FP8": "3"},
+            ):
+                assert (
+                    _select_fused_rs_block_sizes(
+                        size_m=65536, quant_block_size=512, **base_bs_kw
+                    ).tile_n1
+                    != 4096
+                )
         finally:
             jax.clear_caches()

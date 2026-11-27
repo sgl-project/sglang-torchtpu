@@ -4469,6 +4469,15 @@ class MuseSparkDecoderLayer(nn.Module):
                         if (dist_len > 3 and (n_seqs_step_c % (dist_len - 3)) == 0)
                         else 0
                     )
+                    b128_d2_w4a8 = (
+                        n_tok == 128
+                        and dense2
+                        and (not bd4)
+                        and int(getattr(mlp, "_fused_decode_block", 512)) >= 256
+                        and bool(tpu_envs.SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8.get())
+                        and int(tpu_envs.SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8_MIN_BATCH.get())
+                        <= 128
+                    )
                     cfg_rpa, _, _, _, step_c_rpa_ok = resolve_step_c_rpa_plan(
                         rpa_mode_str,
                         sliding_window=sw,
@@ -4480,6 +4489,7 @@ class MuseSparkDecoderLayer(nn.Module):
                         max_num_seqs=n_seqs_step_c,
                         shared_group_size=shared_grp_step_c,
                         has_shared_prefix=(dist_len > 3),
+                        allow_large_b=(False if b128_d2_w4a8 else None),
                     )
                     if step_c_rpa_ok and (tp != 16 or cfg_rpa.num_slots <= 4):
                         op_c = get_b1_moe_b2_rpad_chip_sharded_op(
