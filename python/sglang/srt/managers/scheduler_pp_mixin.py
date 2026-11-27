@@ -156,6 +156,9 @@ class SchedulerPPMixin:
     _pp_release_reqs_awaiting_verdict: Tuple[ReleaseMemoryOccupationReqInput, ...] = ()
     # The TPU KV free fence the PP loops drive; maybe_init_kv_free_fence sets it.
     pp_kv_free_fence = None
+    # Last stage: slot -> send work of outputs sent before their deferred send
+    # (`_pp_pd_send_finished_outputs`); init_pp_loop_state makes it a dict.
+    _pp_pd_early_output_work: Optional[Dict[int, List[P2PWork]]] = None
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -513,6 +516,7 @@ class SchedulerPPMixin:
                     self._pp_send_proxy(result if cur_batch else None)
                 if get_parallel().pp_async_batch_depth > 0:
                     self._pp_pd_send_deferred_output(next_first_rank_mb_id)
+                    self._pp_pd_send_finished_outputs(mb_id)
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -557,6 +561,7 @@ class SchedulerPPMixin:
                     self._pp_apply_war_barrier()
 
                 self.running_batch.batch_is_full = False
+                self._pp_pd_send_finished_outputs(mb_id)
 
                 self.invariant_checker.run(CheckPhase.BUSY, cur_batch)
 
@@ -880,6 +885,7 @@ class SchedulerPPMixin:
         self.send_req_work = []
         self.send_proxy_work = []
         self.send_output_work = []
+        self._pp_pd_early_output_work = {}
         self.send_proxy_requires_forward_fence = False
         self.launch_event = None
         self.pp_proxy_recv_event = None
@@ -946,6 +952,41 @@ class SchedulerPPMixin:
         """_pp_send_deferred_output for the prefill. The wave ships outputs as
         host copies; the sampled tokens are copied first, so the prefill KV
         manager gets the same copy once it is sent."""
+        early_work = (
+            self._pp_pd_early_output_work.pop(mb_id, None)
+            if self._pp_pd_early_output_work
+            else None
+        )
+        if early_work is not None:
+            # Sent once its forward finished; its sends still retire at the next
+            # exchange, so no stage waits on them earlier than on this send.
+            self.send_output_work = early_work
+            return
+        self._pp_pd_copy_and_send_output(mb_id)
+
+    def _pp_pd_send_finished_outputs(self: Scheduler, mb_id: int) -> None:
+        """Last stage over the stage hand-off, after this iteration's deferred
+        send: send the outputs of later micro-batches whose forward has
+        finished, oldest first, before their own iteration comes. Never blocks;
+        the deferred send stays the fallback."""
+        if not self._pp_output_send_deferred():
+            return
+        depth = get_parallel().pp_async_batch_depth
+        # Slots launched after the one sent at this iteration (lag = depth).
+        for lag in range(depth - 1, 0, -1):
+            slot = (mb_id - lag) % self.pp_loop_size
+            if self.mbs[slot] is None or slot in self._pp_pd_early_output_work:
+                continue
+            # The queue holds the unsent launched forwards in launch order.
+            ready_event, _ = self.last_rank_comm_queue[0]
+            if ready_event is not None and not ready_event.query():
+                return
+            deferred_work = self.send_output_work
+            self._pp_pd_copy_and_send_output(slot)
+            self._pp_pd_early_output_work[slot] = self.send_output_work
+            self.send_output_work = deferred_work
+
+    def _pp_pd_copy_and_send_output(self: Scheduler, mb_id: int) -> None:
         target = self.mbs[mb_id] if self._pp_output_send_deferred() else None
         if target is None or _pp_can_skip_output_comm(target):
             self._pp_send_deferred_output(mb_id)
