@@ -18,6 +18,15 @@ def install_runtime_patches() -> None:
     rope.install()
     minimax_h3.install()
 
+    from sglang_tpu.envs import envs
+
+    # The kernel's hooks come from the sglang.multimodal_gen.plugins entry
+    # point; a worker that enables it without them refuses to start.
+    if envs.SGLANG_TPU_ENABLE_H3_MEGAKERNEL.get():
+        from sglang_tpu.multimodal_gen import hooks
+
+        hooks.require_h3_megakernel_hooks()
+
 
 def configure_compile_cache() -> None:
     """Scope persisted torch.compile artifacts to what FX graphs cannot see.

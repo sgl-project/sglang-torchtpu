@@ -129,6 +129,130 @@ class TpuEnvs:
     # Vision: run single-sequence "tpu" vision attention through block-skipping splash
     # (attention/vision_splash.py); False keeps the segment-id flash op.
     SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION = EnvBool(False)
+    # MiniMax-H3 (multimodal_gen): every DiT block of a denoise step as one
+    # Pallas megakernel call over the Ulysses group (multimodal_gen/h3_megakernel/).
+    # Needs TPU, Ulysses over the whole world, ring 1, TP 1 and resident bf16
+    # blocks (no FSDP, DiT offload, LoRA, Cache-DiT, Spectrum, AdaLN cache or
+    # torch.compile); otherwise sglang's blocks run. The kernel takes over the
+    # blocks' projection weights at load.
+    SGLANG_TPU_ENABLE_H3_MEGAKERNEL = EnvBool(False)
+    # H3 megakernel: rows a device the packed sequence pads to when a request
+    # fits them (a multiple of 128). Unset: the kernel's padded_rows rule
+    # (4,992 a device at 8 devices for 1344x768x124). With
+    # SGLANG_TPU_OPT_H3_MEGAKERNEL_STATIC_STRUCTURE, 19200 at 2 devices runs
+    # the 4 x 9,600 query and phase tiles with 2 x 19,456's key tiles
+    # (h3_megakernel/op.py STRUCTURED_TILINGS; rounding-level against 19456).
+    # 4800 at 8 devices runs 4 x 9,600's query and key tiles, the query tiles
+    # crossing device boundaries (op.py SHAPE_TILINGS; rounding-level against
+    # 4864).
+    SGLANG_TPU_OPT_H3_MEGAKERNEL_ROWS = EnvInt(None)
+    # H3 megakernel: shape the kernel's loops from each request's live length
+    # on the host (kernel.stack static_structure): the narrowed last query tile
+    # and cut key tile, and with no query tile of padding the dense walk. One
+    # program serves every live length of a loop structure (the 21 prompts of
+    # a 1344x768x124 benchmark set share one), at the row counts checked for
+    # that request (h3_megakernel/op.py STRUCTURED_SHAPES); other row counts
+    # keep the generic walk. Also pads to 19,456 rows a device at 2 devices where
+    # padded_rows gives 18,944 (512-row query tiles) and drops the phase C
+    # down-weight prefetch at 4 devices (VMEM headroom at 9,600 rows). Unset:
+    # a traced live length takes the generic walk.
+    SGLANG_TPU_OPT_H3_MEGAKERNEL_STATIC_STRUCTURE = EnvBool(False)
+    # H3 megakernel: from a request's second denoise step on, also run at a
+    # fixed max the heads of the layers the norm weights leave online whose
+    # q/k peaks in that request's previous step clear the fixed-max bound by a
+    # margin of 1.1 (h3_megakernel/hook.py VOUCH_MARGIN). The op checks each
+    # step's own peaks on device and recomputes a step whose tried heads exceed
+    # the bound with the proven layers only, so every step's result is the
+    # fixed-max softmax inside its bound or the proven-only one. The heads are
+    # kept per request only; a request's first step runs the proven layers.
+    SGLANG_TPU_OPT_H3_MEGAKERNEL_VOUCH = EnvBool(False)
+    # H3 megakernel: each rank keeps the AdaLN projections (adaln_proj) of a
+    # contiguous ceil(blocks / ranks) of the blocks and frees the other blocks'
+    # at load: of H3's 24.2 GiB a rank, 12.1 / 6.3 / 3.4 GiB stay at 2 / 4 / 8
+    # ranks. Each step a rank projects its own blocks' tables exactly as the
+    # replicated path does, and one all-gather over the sequence-parallel
+    # group (every rank) puts all of them in block order: the same tables, bit
+    # for bit, as every rank computes the same AdaLN input (each rank checks
+    # the all-gather on the device at startup). Every rank must set it (set on
+    # some ranks only, the kernel stays off); a no-op on one rank.
+    SGLANG_TPU_OPT_H3_MEGAKERNEL_SHARD_ADALN = EnvBool(False)
+    # H3 megakernel kernel levers of the static-structure calls (with
+    # SGLANG_TPU_OPT_H3_MEGAKERNEL_STATIC_STRUCTURE), each at the row counts
+    # h3_megakernel/op.py LEVER_SHAPES lists; other calls are unchanged.
+    # LEAN_CUT: the fixed-max softmax's cut key tile halves its last real
+    # sub-block while the real keys fit (one 1,024-key sub-block instead of
+    # 2,048 keys at 8 x 4,864 and 2 x 19,456 rows): the same bits.
+    SGLANG_TPU_OPT_H3_MEGAKERNEL_LEAN_CUT = EnvBool(False)
+    # SPLIT_ITEMS: phase B runs the full-width attention items in one loop
+    # and the narrowed tail items in a second (smaller hot loops, fewer
+    # instruction-overlay swaps): the same bits.
+    SGLANG_TPU_OPT_H3_MEGAKERNEL_SPLIT_ITEMS = EnvBool(False)
+    # EPILOGUE_CHUNKS: phase A's QKV epilogue in 64-row chunks and a shorter
+    # last one at 608- and 480-row tiles instead of 32- and 48-row chunks (the
+    # epilogue then runs under its step's matmul instead of partly after it;
+    # 640-row tiles already take 64-row chunks). The same per-row math, may
+    # round differently.
+    SGLANG_TPU_OPT_H3_MEGAKERNEL_EPILOGUE_CHUNKS = EnvBool(False)
+    # WIDE_KV: phase B moves and walks the keys two 2,048-key tiles at a time
+    # (4,096-key DMAs and key steps, each run as the same 2,048- and 1,024-key
+    # sub-blocks) at 8 x 4,864, 2 x 19,456 and 2 x 19,200 rows: half the key
+    # steps, the same bits.
+    SGLANG_TPU_OPT_H3_MEGAKERNEL_WIDE_KV = EnvBool(False)
+    # WIDE_KV_ONLINE: the same for the online softmax only (WIDE_KV covers
+    # both), also at 2 x 19,200 rows.
+    SGLANG_TPU_OPT_H3_MEGAKERNEL_WIDE_KV_ONLINE = EnvBool(False)
+    # MODULATE_PIECES: phase A modulates the next row tile one chunk a step
+    # (19 steps at 608-row tiles, 8 at 640, 6 at 480) instead of in one or two
+    # steps whose modulate outlasts their QKV matmul: the same bits.
+    SGLANG_TPU_OPT_H3_MEGAKERNEL_MODULATE_PIECES = EnvBool(False)
+    # PREFETCH_DOWN: phase C's down projection loads its first weight tile during
+    # the up projection at 4 x 9,600 rows too (the other row counts always do;
+    # 63.45 of the 63.94 MiB of VMEM there): the same bits.
+    SGLANG_TPU_OPT_H3_MEGAKERNEL_PREFETCH_DOWN = EnvBool(False)
+    # UNIFORM_ADALN: phase C's row tiles whose rows all read one AdaLN row
+    # modulate the MLP input with norm2's shift and scale from one lookup a
+    # tile, not a one-hot matmul per chunk: the same bits.
+    SGLANG_TPU_OPT_H3_MEGAKERNEL_UNIFORM_ADALN = EnvBool(False)
+    # ZERO_AHEAD: phase B zeroes each attention item's running state at the end
+    # of the item before it (under its epilogue) instead of at its start: the
+    # same bits.
+    SGLANG_TPU_OPT_H3_MEGAKERNEL_ZERO_AHEAD = EnvBool(False)
+    # MASK_SCORES: phase B's masked sub-blocks (keys past the live length: each
+    # real item's cut key tile) subtract a per-key column from their scores (the
+    # fixed max, or 0 online, at a visible key; +inf at a masked one) instead of
+    # selecting their probabilities after exp2: exp2(-inf) is the select's +0, so
+    # the same bits, without a select per score between the EUP and the sums.
+    SGLANG_TPU_OPT_H3_MEGAKERNEL_MASK_SCORES = EnvBool(False)
+    # SUM_VOUCH (with SGLANG_TPU_OPT_H3_MEGAKERNEL_VOUCH): the vouched op
+    # certifies each head it tries at a fixed max by that head's own softmax
+    # row sums, exp2(s - 17) summed over the keys, each real row's in
+    # [2^-60, 2^104] (no weight can overflow; weights that flush to zero move a
+    # row by under 2^-50 of its sum), instead of by its q/k norm peaks, and
+    # tries next the heads whose sums stay 2^8 inside that; phase A then
+    # computes no peaks. Heads the norm bound leaves out (layer 49's) can run
+    # at a fixed max: rounding moves with them (a failed step still recomputes
+    # with the proven layers only).
+    SGLANG_TPU_OPT_H3_MEGAKERNEL_SUM_VOUCH = EnvBool(False)
+    # CAST_FIRST: phase B's item epilogue rounds each output tile to bf16 before
+    # transposing it (half the bytes through the transposes): the same bits.
+    SGLANG_TPU_OPT_H3_MEGAKERNEL_CAST_FIRST = EnvBool(False)
+    # STEP_TABLES: phase A takes each step's row tile, head group and staging
+    # slot, and each head's owner, from SMEM tables filled once a call instead
+    # of integer divisions every step (scalar chains the MXUs wait out): the
+    # same bits.
+    SGLANG_TPU_OPT_H3_MEGAKERNEL_STEP_TABLES = EnvBool(False)
+    # SLAB_MODULATE (with UNIFORM_ADALN): phase C's uniform row tiles modulate
+    # the MLP input a row's rms factor then 256-lane slabs at a time (as phase
+    # A's modulate pieces do) instead of whole rows a chunk: the same bits.
+    SGLANG_TPU_OPT_H3_MEGAKERNEL_SLAB_MODULATE = EnvBool(False)
+    # H3 megakernel tiling of the static-structure calls (an A/B knob, with
+    # SGLANG_TPU_OPT_H3_MEGAKERNEL_STATIC_STRUCTURE): Tiling bounds over each
+    # call's own tiling (h3_megakernel/op.py structured_tiling), name=value
+    # pairs separated by commas, spaces or "+", e.g. "block_q=4864+
+    # block_kv_compute=1024+block_kv_compute_online=512". Fields in op.py
+    # TILING_FIELDS. Bounds that change the key sub-blocks or the query tiles
+    # change rounding; a tiling over VMEM fails at compile. Unset: none.
+    SGLANG_TPU_OPT_H3_MEGAKERNEL_TILING = EnvStr(None)
     # Launch-time xprof capture (see profile_auto.py): each stage once, without
     # /start_profile. Keep the step count small: each chip's trace is hundreds
     # of MB.
@@ -598,7 +722,9 @@ class TpuEnvs:
     SGLANG_TPU_MK_SAL_FP8_DOT = EnvInt(0)
     # Profiling only: name the megakernel's in-kernel regions for xprof (needs libtpu
     # --xla_enable_custom_call_region_trace=true and a device tracer level above 1): 1 per
-    # phase; 2 also per chunk / expert, which distorts the timing they show.
+    # phase; 2 also per chunk / expert, which distorts the timing they show. The H3
+    # megakernel (multimodal_gen/h3_megakernel, kernel.stack trace) takes the same levels: 1
+    # per layer phase and its waits, 2 per row tile and stream, 3 phase C's stream leads.
     SGLANG_TPU_MK_TRACE_REGIONS = EnvInt(0)
     # Megakernel attention: fold a power-of-two attn_scale into the bf16 queries instead of
     # scaling every score (exact).
