@@ -13,6 +13,8 @@ from statistics import median
 
 # Buckets below a quarter of the largest one are timed without a prefix only.
 _PREFIX_PROFILE_MIN_DIVISOR = 4
+# Float rounding allowed when a chunk is checked against the target.
+_FIT_TOLERANCE_MS = 1e-6
 
 
 def chunk_granularity(block_size: int, max_tokens: int, block_aligned: bool) -> int:
@@ -87,10 +89,9 @@ def profile_points(
     return points
 
 
-def is_target_ref(tokens: int, buckets: list[int]) -> bool:
-    """Whether ``tokens`` may size the step target: a bucket of at least a
-    quarter step, which keeps the fixed cost counted at most 4 times."""
-    return tokens in buckets and tokens * _PREFIX_PROFILE_MIN_DIVISOR >= buckets[-1]
+def is_step_target_ms(value: float) -> bool:
+    """Whether ``value`` can be a fixed step target: positive and finite."""
+    return math.isfinite(value) and value > 0
 
 
 @dataclass
@@ -114,17 +115,20 @@ class StepCostModel:
         slack: float,
         granularity: int,
         schedule: tuple[int, int, int] | None = None,
-        target_ref_tokens: int | None = None,
+        target_ms: float | None = None,
     ) -> "StepCostModel":
         """``stage_samples`` holds one list of (tokens, prefix, ms) per
         stage. Every stage yields a ladder and a slope; the model keeps the
         slowest ladder entry per bucket and the largest slope. The target is
-        a prefix-free top-bucket step plus ``slack``; with
-        ``target_ref_tokens``, the step's linear part runs at that bucket's
-        per-token cost, which also counts its fixed cost ``top / ref`` times.
-        A reference below the top bucket also makes the quarter-step floor
-        count the step's tokens (see ``chunk``)."""
-        if slack < 0:
+        a prefix-free top-bucket step plus ``slack``. A fixed ``target_ms``
+        replaces it and ignores the slack; it is raised to the modeled
+        prefix-free top-bucket step (slowest ladder entry plus largest slope)
+        when that is slower, so a full chunk always fits. While ``target_ms``
+        covers that step, profiled costs never move the target, and a kernel
+        speedup that lowers the fitted ladder or slope never shrinks a chunk.
+        A fixed target also makes the quarter-step floor count the step's
+        tokens (see ``chunk``)."""
+        if target_ms is None and slack < 0:
             raise ValueError(f"the chunk slack must not be negative: {slack}")
         if not stage_samples:
             raise ValueError("no stage reported step timings")
@@ -163,25 +167,23 @@ class StepCostModel:
         linear = {b: max(ladder[b] for ladder in ladders) for b in buckets}
         attn = max(slopes)
         top = buckets[-1]
-        floor_counts_step = target_ref_tokens is not None and target_ref_tokens < top
-        if target_ref_tokens is None:
-            target_ref_tokens = top
-        elif not is_target_ref(target_ref_tokens, buckets):
+        full_step = linear[top] + attn * top * top / 2
+        if target_ms is None:
+            target = full_step * (1.0 + slack)
+        elif not is_step_target_ms(target_ms):
             raise ValueError(
-                f"the chunk target reference {target_ref_tokens} is not a "
-                f"profiled token bucket of at least a quarter step: {buckets}"
+                f"the chunk step target must be a positive number of ms: {target_ms}"
             )
-        full_step = (
-            linear[target_ref_tokens] * (top / target_ref_tokens) + attn * top * top / 2
-        )
+        else:
+            target = max(float(target_ms), full_step)
         return cls(
             buckets,
             linear,
             attn,
-            full_step * (1.0 + slack),
+            target,
             int(granularity),
             schedule=schedule,
-            floor_counts_step=floor_counts_step,
+            floor_counts_step=target_ms is not None,
         )
 
     def pairs(self, chunk: int, prefix: int) -> int:
@@ -223,6 +225,10 @@ class StepCostModel:
         fits."""
         best = 0
         attn = self.attn_ms_per_token_pair
+
+        def attn_ms(tokens: int) -> float:
+            return attn * (tokens * prefix + tokens * tokens / 2)
+
         floor = self.buckets[-1] // 4
         if self.floor_counts_step:
             floor -= step_tokens
@@ -236,11 +242,15 @@ class StepCostModel:
             if spare < 0:
                 continue
             fit = min(remaining, room)
-            if attn > 0:
-                # attn * (x * prefix + x^2 / 2) <= spare
+            budget = spare + _FIT_TOLERANCE_MS
+            if attn_ms(fit) > budget:
+                # attn * (x * prefix + x^2 / 2) <= spare; the root can round an
+                # exact fit down by a token.
                 fit = min(
                     fit, int(-prefix + math.sqrt(prefix * prefix + 2 * spare / attn))
                 )
+                if attn_ms(fit + 1) <= budget:
+                    fit += 1
             if fit < remaining:
                 fit = min(max(fit, floor), remaining, room)
             if fit < remaining:
