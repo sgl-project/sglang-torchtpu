@@ -149,7 +149,9 @@ class TestCommonSenderLifecycle(unittest.TestCase):
                 sender.abort()
                 with self.assertRaises(KVTransferError) as ctx:
                     sender.failure_exception()
-                expected = "Aborted by AbortReq." if case == "live" else "transport error"
+                expected = (
+                    "Aborted by AbortReq." if case == "live" else "transport error"
+                )
                 self.assertEqual(ctx.exception.failure_reason, expected)
                 self.assertFalse(ctx.exception.is_from_another_rank)
 
