@@ -4128,3 +4128,456 @@ def test_tp16_parallel_xyz_ag_interpret_races_and_aot():
     ).trace(*stepc_shapes).lower(lowering_platforms=("tpu",)).compile()
     assert "tpu_custom_call" in c_stepc.as_text()
 
+
+def test_tp8_parallel_xy_ag_interpret_races_and_aot():
+    """Verify TP=8 2-slab parallel XY AG (guards, detect_races bit-exact parity, B=256/384, AOT)."""
+    import jax
+
+    if len(jax.devices("cpu")) < 8:
+        pytest.skip("Requires XLA_FLAGS=--xla_force_host_platform_device_count=8")
+
+    import jax.numpy as jnp
+    from jax.experimental import topologies
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, PartitionSpec as P
+    from sglang_tpu.attention.pallas.decode_qkv_epilogue import build_decode_rope_step_tables
+    from sglang_tpu.kernels import decode_collective_bridges_w8 as w8
+
+    assert w8._use_tp8_parallel_xy_ag(world_size=8, is_3d_out=False, r_pair=64, half_h=4096) is True
+    assert w8._use_tp8_parallel_xy_ag(world_size=8, is_3d_out=False, r_pair=96, half_h=4096) is True
+    assert w8._use_tp8_parallel_xy_ag(world_size=8, is_3d_out=False, r_pair=32, half_h=4096) is False
+    assert w8._use_tp8_parallel_xy_ag(world_size=8, is_3d_out=False, r_pair=16, half_h=4096) is False
+    assert w8._use_tp8_parallel_xy_ag(world_size=8, is_3d_out=False, r_pair=64, half_h=2048) is False
+    assert w8._use_tp8_parallel_xy_ag(world_size=8, is_3d_out=True, r_pair=64, half_h=4096) is False
+    assert w8._use_tp8_parallel_xy_ag(world_size=16, is_3d_out=False, r_pair=64, half_h=4096) is False
+    assert w8._use_tp8_parallel_xy_ag(world_size=8, is_3d_out=False, r_pair=72, half_h=4096) is False
+    assert w8._use_tp8_parallel_xy_ag(world_size=8, is_3d_out=False, r_pair=64, half_h=4032) is False
+    assert w8._use_tp8_parallel_xy_ag(world_size=8, is_3d_out=False, r_pair=64, half_h=4096, n_ici_sems=3) is False
+    assert w8._use_tp8_parallel_xy_ag(world_size=8, is_3d_out=False, r_pair=64, half_h=4096, n_ici_sems=5) is True
+
+    ip_race = pltpu.InterpretParams(
+        dma_execution_mode="eager",
+        detect_races=True,
+        uninitialized_memory="nan",
+    )
+    TP = 8
+    n_chips = TP // 2
+    mesh = Mesh(np.array(jax.devices("cpu")[:TP]), ("model",))
+    rng = np.random.default_rng(2026112704)
+
+    # 1. Isolated ag_chip_sharded_capture_jax parity (copy_local_from_pair=True) across B=256/384 H=8192.
+    for B_cur in (256, 384):
+        cols = 8192
+        r_pair = B_cur // n_chips
+        chip_data = (rng.standard_normal((n_chips, r_pair, cols)) * 0.4).astype(np.float32)
+        cap_in = jnp.asarray(
+            np.concatenate([chip_data[r >> 1] for r in range(TP)], axis=0),
+            dtype=jnp.bfloat16,
+        )
+
+        def _run_cap():
+            return jax.jit(
+                jax.shard_map(
+                    lambda lx: w8.ag_chip_sharded_capture_jax(lx, world_size=TP, interpret=ip_race),
+                    mesh=mesh,
+                    in_specs=P("model", None),
+                    out_specs=P("model", None),
+                    check_vma=False,
+                )
+            )(cap_in)
+
+        out_par = _run_cap()
+        with mock.patch.object(w8, "_use_tp8_parallel_xy_ag", return_value=False):
+            out_ref = _run_cap()
+        np.testing.assert_array_equal(np.asarray(out_par), np.asarray(out_ref))
+        out_np = np.asarray(out_par).reshape(TP, B_cur, cols)
+        expected = np.asarray(jnp.asarray(chip_data.reshape(B_cur, cols), dtype=jnp.bfloat16))
+        for r in range(TP):
+            np.testing.assert_array_equal(out_np[r], expected)
+
+    # 2. Standalone chip_b2 (B=256 H=8192 -> ag_next_in=True, copy_local_from_pair=False).
+    B256 = 256
+    r_p = B256 // n_chips
+    valid = B256 - 1
+    H_b2, H_PRE_b2 = 8192, 512
+    qkv_cols, gate_cols = 1280, 1024
+    st_b2 = (rng.standard_normal((B256, H_b2)) * 0.4).astype(np.float32)
+    st_b2[-1, :] = np.nan
+    st_b2_stk = jnp.asarray(
+        np.concatenate([st_b2[(r >> 1) * r_p : ((r >> 1) + 1) * r_p] for r in range(TP)], axis=0)
+    )
+    moe_sh_np = (rng.standard_normal((B256, H_PRE_b2)) * 0.3).astype(np.float32)
+    moe_sh_np[-1, :] = np.nan
+    moe_sh_bf16 = jnp.asarray(moe_sh_np, dtype=jnp.bfloat16)
+    wp_tp2 = jnp.asarray((rng.standard_normal((H_PRE_b2, TP * (H_b2 // 2))) * 0.04).astype(np.float32), jnp.float8_e4m3fn)
+    sp_tp2 = jnp.asarray((np.abs(rng.standard_normal((TP * (H_b2 // 2),))) * 0.02 + 1e-3).astype(np.float32))
+    pff_g = jnp.full((H_b2,), 1.03, jnp.float32)
+    pf_a = jnp.full((H_b2,), 0.92, jnp.float32)
+    pf_b = jnp.full((H_b2,), 0.88, jnp.float32)
+    nin_g = jnp.full((H_b2,), 1.07, jnp.float32)
+    wq = jnp.asarray((rng.standard_normal((H_b2, TP * qkv_cols)) * 0.04).astype(np.float32), jnp.float8_e4m3fn)
+    sq = jnp.asarray((np.abs(rng.standard_normal((TP * qkv_cols,))) * 0.02 + 1e-3).astype(np.float32))
+    wg = jnp.asarray((rng.standard_normal((H_b2, TP * gate_cols)) * 0.04).astype(np.float32), jnp.float8_e4m3fn)
+    sg = jnp.asarray((np.abs(rng.standard_normal((TP * gate_cols,))) * 0.02 + 1e-3).astype(np.float32))
+    cs_pairs = jnp.asarray(rng.standard_normal((512, 128)).astype(np.float32) * 0.5)
+    cs_step = build_decode_rope_step_tables(jnp.arange(B256, dtype=jnp.int32), cs_pairs)
+
+    def _run_b2():
+        return jax.jit(
+            jax.shard_map(
+                lambda *a: w8.moe_to_attn_chip_sharded_bridge_jax(
+                    *a, world_size=TP, sharded_moe_in=True, fuse_qkv_epi=True, interpret=ip_race
+                ),
+                mesh=mesh,
+                in_specs=(
+                    P("model", None), P("model", None), P(None, "model"), P("model"),
+                    P(), P(), P(), P(), P(None, "model"), P("model"), P(None, "model"), P("model"), P(),
+                ),
+                out_specs=(
+                    P("model", None),
+                    P(None, None, "model", None, None),
+                    P(None, "model", None, None),
+                    P(None, "model"),
+                ),
+                check_vma=False,
+            )
+        )(st_b2_stk, moe_sh_bf16, wp_tp2, sp_tp2, pff_g, pf_a, pf_b, nin_g, wq, sq, wg, sg, cs_step)
+
+    b2_par = _run_b2()
+    with mock.patch.object(w8, "_use_tp8_parallel_xy_ag", return_value=False):
+        b2_ref = _run_b2()
+    st_p, q_p, kv_p, g_p = b2_par
+    st_r, q_r, kv_r, g_r = b2_ref
+    st_p_r = np.concatenate([np.asarray(st_p).reshape(TP, r_p, H_b2)[2 * c] for c in range(n_chips)], axis=0)[:valid]
+    st_r_r = np.concatenate([np.asarray(st_r).reshape(TP, r_p, H_b2)[2 * c] for c in range(n_chips)], axis=0)[:valid]
+    assert np.isfinite(st_p_r).all()
+    assert np.isfinite(np.asarray(q_p, dtype=np.float32)[:, :valid]).all()
+    assert np.isfinite(np.asarray(kv_p, dtype=np.float32)[:valid]).all()
+    assert np.isfinite(np.asarray(g_p, dtype=np.float32)[:valid]).all()
+    np.testing.assert_array_equal(st_p_r, st_r_r)
+    np.testing.assert_array_equal(np.asarray(q_p)[:, :valid], np.asarray(q_r)[:, :valid])
+    np.testing.assert_array_equal(np.asarray(kv_p)[:valid], np.asarray(kv_r)[:valid])
+    np.testing.assert_array_equal(np.asarray(g_p)[:valid], np.asarray(g_r)[:valid])
+
+    # 3. TPU7x 2x2x1 AOT compile at B=256/384 H=8192 (ag_capture + ChipB2 B=256).
+    tpu_devs = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x=2x2x1").devices
+    aot_mesh = Mesh(
+        np.array(sorted(tpu_devs, key=lambda d: (d.coords[1], d.coords[0], d.core_on_chip))),
+        ("model",),
+    )
+    for B_cur in (256, 384):
+        cap_sh = (jax.ShapeDtypeStruct((B_cur // n_chips, 8192), jnp.bfloat16),)
+        c_cap = jax.jit(
+            jax.shard_map(
+                lambda x: w8.ag_chip_sharded_capture_jax(x, world_size=8, interpret=False),
+                mesh=aot_mesh, in_specs=(P(),), out_specs=P(), check_vma=False,
+            )
+        ).trace(*cap_sh).lower(lowering_platforms=("tpu",)).compile()
+        assert "tpu_custom_call" in c_cap.as_text()
+
+    b2_aot_shapes = (
+        jax.ShapeDtypeStruct((B256 // n_chips, 8192), jnp.float32),
+        jax.ShapeDtypeStruct((B256 // TP, 4096), jnp.bfloat16),
+        jax.ShapeDtypeStruct((4096, 4096), jnp.float8_e4m3fn),
+        jax.ShapeDtypeStruct((1, 4096), jnp.float32),
+        jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+        jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+        jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+        jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+        jax.ShapeDtypeStruct((8192, 1280), jnp.float8_e4m3fn),
+        jax.ShapeDtypeStruct((1, 1280), jnp.float32),
+        jax.ShapeDtypeStruct((8192, 1024), jnp.float8_e4m3fn),
+        jax.ShapeDtypeStruct((1, 1024), jnp.float32),
+        jax.ShapeDtypeStruct((B256, 2, 128), jnp.float32),
+    )
+    c_b2 = jax.jit(
+        jax.shard_map(
+            lambda *a: w8.moe_to_attn_chip_sharded_bridge_jax(
+                *a, world_size=8, sharded_moe_in=True, fuse_qkv_epi=True, interpret=False
+            ),
+            mesh=aot_mesh,
+            in_specs=tuple(P() for _ in b2_aot_shapes),
+            out_specs=(P(), P(), P(), P()),
+            check_vma=False,
+        )
+    ).trace(*b2_aot_shapes).lower(lowering_platforms=("tpu",)).compile()
+    assert "tpu_custom_call" in c_b2.as_text()
+
+    fnorm_aot_shapes = (
+        jax.ShapeDtypeStruct((B256 // n_chips, 8192), jnp.float32),
+        jax.ShapeDtypeStruct((B256 // TP, 4096), jnp.bfloat16),
+        jax.ShapeDtypeStruct((4096, 4096), jnp.float8_e4m3fn),
+        jax.ShapeDtypeStruct((1, 4096), jnp.float32),
+        jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+        jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+        jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+        jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+    )
+    c_fnorm = jax.jit(
+        jax.shard_map(
+            lambda *a: w8.moe_post_chip_sharded_final_norm_jax(
+                *a, world_size=8, sharded_moe_in=True, return_stream_too=True, interpret=False
+            ),
+            mesh=aot_mesh,
+            in_specs=tuple(P() for _ in fnorm_aot_shapes),
+            out_specs=(P(), P()),
+            check_vma=False,
+        )
+    ).trace(*fnorm_aot_shapes).lower(lowering_platforms=("tpu",)).compile()
+    assert "tpu_custom_call" in c_fnorm.as_text()
+
+    emb_aot_shapes = (
+        jax.ShapeDtypeStruct((B256,), jnp.int32),
+        jax.ShapeDtypeStruct((2048, 8192), jnp.bfloat16),
+        jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+    )
+    c_emb = jax.jit(
+        jax.shard_map(
+            lambda *a: w8.decode_vocab_embed_chip_sharded_jax(*a, world_size=8, interpret=False),
+            mesh=aot_mesh,
+            in_specs=(P(), P(), P()),
+            out_specs=(P(), P()),
+            check_vma=False,
+        )
+    ).trace(*emb_aot_shapes).lower(lowering_platforms=("tpu",)).compile()
+    assert "tpu_custom_call" in c_emb.as_text()
+
+    # 4. Callers with only 3 ICI sems fall back cleanly to 3-peer without OOB.
+    from jax.experimental import pallas as pl
+
+    def _run_3sem_cap(pair_ref, out_ref, ici_s, ici_r, d2d_s, d2d_r):
+        me = jax.lax.axis_index("model").astype(jnp.int32)
+        w8._signal_barrier(me, 8)
+        w8._wait_barrier(8)
+        w8._ag_chip_sharded_half_col_xor1(
+            pair_ref, out_ref, ici_s, ici_r, d2d_s, d2d_r, me=me, world_size=8
+        )
+
+    v_sp = pl.BlockSpec(memory_space=pltpu.VMEM)
+    c_3sem = jax.jit(
+        jax.shard_map(
+            lambda x: pl.pallas_call(
+                _run_3sem_cap,
+                out_shape=jax.ShapeDtypeStruct((B256, 8192), jnp.bfloat16),
+                in_specs=(v_sp,),
+                out_specs=v_sp,
+                scratch_shapes=(pltpu.SemaphoreType.DMA((3,)), pltpu.SemaphoreType.DMA((3,)), pltpu.SemaphoreType.DMA((1,)), pltpu.SemaphoreType.DMA((1,))),
+                compiler_params=pltpu.CompilerParams(collective_id=w8._W8_CID_BASE + 126, disable_bounds_checks=True),
+            )(x),
+            mesh=aot_mesh, in_specs=(P(),), out_specs=P(), check_vma=False,
+        )
+    ).trace(jax.ShapeDtypeStruct((B256 // n_chips, 8192), jnp.bfloat16)).lower(lowering_platforms=("tpu",)).compile()
+    assert "tpu_custom_call" in c_3sem.as_text()
+
+
+def test_chip_b2_during_in_ici_hooks_interpret_races_and_aot():
+    """Verify _run_chip_b2_vmem_core during_in_ici_fn + during_in_ici_early across 7-peer & XYZ AG."""
+    import jax
+
+    if len(jax.devices("cpu")) < 16:
+        pytest.skip("Requires XLA_FLAGS=--xla_force_host_platform_device_count=16")
+
+    import jax.numpy as jnp
+    from jax.experimental import pallas as pl
+    from jax.experimental import topologies
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, PartitionSpec as P
+    from sglang_tpu.attention.pallas.decode_qkv_epilogue import build_decode_rope_step_tables
+    from sglang_tpu.kernels import decode_collective_bridges_w8 as w8
+
+    ip_race = pltpu.InterpretParams(
+        dma_execution_mode="eager",
+        detect_races=True,
+        uninitialized_memory="nan",
+    )
+    rng = np.random.default_rng(2026112705)
+    H, H_PRE, qkv_c, gate_c = 4096, 512, 640, 512
+    half_h, post_c = H // 2, H // 2
+    TP = 16
+    n_chips = TP // 2
+    mesh = Mesh(np.array(jax.devices("cpu")[:TP]), ("model",))
+
+    # B=64 -> 7-peer (sharded_moe_in=False); B=256 H=4096 -> 3-slab XYZ AG (r_pair=32, half_h=2048).
+    for B_cur, early_flag in ((64, False), (256, True)):
+        r_pair = B_cur // n_chips
+        sh_in = B_cur >= 128
+        in_r = B_cur // TP if sh_in else B_cur
+        valid = B_cur - 1
+        st_np = (rng.standard_normal((B_cur, H)) * 0.4).astype(np.float32)
+        st_np[-1, :] = np.nan
+        st_stk = jnp.asarray(
+            np.concatenate([st_np[(r >> 1) * r_pair : ((r >> 1) + 1) * r_pair] for r in range(TP)], axis=0)
+        )
+        moe_np = (rng.standard_normal((B_cur, H_PRE)) * 0.3).astype(np.float32)
+        moe_np[-1, :] = np.nan
+        moe_bf = jnp.asarray(moe_np, dtype=jnp.bfloat16)
+        wp = jnp.asarray((rng.standard_normal((H_PRE, TP * post_c)) * 0.04).astype(np.float32), jnp.float8_e4m3fn)
+        sp = jnp.asarray((np.abs(rng.standard_normal((TP * post_c,))) * 0.02 + 1e-3).astype(np.float32))
+        pff = jnp.full((H,), 1.03, jnp.float32)
+        pfa = jnp.full((H,), 0.92, jnp.float32)
+        pfb = jnp.full((H,), 0.88, jnp.float32)
+        nin = jnp.full((H,), 1.07, jnp.float32)
+        wq = jnp.asarray((rng.standard_normal((H, TP * qkv_c)) * 0.04).astype(np.float32), jnp.float8_e4m3fn)
+        sq = jnp.asarray((np.abs(rng.standard_normal((TP * qkv_c,))) * 0.02 + 1e-3).astype(np.float32))
+        wg = jnp.asarray((rng.standard_normal((H, TP * gate_c)) * 0.04).astype(np.float32), jnp.float8_e4m3fn)
+        sg = jnp.asarray((np.abs(rng.standard_normal((TP * gate_c,))) * 0.02 + 1e-3).astype(np.float32))
+        cs_step = build_decode_rope_step_tables(
+            jnp.arange(B_cur, dtype=jnp.int32),
+            jnp.asarray(rng.standard_normal((512, 128)).astype(np.float32) * 0.5),
+        )
+
+        vmem, hbm, sem = pltpu.VMEM, pltpu.HBM, pltpu.SemaphoreType.DMA
+        v_sp, h_sp = pl.BlockSpec(memory_space=vmem), pl.BlockSpec(memory_space=hbm)
+        out_shapes = (
+            jax.ShapeDtypeStruct((r_pair, H), jnp.float32),
+            jax.ShapeDtypeStruct((B_cur, 16, 128), jnp.bfloat16),
+            jax.ShapeDtypeStruct((B_cur, 1, 4, 128), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((B_cur, gate_c), jnp.bfloat16),
+            jax.ShapeDtypeStruct((B_cur, 16, 128), jnp.bfloat16),
+            jax.ShapeDtypeStruct((8, 128), jnp.float32),
+        )
+
+        def _make_call(with_hooks: bool):
+            def _k(*refs):
+                (
+                    st_h, moe_r, wp_h, sp_r, pfg_r, pa_r, pb_r, ng_r, wq_h, sq_r, wg_h, sg_r, cs_r,
+                    ost_h, oq_r, okv_r, og_r, snap_q_r, ici_mark_r,
+                    wp_b, wq_b, wg_b, sb_v, nin_pair, nin_v, qkv_v,
+                    mtok_b, mfull_b, psh, mpost, chip_c, post_pf, cols3d_b, ag3d_b,
+                    sems, tok1_s, tok1_r, tok2_s, tok2_r, td2_s, td2_r,
+                    pd2d_s, pd2d_r, pici_s, pici_r, in_ici_s, in_ici_r, in_d2d_s, in_d2d_r,
+                ) = refs
+                ici_mark_r[...] = jnp.zeros((8, 128), jnp.float32)
+                w8._run_chip_b2_vmem_core(
+                    st_h, moe_r, wp_h, sp_r, pfg_r, pa_r, pb_r, ng_r, wq_h, sq_r, wg_h, sg_r, cs_r,
+                    ost_h, oq_r, okv_r, og_r,
+                    wp_b, wq_b, wg_b, sb_v, nin_pair, nin_v, qkv_v,
+                    mtok_b, mfull_b, psh, mpost, chip_c, post_pf, cols3d_b, ag3d_b,
+                    sems.at[0:1], sems.at[1:2], sems.at[2:3], sems.at[3:4], sems.at[4:5],
+                    tok1_s, tok1_r, tok2_s, tok2_r, td2_s, td2_r,
+                    pd2d_s, pd2d_r, pici_s, pici_r, in_ici_s, in_ici_r, in_d2d_s, in_d2d_r,
+                    world_size=TP, sharded_moe_in=sh_in,
+                    post_ff_eps=1e-5, post_ff_scale_input=True,
+                    next_in_eps=1e-5, next_in_scale_input=False,
+                    fuse_qkv_epi=True, qkv_norm_eps=1e-6,
+                    query_scale=0.125, k_scale=0.75, v_scale=1.25,
+                    has_rope=True, interpret_mode=True,
+                    after_qkv_epi_fn=(
+                        (lambda: snap_q_r.__setitem__(slice(None), oq_r[...]))
+                        if with_hooks
+                        else None
+                    ),
+                    during_in_ici_fn=(
+                        (lambda: ici_mark_r.__setitem__(slice(None), jnp.full((8, 128), 7.0, jnp.float32)))
+                        if with_hooks
+                        else None
+                    ),
+                    during_in_ici_early=early_flag if with_hooks else False,
+                )
+                if not with_hooks:
+                    snap_q_r[...] = oq_r[...]
+
+            return w8._pallas_call_maybe_interpret(
+                _k, interpret=ip_race, out_shape=out_shapes,
+                in_specs=(h_sp, v_sp, h_sp, v_sp, v_sp, v_sp, v_sp, v_sp, h_sp, v_sp, h_sp, v_sp, v_sp),
+                out_specs=(h_sp, v_sp, v_sp, v_sp, v_sp, v_sp),
+                scratch_shapes=(
+                    vmem((H_PRE, post_c), jnp.float8_e4m3fn),
+                    vmem((H, qkv_c), jnp.float8_e4m3fn),
+                    vmem((H, gate_c), jnp.float8_e4m3fn),
+                    vmem((r_pair, H), jnp.float32),
+                    vmem((r_pair, H), jnp.bfloat16),
+                    vmem((B_cur, H), jnp.bfloat16),
+                    vmem((B_cur, qkv_c), jnp.bfloat16),
+                    vmem((in_r, H_PRE) if sh_in else (8, 128), jnp.bfloat16),
+                    vmem((r_pair, H_PRE), jnp.bfloat16),
+                    vmem((8, 128), jnp.bfloat16),
+                    vmem((r_pair, half_h), jnp.bfloat16),
+                    vmem((r_pair, half_h), jnp.bfloat16),
+                    vmem((r_pair, H), jnp.bfloat16),
+                    vmem((8, 128), jnp.bfloat16),
+                    vmem((n_chips, 8, half_h) if r_pair == 8 else (8, 128), jnp.bfloat16),
+                    sem((5,)),
+                    sem((1,)), sem((1,)),
+                    sem((n_chips - 1,)), sem((n_chips - 1,)),
+                    sem((1,)), sem((1,)),
+                    sem((1,)), sem((1,)),
+                    sem((n_chips - 1,)), sem((n_chips - 1,)),
+                    sem((n_chips - 1,)), sem((n_chips - 1,)),
+                    sem((1,)), sem((1,)),
+                ),
+                compiler_params=pltpu.CompilerParams(collective_id=w8._W8_CID_BASE + 120, disable_bounds_checks=True),
+            )
+
+        def _exec(with_hooks: bool):
+            c_fn = _make_call(with_hooks)
+            return jax.jit(jax.shard_map(
+                lambda *xs: (lambda r: (r[0], r[1].reshape(1, B_cur, 8, 2, 128), r[2], r[3], r[4].reshape(1, B_cur, 8, 2, 128), r[5]))(
+                    c_fn(
+                        xs[0], xs[1], xs[2], w8._as_dot_scale_f32(xs[3], post_c),
+                        w8._as_2d_f32(xs[4], H), w8._as_2d_f32(xs[5], H), w8._as_2d_f32(xs[6], H), w8._as_2d_f32(xs[7], H),
+                        xs[8], w8._as_dot_scale_f32(xs[9], qkv_c), xs[10], w8._as_dot_scale_f32(xs[11], gate_c), xs[12],
+                    )
+                ),
+                mesh=mesh,
+                in_specs=(
+                    P("model", None), P("model", None) if sh_in else P(), P(None, "model"), P("model"),
+                    P(), P(), P(), P(), P(None, "model"), P("model"), P(None, "model"), P("model"), P(),
+                ),
+                out_specs=(
+                    P("model", None), P(None, None, "model", None, None), P(None, "model", None, None),
+                    P(None, "model"), P(None, None, "model", None, None), P(),
+                ),
+                check_vma=False,
+            ))(st_stk, moe_bf, wp, sp, pff, pfa, pfb, nin, wq, sq, wg, sg, cs_step)
+
+        res_h = _exec(True)
+        res_r = _exec(False)
+        jax.block_until_ready(res_h[0])
+        st_h_r = np.concatenate([np.asarray(res_h[0]).reshape(TP, r_pair, H)[2 * c] for c in range(n_chips)], axis=0)[:valid]
+        st_r_r = np.concatenate([np.asarray(res_r[0]).reshape(TP, r_pair, H)[2 * c] for c in range(n_chips)], axis=0)[:valid]
+        np.testing.assert_array_equal(st_h_r, st_r_r)
+        np.testing.assert_array_equal(np.asarray(res_h[1])[:, :valid], np.asarray(res_r[1])[:, :valid])
+        np.testing.assert_array_equal(np.asarray(res_h[4])[:, :valid], np.asarray(res_r[1])[:, :valid])
+        np.testing.assert_array_equal(
+            np.asarray(jax.lax.bitcast_convert_type(res_h[2], jnp.uint8))[:valid],
+            np.asarray(jax.lax.bitcast_convert_type(res_r[2], jnp.uint8))[:valid],
+        )
+        np.testing.assert_array_equal(np.asarray(res_h[3])[:valid], np.asarray(res_r[3])[:valid])
+        np.testing.assert_array_equal(np.asarray(res_h[5]), np.full((8, 128), 7.0, np.float32))
+
+    # AOT compile TP=16 _tp16_parallel_xyz_ag with during_ici_early=True at B=128/256 H=8192.
+    tpu_devs = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x=2x2x2").devices
+    aot_mesh = Mesh(
+        np.array(sorted(tpu_devs, key=lambda d: (d.coords[1], d.coords[0], d.core_on_chip))),
+        ("model",),
+    )
+    for B_cur in (128, 256):
+        r_pair = B_cur // n_chips
+        v_sp = pl.BlockSpec(memory_space=pltpu.VMEM)
+
+        def _aot_k(pair_ref, out_ref, mark_ref, ici_s, ici_r, d2d_s, d2d_r):
+            me = jax.lax.axis_index("model").astype(jnp.int32)
+            w8._signal_barrier(me, 16)
+            w8._wait_barrier(16)
+            w8._ag_chip_sharded_half_col_xor1(
+                pair_ref, out_ref, ici_s, ici_r, d2d_s, d2d_r,
+                me=me, world_size=16,
+                during_ici_fn=lambda: mark_ref.__setitem__(slice(None), jnp.zeros((8, 128), jnp.float32)),
+                during_ici_early=True,
+            )
+
+        c_aot = jax.jit(
+            jax.shard_map(
+                lambda x: pl.pallas_call(
+                    _aot_k,
+                    out_shape=(jax.ShapeDtypeStruct((B_cur, 8192), jnp.bfloat16), jax.ShapeDtypeStruct((8, 128), jnp.float32)),
+                    in_specs=(v_sp,),
+                    out_specs=(v_sp, v_sp),
+                    scratch_shapes=(pltpu.SemaphoreType.DMA((7,)), pltpu.SemaphoreType.DMA((7,)), pltpu.SemaphoreType.DMA((1,)), pltpu.SemaphoreType.DMA((1,))),
+                    compiler_params=pltpu.CompilerParams(collective_id=w8._W8_CID_BASE + 125, disable_bounds_checks=True),
+                )(x),
+                mesh=aot_mesh, in_specs=(P(),), out_specs=(P(), P()), check_vma=False,
+            )
+        ).trace(jax.ShapeDtypeStruct((r_pair, 8192), jnp.bfloat16)).lower(lowering_platforms=("tpu",)).compile()
+        assert "tpu_custom_call" in c_aot.as_text()
