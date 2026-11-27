@@ -4624,6 +4624,212 @@ def moe_post_tok_sharded_final_norm_jax(
 # =============================================================================
 # 5b. Wave-9 Chip-Granularity Stream Bridges (`stream [B//(TP//2), 8192]`, TP=8 & TP=16)
 # =============================================================================
+def _use_tp16_parallel_xyz_ag(
+    *,
+    world_size: int,
+    is_3d_out: bool,
+    r_pair: int,
+    half_h: int,
+) -> bool:
+    """Return True when 3-slab parallel XYZ doubling beats 7-peer AG on TP=16 silicon.
+
+    Verified bit-exact on 2x2x2 TPU7x across 2D ``[B, H]`` all-gathers with
+    ``r_pair * half_h >= 65536`` (``B=128 H=8192``, ``B=256 H>=4096``, ``B=384``);
+    smaller 2D payloads (``<= 32768``) and 3D ``out_expert_3d_ref`` stay on 7-peer.
+    """
+    return (
+        world_size == 16
+        and not is_3d_out
+        and r_pair >= 16
+        and r_pair % 16 == 0
+        and half_h >= 384
+        and (half_h % 128 == 0)
+        and (r_pair * half_h) >= 65536
+    )
+
+
+def _tp16_parallel_xyz_ag(
+    pair_ref,
+    out_full_ref,
+    ici_send,
+    ici_recv,
+    d2d2_send,
+    d2d2_recv,
+    *,
+    me,
+    mate,
+    side,
+    other_side,
+    chip,
+    r_pair: int,
+    half_h: int,
+    side_c0,
+    during_ici_fn,
+    during_d2d2_fn,
+    copy_local_from_pair: bool,
+) -> None:
+    """3-slab parallel XYZ doubling all-gather for TP=16 (``-42%`` link volume, ``0`` extra VMEM).
+
+    Keeps ``slab_z`` in place on ``side_c0`` and stages permuted ``slab_y`` / ``slab_x`` in the
+    dead ``other_c0`` half during ICI. After unpacking into ``side_c0``, swaps ``slab_z`` over
+    ``ici[6]`` before ``d2d2_yx`` on ``d2d2[0]`` so mate completes unpack before overwrite.
+    """
+    import jax.numpy as jnp
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    cx = chip & jnp.int32(1)
+    cy = (chip >> jnp.int32(1)) & jnp.int32(1)
+    cz = (chip >> jnp.int32(2)) & jnp.int32(1)
+    peer_x = me ^ jnp.int32(2)
+    peer_y = me ^ jnp.int32(4)
+    peer_z = me ^ jnp.int32(8)
+    other_c0 = pl.multiple_of(other_side * half_h, 128)
+    chip_r0 = pl.multiple_of(chip * r_pair, 16)
+
+    n_tiles = half_h // 128
+    t_z = n_tiles // 3
+    t_y = n_tiles // 3
+    t_x = n_tiles - t_z - t_y
+    w_z, w_y, w_x = t_z * 128, t_y * 128, t_x * 128
+    off_y_c = w_z
+    off_x_c = w_z + w_y
+
+    # Cyclic axis schedules: z-slab X->Y->Z (in-place), y-slab Y->Z->X, x-slab Z->X->Y.
+    q_y = (cx << jnp.int32(2)) | (cz << jnp.int32(1)) | cy
+    q_x = (cy << jnp.int32(2)) | (cx << jnp.int32(1)) | cz
+    qy_r0 = pl.multiple_of(q_y * r_pair, 16)
+    qx_r0 = pl.multiple_of(q_x * r_pair, 16)
+
+    slab_z = out_full_ref.at[:, pl.ds(pl.multiple_of(side_c0, 128), w_z)]
+    slab_y_dst = out_full_ref.at[:, pl.ds(pl.multiple_of(side_c0 + off_y_c, 128), w_y)]
+    slab_x_dst = out_full_ref.at[:, pl.ds(pl.multiple_of(side_c0 + off_x_c, 128), w_x)]
+    slab_y = out_full_ref.at[:, pl.ds(pl.multiple_of(other_c0 + off_y_c, 128), w_y)]
+    slab_x = out_full_ref.at[:, pl.ds(pl.multiple_of(other_c0 + off_x_c, 128), w_x)]
+
+    bm = _pick_strip(r_pair, 32)
+    max_step = 1024 if r_pair <= 16 else 512
+    spans_z = _tile_spans(w_z, max_step)
+    spans_y = _tile_spans(w_y, max_step)
+    spans_x = _tile_spans(w_x, max_step)
+
+    if copy_local_from_pair:
+        assert pair_ref is not None
+        for r0 in range(0, r_pair, bm):
+            rs_l = pl.ds(r0, bm)
+            rs_ch = pl.ds(pl.multiple_of(chip_r0 + r0, 16), bm)
+            rs_qy = pl.ds(pl.multiple_of(qy_r0 + r0, 16), bm)
+            rs_qx = pl.ds(pl.multiple_of(qx_r0 + r0, 16), bm)
+            for off, cw in spans_z:
+                c_l = pl.ds(pl.multiple_of(off, 128), cw)
+                slab_z[rs_ch, c_l] = pair_ref[rs_l, pl.ds(pl.multiple_of(side_c0 + off, 128), cw)]
+            for off, cw in spans_y:
+                c_l = pl.ds(pl.multiple_of(off, 128), cw)
+                slab_y[rs_qy, c_l] = pair_ref[
+                    rs_l, pl.ds(pl.multiple_of(side_c0 + off_y_c + off, 128), cw)
+                ]
+            for off, cw in spans_x:
+                c_l = pl.ds(pl.multiple_of(off, 128), cw)
+                slab_x[rs_qx, c_l] = pair_ref[
+                    rs_l, pl.ds(pl.multiple_of(side_c0 + off_x_c + off, 128), cw)
+                ]
+    else:
+        for r0 in range(0, r_pair, bm):
+            rs_src = pl.ds(pl.multiple_of(chip_r0 + r0, 16), bm)
+            rs_qy = pl.ds(pl.multiple_of(qy_r0 + r0, 16), bm)
+            rs_qx = pl.ds(pl.multiple_of(qx_r0 + r0, 16), bm)
+            for off, cw in spans_y:
+                cs = pl.ds(pl.multiple_of(off, 128), cw)
+                slab_y[rs_qy, cs] = slab_y_dst[rs_src, cs]
+            for off, cw in spans_x:
+                cs = pl.ds(pl.multiple_of(off, 128), cw)
+                slab_x[rs_qx, cs] = slab_x_dst[rs_src, cs]
+
+    def _run_step(specs, sem_base: int, n_r: int, overlap_fn=None) -> None:
+        ops = [
+            pltpu.make_async_remote_copy(
+                slab.at[pl.ds(pl.multiple_of(r0, 16), n_r), :],
+                slab.at[pl.ds(pl.multiple_of(r0, 16), n_r), :],
+                ici_send.at[sem_base + idx],
+                ici_recv.at[sem_base + idx],
+                device_id=(peer,),
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+            for idx, (slab, r0, peer) in enumerate(specs)
+        ]
+        for op in ops:
+            op.start()
+        if overlap_fn is not None:
+            overlap_fn()
+        for op in ops:
+            op.wait()
+
+    _run_step(
+        ((slab_z, chip * r_pair, peer_x), (slab_y, q_y * r_pair, peer_y), (slab_x, q_x * r_pair, peer_z)),
+        0,
+        r_pair,
+    )
+    _run_step(
+        (
+            (slab_z, ((chip >> jnp.int32(1)) << jnp.int32(1)) * r_pair, peer_y),
+            (slab_y, ((q_y >> jnp.int32(1)) << jnp.int32(1)) * r_pair, peer_z),
+            (slab_x, ((q_x >> jnp.int32(1)) << jnp.int32(1)) * r_pair, peer_x),
+        ),
+        3,
+        2 * r_pair,
+    )
+    # Step 2 wait clears peers X/Y/Z before Step 3 reuses semaphores 0..2.
+    _run_step(
+        ((slab_z, cz * (4 * r_pair), peer_z), (slab_y, cx * (4 * r_pair), peer_x), (slab_x, cy * (4 * r_pair), peer_y)),
+        0,
+        4 * r_pair,
+        overlap_fn=during_ici_fn,
+    )
+
+    perm_y = (0, 2, 4, 6, 1, 3, 5, 7)
+    perm_x = (0, 4, 1, 5, 2, 6, 3, 7)
+    for q in range(8):
+        cy_dst = perm_y[q] * r_pair
+        cx_dst = perm_x[q] * r_pair
+        q_r0 = q * r_pair
+        for r0 in range(0, r_pair, bm):
+            rs_q = pl.ds(pl.multiple_of(q_r0 + r0, 16), bm)
+            rs_yd = pl.ds(pl.multiple_of(cy_dst + r0, 16), bm)
+            rs_xd = pl.ds(pl.multiple_of(cx_dst + r0, 16), bm)
+            for off, cw in spans_y:
+                cs = pl.ds(pl.multiple_of(off, 128), cw)
+                slab_y_dst[rs_yd, cs] = slab_y[rs_q, cs]
+            for off, cw in spans_x:
+                cs = pl.ds(pl.multiple_of(off, 128), cw)
+                slab_x_dst[rs_xd, cs] = slab_x[rs_q, cs]
+
+    # Swap slab_z first on ici[6] so wait(op_dz) synchronizes mate before d2d2_yx overwrites other_c0[w_z:].
+    op_dz = pltpu.make_async_remote_copy(
+        slab_z,
+        slab_z,
+        ici_send.at[6],
+        ici_recv.at[6],
+        device_id=(mate,),
+        device_id_type=pl.DeviceIdType.MESH,
+    )
+    op_dz.start()
+    op_dz.wait()
+
+    d2_yx = out_full_ref.at[:, pl.ds(pl.multiple_of(side_c0 + off_y_c, 128), w_y + w_x)]
+    op_dyx = pltpu.make_async_remote_copy(
+        d2_yx,
+        d2_yx,
+        d2d2_send.at[0],
+        d2d2_recv.at[0],
+        device_id=(mate,),
+        device_id_type=pl.DeviceIdType.MESH,
+    )
+    op_dyx.start()
+    if during_d2d2_fn is not None:
+        during_d2d2_fn()
+    op_dyx.wait()
+
+
 def _ag_chip_sharded_half_col_xor1(
     pair_ref,
     out_full_ref,
@@ -4645,7 +4851,8 @@ def _ag_chip_sharded_half_col_xor1(
     Because both cores on a chip already hold the identical `r_pair`-row `pair_ref`, `side=0`
     gathers columns `0:H/2` and `side=1` gathers `H/2:H` directly over inter-chip ICI with
     ZERO pre-ICI D2D, finishing with a single `733 GB/s` D2D swap. Uses `ag_3d_buf [n_chips, 8, H/2]`
-    when `r_pair == 8` (`TP=8 B=32` / `TP=16 B=64`) to respect TPU7x `(16, 128)` `bf16` VMEM tiling.
+    when `r_pair == 8` (`TP=8 B=32` / `TP=16 B=64`) to respect TPU7x `(16, 128)` `bf16` VMEM tiling,
+    and dispatches TP=16 large 2D payloads (`r_pair * half_h >= 65536`) to 3-slab parallel XYZ.
     """
     import jax.numpy as jnp
     from jax.experimental import pallas as pl
@@ -4660,16 +4867,44 @@ def _ag_chip_sharded_half_col_xor1(
 
     mate = me ^ jnp.int32(1)
     side = me & jnp.int32(1)
+    other_side = jnp.int32(1) - side
     chip = me >> jnp.int32(1)
     side_c0 = pl.multiple_of(side * half_h, 128)
     side_t0 = pl.multiple_of(side * half_tiles, 16) if is_3d_out else 0
     ag_w = min(half_h, 1024 if r_pair <= 16 else 512)
 
+    if _use_tp16_parallel_xyz_ag(
+        world_size=world_size,
+        is_3d_out=is_3d_out,
+        r_pair=r_pair,
+        half_h=half_h,
+    ):
+        _tp16_parallel_xyz_ag(
+            pair_ref,
+            out_full_ref,
+            ici_send,
+            ici_recv,
+            d2d2_send,
+            d2d2_recv,
+            me=me,
+            mate=mate,
+            side=side,
+            other_side=other_side,
+            chip=chip,
+            r_pair=r_pair,
+            half_h=half_h,
+            side_c0=side_c0,
+            during_ici_fn=during_ici_fn,
+            during_d2d2_fn=during_d2d2_fn,
+            copy_local_from_pair=copy_local_from_pair,
+        )
+        return
+
     if r_pair == 8 and not is_3d_out:
         assert ag_3d_buf is not None and pair_ref is not None
-        for c0 in range(0, half_h, ag_w):
-            c_l = pl.ds(c0, ag_w)
-            c_g = pl.ds(pl.multiple_of(side_c0 + c0, 128), ag_w)
+        for off, cw in _tile_spans(half_h, ag_w):
+            c_l = pl.ds(pl.multiple_of(off, 128), cw)
+            c_g = pl.ds(pl.multiple_of(side_c0 + off, 128), cw)
             ag_3d_buf[chip, :, c_l] = pair_ref[:, c_g]
 
         ici_ops = []
@@ -4692,9 +4927,9 @@ def _ag_chip_sharded_half_col_xor1(
 
         for p in range(n_chips // 2):
             r16 = pl.ds(16 * p, 16)
-            for c0 in range(0, half_h, ag_w):
-                c_l = pl.ds(c0, ag_w)
-                c_g = pl.ds(pl.multiple_of(side_c0 + c0, 128), ag_w)
+            for off, cw in _tile_spans(half_h, ag_w):
+                c_l = pl.ds(pl.multiple_of(off, 128), cw)
+                c_g = pl.ds(pl.multiple_of(side_c0 + off, 128), cw)
                 out_full_ref[r16, c_g] = jnp.concatenate(
                     [ag_3d_buf[2 * p, :, c_l], ag_3d_buf[2 * p + 1, :, c_l]], axis=0
                 )
@@ -4702,8 +4937,8 @@ def _ag_chip_sharded_half_col_xor1(
         chip_r0 = pl.multiple_of(chip * r_pair, 16)
         if copy_local_from_pair:
             assert pair_ref is not None and not is_3d_out
-            for c0 in range(0, half_h, ag_w):
-                c_g = pl.ds(pl.multiple_of(side_c0 + c0, 128), ag_w)
+            for off, cw in _tile_spans(half_h, ag_w):
+                c_g = pl.ds(pl.multiple_of(side_c0 + off, 128), cw)
                 out_full_ref[pl.ds(chip_r0, r_pair), c_g] = pair_ref[:, c_g]
 
         ici_slice = (
