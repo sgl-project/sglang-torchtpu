@@ -67,7 +67,7 @@ def resolve_static_fp8_lhs_scale(
     shorthand ``SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8 == 6`` (defaults to ``8.0``).
     """
     val = 0.0 if raw_scale is None else float(raw_scale)
-    if val < 0.0 or val > 32.0:
+    if not (0.0 <= val <= 32.0):
         raise ValueError(
             "SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_LHS must be in [0, 32], "
             f"got {val}"
@@ -80,7 +80,7 @@ def resolve_static_fp8_lhs_scale(
 def resolve_static_fp8_gmm2_scale(raw_scale: float | int | None) -> float:
     """Resolve static FP8 quantization scale for ``gmm1 -> gmm2`` activations."""
     val = 0.0 if raw_scale is None else float(raw_scale)
-    if val < 0.0 or val > 32.0:
+    if not (0.0 <= val <= 32.0):
         raise ValueError(
             "SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_GMM2_LHS must be in [0, 32], "
             f"got {val}"
@@ -1106,7 +1106,7 @@ def scoped_w4a8_dual_strip_acc(
     import jax.numpy as jnp
     from jax.experimental.pallas import tpu as pltpu
 
-    if rhs_qbs >= 512 and (hoist_rhs_scale or (zero_spill_sub_m and tile_m >= 256)):
+    if rhs_qbs >= 256 and (hoist_rhs_scale or (zero_spill_sub_m and tile_m >= 256)):
         _dual_mh_outer = mh_outer or (rhs_qbs > 512)
         acc_g = scoped_w4a8_strip_acc(
             w_weight_ref=w_weight_ref,
