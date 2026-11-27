@@ -1537,6 +1537,9 @@ class TpuEnvs:
     # Wave-18 opt-in BF16 reverse all-to-all in Ulysses attention (A1_VARIANT="v10_sp"):
     # sends bf16 across rev-A2A and applies 1x final static-FP8 quant inside gate-fuse, matching v6.
     SGLANG_TPU_MUSE_KERNEL_ULYSSES_REV_BF16 = EnvBool(False)
+    # Wave-14 Ulysses attention (A1_VARIANT="v10_sp", TP>=8, q_size<=512, c_k>=128): fuse A1
+    # QKV+Norm+RoPE, local Gate, and 16-slot Pallas async P2P A2A with 1x x_fp8 read (0-ULP exact).
+    SGLANG_TPU_MUSE_KERNEL_ULYSSES_ASYNC_A2A = EnvBool(True)
     # Wave-8 prefill SP Entry: Pallas async remote-copy A2A + fused Pallas embed RMSNorm.
     SGLANG_TPU_MUSE_KERNEL_ENTRY_ASYNC_A2A = EnvBool(False)
     # Wave-8 prefill Kernel A3 (v16 opt_wo): unlock bn=2048 at T=16384 (num_t_half=2, 60 MiB VMEM).
