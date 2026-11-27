@@ -606,6 +606,9 @@ class TpuEnvs:
     # Opt-in load-aware rank-capped FREE tail shedding ("<cap>:<tail_rows>:<tail_w>", e.g. "11:2:0.32").
     SGLANG_TPU_MUSE_DECODE_FREE_RANK_CAP = EnvStr("")
     SGLANG_TPU_MUSE_KERNEL_DECODE_TILE_M128 = EnvBool(False)
+    # Minimum batch size where SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8 activates W4A8
+    # (default 256 preserves decode B<=128 BF16; set 64 or 128 to opt into W4A8 decode).
+    SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8_MIN_BATCH = EnvInt(256)
     # Muse Wave-7B: allow DECODE_REPLICA_SLOTS > 0 alongside PREFILL_EPLB_STATS_PATH when
     # PrefillEplbManager._refresh_decode_replicas keeps _fused_decode_rep_* synchronized.
     SGLANG_TPU_MUSE_KERNEL_DECODE_SYNC_PREFILL_EPLB = EnvBool(False)
@@ -785,6 +788,8 @@ class TpuEnvs:
     # Allow fused Step (c) (b1_moe_b2_rpad) on SWA layers during shared-prefix LC steps
     # (decode_shared_prefix_pages is Full-only; SWA uses standard per-seq distribution).
     SGLANG_TPU_MUSE_MK_STEP_C_LC_SWA = EnvBool(False)
+    # Allow fused Step (c) (b1_moe_b2_rpad) on Full-Attn shared16/32/64 layers during LC steps.
+    SGLANG_TPU_MUSE_MK_STEP_C_LC_FULL = EnvBool(False)
     # Route uniform-width speculative TARGET_VERIFY (decode_query_size in 2..8, e.g.
     # DFlash dq=5/6) through RPAd_fast batched [16*dq, 128] single-MXU-pass verify.
     SGLANG_TPU_RPA_V3_DECODE_FAST_VERIFY = EnvBool(False)
@@ -1145,6 +1150,8 @@ class TpuEnvs:
     SGLANG_TPU_RPA_V3_PREFILL_TOPK_SLICES = EnvInt(0)
     # Query pooling stride for Stage-1 All-QK scoring (2 = pair-averaged Q, 1 = full Q).
     SGLANG_TPU_RPA_V3_PREFILL_TOPK_QSTRIDE = EnvInt(2)
+    # Use Stage-1 GQA-batched paired-K scorer + in-kernel exact top-k/bitpack (eliminates XLA sort).
+    SGLANG_TPU_RPA_V3_PREFILL_TOPK_FAST = EnvBool(False)
     # Muse prefill kernel path with SGLANG_TPU_KV_PACK_HEADS: A1 (two-half bf16 variants)
     # writes q and kv in RPA v3's packed layout, dropping the XLA expand/repack glue.
     SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT = EnvBool(False)

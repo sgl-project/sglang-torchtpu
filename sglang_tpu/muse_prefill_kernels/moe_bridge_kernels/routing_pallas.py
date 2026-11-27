@@ -315,32 +315,58 @@ def pallas_local_inv_perm_and_counts(
                 inv_pad_out_ref[r_sl, :] = out_blk
 
         # Part B: Exact `chip_before_local`, `local_chip_counts`, `group_sizes`, `group_start_arg`.
+        # Accumulate across `ep_size` inside `lax.fori_loop` rather than unrolling
+        # `ep_size * num_local_experts` scalar reductions in one basic block, which triggers
+        # TPU7x TensorCore scalar-program halts at `t_local <= 256`.
         lane_1d = lax.broadcasted_iota(jnp.int32, (8, LANE), 1)
-        bef_vals = []
-        ce_vals = []
-        active_my_slots = jnp.int32(0)
-        my_hits = jnp.int32(0)
+        init_h = tuple(jnp.zeros((8, LANE), dtype=jnp.int32) for _ in range(hdr_strips))
+        init_lgs = tuple(jnp.int32(0) for _ in range(num_local_experts))
+        cb_hs_lo = 2 // LANE
+        cb_hs_hi = (2 + ep_size - 1) // LANE
 
-        for c in range(ep_size):
-            g_chip = global_ref[pl.ds(c * g_rows_per_chip, g_rows_per_chip), :]
-            bef_vals.append(jnp.sum((g_chip < go).astype(jnp.int32)))
+        def _chip_step(c, carry):
+            hs_tup, lgs_tup, act_my, my_h, bef_tot = carry
+            hs_l = list(hs_tup)
+            lgs_l = list(lgs_tup)
+            r0_c = (
+                pl.multiple_of(c * g_rows_per_chip, 8)
+                if g_rows_per_chip % 8 == 0
+                else c * g_rows_per_chip
+            )
+            g_chip = global_ref[pl.ds(r0_c, g_rows_per_chip), :]
+            bef_c = jnp.sum((g_chip < go).astype(jnp.int32))
             if has_pad_sentinel:
                 act_c = jnp.sum((g_chip < jnp.int32(num_experts)).astype(jnp.int32))
-                active_my_slots = jnp.where(c == me, act_c, active_my_slots)
+                act_my = jnp.where(c == me, act_c, act_my)
+            if not zero_local_start:
+                bef_tot = bef_tot + bef_c
+            idx_cb = jnp.int32(2) + c
+            for hs in range(cb_hs_lo, cb_hs_hi + 1):
+                hs_l[hs] = jnp.where(
+                    lane_1d == (idx_cb - jnp.int32(hs * LANE)), bef_c, hs_l[hs]
+                )
             rel_c = g_chip - go
-            row_ce = []
             c_tot = jnp.int32(0)
             for e_loc in range(num_local_experts):
                 cnt_ce = jnp.sum((rel_c == e_loc).astype(jnp.int32))
-                row_ce.append(cnt_ce)
                 c_tot = c_tot + cnt_ce
-            ce_vals.append(row_ce)
-            my_hits = jnp.where(c == me, c_tot, my_hits)
+                lgs_l[e_loc] = lgs_l[e_loc] + cnt_ce
+                f_base = 2 + ep_size + e_loc * ep_size
+                f_idx = jnp.int32(f_base) + c
+                for hs in range(f_base // LANE, (f_base + ep_size - 1) // LANE + 1):
+                    hs_l[hs] = jnp.where(
+                        lane_1d == (f_idx - jnp.int32(hs * LANE)), cnt_ce, hs_l[hs]
+                    )
+            my_h = jnp.where(c == me, c_tot, my_h)
+            return tuple(hs_l), tuple(lgs_l), act_my, my_h, bef_tot
 
-        local_gs = [
-            sum(ce_vals[c][e_loc] for c in range(ep_size))
-            for e_loc in range(num_local_experts)
-        ]
+        hs_fin, local_gs, active_my_slots, my_hits, bef_tot_fin = lax.fori_loop(
+            0,
+            ep_size,
+            _chip_step,
+            (init_h, init_lgs, jnp.int32(0), jnp.int32(0), jnp.int32(0)),
+        )
+
         for gs_s in range(gs_strips):
             rel_g = (gs_s * LANE + lane_1d) - go
             val_gs = jnp.zeros((8, LANE), dtype=jnp.int32)
@@ -348,29 +374,15 @@ def pallas_local_inv_perm_and_counts(
                 val_gs = jnp.where(rel_g == e_loc, local_gs[e_loc], val_gs)
             gs_pad_out_ref[pl.ds(0, 8), pl.ds(gs_s * LANE, LANE)] = val_gs
 
-        local_start = (
-            jnp.int32(0) if zero_local_start else sum(bef_vals)
-        )
+        local_start = jnp.int32(0) if zero_local_start else bef_tot_fin
         t_recv = (
             (active_my_slots - my_hits)
             if has_pad_sentinel
             else (jnp.int32(t_local * topk) - my_hits)
         )
-
-        h_strips = [jnp.zeros((8, LANE), dtype=jnp.int32) for _ in range(hdr_strips)]
+        h_strips = list(hs_fin)
         h_strips[0] = jnp.where(lane_1d == 0, local_start, h_strips[0])
         h_strips[0] = jnp.where(lane_1d == 1, t_recv, h_strips[0])
-        for c in range(ep_size):
-            idx_cb = 2 + c
-            h_strips[idx_cb // LANE] = jnp.where(
-                lane_1d == (idx_cb % LANE), bef_vals[c], h_strips[idx_cb // LANE]
-            )
-            for e_loc in range(num_local_experts):
-                f_idx = 2 + ep_size + e_loc * ep_size + c
-                hs = f_idx // LANE
-                h_strips[hs] = jnp.where(
-                    lane_1d == (f_idx % LANE), ce_vals[c][e_loc], h_strips[hs]
-                )
         for hs in range(hdr_strips):
             hdr_pad_out_ref[pl.ds(0, 8), pl.ds(hs * LANE, LANE)] = h_strips[hs]
 

@@ -82,6 +82,62 @@ def _alias_b2_weights(
     return w_post_buf, w_qkv_buf, w_gate_buf
 
 
+def _unpack_rpad_outer_meta(it, msc_outer, *, world_size: int, rpa_cfg, rpa_skip_kv_write: bool):
+    """Unpack outer Step (c) RPAd metadata SMEM and DMA semaphores."""
+    from jax.experimental import pallas as pl
+
+    written_cnt_smem_ref = next(it)
+    if world_size == 16:
+        rpad_bkv_sems = msc_outer["rs_pair_ssem"].at[pl.ds(0, rpa_cfg.num_slots)]
+        rpad_cache_write_sem = (
+            None
+            if rpa_skip_kv_write
+            else msc_outer["rs_pair_ssem"].at[pl.ds(rpa_cfg.num_slots, 1)]
+        )
+    else:
+        rpad_bkv_sems = next(it)
+        rpad_cache_write_sem = None if rpa_skip_kv_write else next(it)
+    return written_cnt_smem_ref, rpad_bkv_sems, rpad_cache_write_sem
+
+
+def _unpack_rpad_scope_refs(
+    s_it,
+    *,
+    rpa_skip_kv_write: bool,
+    rpa_kv_pack_dense2: bool,
+    rpa_kv_pack_bd4: bool,
+    rpa_cfg,
+    rpa_use_grp_vec: bool,
+) -> tuple:
+    """Unpack Scope 2 / Scope 3 RPAd VMEM buffers from a scoped ref iterator."""
+    rpad_q_vmem = next(s_it)
+    rpad_kv_vmem = None if rpa_skip_kv_write else next(s_it)
+    rpad_gate_vmem = next(s_it)
+    bkv_vmem_ref = next(s_it)
+    state_vmem_ref = next(s_it)
+    o_vmem_ref = next(s_it)
+    kv_write_vmem_ref = (
+        next(s_it)
+        if ((rpa_kv_pack_dense2 or rpa_kv_pack_bd4) and not rpa_skip_kv_write)
+        else None
+    )
+    init_sv_vmem_ref = (
+        next(s_it)
+        if (getattr(rpa_cfg, "hoist_new_kv", False) or rpa_use_grp_vec)
+        else None
+    )
+    return (
+        rpad_q_vmem,
+        rpad_kv_vmem,
+        rpad_gate_vmem,
+        bkv_vmem_ref,
+        state_vmem_ref,
+        o_vmem_ref,
+        kv_write_vmem_ref,
+        init_sv_vmem_ref,
+    )
+
+
 def _b1_moe_b2_chip_sharded_impl(
     all_refs,
     *,
@@ -867,10 +923,10 @@ def _b1_moe_b2_chip_sharded_impl(
         )
         return
 
-    if (not has_rpad) and use_3scope:
-        # 3-Scope Step (b) for rows > 128 (TP=16 B=256): w_pre_pair stays in Scope 1 (-16 MiB
-        # outer/Scope 2) and w_qkv+w_gate live in Scope 3, keeping peak VMEM well < 63.94 MiB
-        # even under _dfp (FREE + FREE_RANK_CAP).
+    if use_3scope:
+        # 3-Scope Step (b) for rows > 128 and 3-Scope Step (c) for rows > 64:
+        # w_pre_pair stays in Scope 1 (-16 MiB outer/Scope 2) and w_qkv+w_gate live in
+        # Scope 3 (alongside RPAd when has_rpad=True), keeping peak VMEM < 63.94 MiB.
         moe_outer_refs = [next(it) for _ in range(step_b3_n_moe_outer)]
         s_buf = next(it)
         my_pair_bf16 = next(it)
@@ -912,6 +968,20 @@ def _b1_moe_b2_chip_sharded_impl(
             w_post_buf = (
                 msc_outer_b3["w1_buf"].bitcast(jnp.float8_e4m3fn).reshape((4096, 4096))
             )
+        if has_rpad:
+            written_cnt_smem_ref, rpad_bkv_sems, rpad_cache_write_sem = (
+                _unpack_rpad_outer_meta(
+                    it,
+                    msc_outer_b3,
+                    world_size=world_size,
+                    rpa_cfg=rpa_cfg,
+                    rpa_skip_kv_write=rpa_skip_kv_write,
+                )
+            )
+        else:
+            written_cnt_smem_ref = None
+            rpad_bkv_sems = None
+            rpad_cache_write_sem = None
 
         plan_holder_b3 = []
 
@@ -1163,7 +1233,19 @@ def _b1_moe_b2_chip_sharded_impl(
         pl.run_scoped(_run_b3_scope2, *step_b3_scope2_shapes)
 
         def _run_b3_scope3(*s3_refs) -> None:
-            next_in_vmem, mate_recv_b2, mate_tok_b2, w_qkv_buf, w_gate_buf = s3_refs
+            next_in_vmem, mate_recv_b2, mate_tok_b2, w_qkv_buf, w_gate_buf = s3_refs[:5]
+            rpad_refs_b3 = (
+                _unpack_rpad_scope_refs(
+                    iter(s3_refs[5:]),
+                    rpa_skip_kv_write=rpa_skip_kv_write,
+                    rpa_kv_pack_dense2=rpa_kv_pack_dense2,
+                    rpa_kv_pack_bd4=rpa_kv_pack_bd4,
+                    rpa_cfg=rpa_cfg,
+                    rpa_use_grp_vec=rpa_use_grp_vec,
+                )
+                if has_rpad
+                else None
+            )
             _run_stage5_6_b2_rpad(
                 moe_dst_vmem=moe_sh_vmem,
                 w_post_buf=w_post_buf,
@@ -1180,12 +1262,18 @@ def _b1_moe_b2_chip_sharded_impl(
                 b2_scalar_dummy_cols=b2_scalar_dummy_cols,
                 exp_3d_buf=exp_3d_buf,
                 sems=sems,
-                rpad_refs=None,
+                rpad_refs=rpad_refs_b3,
+                written_cnt_smem_ref=written_cnt_smem_ref,
+                rpad_bkv_sems=rpad_bkv_sems,
+                rpad_cache_write_sem=rpad_cache_write_sem,
                 sync_entry_barrier=True,
                 prestarted_qkv_gate_dma=False,
             )
 
-        pl.run_scoped(_run_b3_scope3, *step_b3_scope3_shapes)
+        scope3_shapes = step_b3_scope3_shapes + (
+            tuple(step_c_scope2_shapes) if has_rpad else ()
+        )
+        pl.run_scoped(_run_b3_scope3, *scope3_shapes)
         return
 
     # 2-Scope Step (c): Outer (live + sems) -> Scope 1 (Stage 1..4) -> Scope 2 (b2 + RPAd)
@@ -1251,17 +1339,15 @@ def _b1_moe_b2_chip_sharded_impl(
             gate_cols=gate_cols,
         )
 
-    written_cnt_smem_ref = next(it)
-    if world_size == 16:
-        rpad_bkv_sems = msc_outer["rs_pair_ssem"].at[pl.ds(0, rpa_cfg.num_slots)]
-        rpad_cache_write_sem = (
-            None
-            if rpa_skip_kv_write
-            else msc_outer["rs_pair_ssem"].at[pl.ds(rpa_cfg.num_slots, 1)]
+    written_cnt_smem_ref, rpad_bkv_sems, rpad_cache_write_sem = (
+        _unpack_rpad_outer_meta(
+            it,
+            msc_outer,
+            world_size=world_size,
+            rpa_cfg=rpa_cfg,
+            rpa_skip_kv_write=rpa_skip_kv_write,
         )
-    else:
-        rpad_bkv_sems = next(it)
-        rpad_cache_write_sem = None if rpa_skip_kv_write else next(it)
+    )
 
     if sharded_moe_in:
         moe_dst_vmem = moe_sh_vmem
@@ -1327,22 +1413,13 @@ def _b1_moe_b2_chip_sharded_impl(
     pl.run_scoped(_run_scope1, *step_c_scope1_shapes)
 
     def _run_scope2(*s2_refs) -> None:
-        s2_it = iter(s2_refs)
-        rpad_q_vmem = next(s2_it)
-        rpad_kv_vmem = None if rpa_skip_kv_write else next(s2_it)
-        rpad_gate_vmem = next(s2_it)
-        bkv_vmem_ref = next(s2_it)
-        state_vmem_ref = next(s2_it)
-        o_vmem_ref = next(s2_it)
-        kv_write_vmem_ref = (
-            next(s2_it)
-            if ((rpa_kv_pack_dense2 or rpa_kv_pack_bd4) and not rpa_skip_kv_write)
-            else None
-        )
-        init_sv_vmem_ref = (
-            next(s2_it)
-            if (getattr(rpa_cfg, "hoist_new_kv", False) or rpa_use_grp_vec)
-            else None
+        rpad_refs_s2 = _unpack_rpad_scope_refs(
+            iter(s2_refs),
+            rpa_skip_kv_write=rpa_skip_kv_write,
+            rpa_kv_pack_dense2=rpa_kv_pack_dense2,
+            rpa_kv_pack_bd4=rpa_kv_pack_bd4,
+            rpa_cfg=rpa_cfg,
+            rpa_use_grp_vec=rpa_use_grp_vec,
         )
         _run_stage5_6_b2_rpad(
             moe_dst_vmem=moe_dst_vmem,
@@ -1360,16 +1437,7 @@ def _b1_moe_b2_chip_sharded_impl(
             b2_scalar_dummy_cols=b2_scalar_dummy_cols,
             exp_3d_buf=exp_3d_buf,
             sems=sems,
-            rpad_refs=(
-                rpad_q_vmem,
-                rpad_kv_vmem,
-                rpad_gate_vmem,
-                bkv_vmem_ref,
-                state_vmem_ref,
-                o_vmem_ref,
-                kv_write_vmem_ref,
-                init_sv_vmem_ref,
-            ),
+            rpad_refs=rpad_refs_s2,
             written_cnt_smem_ref=written_cnt_smem_ref,
             rpad_bkv_sems=rpad_bkv_sems,
             rpad_cache_write_sem=rpad_cache_write_sem,
@@ -1533,7 +1601,11 @@ def _prepare_chip_b1_moe_b2_setup(
         config=config,
     )
     use_3d_x = config.row_mode != "dense"
-    use_3scope = (not has_rpad) and (rows > 128)
+    use_3scope = (rows > 128) or (has_rpad and rows > 64)
+    if use_3scope and not sharded_moe_in:
+        raise ValueError(
+            f"3-scope decode superkernel requires sharded_moe_in=True, got B={rows}, world_size={world_size}"
+        )
     w_pre_cols_buf = pre_pair_cols if interpret_mode else max(pre_pair_cols, qkv_cols + gate_cols)
     alias_mate_recv = (
         (not has_rpad)
@@ -2050,6 +2122,7 @@ def b1_moe_b2_chip_sharded_jax(
 
 _STEP_C_BASE_MAX_BKV_ROWS = 80 * 512
 _STEP_C_GROUP_MAX_BKV_ROWS = 80 * 512
+_STEP_C_LARGE_B_MAX_BKV_ROWS = 16 * 512
 
 
 def resolve_step_c_rpa_plan(
@@ -2062,6 +2135,7 @@ def resolve_step_c_rpa_plan(
     kv_pack_bd4: bool = False,
     b_tokens: int | None = None,
     max_num_seqs: int | None = None,
+    shared_group_size: int = 0,
     has_shared_prefix: bool = False,
 ):
     """Resolve Step (c) RPAd config, ``one_block_per_seq``, ``bkv_slot_pages``, and ``use_grp_vec``."""
@@ -2078,7 +2152,17 @@ def resolve_step_c_rpa_plan(
         if kv_pack_bd4
         else (phys_page_rows * 2 if kv_pack_dense2 else phys_page_rows)
     )
-    eff_shared_grp = get_shared_group_size(rpa_mode_str) if has_shared_prefix else 0
+    eff_b = int(b_tokens) if b_tokens is not None else 64
+    eff_seqs = int(max_num_seqs) if max_num_seqs is not None else eff_b
+    max_bkv_rows = _STEP_C_LARGE_B_MAX_BKV_ROWS if eff_b > 64 else _STEP_C_BASE_MAX_BKV_ROWS
+
+    if shared_group_size > 0:
+        eff_shared_grp = int(shared_group_size)
+    elif has_shared_prefix:
+        eff_shared_grp = get_shared_group_size(rpa_mode_str)
+    else:
+        eff_shared_grp = 0
+
     cfg_rpa = parse_decode_fast_config(
         rpa_mode_str,
         sliding_window=sliding_window,
@@ -2094,18 +2178,22 @@ def resolve_step_c_rpa_plan(
         if cfg_rpa.loop_kind == "ring4k"
         else (True if sliding_window is not None else (pages_per_seq <= cfg_rpa.max_ring_pages))
     )
+    sh_grp = cfg_rpa.shared_group_size or (16 if cfg_rpa.loop_kind == "shared16" else 0)
+    shared_bad = (
+        (has_shared_prefix and shared_group_size <= 0)
+        or (sh_grp > 0 and (shared_group_size <= 0 or eff_b < eff_seqs or (eff_seqs % sh_grp) != 0))
+        or (sh_grp == 0 and cfg_rpa.loop_kind.startswith("shared"))
+    )
     if (
-        cfg_rpa.shared_group_size > 0
-        or cfg_rpa.loop_kind.startswith("shared")
-        or cfg_rpa.num_slots * cfg_rpa.max_ring_pages * phys_page_rows > _STEP_C_BASE_MAX_BKV_ROWS
+        shared_bad
+        or cfg_rpa.num_slots * cfg_rpa.max_ring_pages * phys_page_rows > max_bkv_rows
     ):
         return cfg_rpa, one_block_per_seq, cfg_rpa.max_ring_pages, False, False
 
     eff_grp = 1
     use_grp_vec = False
-    eff_b = int(b_tokens) if b_tokens is not None else 64
-    eff_seqs = int(max_num_seqs) if max_num_seqs is not None else eff_b
-    if cfg_rpa.swabatch_group_size > 1 and eff_b == eff_seqs:
+    if cfg_rpa.swabatch_group_size > 1 and eff_b == eff_seqs and sh_grp == 0:
+        grp_limit = _STEP_C_LARGE_B_MAX_BKV_ROWS if eff_b > 64 else _STEP_C_GROUP_MAX_BKV_ROWS
         for cand_grp in (4, 2):
             if cand_grp > cfg_rpa.swabatch_group_size or (eff_b % cand_grp) != 0:
                 continue
@@ -2121,7 +2209,7 @@ def resolve_step_c_rpa_plan(
                     max_num_seqs=eff_seqs,
                 )
                 and cand_cfg.num_slots * cand_grp * cand_cfg.max_ring_pages * phys_page_rows
-                <= _STEP_C_GROUP_MAX_BKV_ROWS
+                <= grp_limit
             ):
                 cfg_rpa = cand_cfg
                 eff_grp = cand_grp
@@ -2234,8 +2322,8 @@ def b1_moe_b2_rpad_chip_sharded_jax(
     rows = st["rows"]
     r_pair = st["r_pair"]
     hidden = st["hidden"]
-    if rows > 64:
-        raise ValueError(f"Step (c) requires B <= 64 to fit bkv VMEM, got B={rows}")
+    if rows > 256:
+        raise ValueError(f"Step (c) requires B <= 256 to fit VMEM, got B={rows}")
 
     eff_sw = None if (rpa_sliding_window is None or rpa_sliding_window <= 0) else int(rpa_sliding_window)
     kv_cache_flat = kv_cache_fused
@@ -2260,7 +2348,13 @@ def b1_moe_b2_rpad_chip_sharded_jax(
     max_num_seqs = kv_lens.shape[0]
     pages_per_seq = eff_page_indices.shape[0] // max_num_seqs
     phys_page_rows = kv_cache_flat.shape[1]
-    has_shared_prefix = int(distribution.shape[0]) > 3
+    dist_len = int(distribution.shape[0])
+    has_shared_prefix = dist_len > 3
+    shared_group_size = (
+        max_num_seqs // (dist_len - 3)
+        if (has_shared_prefix and (max_num_seqs % (dist_len - 3)) == 0)
+        else 0
+    )
     cfg_rpa, one_block_per_seq, bkv_slot_pages, use_grp_vec, is_ok = resolve_step_c_rpa_plan(
         rpa_mode_str,
         sliding_window=eff_sw,
@@ -2270,13 +2364,14 @@ def b1_moe_b2_rpad_chip_sharded_jax(
         kv_pack_bd4=kv_pack_bd4,
         b_tokens=rows,
         max_num_seqs=max_num_seqs,
+        shared_group_size=shared_group_size,
         has_shared_prefix=has_shared_prefix,
     )
     if not is_ok:
         raise ValueError(
-            "Step (c) requires RPAd bkv <= 80*512 rows (20 MiB) and non-shared loop_kind; "
+            "Step (c) requires RPAd bkv within VMEM budget and compatible shared_group; "
             f"got num_slots={cfg_rpa.num_slots}, max_ring_pages={cfg_rpa.max_ring_pages}, "
-            f"phys_page_rows={phys_page_rows}, loop_kind={cfg_rpa.loop_kind!r}"
+            f"phys_page_rows={phys_page_rows}, loop_kind={cfg_rpa.loop_kind!r}, B={rows}"
         )
     if world_size == 16 and cfg_rpa.num_slots > 4:
         raise ValueError(
@@ -2335,7 +2430,19 @@ def b1_moe_b2_rpad_chip_sharded_jax(
             if run_cfg.loop_kind == "ring4k"
             else 0
         )
-        smem_words = 2 + run_cfg.num_slots + 4 * max(max_num_seqs * max_blks_4k, 0)
+        sh_grp = run_cfg.shared_group_size or (16 if run_cfg.loop_kind == "shared16" else 0)
+        max_blks_sh = (
+            cdiv(max(pages_per_seq, 1), run_cfg.max_ring_pages) if sh_grp > 0 else 0
+        )
+        sh_smem_words = 4 * max(sh_grp * max_blks_sh, 0)
+        if (max_num_seqs * pages_per_seq + 2 + run_cfg.num_slots + sh_smem_words) * 4 > 960 * 1024:
+            sh_smem_words = 0
+        smem_words = (
+            2
+            + run_cfg.num_slots
+            + max(4 * max(max_num_seqs * max_blks_4k, 0), sh_smem_words)
+        )
+        state_rows = q_heads * sh_grp if sh_grp > 0 else q_heads
         scope2_rpad_vmem = (
             vmem((rows, 16, 128), jnp.bfloat16),  # rpad_q_vmem
             *(
@@ -2348,7 +2455,7 @@ def b1_moe_b2_rpad_chip_sharded_jax(
                 (run_cfg.num_slots, run_slot_pg, phys_page_rows, 1, 4, 128),
                 kv_cache_flat.dtype,
             ),
-            vmem((3, q_heads, 128), jnp.float32),
+            vmem((3, state_rows, 128), jnp.float32),
             vmem((rows, q_heads, 128), jnp.bfloat16),
             *(
                 (vmem((max(rows, 8), 8, 1, 4, 128), kv_cache_flat.dtype),)
@@ -2413,12 +2520,21 @@ def b1_moe_b2_rpad_chip_sharded_jax(
             rpa_kv_pack_bd4=bool(kv_pack_bd4),
             rpa_use_grp_vec=bool(run_grp_vec),
             rpa_skip_kv_write=bool(skip_kv_write),
+            use_3scope=st["use_3scope"],
+            step_b3_moe_is_scope2=st["step_b3_moe_is_scope2"],
+            step_b3_n_moe_outer=st["step_b3_n_moe_outer"],
+            step_b3_scope1_shapes=st["step_b3_scope1_shapes"],
+            step_b3_scope2_shapes=st["step_b3_scope2_shapes"],
+            step_b3_scope3_shapes=st["step_b3_scope3_shapes"],
             step_c_moe_is_scope1=st["step_c_moe_is_scope1"],
             step_c_n_moe_outer=st["step_c_n_moe_outer"],
             step_c_n_moe_scope1=st["step_c_n_moe_scope1"],
             step_c_n_b1_scope1=st["step_c_n_b1_scope1"],
             step_c_scope1_shapes=st["step_c_scope1_shapes"],
             step_c_scope2_shapes=scope2_rpad_vmem,
+        )
+        outer_scratch = (
+            st["step_b3_outer_scratch"] if st["use_3scope"] else st["step_c_outer_scratch"]
         )
         return pl.pallas_call(
             kernel_fn,
@@ -2428,11 +2544,11 @@ def b1_moe_b2_rpad_chip_sharded_jax(
                 grid=(1,),
                 in_specs=in_specs,
                 out_specs=out_specs,
-                scratch_shapes=st["step_c_outer_scratch"] + outer_rpad_meta,
+                scratch_shapes=outer_scratch + outer_rpad_meta,
             ),
             input_output_aliases=pallas_aliases,
             compiler_params=pltpu.CompilerParams(
-                vmem_limit_bytes=64 * 1024**2,
+                vmem_limit_bytes=63 * 1024**2,
                 collective_id=collective_id,
                 disable_bounds_checks=True,
             ),
@@ -2453,6 +2569,7 @@ def b1_moe_b2_rpad_chip_sharded_jax(
     )
     use_adaptive_1k = (
         eff_sw is None
+        and shared_group_size == 0
         and skip_kv_write
         and cfg_rpa.loop_kind == "w7auto"
         and (1024 % page_size == 0)

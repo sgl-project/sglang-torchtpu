@@ -1113,8 +1113,11 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 torch.tensor(query_lens, dtype=torch.int32), dim=0, dtype=torch.int32
             )
             # One value slot, so varying prefills cannot grow the cache.
-            cu_q_lens = self._value_metadata(
-                name="cu_q_lens", value=cu_q_lens_cpu, device=device
+            cu_q_lens = self._value_metadata_fast(
+                name="cu_q_lens",
+                value=cu_q_lens_cpu,
+                device=device,
+                own_cpu=True,
             )
             active_tokens = sum(query_lens[:non_empty_bs])
         cu_kv_lens = self._layout_metadata(
@@ -1171,24 +1174,17 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         kv_len_bump = 0
         query_width = None
         query_lens = None
-        if forward_batch.forward_mode.is_target_verify():
-            assert forward_batch.spec_info is not None
-            verify_width = forward_batch.spec_info.num_tokens_per_req
-            kv_len_bump = verify_width
-            kv_lens = (forward_batch.seq_lens + verify_width).to(torch.int32)
-            query_width = verify_width
-        elif self._is_extend_including_draft(forward_batch.forward_mode):
-            # EXTEND and DRAFT_EXTEND use current lengths.
-            assert forward_batch.extend_seq_lens is not None
-            kv_lens = forward_batch.seq_lens.to(torch.int32)
-            query_lens = self._extend_query_lens(forward_batch, bs)
-        else:
+        def _resolve_kv_lens_host_or_device() -> torch.Tensor:
             if (
                 self._dcp <= 1
                 and getattr(device, "type", str(device)) == "tpu"
-                and forward_batch.forward_mode.is_decode()
+                and (
+                    forward_batch.forward_mode.is_decode()
+                    or forward_batch.forward_mode.is_extend_without_speculative()
+                )
                 and forward_batch.spec_info is None
                 and isinstance(seq_lens_cpu, torch.Tensor)
+                and seq_lens_cpu.device.type == "cpu"
                 and 0 < seq_lens_cpu.numel() <= bs
                 and not torch.compiler.is_compiling()
             ):
@@ -1198,17 +1194,28 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                     kv_lens_cpu = torch.zeros(bs, dtype=torch.int32)
                     live = int(seq_lens_cpu.numel())
                     kv_lens_cpu[:live] = seq_lens_cpu.to(torch.int32)
-                    kv_lens = self._value_metadata_fast(
+                    return self._value_metadata_fast(
                         name="kv_lens",
                         value=kv_lens_cpu,
                         device=device,
                         own_cpu=True,
                         skip_equal=True,
                     )
-                else:
-                    kv_lens = forward_batch.seq_lens.to(torch.int32)
-            else:
-                kv_lens = forward_batch.seq_lens.to(torch.int32)
+            return forward_batch.seq_lens.to(torch.int32)
+
+        if forward_batch.forward_mode.is_target_verify():
+            assert forward_batch.spec_info is not None
+            verify_width = forward_batch.spec_info.num_tokens_per_req
+            kv_len_bump = verify_width
+            kv_lens = (forward_batch.seq_lens + verify_width).to(torch.int32)
+            query_width = verify_width
+        elif self._is_extend_including_draft(forward_batch.forward_mode):
+            # EXTEND and DRAFT_EXTEND use current lengths.
+            assert forward_batch.extend_seq_lens is not None
+            kv_lens = _resolve_kv_lens_host_or_device()
+            query_lens = self._extend_query_lens(forward_batch, bs)
+        else:
+            kv_lens = _resolve_kv_lens_host_or_device()
             if (
                 forward_batch.forward_mode.is_decode()
                 and forward_batch.spec_info is not None
@@ -1550,17 +1557,41 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                                 segments=segments,
                             )
 
-        req_pool_indices = (
-            req_pool_indices_raw
-            if req_pool_indices_raw.dtype == torch.int64
-            else req_pool_indices_raw.to(torch.int64)
-        )
         # Gather only the strided page-slot columns [bs, pages_per_seq] (one
         # slot per page), not the full [bs, max_ctx] row.
         page_cols = self._host_page_columns(pages_per_seq, self._page_stride)
-        per_seq = req_to_token[req_pool_indices[:, None], page_cols[None, :]]
-        page_indices = (per_seq // self._page_stride).to(torch.int32)
-        page_indices = page_indices.reshape(bs * pages_per_seq).contiguous()
+        stride = self._page_stride
+        if req_to_token.device.type == "cpu":
+            rp_np = req_pool_indices_raw.numpy()
+            cols_np = page_cols.numpy()
+            per_seq_np = np.ascontiguousarray(
+                req_to_token.numpy()[rp_np[:, None], cols_np[None, :]]
+            )
+            if stride > 0 and (stride & (stride - 1)) == 0:
+                page_indices_np = (per_seq_np >> (stride.bit_length() - 1)).astype(
+                    np.int32, copy=False
+                )
+            else:
+                page_indices_np = np.floor_divide(per_seq_np, stride).astype(
+                    np.int32, copy=False
+                )
+            page_indices = torch.from_numpy(page_indices_np.reshape(-1))
+        else:
+            req_pool_indices = (
+                req_pool_indices_raw
+                if req_pool_indices_raw.dtype == torch.int64
+                else req_pool_indices_raw.to(torch.int64)
+            )
+            per_seq = req_to_token[req_pool_indices[:, None], page_cols[None, :]]
+            page_indices = (per_seq // stride).to(torch.int32)
+            page_indices = page_indices.reshape(bs * pages_per_seq).contiguous()
+            page_indices_np = page_indices.view(bs, pages_per_seq).numpy()
+
+        # Extend batches allocate fresh page tails every step, so CPU equality
+        # scans inside HostMetadataCache almost always miss; skip them safely.
+        skip_extend_equal = bool(
+            forward_batch.forward_mode.is_extend_without_speculative()
+        )
 
         # Sliding-window attention uses a separate KV pool. Translate full-pool
         # page indices through the CPU mapping before uploading or reusing them.
@@ -1569,22 +1600,37 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         swa_pages_np = None
         if self._is_hybrid_swa:
             swa_pages, swa_pages_np = _translate_full_pages_to_swa(
-                page_indices, page_indices.numpy()
+                page_indices, page_indices_np.reshape(-1)
             )
             swa_page_indices = self._value_metadata_fast(
                 name="swa_page_indices",
                 value=swa_pages,
                 device=device,
                 own_cpu=True,
+                skip_equal=skip_extend_equal,
             )
             if self._swa_group_pages is not None:
-                swa_group_page_indices = self._value_metadata(
+                if (
+                    isinstance(self._swa_group_pages, torch.Tensor)
+                    and self._swa_group_pages.device.type == "cpu"
+                ):
+                    swa_group_val = torch.from_numpy(
+                        np.ascontiguousarray(
+                            self._swa_group_pages.numpy()[:, swa_pages_np]
+                        )
+                    )
+                else:
+                    swa_group_val = self._swa_group_pages[
+                        :, swa_pages.to(torch.int64)
+                    ]
+                swa_group_page_indices = self._value_metadata_fast(
                     name="swa_group_page_indices",
-                    value=self._swa_group_pages[:, swa_pages.to(torch.int64)],
+                    value=swa_group_val,
                     device=device,
+                    own_cpu=True,
+                    skip_equal=skip_extend_equal,
                 )
 
-        page_indices_np = page_indices.view(bs, pages_per_seq).numpy()
         mismatch_cache = {}
         shared_dist_cache = {}
         full_distribution = (
@@ -1593,9 +1639,13 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             else None
         )
 
-        # Page tables change with KV growth, so they are value-checked.
+        # Page tables change with KV growth, so they are value-checked on decode.
         page_indices_dev = self._value_metadata_fast(
-            name="page_indices", value=page_indices, device=device, own_cpu=True
+            name="page_indices",
+            value=page_indices,
+            device=device,
+            own_cpu=True,
+            skip_equal=skip_extend_equal,
         )
         if can_cache_decode_pages:
             self._cached_decode_page_tables = (

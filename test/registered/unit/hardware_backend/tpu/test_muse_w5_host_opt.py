@@ -837,3 +837,94 @@ def test_nonspec_d1_fast_filter_finished_batch_zombie_reqs():
     assert b_active.filter_calls == 0
 
 
+def test_extend_host_metadata_numpy_and_skip_equal_with_live_swa_group_pages():
+    """Verify NumPy req_to_token/swa_group_pages indexing + EXTEND skip_equal + live mutation safety."""
+    from sglang_tpu.attention_pallas_rpa_base import BaseTpuPallasRpaAttnBackend
+    from sglang_tpu.host_metadata_cache import HostMetadataCache
+
+    backend = object.__new__(BaseTpuPallasRpaAttnBackend)
+    backend._dcp = 1
+    backend._page_stride = 128
+    backend._host_page_cols = None
+    backend._is_hybrid_swa = True
+    backend._swa_group_pages = torch.tensor(
+        [
+            [10, 11, 12, 13, 14, 15, 16, 17],
+            [20, 21, 22, 23, 24, 25, 26, 27],
+            [30, 31, 32, 33, 34, 35, 36, 37],
+        ],
+        dtype=torch.int32,
+    )
+    backend._host_metadata_cache = HostMetadataCache()
+    backend._is_extend_including_draft = lambda mode: mode.is_extend(
+        include_draft_extend_v2=True
+    )
+    backend._extend_query_lens = lambda fb, bs: [200, 100, 0]
+    backend.supports_shared_decode_batch = lambda bs: False
+
+    full_to_swa = torch.zeros(1024, dtype=torch.int64)
+    for fp in range(8):
+        full_to_swa[fp * 128] = ((fp * 3 + 1) % 8) * 128
+    backend.token_to_kv_pool = SimpleNamespace(full_to_swa_index_mapping=full_to_swa)
+
+    req_to_token = torch.zeros((4, 512), dtype=torch.int32)
+    req_to_token[1, :512] = torch.arange(512, dtype=torch.int32)
+    req_to_token[2, :512] = 512 + torch.arange(512, dtype=torch.int32)
+
+    fb = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        spec_info=None,
+        seq_lens=torch.tensor([200, 100, 0], dtype=torch.int64),
+        seq_lens_cpu=torch.tensor([200, 100, 0], dtype=torch.int64),
+        extend_seq_lens=torch.tensor([200, 100, 0], dtype=torch.int32),
+        extend_seq_lens_cpu=[200, 100, 0],
+        req_pool_indices_cpu=torch.tensor([1, 2, 0], dtype=torch.int32),
+    )
+    dist = torch.tensor([0, 0, 2], dtype=torch.int32)
+
+    equal_calls = []
+    orig_equal = torch.equal
+
+    def tracked_equal(a, b):
+        equal_calls.append((a.shape, b.shape))
+        return orig_equal(a, b)
+
+    with patch("torch.equal", side_effect=tracked_equal):
+        m1 = backend._build_metadata_host(
+            fb, 128, torch.device("cpu"), 3, req_to_token, 4, dist, 2, decode_query_size=1
+        )
+    # On EXTEND, page_indices / swa_page_indices / swa_group_page_indices skip torch.equal!
+    assert len(equal_calls) <= 1
+
+    expected_pages = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 0, 0, 0, 0], dtype=torch.int32)
+    torch.testing.assert_close(m1.page_indices, expected_pages)
+    expected_swa = ((expected_pages.to(torch.int64) * 3 + 1) % 8).to(torch.int32)
+    torch.testing.assert_close(m1.swa_page_indices, expected_swa)
+    expected_grp1 = backend._swa_group_pages[:, expected_swa.to(torch.int64)]
+    torch.testing.assert_close(m1.swa_group_page_indices, expected_grp1)
+
+    # Dynamic allocation mutates _swa_group_pages in place -> next EXTEND sees new mapping!
+    backend._swa_group_pages[1, int(expected_swa[0])] = 99
+    m2 = backend._build_metadata_host(
+        fb, 128, torch.device("cpu"), 3, req_to_token, 4, dist, 2, decode_query_size=1
+    )
+    assert int(m2.swa_group_page_indices[1, 0]) == 99
+
+    # DECODE / TARGET_VERIFY still performs torch.equal hit reuse in HostMetadataCache.
+    fb_dec = SimpleNamespace(
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        spec_info=SimpleNamespace(num_tokens_per_req=5),
+        seq_lens=torch.tensor([200, 100, 0], dtype=torch.int64),
+        seq_lens_cpu=torch.tensor([200, 100, 0], dtype=torch.int64),
+        req_pool_indices_cpu=torch.tensor([1, 2, 0], dtype=torch.int32),
+    )
+    with _temp_env(SGLANG_TPU_RPA_CACHE_DECODE_PAGE_TABLE="0"):
+        md1 = backend._build_metadata_host(
+            fb_dec, 128, torch.device("cpu"), 3, req_to_token, 4, dist, 2, decode_query_size=5
+        )
+        md2 = backend._build_metadata_host(
+            fb_dec, 128, torch.device("cpu"), 3, req_to_token, 4, dist, 2, decode_query_size=5
+        )
+        assert md2.page_indices is md1.page_indices
+        assert md2.swa_page_indices is md1.swa_page_indices
+        assert md2.swa_group_page_indices is md1.swa_group_page_indices

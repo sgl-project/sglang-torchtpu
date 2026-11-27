@@ -3573,6 +3573,10 @@ def _prefix_score_kernel(
     kv_pack_dense2: bool = False,
     kv_pack_bd4: bool = False,
     interpret: bool = False,
+    topk_slices: int = 0,
+    topk_in_kernel: bool = False,
+    topk_gqa_batch: int = 1,
+    topk_k_pair: int = 1,
 ):
     """Stage-1 prefix All-QK scorer (read-only on Q and KV cache)."""
     start_seq_idx, end_seq_idx = case.get_range(distribution_ref)
@@ -3606,7 +3610,9 @@ def _prefix_score_kernel(
     n_qgrps_per_bq = eff_bq // q_grp_sz
 
     sc_k1_ref[...] = jnp.zeros(sc_k1_ref.shape, jnp.bfloat16)
-    sc_out_vmem[...] = jnp.zeros(sc_out_vmem.shape, jnp.float32)
+    sc_out_vmem[...] = jnp.zeros(
+        sc_out_vmem.shape, jnp.int32 if topk_in_kernel else jnp.float32
+    )
 
     cache_hbm_shape = kv_cache_hbm_ref.shape
     flat_cache_hbm_ref = (
@@ -3752,6 +3758,8 @@ def _prefix_score_kernel(
     q_h_iota = lax.broadcasted_iota(jnp.int32, (8, 128), 0)
     col_iota_8w = lax.broadcasted_iota(jnp.int32, (8, w_q), 1)
     col_iota_64w = lax.broadcasted_iota(jnp.int32, (64, w_q), 1)
+    tk_iota_128 = lax.broadcasted_iota(jnp.int32, (8, 128), 1)
+    tk_valid_mask = tk_iota_128 < num_h_per_bkv
 
     @pl.loop(start_seq_idx, end_seq_idx)
     def _k1_seq(seq_idx):
@@ -3981,65 +3989,241 @@ def _prefix_score_kernel(
                         )
                         valid_cols = cdiv(valid_g_rows, qstride)
                         col_ok_8w = col_iota_8w < valid_cols
-                        for kv_h in range(sq_kv_heads):
-
-                            def _qh_score(q_h, m_acc):
-                                q_1h = q_k1_f8_ref[g_idx, kv_h * 8 + q_h][
-                                    None, :, :
+                        sc_pair_f32 = jnp.full(
+                            (8, 128), jnp.float32(-1e30), dtype=jnp.float32
+                        )
+                        if topk_gqa_batch > 1 and (8 % topk_gqa_batch == 0):
+                            col_ok_1w = lax.broadcasted_iota(jnp.int32, (1, w_q), 1) < valid_cols
+                            for kv_h in range(sq_kv_heads):
+                                head_chunks = [[] for _ in range(8)]
+                                q_batches = [
+                                    jnp.concatenate(
+                                        [
+                                            q_k1_f8_ref[g_idx, kv_h * 8 + qh]
+                                            for qh in range(b0, b0 + topk_gqa_batch)
+                                        ],
+                                        axis=1,
+                                    )[None, :, :]
+                                    for b0 in range(0, 8, topk_gqa_batch)
                                 ]
                                 for g_c in range(n_s_chunks):
-                                    m_parts = []
-                                    for sub_s in range(8):
-                                        k_1h = k_k1_ref[kv_h, g_c * 8 + sub_s][
-                                            :, :64
-                                        ][None, :, :]
-                                        qk = lax.dot(
-                                            k_1h,
-                                            q_1h,
-                                            dimension_numbers=(([2], [1]), ([0], [0])),
-                                            preferred_element_type=jnp.float32,
-                                        ).astype(jnp.bfloat16)
-                                        m_q = jnp.max(
+                                    m_sub = [[] for _ in range(8)]
+                                    if topk_k_pair == 2:
+                                        for sub_p in range(4):
+                                            k_2h = jnp.concatenate(
+                                                [
+                                                    k_k1_ref[kv_h, g_c * 8 + 2 * sub_p][:, :64],
+                                                    k_k1_ref[kv_h, g_c * 8 + 2 * sub_p + 1][:, :64],
+                                                ],
+                                                axis=0,
+                                            )[None, :, :]
+                                            for bi, q_blk in enumerate(q_batches):
+                                                qk = lax.dot(
+                                                    k_2h,
+                                                    q_blk,
+                                                    dimension_numbers=(
+                                                        ([2], [1]),
+                                                        ([0], [0]),
+                                                    ),
+                                                    preferred_element_type=jnp.float32,
+                                                ).astype(jnp.bfloat16)
+                                                m_2q = jnp.max(
+                                                    jnp.max(
+                                                        qk.reshape(
+                                                            (2, 16, 8, topk_gqa_batch * w_q)
+                                                        ),
+                                                        axis=1,
+                                                    ),
+                                                    axis=1,
+                                                )
+                                                for hi in range(topk_gqa_batch):
+                                                    mh = m_2q[
+                                                        :, hi * w_q : (hi + 1) * w_q
+                                                    ]
+                                                    mh_m = jnp.where(col_ok_1w, mh, neg_col)
+                                                    m_sub[bi * topk_gqa_batch + hi].append(
+                                                        mh_m[0:1]
+                                                    )
+                                                    m_sub[bi * topk_gqa_batch + hi].append(
+                                                        mh_m[1:2]
+                                                    )
+                                    else:
+                                        for sub_s in range(8):
+                                            k_1h = k_k1_ref[kv_h, g_c * 8 + sub_s][
+                                                :, :64
+                                            ][None, :, :]
+                                            for bi, q_blk in enumerate(q_batches):
+                                                qk = lax.dot(
+                                                    k_1h,
+                                                    q_blk,
+                                                    dimension_numbers=(
+                                                        ([2], [1]),
+                                                        ([0], [0]),
+                                                    ),
+                                                    preferred_element_type=jnp.float32,
+                                                ).astype(jnp.bfloat16)
+                                                m_q = jnp.max(
+                                                    jnp.max(
+                                                        qk.reshape(
+                                                            (1, 16, 8, topk_gqa_batch * w_q)
+                                                        ),
+                                                        axis=1,
+                                                    ),
+                                                    axis=1,
+                                                )
+                                                for hi in range(topk_gqa_batch):
+                                                    mh = m_q[
+                                                        :, hi * w_q : (hi + 1) * w_q
+                                                    ]
+                                                    m_sub[bi * topk_gqa_batch + hi].append(
+                                                        jnp.where(col_ok_1w, mh, neg_col)
+                                                    )
+                                    for qh in range(8):
+                                        m_8w = jnp.concatenate(m_sub[qh], axis=0)
+                                        if w_q == 512:
+                                            m_8w = jnp.maximum(
+                                                m_8w[:, :256], m_8w[:, 256:]
+                                            )
+                                        head_chunks[qh].append(
                                             jnp.max(
-                                                qk.reshape((1, 16, 8, w_q)), axis=1
-                                            ),
-                                            axis=1,
+                                                m_8w.astype(jnp.float32), axis=1
+                                            )
                                         )
-                                        m_parts.append(m_q)
-                                    m_8w = jnp.where(
-                                        col_ok_8w,
-                                        jnp.concatenate(m_parts, axis=0),
-                                        neg_col,
+                                row_vecs = [
+                                    jnp.concatenate(head_chunks[qh], axis=0)
+                                    for qh in range(8)
+                                ]
+                                if num_h_per_bkv < 128:
+                                    pad_tail = jnp.zeros(
+                                        (128 - num_h_per_bkv,), jnp.float32
                                     )
-                                    if w_q == 512:
-                                        m_8w = jnp.maximum(
-                                            m_8w[:, :256], m_8w[:, 256:]
-                                        )
-                                    sc_k1_ref[g_c] = m_8w
-                                sc_128 = jnp.max(
-                                    sc_k1_ref[...]
-                                    .reshape((128, w_red))
-                                    .astype(jnp.float32),
-                                    axis=1,
-                                )
-                                return jnp.where(
-                                    q_h_iota == q_h, sc_128[None, :], m_acc
-                                )
+                                    row_vecs = [
+                                        jnp.concatenate([rv, pad_tail], axis=0)
+                                        for rv in row_vecs
+                                    ]
+                                m_8 = jnp.stack(row_vecs, axis=0)
+                                m_8 = m_8 * q_sc_k1_ref[g_idx, kv_h]
+                                mean_8 = jnp.sum(
+                                    m_8, axis=1, keepdims=True
+                                ) * jnp.float32(1.0 / float(num_h_per_bkv))
+                                s_vec = jnp.max(m_8 - mean_8, axis=0)
+                                if topk_in_kernel:
+                                    sc_pair_f32 = jnp.where(
+                                        q_h_iota == kv_h, s_vec[None, :], sc_pair_f32
+                                    )
+                                else:
+                                    sc_out_vmem[
+                                        sc_slot, g_idx, kv_h : kv_h + 1, :
+                                    ] = s_vec[None, :]
+                        else:
+                            for kv_h in range(sq_kv_heads):
 
-                            m_8 = lax.fori_loop(
+                                def _qh_score(q_h, m_acc):
+                                    q_1h = q_k1_f8_ref[g_idx, kv_h * 8 + q_h][
+                                        None, :, :
+                                    ]
+                                    for g_c in range(n_s_chunks):
+                                        m_parts = []
+                                        for sub_s in range(8):
+                                            k_1h = k_k1_ref[kv_h, g_c * 8 + sub_s][
+                                                :, :64
+                                            ][None, :, :]
+                                            qk = lax.dot(
+                                                k_1h,
+                                                q_1h,
+                                                dimension_numbers=(
+                                                    ([2], [1]),
+                                                    ([0], [0]),
+                                                ),
+                                                preferred_element_type=jnp.float32,
+                                            ).astype(jnp.bfloat16)
+                                            m_q = jnp.max(
+                                                jnp.max(
+                                                    qk.reshape((1, 16, 8, w_q)), axis=1
+                                                ),
+                                                axis=1,
+                                            )
+                                            m_parts.append(m_q)
+                                        m_8w = jnp.where(
+                                            col_ok_8w,
+                                            jnp.concatenate(m_parts, axis=0),
+                                            neg_col,
+                                        )
+                                        if w_q == 512:
+                                            m_8w = jnp.maximum(
+                                                m_8w[:, :256], m_8w[:, 256:]
+                                            )
+                                        sc_k1_ref[g_c] = m_8w
+                                    sc_128 = jnp.max(
+                                        sc_k1_ref[...]
+                                        .reshape((128, w_red))
+                                        .astype(jnp.float32),
+                                        axis=1,
+                                    )
+                                    return jnp.where(
+                                        q_h_iota == q_h, sc_128[None, :], m_acc
+                                    )
+
+                                m_8 = lax.fori_loop(
+                                    0,
+                                    8,
+                                    _qh_score,
+                                    jnp.zeros((8, 128), jnp.float32),
+                                    unroll=False,
+                                )
+                                m_8 = m_8 * q_sc_k1_ref[g_idx, kv_h]
+                                mean_8 = jnp.sum(
+                                    m_8, axis=1, keepdims=True
+                                ) * jnp.float32(1.0 / float(num_h_per_bkv))
+                                s_vec = jnp.max(m_8 - mean_8, axis=0)
+                                if topk_in_kernel:
+                                    sc_pair_f32 = jnp.where(
+                                        q_h_iota == kv_h, s_vec[None, :], sc_pair_f32
+                                    )
+                                else:
+                                    sc_out_vmem[
+                                        sc_slot, g_idx, kv_h : kv_h + 1, :
+                                    ] = s_vec[None, :]
+                        if topk_in_kernel:
+                            x_tk = jnp.where(
+                                tk_valid_mask, sc_pair_f32, jnp.float32(-1e30)
+                            )
+                            out_tk = jnp.zeros((8, 128), jnp.int32)
+
+                            def _tk_word(w_idx, state):
+                                cur_x, cur_out = state
+                                word = jnp.zeros((8,), jnp.uint32)
+                                for b_i in range(4):
+                                    mx = jnp.max(cur_x, axis=1, keepdims=True)
+                                    idx = jnp.min(
+                                        jnp.where(
+                                            cur_x == mx, tk_iota_128, jnp.int32(128)
+                                        ),
+                                        axis=1,
+                                    )
+                                    cur_x = jnp.where(
+                                        tk_iota_128 == idx[:, None],
+                                        jnp.float32(-1e30),
+                                        cur_x,
+                                    )
+                                    word = word | (
+                                        idx.astype(jnp.uint32) << jnp.uint32(8 * b_i)
+                                    )
+                                cur_out = jnp.where(
+                                    tk_iota_128 == w_idx,
+                                    word[:, None].astype(jnp.int32),
+                                    cur_out,
+                                )
+                                return cur_x, cur_out
+
+                            _, out_tk = lax.fori_loop(
                                 0,
-                                8,
-                                _qh_score,
-                                jnp.zeros((8, 128), jnp.float32),
+                                topk_slices // 4,
+                                _tk_word,
+                                (x_tk, out_tk),
                                 unroll=False,
                             )
-                            m_8 = m_8 * q_sc_k1_ref[g_idx, kv_h]
-                            mean_8 = jnp.sum(m_8, axis=1, keepdims=True) * jnp.float32(
-                                1.0 / float(num_h_per_bkv)
-                            )
-                            sc_out_vmem[sc_slot, g_idx, kv_h : kv_h + 1, :] = jnp.max(
-                                m_8 - mean_8, axis=0
-                            )[None, :]
+                            sc_out_vmem[sc_slot, g_idx] = out_tk
 
                     _sc_dma(bkv_idx, sc_slot, wait=False)
 
@@ -7730,6 +7914,9 @@ def get_vmem_limit():
         "_interpret",
         "_prefill_topk_slices",
         "_prefill_topk_qstride",
+        "_prefill_topk_in_kernel",
+        "_prefill_topk_gqa_batch",
+        "_prefill_topk_k_pair",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache_fused"),
 )
@@ -7818,6 +8005,9 @@ def ragged_paged_attention(
     # Private: Opt-in 2-kernel LC Full top-k prefix slice selection (0 = disabled).
     _prefill_topk_slices: int = 0,
     _prefill_topk_qstride: int = 2,
+    _prefill_topk_in_kernel: bool = False,
+    _prefill_topk_gqa_batch: int = 1,
+    _prefill_topk_k_pair: int = 1,
 ):
     """Ragged paged attention with fused KV cache.
 
@@ -8514,6 +8704,8 @@ def ragged_paged_attention(
                 sm_scale * (k_scale if k_scale is not None else 1.0) * math.log2(math.e)
             )
             k1_n_qgrps_per_bq = eff_bq_topk // q_grp_sz_topk
+            topk_in_kernel_eff = bool(_prefill_topk_in_kernel)
+            sc_out_dtype_k1 = jnp.int32 if topk_in_kernel_eff else jnp.float32
             k1_scratches = [
                 pltpu.VMEM((2, 1, 256, *q.shape[2:]), q.dtype),
                 pltpu.VMEM(
@@ -8532,7 +8724,7 @@ def ragged_paged_attention(
                 ),
                 pltpu.VMEM((k1_n_qgrps_per_bq, sq_kv_heads, 8, 128), jnp.float32),
                 pltpu.VMEM((16, 8, w_red_topk), jnp.bfloat16),
-                pltpu.VMEM((2, k1_n_qgrps_per_bq, 8, 128), jnp.float32),
+                pltpu.VMEM((2, k1_n_qgrps_per_bq, 8, 128), sc_out_dtype_k1),
             ]
             k1_kernel = pl.pallas_call(
                 functools.partial(
@@ -8547,6 +8739,10 @@ def ragged_paged_attention(
                     kv_pack_dense2=_kv_pack_dense2,
                     kv_pack_bd4=_kv_pack_bd4,
                     interpret=bool(_interpret),
+                    topk_slices=_prefill_topk_slices,
+                    topk_in_kernel=topk_in_kernel_eff,
+                    topk_gqa_batch=_prefill_topk_gqa_batch,
+                    topk_k_pair=_prefill_topk_k_pair,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=6,
@@ -8568,14 +8764,14 @@ def ragged_paged_attention(
                     [
                         pltpu.HBM(
                             shape=(max_q_grps_topk, max_bkv_topk, 8, 128),
-                            dtype=jnp.float32,
+                            dtype=sc_out_dtype_k1,
                         )
                     ]
                     if tpu_version >= 7
                     else [
                         jax.ShapeDtypeStruct(
                             shape=(max_q_grps_topk, max_bkv_topk, 8, 128),
-                            dtype=jnp.float32,
+                            dtype=sc_out_dtype_k1,
                         )
                     ]
                 ),
@@ -8592,29 +8788,41 @@ def ragged_paged_attention(
             else:
                 (sc_hbm_out,) = k1_kernel(*k1_sp, q, kv_cache)
 
-            sc_active = sc_hbm_out[:, :, :sq_kv_heads, :num_h_per_bkv]
-            _, top_idx = lax.top_k(sc_active, _prefill_topk_slices, is_stable=False)
-            top_u8 = top_idx.astype(jnp.uint32).reshape(
-                max_q_grps_topk,
-                max_bkv_topk,
-                sq_kv_heads,
-                _prefill_topk_slices // 4,
-                4,
-            )
-            prefix_topk_packed = (
-                (
-                    top_u8[..., 0]
-                    | (top_u8[..., 1] << jnp.uint32(8))
-                    | (top_u8[..., 2] << jnp.uint32(16))
-                    | (top_u8[..., 3] << jnp.uint32(24))
+            if topk_in_kernel_eff:
+                prefix_topk_packed = sc_hbm_out[
+                    :, :, :sq_kv_heads, : (_prefill_topk_slices // 4)
+                ].reshape(-1)
+            else:
+                sc_active = sc_hbm_out[:, :, :sq_kv_heads, :num_h_per_bkv]
+                _, top_idx = lax.top_k(sc_active, _prefill_topk_slices, is_stable=False)
+                top_u8 = top_idx.astype(jnp.uint32).reshape(
+                    max_q_grps_topk,
+                    max_bkv_topk,
+                    sq_kv_heads,
+                    _prefill_topk_slices // 4,
+                    4,
                 )
-                .astype(jnp.int32)
-                .reshape(-1)
-            )
+                prefix_topk_packed = (
+                    (
+                        top_u8[..., 0]
+                        | (top_u8[..., 1] << jnp.uint32(8))
+                        | (top_u8[..., 2] << jnp.uint32(16))
+                        | (top_u8[..., 3] << jnp.uint32(24))
+                    )
+                    .astype(jnp.int32)
+                    .reshape(-1)
+                )
             scalar_prefetches = scalar_prefetches + (cu_qgrps, prefix_topk_packed)
             extra_sp_count = 2
             prefix_topk_slices_eff = _prefill_topk_slices
-            scope_name += f"-ptk{_prefill_topk_slices}_qs{_prefill_topk_qstride}"
+            scope_name += (
+                f"-ptk{_prefill_topk_slices}_qs{_prefill_topk_qstride}"
+                + (
+                    f"_ik_g{_prefill_topk_gqa_batch}_kp{_prefill_topk_k_pair}"
+                    if topk_in_kernel_eff
+                    else ""
+                )
+            )
 
         extra_compiler_kwargs = (
             {"flags": {"XLA_TPU_EVENLY_DISTRIBUTE_CRITICAL_NODES": True}}

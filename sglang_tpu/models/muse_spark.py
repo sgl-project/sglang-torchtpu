@@ -3762,8 +3762,8 @@ class MuseSparkDecoderLayer(nn.Module):
         mlp = self.mlp
         valid_b = (
             (8, 16)
-            if (replicated and tp == 8)
-            else ((16,) if replicated else ((32, 64, 128) if tp == 8 else (64, 128, 256)))
+            if replicated
+            else ((32, 64, 128) if tp == 8 else (64, 128, 256))
         )
         pre_buf_key = "_w7_wpre_w8k" if replicated else "_w8_wpre_pair_w8k"
         if (
@@ -3811,6 +3811,184 @@ class MuseSparkDecoderLayer(nn.Module):
             and mlp._norm_2d().dtype in (torch.bfloat16, torch.float32)
         )
 
+    @staticmethod
+    def _resolve_step_c_rpa_context(
+        next_layer_attn: MuseSparkAttention,
+        forward_batch: ForwardBatch,
+        *,
+        n_tok: int,
+        tp: int,
+    ) -> Optional[dict]:
+        """Resolve RPAd buffers and compatibility plan for Step (c) superkernels."""
+        from sglang_tpu.muse_megakernel.decode.b1_moe_b2_kernel import (
+            resolve_step_c_rpa_plan,
+        )
+        from sglang_tpu.attention_pallas_rpa_base import _fused_kv_operands
+        from sglang_tpu.decode_qkv_epilogue_tpu import (
+            _resolve_decode_attn_backend,
+        )
+
+        backend = _resolve_decode_attn_backend(forward_batch)
+        md = getattr(backend, "forward_metadata", None) if backend is not None else None
+        rpa_mode_str = str(tpu_envs.SGLANG_TPU_RPA_V3_DECODE_FAST.get()).strip()
+        sw = getattr(next_layer_attn.attn, "sliding_window_size", None)
+        if sw is not None and sw <= 0:
+            sw = None
+        elif sw is not None:
+            sw = int(sw) + 1
+        lc_swa_step_c = bool(tpu_envs.SGLANG_TPU_MUSE_MK_STEP_C_LC_SWA.get())
+        has_shared_lc = md is not None and (
+            getattr(md, "full_decode_distribution", None) is not None
+            or int(getattr(getattr(md, "distribution", None), "shape", (3,))[0]) > 3
+        )
+        if not (
+            rpa_mode_str
+            and backend is not None
+            and md is not None
+            and getattr(backend, "_decode_prepared_gated_op", None) is not None
+            and getattr(md, "decode_query_size", 0) == 1
+            and (
+                (not has_shared_lc)
+                or (lc_swa_step_c and sw is not None)
+            )
+            and backend.can_forward_decode_prepared(
+                next_layer_attn.attn, forward_batch
+            )
+        ):
+            return None
+
+        kv_cache, kv_layer_idx = _fused_kv_operands(
+            backend.token_to_kv_pool, next_layer_attn.attn.layer_id
+        )
+        kv_lens = backend._kv_lens(forward_batch)
+        page_indices = backend._layer_page_indices(
+            next_layer_attn.attn.layer_id, is_swa_layer=(sw is not None)
+        )
+        cu_q_lens = md.cu_q_lens
+        cu_kv_lens = md.cu_kv_lens
+        distribution = backend._layer_distribution(is_swa_layer=(sw is not None))
+        sub_pool = getattr(
+            backend.token_to_kv_pool,
+            "swa_kv_pool" if sw is not None else "full_kv_pool",
+            None,
+        )
+        dense2 = bool(
+            getattr(
+                sub_pool,
+                "kv_pack_dense2",
+                getattr(backend, "_kv_pack_dense2", False),
+            )
+        )
+        bd4 = bool(
+            getattr(
+                sub_pool,
+                "kv_pack_bd4",
+                getattr(backend, "_kv_pack_bd4", False),
+            )
+        )
+        phys_rows = int(kv_cache.shape[1 if kv_layer_idx is None else 2])
+        pages_per_seq = int(page_indices.shape[0]) // max(1, int(kv_lens.shape[0]))
+        has_shared_prefix = int(distribution.shape[0]) > 3
+        cfg_rpa, _, _, _, step_c_rpa_ok = resolve_step_c_rpa_plan(
+            rpa_mode_str,
+            sliding_window=sw,
+            pages_per_seq=pages_per_seq,
+            phys_page_rows=phys_rows,
+            kv_pack_dense2=dense2,
+            kv_pack_bd4=bd4,
+            b_tokens=n_tok,
+            max_num_seqs=int(kv_lens.shape[0]),
+            has_shared_prefix=has_shared_prefix,
+        )
+        if not (step_c_rpa_ok and (tp != 16 or cfg_rpa.num_slots <= 4)):
+            return None
+        return dict(
+            backend=backend,
+            md=md,
+            rpa_mode_str=rpa_mode_str,
+            sw=sw,
+            kv_cache=kv_cache,
+            kv_layer_idx=kv_layer_idx,
+            kv_lens=kv_lens,
+            page_indices=page_indices,
+            cu_q_lens=cu_q_lens,
+            cu_kv_lens=cu_kv_lens,
+            distribution=distribution,
+            dense2=dense2,
+            bd4=bd4,
+        )
+
+    @staticmethod
+    def _enqueue_or_write_step_c_kv(
+        ctx: dict,
+        kv_merged_c: torch.Tensor,
+        next_layer_attn: MuseSparkAttention,
+        pending_step_c_kv_writes: Optional[list],
+    ) -> None:
+        """Queue deferred Step (c) multi-layer KV write or flush single-layer write."""
+        if pending_step_c_kv_writes is not None:
+            backend = ctx["backend"]
+            md = ctx["md"]
+            sw = ctx["sw"]
+            kv_layer_idx = ctx["kv_layer_idx"]
+            dense2 = ctx["dense2"]
+            bd4 = ctx["bd4"]
+            swa_groups = getattr(backend, "_swa_layer_groups", None)
+            if sw is not None and getattr(md, "swa_page_indices", None) is not None:
+                g_id = (
+                    int(swa_groups.get(next_layer_attn.attn.layer_id, 0))
+                    if swa_groups is not None
+                    else 0
+                )
+                swa_grp = (
+                    0
+                    if (g_id == 0 or getattr(md, "swa_group_page_indices", None) is None)
+                    else g_id
+                )
+            else:
+                swa_grp = -1
+            grp_key = (
+                kv_layer_idx is not None,
+                sw is not None,
+                swa_grp,
+                bool(dense2),
+                bool(bd4),
+            )
+            pending_step_c_kv_writes.append(
+                (
+                    ctx["kv_cache"],
+                    ctx["kv_lens"],
+                    ctx["page_indices"],
+                    ctx["cu_q_lens"],
+                    ctx["cu_kv_lens"],
+                    ctx["distribution"],
+                    kv_layer_idx,
+                    kv_merged_c,
+                    dense2,
+                    bd4,
+                    grp_key,
+                    int(next_layer_attn.attn.layer_id),
+                )
+            )
+            return
+
+        from sglang_tpu.muse_megakernel.decode.b1_moe_ops import (
+            get_step_c_kv_write_op,
+        )
+
+        get_step_c_kv_write_op(
+            kv_pack_dense2=ctx["dense2"], kv_pack_bd4=ctx["bd4"]
+        )(
+            kv_merged_c,
+            ctx["kv_cache"],
+            ctx["kv_lens"],
+            ctx["page_indices"],
+            ctx["cu_q_lens"],
+            ctx["cu_kv_lens"],
+            ctx["distribution"],
+            ctx["kv_layer_idx"],
+        )
+
     def _try_b1_moe_replicated_b16_superkernel(
         self,
         *,
@@ -3833,8 +4011,9 @@ class MuseSparkDecoderLayer(nn.Module):
         precomputed_gated: Optional[torch.Tensor],
         next_input_layernorm: Optional[MuseSparkRMSNorm],
         next_layer_attn: Optional[MuseSparkAttention],
+        pending_step_c_kv_writes: Optional[list] = None,
     ):
-        """Run replicated ``B=16`` Step (b) superkernel when enabled."""
+        """Run replicated ``B=8/16`` Step (b)/(c) superkernel when enabled."""
         if b2_kind != 3 or not self._can_run_b1_moe_superkernel(
             n_tok, tp=tp, is_dec_step=is_dec_step, replicated=True
         ):
@@ -3870,6 +4049,7 @@ class MuseSparkDecoderLayer(nn.Module):
             return None
         from sglang_tpu.muse_megakernel.decode.b1_moe_ops import (
             get_b1_moe_b2_replicated_b16_op,
+            get_b1_moe_b2_rpad_replicated_b16_op,
         )
 
         post_ff_gain = self.post_feedforward_layernorm.gain()
@@ -3895,6 +4075,7 @@ class MuseSparkDecoderLayer(nn.Module):
         w2_arg = mlp._buffers["_decode_fp4_w2"] if has_shadow else ex.w2_weight
         s2_arg = mlp._buffers["_decode_fp4_s2"] if has_shadow else ex.w2_weight_scale
         w_router_km = mlp._buffers["_w7_wrouter_km"]
+        bf16_router = w_router_km.dtype == torch.bfloat16
         num_rep = int(mlp.__dict__.get("_fused_decode_num_replicas", 0))
         has_spec = bool(mlp.__dict__.get("_fused_decode_has_spec_slot", False))
         cost_mode = str(mlp.__dict__.get("_fused_decode_replica_cost_mode", "tiles"))
@@ -3912,16 +4093,113 @@ class MuseSparkDecoderLayer(nn.Module):
         spec_tail = (mlp._fused_decode_spec_slot,) if has_spec else ()
         fp_buf = mlp._free_params_for_batch(n_tok)
         fp_tail = (fp_buf,) if fp_buf is not None else ()
+        cs_tail = (cos_sin_step,) if next_has_rope else ()
+        epi_scalars = (
+            float(next_layer_attn.norm_eps),
+            float(next_layer_attn.query_scale),
+            float(getattr(next_layer_attn.attn, "k_scale_float", None) or 1.0),
+            float(getattr(next_layer_attn.attn, "v_scale_float", None) or 1.0),
+        )
+
+        step_c_flag = getattr(tpu_envs, "SGLANG_TPU_MUSE_DECODE_STEP_C_SUPERKERNEL", None)
+        capture_mode = getattr(forward_batch, "capture_hidden_mode", CaptureHiddenMode.NULL)
+        if (
+            step_c_flag is not None
+            and bool(step_c_flag.get())
+            and getattr(next_layer_attn, "decode_attn_gate_fuse", False)
+            and (capture_mode is None or not capture_mode.is_full())
+        ):
+            step_c_ctx = self._resolve_step_c_rpa_context(
+                next_layer_attn, forward_batch, n_tok=n_tok, tp=tp
+            )
+            if step_c_ctx is not None:
+                kv_layer_idx = step_c_ctx["kv_layer_idx"]
+                sw = step_c_ctx["sw"]
+                op_c16 = get_b1_moe_b2_rpad_replicated_b16_op(
+                    tp,
+                    bf16_router=bf16_router,
+                    num_replicas=num_rep,
+                    has_spec_slot=has_spec,
+                    replica_cost_mode=cost_mode,
+                    has_rope=next_has_rope,
+                    has_free_params=(fp_buf is not None),
+                    has_layer_idx=(kv_layer_idx is not None),
+                    kv_pack_dense2=step_c_ctx["dense2"],
+                    kv_pack_bd4=step_c_ctx["bd4"],
+                    rpa_mode_str=step_c_ctx["rpa_mode_str"],
+                )
+                lidx_tail = (kv_layer_idx,) if kv_layer_idx is not None else ()
+                next_stream_c, next_gated_c, kv_merged_c = op_c16(
+                    mlp._fused_decode_rank,
+                    stream,
+                    gated,
+                    self.self_attn._o_proj_w8k,
+                    self.self_attn._o_proj_scale,
+                    pa_alpha_arg,
+                    pa_beta_arg,
+                    pre_ff_gain,
+                    mlp._buffers["_w7_wpre_w8k"],
+                    mlp._buffers["_w7_spre"],
+                    w_router_km,
+                    pre_exp_gain,
+                    mlp._bias_2d(),
+                    w1_arg,
+                    s1_arg,
+                    w2_arg,
+                    s2_arg,
+                    mlp._norm_2d(),
+                    mlp._buffers["_w7_wpost_w8k"],
+                    mlp._buffers["_w7_spost"],
+                    post_ff_gain,
+                    self.post_feedforward_residual_gate.alpha,
+                    self.post_feedforward_residual_gate.beta,
+                    next_in_gain,
+                    next_layer_attn._buffers["_w7_wqkv_w8k"],
+                    next_layer_attn._buffers["_w7_sqkv"],
+                    next_layer_attn._buffers["_w7_wgate_w8k"],
+                    next_layer_attn._buffers["_w7_sgate"],
+                    step_c_ctx["kv_cache"],
+                    step_c_ctx["kv_lens"],
+                    step_c_ctx["page_indices"],
+                    step_c_ctx["cu_q_lens"],
+                    step_c_ctx["cu_kv_lens"],
+                    step_c_ctx["distribution"],
+                    *cs_tail,
+                    *rep_tail,
+                    *spec_tail,
+                    *fp_tail,
+                    *lidx_tail,
+                    float(self.post_attention_layernorm.eps),
+                    float(self.pre_feedforward_layernorm.eps),
+                    bool(self.pre_feedforward_layernorm.scale_input),
+                    float(mlp.router_multiplier),
+                    float(mlp.pre_expert_norm.eps),
+                    bool(mlp.pre_expert_norm.scale_input),
+                    float(self.post_feedforward_layernorm.eps),
+                    bool(self.post_feedforward_layernorm.scale_input),
+                    float(next_input_layernorm.eps),
+                    bool(next_input_layernorm.scale_input),
+                    *epi_scalars,
+                    float(next_layer_attn.attn.scaling),
+                    int(sw) if sw is not None else -1,
+                    float(getattr(next_layer_attn.attn, "k_scale_float", None) or 1.0),
+                    float(getattr(next_layer_attn.attn, "v_scale_float", None) or 1.0),
+                    float(next_layer_attn.norm_eps),
+                )
+                self._enqueue_or_write_step_c_kv(
+                    step_c_ctx, kv_merged_c, next_layer_attn, pending_step_c_kv_writes
+                )
+                return next_stream_c, next_gated_c, None, None, None
+
         op_b16 = get_b1_moe_b2_replicated_b16_op(
             tp,
-            bf16_router=(w_router_km.dtype == torch.bfloat16),
+            bf16_router=bf16_router,
             num_replicas=num_rep,
             has_spec_slot=has_spec,
             replica_cost_mode=cost_mode,
             has_rope=next_has_rope,
             has_free_params=(fp_buf is not None),
         )
-        cs_tail = (cos_sin_step,) if next_has_rope else ()
         return op_b16(
             mlp._fused_decode_rank,
             stream,
@@ -3965,10 +4243,7 @@ class MuseSparkDecoderLayer(nn.Module):
             bool(self.post_feedforward_layernorm.scale_input),
             float(next_input_layernorm.eps),
             bool(next_input_layernorm.scale_input),
-            float(next_layer_attn.norm_eps),
-            float(next_layer_attn.query_scale),
-            float(getattr(next_layer_attn.attn, "k_scale_float", None) or 1.0),
-            float(getattr(next_layer_attn.attn, "v_scale_float", None) or 1.0),
+            *epi_scalars,
         )
 
     def _try_b1_moe_superkernel(
@@ -4094,7 +4369,7 @@ class MuseSparkDecoderLayer(nn.Module):
                 step_c_flag is not None
                 and bool(step_c_flag.get())
                 and use_qkv_epi
-                and 32 <= n_tok <= 64
+                and n_tok in (32, 64, 128, 256)
                 and getattr(next_layer_attn, "decode_attn_gate_fuse", False)
                 and (capture_mode is None or not capture_mode.is_full())
             ):
@@ -4115,6 +4390,19 @@ class MuseSparkDecoderLayer(nn.Module):
                 elif sw is not None:
                     sw = int(sw) + 1
                 lc_swa_step_c = bool(tpu_envs.SGLANG_TPU_MUSE_MK_STEP_C_LC_SWA.get())
+                lc_full_step_c = bool(tpu_envs.SGLANG_TPU_MUSE_MK_STEP_C_LC_FULL.get())
+                has_shared_lc = (
+                    md is not None
+                    and (
+                        getattr(md, "full_decode_distribution", None) is not None
+                        or int(
+                            getattr(
+                                getattr(md, "distribution", None), "shape", (3,)
+                            )[0]
+                        )
+                        > 3
+                    )
+                )
                 if (
                     rpa_mode_str
                     and backend is not None
@@ -4122,8 +4410,9 @@ class MuseSparkDecoderLayer(nn.Module):
                     and getattr(backend, "_decode_prepared_gated_op", None) is not None
                     and getattr(md, "decode_query_size", 0) == 1
                     and (
-                        (lc_swa_step_c and sw is not None)
-                        or getattr(md, "decode_shared_prefix_pages", None) is None
+                        (not has_shared_lc)
+                        or (lc_swa_step_c and sw is not None)
+                        or (lc_full_step_c and sw is None)
                     )
                     and backend.can_forward_decode_prepared(
                         next_layer_attn.attn, forward_batch
@@ -4164,7 +4453,13 @@ class MuseSparkDecoderLayer(nn.Module):
                     pages_per_seq = int(page_indices.shape[0]) // max(
                         1, int(kv_lens.shape[0])
                     )
-                    has_shared_prefix = int(distribution.shape[0]) > 3
+                    dist_len = int(distribution.shape[0])
+                    n_seqs_step_c = int(kv_lens.shape[0])
+                    shared_grp_step_c = (
+                        n_seqs_step_c // (dist_len - 3)
+                        if (dist_len > 3 and (n_seqs_step_c % (dist_len - 3)) == 0)
+                        else 0
+                    )
                     cfg_rpa, _, _, _, step_c_rpa_ok = resolve_step_c_rpa_plan(
                         rpa_mode_str,
                         sliding_window=sw,
@@ -4173,8 +4468,9 @@ class MuseSparkDecoderLayer(nn.Module):
                         kv_pack_dense2=dense2,
                         kv_pack_bd4=bd4,
                         b_tokens=n_tok,
-                        max_num_seqs=int(kv_lens.shape[0]),
-                        has_shared_prefix=has_shared_prefix,
+                        max_num_seqs=n_seqs_step_c,
+                        shared_group_size=shared_grp_step_c,
+                        has_shared_prefix=(dist_len > 3),
                     )
                     if step_c_rpa_ok and (tp != 16 or cfg_rpa.num_slots <= 4):
                         op_c = get_b1_moe_b2_rpad_chip_sharded_op(
@@ -4594,7 +4890,7 @@ class MuseSparkDecoderLayer(nn.Module):
                             return sk_out
                     elif (
                         not tok_sharded_stream
-                        and (n_tok == 16 or (tp == 8 and n_tok == 8))
+                        and n_tok in (8, 16)
                         and b2_kind == 3
                     ):
                         sk16_out = self._try_b1_moe_replicated_b16_superkernel(
@@ -4617,6 +4913,7 @@ class MuseSparkDecoderLayer(nn.Module):
                             precomputed_gated=precomputed_gated,
                             next_input_layernorm=next_input_layernorm,
                             next_layer_attn=next_layer_attn,
+                            pending_step_c_kv_writes=pending_step_c_kv_writes,
                         )
                         if sk16_out is not None:
                             return sk16_out
@@ -6191,6 +6488,8 @@ class MuseSparkTextModel(nn.Module):
                         relay_kw["pending_step_c_kv_writes"] = pending_step_c_kv_writes
                     elif use_tok_sharded_relay:
                         relay_kw["tok_sharded_stream"] = True
+                    else:
+                        relay_kw["pending_step_c_kv_writes"] = pending_step_c_kv_writes
                 layer_out = self.layers[layer_idx](
                     positions,
                     stream,
@@ -7116,8 +7415,7 @@ class MuseSparkForConditionalGeneration(nn.Module):
                             ),
                         )
                         if (
-                            eff_b1_moe_b2_super
-                            and all_chip_sh_ready
+                            ((eff_b1_moe_b2_super and all_chip_sh_ready) or all_rep_ready)
                             and eff_bridge_qkv_epi
                             and step_c_flag is not None
                             and bool(step_c_flag.get())

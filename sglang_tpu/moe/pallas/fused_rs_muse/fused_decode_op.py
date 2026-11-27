@@ -38,7 +38,7 @@ def supported_fuse_all_batches(ep: int | None = None) -> tuple[int, ...]:
         else SUPPORTED_FUSE_ALL_BATCHES
     )
     b8_env = getattr(tpu_envs, "SGLANG_TPU_MUSE_KERNEL_DECODE_B8", None)
-    if b8_env is not None and b8_env.get() and ep in (None, 8):
+    if b8_env is not None and b8_env.get() and ep in (None, 8, 16):
         return (8, *batches)
     return batches
 

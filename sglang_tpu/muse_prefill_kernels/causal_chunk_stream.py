@@ -20,10 +20,20 @@ from __future__ import annotations
 from typing import NamedTuple
 
 
+def _clause_matches_shard(bkt_s: str, t_shard: int) -> bool:
+    """Returns whether a ``resolve_causal_chunks`` selector (``N`` or ``leN``) matches ``t_shard``."""
+    bkt = bkt_s.strip().lower()
+    if bkt.startswith("le"):
+        return t_shard <= int(bkt[2:])
+    return int(bkt) == t_shard
+
+
 def resolve_causal_chunks(t_shard: int, spec: str = "") -> tuple[int, ...]:
-    """Return per-rank chunk row counts summing to ``t_shard`` (all >=64 & 64-aligned)."""
+    """Return per-rank chunk row counts summing to ``t_shard`` (all >=64 & 64-aligned, or 1-chunk)."""
     spec_s = spec.strip()
     if spec_s:
+        if spec_s.lower() in ("1", "1chunk", "single"):
+            return (t_shard,)
         default_raw: tuple[int, ...] | None = None
         for clause in spec_s.split(";"):
             clause = clause.strip()
@@ -31,8 +41,13 @@ def resolve_causal_chunks(t_shard: int, spec: str = "") -> tuple[int, ...]:
                 continue
             if ":" in clause:
                 bkt_s, nums_s = clause.split(":", 1)
-                if int(bkt_s.strip()) == t_shard:
+                if _clause_matches_shard(bkt_s, t_shard):
+                    nums_l = nums_s.strip().lower()
+                    if nums_l in ("1", "1chunk", "single"):
+                        return (t_shard,)
                     nums = tuple(int(x) for x in nums_s.split(",") if x.strip())
+                    if nums == (t_shard,):
+                        return (t_shard,)
                     if (
                         len(nums) >= 2
                         and sum(nums) == t_shard
@@ -40,7 +55,12 @@ def resolve_causal_chunks(t_shard: int, spec: str = "") -> tuple[int, ...]:
                     ):
                         return nums
             else:
-                default_raw = tuple(int(x) for x in clause.split(",") if x.strip())
+                if clause.lower() in ("1", "1chunk", "single"):
+                    default_raw = (1,)
+                else:
+                    default_raw = tuple(int(x) for x in clause.split(",") if x.strip())
+        if default_raw == (1,) or default_raw == (t_shard,):
+            return (t_shard,)
         if default_raw is not None and len(default_raw) >= 2:
             raw = default_raw
             sum_r = sum(raw)

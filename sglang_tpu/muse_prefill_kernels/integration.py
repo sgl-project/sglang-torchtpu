@@ -83,6 +83,9 @@ class _Ops(NamedTuple):
     a3_ulysses_gate_fuse_chunk: object = None
     a3_ulysses_wo: object = None
     a3_ulysses_wo_2chunk: object = None
+    # Wave-11 fused single-chunk Ulysses ops (`7 -> 3` TorchTPU ops/layer on 1-chunk buckets).
+    a1_ulysses_full: object = None
+    a3_ulysses_full: object = None
 
 
 _HYBRID_A1_VARIANTS = (
@@ -1582,6 +1585,8 @@ def _ops(
     a3_ulysses_gate_fuse_chunk_op = None
     a3_ulysses_wo_op = None
     a3_ulysses_wo_2chunk_op = None
+    a1_ulysses_full_op = None
+    a3_ulysses_full_op = None
     if causal_chunk_stream and a1_variant == "v10_sp":
         import jax.numpy as jnp
         from sglang_tpu.muse_prefill_kernels.attn_kernels import kernel_a1, kernel_a3
@@ -1627,10 +1632,10 @@ def _ops(
             tp_d_p, c_k, q_cols = q_3d.shape
             c_tok = tp_d_p * c_k
             q_2d = lax.all_to_all(
-                q_3d, _AXIS, split_axis=0, concat_axis=0, tiled=False
+                q_3d, _AXIS, split_axis=0, concat_axis=0, tiled=True
             ).reshape(c_tok, q_cols)
             kv_2d = lax.all_to_all(
-                kv_3d, _AXIS, split_axis=0, concat_axis=0, tiled=False
+                kv_3d, _AXIS, split_axis=0, concat_axis=0, tiled=True
             ).reshape(c_tok, kv_3d.shape[-1])
             return kernel_a1.pallas_pack_ulysses_qkv_for_rpa(
                 q_2d, kv_2d, h_q_local=h_q_local, h_kv_local=h_kv_local, tm=512
@@ -1653,7 +1658,7 @@ def _ops(
                 quantize_fp8=not ulysses_rev_bf16,
             ).reshape(tp_d_ul, c_k, q_loc)
             return lax.all_to_all(
-                q_3d, _AXIS, split_axis=0, concat_axis=0, tiled=False
+                q_3d, _AXIS, split_axis=0, concat_axis=0, tiled=True
             ).reshape(tp_d_ul, c_k, q_loc)
 
         def a3_ul_gate_fuse_body(attn_3d, gate_k):
@@ -1667,6 +1672,21 @@ def _ops(
         def a3_ul_wo_2chunk_body(q0_fp8, q1_fp8, wo_in, wo_sc):
             return kernel_a3.pallas_ulysses_wo_local((q0_fp8, q1_fp8), wo_in, wo_sc)
 
+        def a1_ul_full_body(
+            attn_in_k, wqkvg, wqkvg_sc3d, w_gate, w_gate_sc, cos_k, sin_k
+        ):
+            q_3d, kv_3d, x_fp8_k = a1_ul_qkv_body(
+                attn_in_k, wqkvg, wqkvg_sc3d, cos_k, sin_k
+            )
+            q_k, kv_k = a1_ul_a2a_pack_body(q_3d, kv_3d)
+            gate_k = a1_ul_gate_body(x_fp8_k, w_gate, w_gate_sc)
+            return q_k, kv_k, gate_k
+
+        def a3_ul_full_body(raw_attn_k, gate_k, wo_in, wo_sc):
+            attn_3d = a3_ul_rev_a2a_body(raw_attn_k)
+            q_fp8 = a3_ul_gate_fuse_body(attn_3d, gate_k)
+            return a3_ul_wo_body(q_fp8, wo_in, wo_sc)
+
         a1_ul_qkv_sm = shard(a1_ul_qkv_body, 5, 3)
         a1_ul_a2a_pack_sm = shard(a1_ul_a2a_pack_body, 2, 2)
         a1_ul_gate_sm = shard(a1_ul_gate_body, 3, 1)
@@ -1674,6 +1694,8 @@ def _ops(
         a3_ul_gate_fuse_sm = shard(a3_ul_gate_fuse_body, 2, 1)
         a3_ul_wo_sm = shard(a3_ul_wo_body, 3, 1)
         a3_ul_wo_2c_sm = shard(a3_ul_wo_2chunk_body, 4, 1)
+        a1_ul_full_sm = shard(a1_ul_full_body, 7, 3)
+        a3_ul_full_sm = shard(a3_ul_full_body, 4, 1)
 
         def a1_ul_qkv(
             attn_in_k: jax.Array,
@@ -1713,6 +1735,27 @@ def _ops(
         ) -> jax.Array:
             return a3_ul_wo_2c_sm(q0_fp8, q1_fp8, wo_in, wo_sc)
 
+        def a1_ul_full(
+            attn_in_k: jax.Array,
+            wqkvg: jax.Array,
+            wqkvg_sc3d: jax.Array,
+            w_gate: jax.Array,
+            w_gate_sc: jax.Array,
+            cos_k: jax.Array,
+            sin_k: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            return a1_ul_full_sm(
+                attn_in_k, wqkvg, wqkvg_sc3d, w_gate, w_gate_sc, cos_k, sin_k
+            )
+
+        def a3_ul_full(
+            raw_attn_k: jax.Array,
+            gate_k: jax.Array,
+            wo_in: jax.Array,
+            wo_sc: jax.Array,
+        ) -> jax.Array:
+            return a3_ul_full_sm(raw_attn_k, gate_k, wo_in, wo_sc)
+
         a1_ulysses_qkv_chunk_op = export(
             "a1_ulysses_qkv_2op" + a1_w8_tag, a1_ul_qkv, 5, 3
         )
@@ -1721,10 +1764,9 @@ def _ops(
         )
         a1_ulysses_gate_chunk_op = export("a1_ulysses_gate", a1_ul_gate, 3, 1)
         rev_bf16_sfx = "_bf16" if ulysses_rev_bf16 else ""
+        eps_sfx = f"{head_norm_eps:g}".replace("-", "m").replace(".", "p")
         a3_ulysses_rev_a2a_chunk_op = export(
-            "a3_ulysses_rev_a2a_e"
-            + f"{head_norm_eps:g}".replace("-", "m").replace(".", "p")
-            + rev_bf16_sfx,
+            "a3_ulysses_rev_a2a_e" + eps_sfx + rev_bf16_sfx,
             a3_ul_rev_a2a,
             1,
             1,
@@ -1735,6 +1777,12 @@ def _ops(
         a3_ulysses_wo_op = export("a3_ulysses_wo", a3_ul_wo, 3, 1)
         a3_ulysses_wo_2chunk_op = export(
             "a3_ulysses_wo_2chunk", a3_ul_wo_2chunk, 4, 1
+        )
+        a1_ulysses_full_op = export(
+            "a1_ulysses_full" + a1_w8_tag, a1_ul_full, 7, 3
+        )
+        a3_ulysses_full_op = export(
+            "a3_ulysses_full_e" + eps_sfx + rev_bf16_sfx, a3_ul_full, 4, 1
         )
     if causal_chunk_stream and a1_variant != "v10_sp":
         import jax.numpy as jnp
@@ -2253,6 +2301,8 @@ def _ops(
         a3_ulysses_gate_fuse_chunk=a3_ulysses_gate_fuse_chunk_op,
         a3_ulysses_wo=a3_ulysses_wo_op,
         a3_ulysses_wo_2chunk=a3_ulysses_wo_2chunk_op,
+        a1_ulysses_full=a1_ulysses_full_op,
+        a3_ulysses_full=a3_ulysses_full_op,
         **agd_ops,
     )
 
@@ -2687,7 +2737,7 @@ class MusePrefillKernels(torch.nn.Module):
             tpu_envs.SGLANG_TPU_MUSE_KERNEL_CAUSAL_CHUNK_STREAM.get()
         )
         self.causal_chunk_spec = tpu_envs.SGLANG_TPU_MUSE_KERNEL_CAUSAL_CHUNK_SPEC.get() or (
-            "256,512" if self.a1_variant == "v10_sp" else ""
+            "le1536:1;256,512" if self.a1_variant == "v10_sp" else ""
         )
         emb_mod = getattr(decoder, "embed_tokens", None)
         self.sp_entry = (
@@ -4338,6 +4388,31 @@ class MusePrefillKernels(torch.nn.Module):
             weights, attn_in, rope, chunks, rope_chunks, chunk_metas
         )
 
+        if (
+            len(eff_chunks) == 1
+            and self.ops.a1_ulysses_full is not None
+            and self.ops.a3_ulysses_full is not None
+            and trap_ctx is None
+        ):
+            q_k, kv_k, gate_k = self.ops.a1_ulysses_full(
+                in_slices[0],
+                weights.wqkvg,
+                wqkvg_sc3d,
+                w_gate,
+                w_gate_sc,
+                eff_rope_chunks[0][0],
+                eff_rope_chunks[0][1],
+            )
+            out_k = be.forward_prepared(
+                q_k, kv_k, attn.attn, forward_batch, chunk_meta=eff_metas[0]
+            )
+            out_tok = (
+                out_k.squeeze(0)
+                if (out_k.ndim > 2 and out_k.shape[0] == 1)
+                else out_k
+            )
+            return self.ops.a3_ulysses_full(out_tok, gate_k, wo, wo_scale)
+
         q3_cur, kv3_cur, x_fp8_cur = self.ops.a1_ulysses_qkv_chunk(
             in_slices[0],
             weights.wqkvg,
@@ -4433,59 +4508,85 @@ class MusePrefillKernels(torch.nn.Module):
             weights, attn_in, rope, chunks, rope_chunks, chunk_metas
         )
 
-        q3_cur, kv3_cur, x_fp8_cur = self.ops.a1_ulysses_qkv_chunk(
-            in_slices[0],
-            weights.wqkvg,
-            wqkvg_sc3d,
-            eff_rope_chunks[0][0],
-            eff_rope_chunks[0][1],
-        )
-        q_pruned = None
-        kv_pruned_u8 = None
-        kv_dtype = None
-        gate_parts = []
-        c_off = 0
-        for k, c_k in enumerate(eff_chunks):
-            has_next = k + 1 < len(eff_chunks)
-            q_k, kv_k = self.ops.a1_ulysses_a2a_pack_chunk(q3_cur, kv3_cur)
-            gate_parts.append(self.ops.a1_ulysses_gate_chunk(x_fp8_cur, w_gate, w_gate_sc))
-            if has_next:
-                q3_cur, kv3_cur, x_fp8_cur = self.ops.a1_ulysses_qkv_chunk(
-                    in_slices[k + 1],
-                    weights.wqkvg,
-                    wqkvg_sc3d,
-                    eff_rope_chunks[k + 1][0],
-                    eff_rope_chunks[k + 1][1],
+        if (
+            len(eff_chunks) == 1
+            and getattr(self.ops, "a1_ulysses_full", None) is not None
+            and trap_ctx is None
+        ):
+            q_k, kv_k, gate_shard = self.ops.a1_ulysses_full(
+                in_slices[0],
+                weights.wqkvg,
+                wqkvg_sc3d,
+                w_gate,
+                w_gate_sc,
+                eff_rope_chunks[0][0],
+                eff_rope_chunks[0][1],
+            )
+            be.write_kv_only(kv_k, attn.attn, forward_batch, chunk_meta=eff_metas[0])
+            c_tok = self.tp_size * eff_chunks[0]
+            loc_idx = idx_128.clamp(0, c_tok - 1)
+            q_pruned = q_k.index_select(1, loc_idx)
+            kv_pruned = kv_k.view(torch.uint8).index_select(0, loc_idx).view(kv_k.dtype)
+        else:
+            q3_cur, kv3_cur, x_fp8_cur = self.ops.a1_ulysses_qkv_chunk(
+                in_slices[0],
+                weights.wqkvg,
+                wqkvg_sc3d,
+                eff_rope_chunks[0][0],
+                eff_rope_chunks[0][1],
+            )
+            q_pruned = None
+            kv_pruned_u8 = None
+            kv_dtype = None
+            gate_parts = []
+            c_off = 0
+            for k, c_k in enumerate(eff_chunks):
+                has_next = k + 1 < len(eff_chunks)
+                q_k, kv_k = self.ops.a1_ulysses_a2a_pack_chunk(q3_cur, kv3_cur)
+                gate_parts.append(
+                    self.ops.a1_ulysses_gate_chunk(x_fp8_cur, w_gate, w_gate_sc)
                 )
-            be.write_kv_only(kv_k, attn.attn, forward_batch, chunk_meta=eff_metas[k])
-            c_tok = self.tp_size * c_k
-            if trap_ctx is not None:
-                _record_nan_trap(
-                    trap_ctx,
-                    layer_idx,
-                    1,
-                    ((q_k, 1), (kv_k, 0)),
-                    trap_ctx["full_real"][c_off : c_off + c_tok],
-                    trap_ctx["orig_full"][c_off : c_off + c_tok],
+                if has_next:
+                    q3_cur, kv3_cur, x_fp8_cur = self.ops.a1_ulysses_qkv_chunk(
+                        in_slices[k + 1],
+                        weights.wqkvg,
+                        wqkvg_sc3d,
+                        eff_rope_chunks[k + 1][0],
+                        eff_rope_chunks[k + 1][1],
+                    )
+                be.write_kv_only(
+                    kv_k, attn.attn, forward_batch, chunk_meta=eff_metas[k]
                 )
-            loc_idx = (idx_128 - c_off).clamp(0, c_tok - 1)
-            q_sel = q_k.index_select(1, loc_idx)
-            kv_dtype = kv_k.dtype
-            kv_sel_u8 = kv_k.view(torch.uint8).index_select(0, loc_idx)
-            if k == 0:
-                q_pruned = q_sel
-                kv_pruned_u8 = kv_sel_u8
-            else:
-                in_c = (idx_128 >= c_off) & (idx_128 < c_off + c_tok)
-                in_q = in_c.view(1, -1, *([1] * (q_sel.ndim - 2)))
-                in_kv = in_c.view(-1, *([1] * (kv_sel_u8.ndim - 1)))
-                q_pruned = torch.where(in_q, q_sel, q_pruned)
-                kv_pruned_u8 = torch.where(in_kv, kv_sel_u8, kv_pruned_u8)
-            c_off += c_tok
+                c_tok = self.tp_size * c_k
+                if trap_ctx is not None:
+                    _record_nan_trap(
+                        trap_ctx,
+                        layer_idx,
+                        1,
+                        ((q_k, 1), (kv_k, 0)),
+                        trap_ctx["full_real"][c_off : c_off + c_tok],
+                        trap_ctx["orig_full"][c_off : c_off + c_tok],
+                    )
+                loc_idx = (idx_128 - c_off).clamp(0, c_tok - 1)
+                q_sel = q_k.index_select(1, loc_idx)
+                kv_dtype = kv_k.dtype
+                kv_sel_u8 = kv_k.view(torch.uint8).index_select(0, loc_idx)
+                if k == 0:
+                    q_pruned = q_sel
+                    kv_pruned_u8 = kv_sel_u8
+                else:
+                    in_c = (idx_128 >= c_off) & (idx_128 < c_off + c_tok)
+                    in_q = in_c.view(1, -1, *([1] * (q_sel.ndim - 2)))
+                    in_kv = in_c.view(-1, *([1] * (kv_sel_u8.ndim - 1)))
+                    q_pruned = torch.where(in_q, q_sel, q_pruned)
+                    kv_pruned_u8 = torch.where(in_kv, kv_sel_u8, kv_pruned_u8)
+                c_off += c_tok
 
-        assert q_pruned is not None and kv_pruned_u8 is not None
-        kv_pruned = kv_pruned_u8.view(kv_dtype)
-        gate_shard = gate_parts[0] if len(gate_parts) == 1 else torch.cat(gate_parts, dim=0)
+            assert q_pruned is not None and kv_pruned_u8 is not None
+            kv_pruned = kv_pruned_u8.view(kv_dtype)
+            gate_shard = (
+                gate_parts[0] if len(gate_parts) == 1 else torch.cat(gate_parts, dim=0)
+            )
         cm_idx = (
             inv_cm_perm.index_select(0, eff_idx.long())
             if inv_cm_perm is not None

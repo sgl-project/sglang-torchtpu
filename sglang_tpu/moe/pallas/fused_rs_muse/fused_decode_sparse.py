@@ -255,6 +255,23 @@ def _read_verify_w4a8_knobs() -> tuple[bool, bool]:
     return lhs_fp8, tm128
 
 
+def _read_lhs_fp8_min_batch() -> int:
+    import os
+
+    raw = os.environ.get("SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8_MIN_BATCH")
+    if raw is not None and raw.strip() != "":
+        return int(raw)
+    try:
+        from sglang_tpu.envs import envs
+
+        ev = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8_MIN_BATCH", None)
+        if ev is not None:
+            return int(ev.get())
+    except Exception:
+        pass
+    return 256
+
+
 def _read_sparse_env_overrides() -> (
     tuple[bool, bool, int, int, str, bool, bool, bool, float, int, float, int, int, str]
 ):
@@ -405,6 +422,12 @@ def default_sparse_decode_config(
     tw_eff = raw_tw if (rc_eff > 0 and tr_eff > 0) else 0.0
     fast_gs = _read_fast_gs_knob()
     use_verify_lhs_fp8, use_verify_tm128 = _read_verify_w4a8_knobs()
+    lhs_fp8_min_b = _read_lhs_fp8_min_batch()
+    w4a8_eligible = (
+        (scale_block >= 256)
+        and use_verify_lhs_fp8
+        and (batch_size >= max(32, lhs_fp8_min_b))
+    )
     route_kw = dict(
         hoist_k256_scales=hoist_sc,
         nc_split512=nc_split512,
@@ -502,6 +525,7 @@ def default_sparse_decode_config(
             pair_rs=use_pair_rs,
             bridge_ag=use_ep16_bridge_ag or (False if is_b16 else use_br64),
             norm_f32_stage=True,
+            lhs_fp8=w4a8_eligible and not is_b16,
             route_chunk_rows=min(batch_size, 16) if is_b16 else (batch_size if fast_b64 >= 1 else 32),
             static_holder_mask=static_mask,
             spec_prime_parts=spec_eff,
@@ -509,16 +533,30 @@ def default_sparse_decode_config(
             **route_kw,
         )
     use_v_tm128 = use_verify_tm128 and batch_size >= 256
+    b128_w4a8 = w4a8_eligible and (batch_size == 128)
+    if b128_w4a8:
+        import os
+
+        # Shrink tile_m to 32 (fits <63.94 MiB VMEM on Step-B superkernel) and prefer
+        # wide N-strips unless NC_SPLIT512 is explicitly overridden by env.
+        if os.environ.get("SGLANG_TPU_MUSE_KERNEL_DECODE_NC_SPLIT512") is None:
+            route_kw["nc_split512"] = False
+    tile_m_large = 128 if use_v_tm128 else (32 if b128_w4a8 else 64)
+    m_bkts_large = (
+        (16, 32, 64, 128)
+        if use_v_tm128
+        else ((16, 32) if b128_w4a8 else (16, 32, 64))
+    )
     return SparseDecodeConfig(
         row_mode="sparse",
         weight_mode="half_n",
-        tile_m=128 if use_v_tm128 else 64,
-        m_buckets=(16, 32, 64, 128) if use_v_tm128 else (16, 32, 64),
+        tile_m=tile_m_large,
+        m_buckets=m_bkts_large,
         loop32_in_tile=False,
         k16_blockdiag_rows=(),
         k256_strip_mode=eff_strip,
         k256_dual_mode="hybrid",
-        lhs_fp8=use_verify_lhs_fp8 and batch_size >= 256,
+        lhs_fp8=w4a8_eligible,
         rs_wire_bf16=True,
         pair_rs=use_pair_rs,
         bridge_ag=(ep == 8) or use_ep16_bridge_ag,
@@ -625,7 +663,7 @@ def _fp4_gmm_chunked(
     gpc = _KC // _FP4_GROUP
     read_m = 16 if m_rows == 8 else m_rows
     use_w4a8 = block256 and (lhs_sc_ref is not None)
-    if block256 and not use_w4a8 and (nc_split512 or k512_chain):
+    if block256 and (nc_split512 or k512_chain):
         eff_sb = scale_block if k512_chain else _KC
         n_sb = k_dim // eff_sb
         n_real_sb = k_dim // scale_block
@@ -638,6 +676,8 @@ def _fp4_gmm_chunked(
             and ((m_rows * sub_nc) // 1024 <= 16 or sub_nc <= 1024 or (k_dim // _KC) <= 8)
         )
         chunks_per_sb = eff_sb // _KC
+        x_read_m_s = max(32, read_m) if use_w4a8 else read_m
+        b_off_s = k_offset // _KC
         accs: list[jax.Array] = []
         for si in range(n_sub):
             col0 = n0 + si * sub_nc
@@ -656,8 +696,8 @@ def _fp4_gmm_chunked(
                 blk_acc = None
                 for ci in range(chunks_per_sb):
                     c0 = c_base + ci * _KC
-                    x = x_2d_ref[pl.ds(0, read_m), pl.ds(k_offset + c0, _KC)]
-                    if read_m != m_rows:
+                    x = x_2d_ref[pl.ds(0, x_read_m_s), pl.ds(k_offset + c0, _KC)]
+                    if x_read_m_s != m_rows:
                         x = x[:m_rows, :]
                     w_fp8 = pltpu.bitcast(
                         w_ref[
@@ -669,6 +709,14 @@ def _fp4_gmm_chunked(
                     part = jnp.dot(
                         x, w_fp8, preferred_element_type=jnp.float32
                     )
+                    if use_w4a8:
+                        x_sc = lhs_sc_ref[
+                            pl.ds(0, read_m),
+                            pl.ds((b_off_s + (c0 // _KC)) * 128, 128),
+                        ]
+                        if m_rows == 8:
+                            x_sc = x_sc[:8, :]
+                        part = part * x_sc[:, 0:1]
                     blk_acc = part if blk_acc is None else blk_acc + part
                 real_sb = c_base // scale_block
                 if s_sub is not None:
@@ -4053,6 +4101,44 @@ def run_muse_sparse_experts_and_rs_from_vmem(
                 def _wc(_op=op_c):
                     _op.wait_send()
 
+    elif rows_per_rank == 0:
+        if return_sharded or cfg.pair_rs or cfg.bridge_ag:
+            raise ValueError(
+                f"batch_size={batch_size} < ep={ep} requires return_sharded=False, pair_rs=False, bridge_ag=False"
+            )
+        rs_owners = batch_size
+        rs_copies = []
+        for d in range(rs_owners):
+            dst_slot = jnp.where(me < d, me, jnp.maximum(me - 1, 0))
+            copy_op = pltpu.make_async_remote_copy(
+                rs_src_ref.at[pl.ds(d, 1), :, :],
+                rs_recv_3d.at[dst_slot],
+                rs_send_sem.at[d],
+                rs_recv_sem,
+                device_id={ep_axis_name: jnp.int32(d)},
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+            rs_copies.append((d, copy_op))
+
+            @pl.when(me != d)
+            def _start_rs_small(_op=copy_op):
+                _op.start()
+
+        @pl.when(me < rs_owners)
+        def _recv_and_reduce_owner():
+            pltpu.make_async_copy(rs_recv_3d, rs_recv_3d, rs_recv_sem).wait()
+            acc = accum_3d[pl.ds(me, 1), :, :]
+            for src in range(ep - 1):
+                acc = acc + rs_recv_3d[src, :, :, :].astype(jnp.float32)
+            owner_3d[...] = acc.astype(jnp.bfloat16)
+
+        def _finish_rs_sends():
+            for d, copy_op in rs_copies:
+
+                @pl.when(me != d)
+                def _wait_rs_small(_op=copy_op):
+                    _op.wait_send()
+
     else:
         rs_copies = []
         for d in range(ep):
@@ -4117,7 +4203,7 @@ def run_muse_sparse_experts_and_rs_from_vmem(
             if return_sharded:
                 z_rows = min(rows_per_rank, 16)
             else:
-                z_rows = 16
+                z_rows = min(batch_size, 16)
             output_ref[pl.ds(0, z_rows), :] = (
                 owner_3d[pl.ds(0, min(rows_per_rank, z_rows)), :, :].reshape(
                     -1, _H
@@ -4217,6 +4303,60 @@ def run_muse_sparse_experts_and_rs_from_vmem(
             @pl.when(my_chip != c)
             def _wait_s2(_op=op2):
                 _op.wait_send()
+    elif rows_per_rank == 0:
+        # 8C. Partial-owner Flat (B < EP, e.g. B=8 EP=16) All-Gather fan-out.
+        rs_owners = batch_size
+        safe_src_row = jnp.minimum(me, rs_owners - 1)
+
+        @pl.when(me < rs_owners)
+        def _write_local_small():
+            fan_3d_buf[pl.ds(safe_src_row, 1), :, :] = owner_3d[...]
+
+        fan_copies = []
+        for dest in range(ep):
+            fan_op = pltpu.make_async_remote_copy(
+                owner_3d,
+                fan_3d_buf.at[pl.ds(safe_src_row, 1), :, :],
+                fan_send_sem.at[dest],
+                fan_recv_sem,
+                device_id={ep_axis_name: jnp.int32(dest)},
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+            fan_copies.append((dest, fan_op))
+
+            @pl.when((me < rs_owners) & (me != dest))
+            def _start_fan_small(_op=fan_op):
+                _op.start()
+
+        @pl.when(me < rs_owners)
+        def _wait_fan_owner_small():
+            pltpu.make_async_copy(
+                fan_3d_buf.at[pl.ds(0, rs_owners - 1), :, :],
+                fan_3d_buf.at[pl.ds(0, rs_owners - 1), :, :],
+                fan_recv_sem,
+            ).wait()
+
+        @pl.when(me >= rs_owners)
+        def _wait_fan_nonowner_small():
+            pltpu.make_async_copy(
+                fan_3d_buf.at[pl.ds(0, rs_owners), :, :],
+                fan_3d_buf.at[pl.ds(0, rs_owners), :, :],
+                fan_recv_sem,
+            ).wait()
+
+        if write_output_ref and output_ref is not None:
+            out_rc = min(batch_size, 16)
+            for r0 in range(0, batch_size, out_rc):
+                output_ref[pl.ds(r0, out_rc), :] = fan_3d_buf[
+                    pl.ds(r0, out_rc), :, :
+                ].reshape(out_rc, _H)
+
+        for dest, fan_op in fan_copies:
+
+            @pl.when((me < rs_owners) & (me != dest))
+            def _wait_fan_send_small(_op=fan_op):
+                _op.wait_send()
+
     else:
         # 8B. Flat (B, 32, 128) All-Gather fan-out + static whole-width output write.
         my_row_off = me * rows_per_rank
@@ -4593,7 +4733,7 @@ def _sparse_decode_kernel(
 
     def _early_exit_finish() -> None:
         pl.semaphore_wait(barrier_sem, ep)
-        z_rows = min(rows_per_rank, 16) if return_sharded else 16
+        z_rows = min(rows_per_rank, 16) if return_sharded else min(batch_size, 16)
         output_ref[pl.ds(0, z_rows), :] = jnp.zeros(
             (z_rows, _H), dtype=jnp.bfloat16
         )
@@ -4858,6 +4998,11 @@ def build_muse_sparse_scratch_shapes(
 
     rows_per_rank = batch_size // ep
     use_pair_rs = config.pair_rs and (ep in (8, 16))
+    if rows_per_rank == 0 and (return_sharded or use_pair_rs or config.bridge_ag):
+        raise ValueError(
+            f"batch_size={batch_size} < ep={ep} requires return_sharded=False, pair_rs=False, bridge_ag=False"
+        )
+    rows_per_owner = 1 if rows_per_rank == 0 else rows_per_rank
     rs_wire_dtype = jnp.bfloat16 if config.rs_wire_bf16 else jnp.float32
     if config.rs_wire_bf16:
         scratch_shapes.append(vmem((batch_size, 32, 128), jnp.bfloat16))
@@ -4865,23 +5010,23 @@ def build_muse_sparse_scratch_shapes(
         num_chips_rs = ep // 2
         scratch_shapes.extend(
             [
-                vmem((num_chips_rs, rows_per_rank, 32, 128), rs_wire_dtype),
-                vmem((num_chips_rs, rows_per_rank, 32, 128), rs_wire_dtype),
-                vmem((num_chips_rs, rows_per_rank, 32, 128), rs_wire_dtype),
+                vmem((num_chips_rs, rows_per_owner, 32, 128), rs_wire_dtype),
+                vmem((num_chips_rs, rows_per_owner, 32, 128), rs_wire_dtype),
+                vmem((num_chips_rs, rows_per_owner, 32, 128), rs_wire_dtype),
                 sem((num_chips_rs,)),
                 sem((num_chips_rs,)),
                 sem((num_chips_rs,)),
                 sem,
-                vmem((rows_per_rank, 32, 128), jnp.bfloat16),
+                vmem((rows_per_owner, 32, 128), jnp.bfloat16),
             ]
         )
     else:
         scratch_shapes.extend(
             [
-                vmem((ep - 1, rows_per_rank, 32, 128), rs_wire_dtype),
+                vmem((ep - 1, rows_per_owner, 32, 128), rs_wire_dtype),
                 sem((ep,)),
                 sem,
-                vmem((rows_per_rank, 32, 128), jnp.bfloat16),
+                vmem((rows_per_owner, 32, 128), jnp.bfloat16),
             ]
         )
     if not return_sharded:
@@ -4925,9 +5070,9 @@ def fused_decode_sparse_from_logits(
         raise ValueError(
             f"Sparse fused decode requires B in (8, 16, 32, 64, 128, 256, 384), got {batch_size}"
         )
-    if batch_size < ep:
+    if return_sharded and batch_size < ep:
         raise ValueError(
-            f"Sparse fused decode requires batch_size ({batch_size}) >= ep ({ep})"
+            f"Sparse fused decode return_sharded=True requires batch_size ({batch_size}) >= ep ({ep})"
         )
     if logits.shape != (batch_size, _E_TOTAL):
         raise ValueError(

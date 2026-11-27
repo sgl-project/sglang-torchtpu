@@ -16,6 +16,7 @@ from sglang_tpu.kernels.decode_collective_bridges import (
 )
 from sglang_tpu.muse_megakernel.decode.b1_moe_b2_b16_kernel import (
     b1_moe_b2_replicated_b16_jax,
+    b1_moe_b2_rpad_replicated_b16_jax,
 )
 from sglang_tpu.muse_megakernel.decode.b1_moe_b2_kernel import (
     b1_moe_b2_chip_sharded_jax,
@@ -28,6 +29,7 @@ from sglang_tpu.muse_megakernel.decode.b1_moe_kernel import (
 _B1_MOE_LOCK = Lock()
 _B1_MOE_B2_OPS: dict[tuple, Callable] = {}
 _B1_MOE_B2_B16_OPS: dict[tuple, Callable] = {}
+_B1_MOE_B2_B16_RPAD_OPS: dict[tuple, Callable] = {}
 _B1_MOE_B2_RPAD_OPS: dict[tuple, Callable] = {}
 _STEP_C_KV_WRITE_OPS: dict[tuple[bool, bool], Callable] = {}
 _STEP_C_KV_WRITE_MULTI_6D_OPS: dict[tuple[bool, bool], Callable] = {}
@@ -417,9 +419,12 @@ def get_b1_moe_b2_replicated_b16_op(
     return op
 
 
-def get_b1_moe_b2_rpad_chip_sharded_op(
+def _get_b1_moe_b2_rpad_op(
     world_size: int,
     *,
+    cache: dict[tuple, Callable],
+    jax_fn: Callable,
+    op_prefix: str,
     bf16_router: bool = True,
     num_replicas: int = 0,
     has_spec_slot: bool = False,
@@ -431,7 +436,7 @@ def get_b1_moe_b2_rpad_chip_sharded_op(
     kv_pack_bd4: bool = False,
     rpa_mode_str: str = "",
 ) -> Callable:
-    """Return cached TorchTPU custom op for Step (c) ``[chip_b1 + muse_sparse(3d) + chip_b2 + RPAd]``."""
+    """Shared registry helper for chip-sharded and replicated Step (c) custom ops."""
     if world_size not in SUPPORTED_WORLD_SIZES:
         raise ValueError(
             f"Step (c) superkernel requires world_size in {SUPPORTED_WORLD_SIZES}, got {world_size}"
@@ -451,12 +456,12 @@ def get_b1_moe_b2_rpad_chip_sharded_op(
         bool(kv_pack_bd4),
         str(rpa_mode_str),
     )
-    op = _B1_MOE_B2_RPAD_OPS.get(key)
+    op = cache.get(key)
     if op is not None:
         return op
 
     with _B1_MOE_LOCK:
-        op = _B1_MOE_B2_RPAD_OPS.get(key)
+        op = cache.get(key)
         if op is None:
             has_rep = num_replicas > 0
             rpad_names = (
@@ -536,7 +541,7 @@ def get_b1_moe_b2_rpad_chip_sharded_op(
                     rpa_v_sc,
                     rpa_norm_eps,
                 ) = s_args[:19]
-                return b1_moe_b2_rpad_chip_sharded_jax(
+                return jax_fn(
                     *t_args[:n_base],
                     kv_cache_arg,
                     kv_lens_arg,
@@ -592,7 +597,7 @@ def get_b1_moe_b2_rpad_chip_sharded_op(
                 else ""
             )
             op_name = (
-                f"sglang_tpu_pallas::muse_w9_b1_moe_b2_rpad_tp{world_size}"
+                f"sglang_tpu_pallas::{op_prefix}_tp{world_size}"
                 f"_{rtag}_rep{num_replicas}_{replica_cost_mode}{stag}{ftag}{ltag}{d2tag}{mtag}{etag}"
             )
             op = _export_superkernel_op(
@@ -603,8 +608,74 @@ def get_b1_moe_b2_rpad_chip_sharded_op(
                 3,
                 _local_step_c,
             )
-            _B1_MOE_B2_RPAD_OPS[key] = op
+            cache[key] = op
     return op
+
+
+def get_b1_moe_b2_rpad_chip_sharded_op(
+    world_size: int,
+    *,
+    bf16_router: bool = True,
+    num_replicas: int = 0,
+    has_spec_slot: bool = False,
+    replica_cost_mode: str = "tiles",
+    has_rope: bool = True,
+    has_free_params: bool = False,
+    has_layer_idx: bool = False,
+    kv_pack_dense2: bool = False,
+    kv_pack_bd4: bool = False,
+    rpa_mode_str: str = "",
+) -> Callable:
+    """Return cached TorchTPU custom op for Step (c) ``[chip_b1 + muse_sparse(3d) + chip_b2 + RPAd]``."""
+    return _get_b1_moe_b2_rpad_op(
+        world_size,
+        cache=_B1_MOE_B2_RPAD_OPS,
+        jax_fn=b1_moe_b2_rpad_chip_sharded_jax,
+        op_prefix="muse_w9_b1_moe_b2_rpad",
+        bf16_router=bf16_router,
+        num_replicas=num_replicas,
+        has_spec_slot=has_spec_slot,
+        replica_cost_mode=replica_cost_mode,
+        has_rope=has_rope,
+        has_free_params=has_free_params,
+        has_layer_idx=has_layer_idx,
+        kv_pack_dense2=kv_pack_dense2,
+        kv_pack_bd4=kv_pack_bd4,
+        rpa_mode_str=rpa_mode_str,
+    )
+
+
+def get_b1_moe_b2_rpad_replicated_b16_op(
+    world_size: int,
+    *,
+    bf16_router: bool = True,
+    num_replicas: int = 0,
+    has_spec_slot: bool = False,
+    replica_cost_mode: str = "tiles",
+    has_rope: bool = True,
+    has_free_params: bool = False,
+    has_layer_idx: bool = False,
+    kv_pack_dense2: bool = False,
+    kv_pack_bd4: bool = False,
+    rpa_mode_str: str = "",
+) -> Callable:
+    """Return cached TorchTPU op for replicated ``B=8/16`` Step (c) superkernel."""
+    return _get_b1_moe_b2_rpad_op(
+        world_size,
+        cache=_B1_MOE_B2_B16_RPAD_OPS,
+        jax_fn=b1_moe_b2_rpad_replicated_b16_jax,
+        op_prefix="muse_w9_b1_moe_b2_rep_b16_rpad",
+        bf16_router=bf16_router,
+        num_replicas=num_replicas,
+        has_spec_slot=has_spec_slot,
+        replica_cost_mode=replica_cost_mode,
+        has_rope=has_rope,
+        has_free_params=has_free_params,
+        has_layer_idx=has_layer_idx,
+        kv_pack_dense2=kv_pack_dense2,
+        kv_pack_bd4=kv_pack_bd4,
+        rpa_mode_str=rpa_mode_str,
+    )
 
 
 def get_step_c_kv_write_op(
@@ -1237,6 +1308,20 @@ def prewarm_b1_moe_superkernel_ops(
                         kv_pack_bd4=eff_bd4,
                         rpa_mode_str=rpa_m,
                     )
+                    if include_rep_b16:
+                        get_b1_moe_b2_rpad_replicated_b16_op(
+                            world_size,
+                            bf16_router=bf16_router,
+                            num_replicas=num_replicas,
+                            has_spec_slot=has_spec_slot,
+                            replica_cost_mode=cost_mode,
+                            has_rope=r_flag,
+                            has_free_params=has_free_params,
+                            has_layer_idx=has_lidx,
+                            kv_pack_dense2=eff_d2,
+                            kv_pack_bd4=eff_bd4,
+                            rpa_mode_str=rpa_m,
+                        )
                     get_step_c_kv_write_op(kv_pack_dense2=eff_d2, kv_pack_bd4=eff_bd4)
                     if has_lidx:
                         get_step_c_kv_write_multi_6d_op(
