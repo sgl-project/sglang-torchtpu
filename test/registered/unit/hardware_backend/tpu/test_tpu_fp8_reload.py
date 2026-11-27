@@ -293,6 +293,60 @@ class TestTpuFp8Reload(unittest.TestCase):
         ).abs().max() / fresh_w13.float().abs().max()
         self.assertLess(rel_err.item(), 0.08)
 
+    def test_reload_fails_loud_where_core_post_processing_rebinds_parameters(self):
+        """Per-tensor and non-channelwise FP8 reloads must raise instead of serving
+        the stale parameters direct_compile captured; supported modes must not."""
+        from sglang_tpu.rl.fp8_reload import (
+            restore_fp8_linear_before_load,
+            restore_fp8_moe_before_load,
+        )
+
+        def linear(*, serialized, block_quant):
+            return SimpleNamespace(
+                use_mxfp8=False,
+                is_checkpoint_fp8_serialized=serialized,
+                block_quant=block_quant,
+            )
+
+        def moe(*, serialized, block_quant):
+            return SimpleNamespace(
+                is_fp4_expert=False,
+                use_mxfp8=False,
+                block_quant=block_quant,
+                quant_config=SimpleNamespace(is_checkpoint_fp8_serialized=serialized),
+            )
+
+        layer = nn.Module()
+        with self.assertRaises(NotImplementedError):
+            restore_fp8_linear_before_load(
+                None, linear(serialized=True, block_quant=False), layer
+            )
+        restore_fp8_linear_before_load(
+            None, linear(serialized=False, block_quant=False), layer
+        )
+        restore_fp8_linear_before_load(
+            None, linear(serialized=True, block_quant=True), layer
+        )
+
+        with patch(
+            "sglang_tpu.fp8_moe._get_tpu_fp8_runtime", return_value="channelwise"
+        ):
+            with self.assertRaises(NotImplementedError):
+                restore_fp8_moe_before_load(
+                    None, moe(serialized=True, block_quant=False), layer
+                )
+            restore_fp8_moe_before_load(
+                None, moe(serialized=False, block_quant=False), layer
+            )
+            restore_fp8_moe_before_load(
+                None, moe(serialized=True, block_quant=True), layer
+            )
+        with patch("sglang_tpu.fp8_moe._get_tpu_fp8_runtime", return_value="blockwise"):
+            with self.assertRaises(NotImplementedError):
+                restore_fp8_moe_before_load(
+                    None, moe(serialized=False, block_quant=False), layer
+                )
+
     def test_rl_fp8_reload_hook_specs(self):
         specs = hook_specs()
         self.assertEqual(len(specs), 4)

@@ -220,11 +220,6 @@ def record_tpu_fp8_linear_reload_state(layer: Module) -> None:
 
 def restore_tpu_fp8_linear_weights_before_loading(layer: Module) -> None:
     """Restore canonical [N, K] parameter shapes before an online RL weight reload."""
-    if isinstance(getattr(layer, "weight", None), StaticFp8Weight):
-        raise RuntimeError(
-            "StaticFp8Weight does not support online weight reload; "
-            "disable SGLANG_TPU_K3_STATIC_FP8 for RL rollout engines."
-        )
     spec: _TpuFp8LinearReloadSpec | None = getattr(
         layer, "_tpu_fp8_linear_reload_spec", None
     )

@@ -36,23 +36,50 @@ def record_fp8_linear_before_process(self, layer):
     return None
 
 
+_UNSUPPORTED_RELOAD = (
+    "TPU FP8 online weight reload supports block-FP8 checkpoints and online "
+    "--quantization fp8 only; core post-processing for {} rebinds parameters that "
+    "direct_compile has already captured, so a reload would serve stale weights."
+)
+
+
 def restore_fp8_linear_before_load(result, self, layer):
     from sglang_tpu.fp8_linear import restore_tpu_fp8_linear_weights_before_loading
 
+    if self.use_mxfp8 or (self.is_checkpoint_fp8_serialized and not self.block_quant):
+        raise NotImplementedError(
+            _UNSUPPORTED_RELOAD.format("per-tensor or MXFP8 linear layers")
+        )
     restore_tpu_fp8_linear_weights_before_loading(layer)
     return result
+
+
+def _is_online_channelwise_moe(method) -> bool:
+    from sglang_tpu.fp8_moe import _get_tpu_fp8_runtime
+
+    return (
+        not method.block_quant
+        and not method.quant_config.is_checkpoint_fp8_serialized
+        and not method.use_mxfp8
+        and not method.is_fp4_expert
+        and _get_tpu_fp8_runtime() == "channelwise"
+    )
 
 
 def restore_fp8_moe_before_load(result, self, layer):
     from sglang_tpu.fp8_moe import restore_tpu_fp8_moe_weights_before_loading
 
+    is_fp8_expert = not self.is_fp4_expert and not self.use_mxfp8
+    if is_fp8_expert and not self.block_quant and not _is_online_channelwise_moe(self):
+        raise NotImplementedError(
+            _UNSUPPORTED_RELOAD.format("per-tensor or non-channelwise MoE layers")
+        )
     restore_tpu_fp8_moe_weights_before_loading(layer)
     return result
 
 
 def process_fp8_moe_after_load(original_fn, self, layer):
     from sglang_tpu.fp8_moe import (
-        _get_tpu_fp8_runtime,
         finalize_tpu_fp8_moe_after_loading,
         prepare_tpu_online_fp8_moe_weights,
         record_tpu_fp8_moe_reload_state,
@@ -60,13 +87,7 @@ def process_fp8_moe_after_load(original_fn, self, layer):
 
     if not self.is_fp4_expert and not self.use_mxfp8:
         record_tpu_fp8_moe_reload_state(layer)
-    if (
-        not self.block_quant
-        and not self.quant_config.is_checkpoint_fp8_serialized
-        and not self.use_mxfp8
-        and not self.is_fp4_expert
-        and _get_tpu_fp8_runtime() == "channelwise"
-    ):
+    if _is_online_channelwise_moe(self):
         prepare_tpu_online_fp8_moe_weights(layer)
         finalize_tpu_fp8_moe_after_loading(self, layer)
         return None
