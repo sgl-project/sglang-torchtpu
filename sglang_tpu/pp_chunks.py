@@ -87,10 +87,9 @@ def profile_points(
     return points
 
 
-def is_target_ref(tokens: int, buckets: list[int]) -> bool:
-    """Whether ``tokens`` may size the step target: a bucket of at least a
-    quarter step, which keeps the fixed cost counted at most 4 times."""
-    return tokens in buckets and tokens * _PREFIX_PROFILE_MIN_DIVISOR >= buckets[-1]
+def is_step_target_ms(value: float) -> bool:
+    """Whether ``value`` can be a fixed step target: positive and finite."""
+    return math.isfinite(value) and value > 0
 
 
 @dataclass
@@ -112,14 +111,15 @@ class StepCostModel:
         slack: float,
         granularity: int,
         schedule: tuple[int, int, int] | None = None,
-        target_ref_tokens: int | None = None,
+        target_ms: float | None = None,
     ) -> "StepCostModel":
         """``stage_samples`` holds one list of (tokens, prefix, ms) per
         stage. Every stage yields a ladder and a slope; the model keeps the
         slowest ladder entry per bucket and the largest slope. The target is
-        a prefix-free top-bucket step plus ``slack``; with
-        ``target_ref_tokens``, the step's linear part runs at that bucket's
-        per-token cost, which also counts its fixed cost ``top / ref`` times."""
+        a prefix-free top-bucket step plus ``slack``. A fixed ``target_ms``
+        replaces it, and the slack, and is raised to the prefix-free
+        top-bucket step when that step is slower; profiled costs then never
+        lower the target, so a faster kernel never shrinks a chunk."""
         if slack < 0:
             raise ValueError(f"the chunk slack must not be negative: {slack}")
         if not stage_samples:
@@ -159,19 +159,16 @@ class StepCostModel:
         linear = {b: max(ladder[b] for ladder in ladders) for b in buckets}
         attn = max(slopes)
         top = buckets[-1]
-        if target_ref_tokens is None:
-            target_ref_tokens = top
-        elif not is_target_ref(target_ref_tokens, buckets):
+        full_step = linear[top] + attn * top * top / 2
+        if target_ms is None:
+            target = full_step * (1.0 + slack)
+        elif not is_step_target_ms(target_ms):
             raise ValueError(
-                f"the chunk target reference {target_ref_tokens} is not a "
-                f"profiled token bucket of at least a quarter step: {buckets}"
+                f"the chunk step target must be a positive number of ms: {target_ms}"
             )
-        full_step = (
-            linear[target_ref_tokens] * (top / target_ref_tokens) + attn * top * top / 2
-        )
-        return cls(
-            buckets, linear, attn, full_step * (1.0 + slack), int(granularity), schedule
-        )
+        else:
+            target = max(float(target_ms), full_step)
+        return cls(buckets, linear, attn, target, int(granularity), schedule)
 
     def pairs(self, chunk: int, prefix: int) -> int:
         """(query block, KV block) pairs the attention kernel schedules for

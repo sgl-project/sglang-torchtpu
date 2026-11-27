@@ -118,27 +118,53 @@ def test_fit_slope_ignores_an_offset_on_the_prefix_free_points():
 def test_fit_rejects_negative_slack_empty_input_and_mismatched_ladders():
     with pytest.raises(ValueError, match="slack"):
         StepCostModel.fit([_stage()], -0.1, 4096)
-    for ref in (6144, 16):  # not a bucket; under a quarter step
-        with pytest.raises(ValueError, match="not a profiled token bucket"):
-            StepCostModel.fit([_stage()], 0.1, 4096, target_ref_tokens=ref)
+    for bad in (0.0, -1.0, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="positive number of ms"):
+            StepCostModel.fit([_stage()], 0.1, 4096, target_ms=bad)
     with pytest.raises(ValueError, match="no stage"):
         StepCostModel.fit([], 0.1, 4096)
     with pytest.raises(ValueError, match="different token buckets"):
         StepCostModel.fit([_stage(), [(16384, 0, 190.0)]], 0.1, 4096)
 
 
-def test_a_target_reference_ignores_speedups_in_larger_buckets():
-    """A speedup confined to the buckets above the reference must not shrink
-    the chunks behind a long prefix, which run below them."""
+def test_a_fixed_target_ignores_kernel_speedups():
+    """With the target from the profile, a speedup in the larger buckets
+    shrinks the chunks behind a long prefix, which run below them; a fixed
+    target keeps them, and a speedup anywhere never shrinks a chunk."""
 
     def faster(stage):
         return [(t, p, ms - (20.0 if t > 8192 else 0.0)) for t, p, ms in stage]
 
-    for ref, before, after in ((None, 8192, 4096), (8192, 8192, 8192)):
-        base = StepCostModel.fit([_stage()], 0.1, 4096, target_ref_tokens=ref)
-        fast = StepCostModel.fit([faster(_stage())], 0.1, 4096, target_ref_tokens=ref)
-        assert base.chunk(98304, 16384, 0, 0.0, 0.0) == before
-        assert fast.chunk(98304, 16384, 0, 0.0, 0.0) == after
+    def uniform(stage):
+        return [(t, p, 0.9 * ms) for t, p, ms in stage]
+
+    base = StepCostModel.fit([_stage()], 0.1, 4096)
+    assert base.chunk(98304, 16384, 0, 0.0, 0.0) == 8192
+    assert (
+        StepCostModel.fit([faster(_stage())], 0.1, 4096).chunk(
+            98304, 16384, 0, 0.0, 0.0
+        )
+        == 4096
+    )
+    for speedup in (faster, uniform):
+        # The slack does not apply to a fixed target.
+        fixed = StepCostModel.fit(
+            [speedup(_stage())], 0.5, 4096, target_ms=base.target_ms
+        )
+        assert fixed.target_ms == base.target_ms
+        for prefix, remaining in ((98304, 16384), (16384, 16384), (0, 16384)):
+            assert fixed.chunk(prefix, remaining, 0, 0.0, 0.0) >= base.chunk(
+                prefix, remaining, 0, 0.0, 0.0
+            )
+
+
+def test_a_fixed_target_below_the_top_step_rises_to_it():
+    """A kernel slower than the pinned target still runs full top-bucket steps."""
+    top = BUCKETS[-1]
+    full_step = _linear(top) + ATTN * top * top / 2
+    model = StepCostModel.fit([_stage()], 0.1, 4096, target_ms=50.0)
+    assert model.target_ms == pytest.approx(full_step)
+    assert model.chunk(0, top, 0, 0.0, 0.0) == top
 
 
 def test_step_time_adds_the_causal_term_of_each_chunk():

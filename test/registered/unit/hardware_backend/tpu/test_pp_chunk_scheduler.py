@@ -401,27 +401,22 @@ def test_profile_requires_resolved_compiler_setting(monkeypatch):
             profile_and_install_cost_model(scheduler)
 
 
-def test_a_malformed_target_reference_fails_startup(monkeypatch):
-    """The env parser falls back to the default on a non-integer value, which
-    would silently keep the top-bucket target."""
-    monkeypatch.setenv("SGLANG_TPU_PP_CHUNK_TARGET_REF_TOKENS", "8k")
+def test_a_malformed_step_target_fails_startup(monkeypatch):
+    """The env parser falls back to the default on a non-numeric value, which
+    would silently keep the profiled target."""
     monkeypatch.setattr(
         torch.distributed,
         "all_gather_object",
         lambda out, obj, group: out.__setitem__(slice(None), [obj] * len(out)),
     )
-    with pytest.raises(ValueError, match='"8k" is not a valid integer'):
-        pp_chunk_scheduler._agreed_target_ref(
-            world_group=NS(world_size=2, cpu_group=None), buckets=[4096, 8192]
-        )
+    group = NS(world_size=2, cpu_group=None)
+    for raw, message in (("100ms", "not a valid float"), ("0", "not a positive")):
+        monkeypatch.setenv("SGLANG_TPU_PP_CHUNK_TARGET_MS", raw)
+        with pytest.raises(ValueError, match=message):
+            pp_chunk_scheduler._agreed_target_ms(world_group=group)
     # The env API's explicit unset is not malformed.
-    with envs.SGLANG_TPU_PP_CHUNK_TARGET_REF_TOKENS.override(None):
-        assert (
-            pp_chunk_scheduler._agreed_target_ref(
-                world_group=NS(world_size=2, cpu_group=None), buckets=[4096, 8192]
-            )
-            is None
-        )
+    with envs.SGLANG_TPU_PP_CHUNK_TARGET_MS.override(None):
+        assert pp_chunk_scheduler._agreed_target_ms(world_group=group) is None
 
 
 def test_devices_of_a_stage_fit_one_cost_model(monkeypatch):
@@ -444,7 +439,7 @@ def test_devices_of_a_stage_fit_one_cost_model(monkeypatch):
         else:
             out[:] = [target_views[rank] for rank in group]
 
-    monkeypatch.delenv("SGLANG_TPU_PP_CHUNK_TARGET_REF_TOKENS", raising=False)
+    monkeypatch.delenv("SGLANG_TPU_PP_CHUNK_TARGET_MS", raising=False)
 
     monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
     monkeypatch.setattr(pp_chunk_scheduler, "uses_dynamic_chunks", lambda: True)
@@ -477,21 +472,20 @@ def test_devices_of_a_stage_fit_one_cost_model(monkeypatch):
         profile_and_install_cost_model(scheduler)
         models.append(scheduler._tpu_pp_chunk_cost)
     assert all(model == models[0] for model in models)
-    # A reference set on every rank reaches the fit; here the 2048 bucket's
-    # per-token cost exceeds the 4096 bucket's, so the target rises.
-    monkeypatch.setenv("SGLANG_TPU_PP_CHUNK_TARGET_REF_TOKENS", "2048")
-    target_views.update(dict.fromkeys(range(4), (2048, None)))
+    # A step target set on every rank reaches the fit.
+    monkeypatch.setenv("SGLANG_TPU_PP_CHUNK_TARGET_MS", "5000")
+    target_views.update(dict.fromkeys(range(4), (5000.0, None)))
     profile_and_install_cost_model(scheduler)
-    assert scheduler._tpu_pp_chunk_cost.target_ms > models[3].target_ms
-    # A target reference set on one rank only would size that rank's chunks apart;
+    assert scheduler._tpu_pp_chunk_cost.target_ms == 5000.0
+    # A step target set on one rank only would size that rank's chunks apart;
     # every rank rejects it before profiling.
     target_views[0] = (None, None)
     policy.__dict__.pop("_run_one")
-    with pytest.raises(ValueError, match="TARGET_REF_TOKENS differs"):
+    with pytest.raises(ValueError, match="TARGET_MS differs"):
         profile_and_install_cost_model(scheduler)
     # So does a value that another rank could not use.
-    target_views[0] = (None, "not a profiled token bucket")
-    with pytest.raises(ValueError, match="not a profiled token bucket"):
+    target_views[0] = (None, "not a positive number of ms")
+    with pytest.raises(ValueError, match="not a positive number of ms"):
         profile_and_install_cost_model(scheduler)
 
 

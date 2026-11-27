@@ -27,7 +27,7 @@ from sglang_tpu.pp_attention_capacity import (
 from sglang_tpu.pp_chunks import (
     StepCostModel,
     chunk_granularity,
-    is_target_ref,
+    is_step_target_ms,
     longest_prompt,
     profile_points,
     uses_dynamic_chunks,
@@ -202,36 +202,33 @@ class TpuPipelinePrefillAdder(PrefillAdder):
         return self.budget_state() if len(self.can_run_list) > before else result
 
 
-def _agreed_target_ref(*, world_group: Any, buckets: list[int]) -> int | None:
-    """The chunk target reference, checked on every rank before profiling so
+def _agreed_target_ms(*, world_group: Any) -> float | None:
+    """The fixed chunk step target, checked on every rank before profiling so
     that a bad or rank-local value fails every rank instead of stranding peers."""
-    field = envs.SGLANG_TPU_PP_CHUNK_TARGET_REF_TOKENS
+    field = envs.SGLANG_TPU_PP_CHUNK_TARGET_MS
     raw = os.getenv(field.name)
-    target_ref, error = None, None
+    target_ms, error = None, None
     # Parsed here, not with get(), which warns and falls back to the default;
     # "None" is how the env API records an explicit unset.
     try:
-        target_ref = None if raw in (None, str(None)) else field.parse(raw)
+        target_ms = None if raw in (None, str(None)) else field.parse(raw)
     except ValueError as exc:
         error = str(exc)
-    if target_ref is not None and not is_target_ref(target_ref, buckets):
-        error = (
-            f"{target_ref} is not a profiled token bucket of at least a quarter "
-            f"step: {buckets}"
-        )
+    if target_ms is not None and not is_step_target_ms(target_ms):
+        error = f"{target_ms} is not a positive number of ms"
     views = [None] * world_group.world_size
     torch.distributed.all_gather_object(
-        views, (target_ref, error), group=world_group.cpu_group
+        views, (target_ms, error), group=world_group.cpu_group
     )
     errors = sorted({error for _, error in views if error is not None})
     if errors:
-        raise ValueError(f"SGLANG_TPU_PP_CHUNK_TARGET_REF_TOKENS: {'; '.join(errors)}")
-    if len({ref for ref, _ in views}) > 1:
+        raise ValueError(f"SGLANG_TPU_PP_CHUNK_TARGET_MS: {'; '.join(errors)}")
+    if len({ms for ms, _ in views}) > 1:
         raise ValueError(
-            "SGLANG_TPU_PP_CHUNK_TARGET_REF_TOKENS differs across ranks: "
-            f"{sorted({str(ref) for ref, _ in views})}"
+            "SGLANG_TPU_PP_CHUNK_TARGET_MS differs across ranks: "
+            f"{sorted({str(ms) for ms, _ in views})}"
         )
-    return target_ref
+    return target_ms
 
 
 def profile_and_install_cost_model(scheduler: Scheduler) -> None:
@@ -248,7 +245,7 @@ def profile_and_install_cost_model(scheduler: Scheduler) -> None:
         scheduler.page_size, scheduler.chunked_prefill_size, True
     )
     buckets = policy.t_bucketer.buckets
-    target_ref = _agreed_target_ref(world_group=scheduler.world_group, buckets=buckets)
+    target_ms = _agreed_target_ms(world_group=scheduler.world_group)
     if buckets[-1] > runner.model_config.context_len:
         raise ValueError(
             "TPU pipeline dynamic chunks require --chunked-prefill-size "
@@ -288,7 +285,7 @@ def profile_and_install_cost_model(scheduler: Scheduler) -> None:
         slack=envs.SGLANG_TPU_PP_CHUNK_SLACK.get(),
         granularity=granularity,
         schedule=min(schedules) if schedules else None,
-        target_ref_tokens=target_ref,
+        target_ms=target_ms,
     )
     context_len = runner.model_config.context_len
     if cost.schedule is not None:
