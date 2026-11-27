@@ -243,7 +243,8 @@ zero launches.
 - `SGLANG_TPU_ENABLE_PP_BUFFERED_HANDOFF=1` selects the buffered hand-off
   (`pp_buffered.py`). Each stage sends a forward's output to the same column of
   the next stage with a point-to-point send as soon as the forward is launched,
-  so a stage waits only for its own input.
+  so a stage waits only for its own input. The scheduler loop keeps
+  `--pp-async-batch-depth 1` unless set; any depth of at least 1 is accepted.
 - `SGLANG_TPU_PP_BUFFERED_SEND_DEPTH` (default `2`) caps the forwards a stage
   queues for sending before it blocks.
 - Needs torch_tpu 0.2.0 and libtpu 0.0.50 or later; a start-up self-test checks
