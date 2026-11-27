@@ -457,8 +457,13 @@ def parse_decode_fast_config(
             loop_kind = "swabatch"
         elif shared_group > 0 and decode_query_size == 1:
             loop_kind = f"shared{shared_group}"
-            chunk_sz = 2048
-            num_slots = 3 if kv_pack_dense2 else 4
+            use_sh8_8k = (
+                shared_group == 8
+                and kv_cap_tokens > 16384
+                and "c2048" not in toks_cfg
+            )
+            chunk_sz = 8192 if use_sh8_8k else 2048
+            num_slots = 3 if use_sh8_8k else 4
             coalesce_dma = True
         elif explicit_ring4k or (raw == "shared16_host" and kv_cap_tokens > 16384) or (use_w7 and kv_cap_tokens > 20480 and decode_query_size == 1):
             loop_kind = "ring4k"
@@ -531,8 +536,16 @@ def parse_decode_fast_config(
                     and ("w8" in toks_cfg or "w7" in toks_cfg)
                 ) or (
                     loop_kind.startswith("shared")
-                    and parsed_c == 1024
-                    and ("w8" in toks_cfg or "w7" in toks_cfg or loop_kind == "shared16")
+                    and (
+                        (parsed_c == 1024 and ("w8" in toks_cfg or "w7" in toks_cfg or loop_kind == "shared16"))
+                        or (
+                            parsed_c == 4096
+                            and loop_kind == "shared8"
+                            and kv_cap_tokens > 16384
+                            and "shared8" not in toks_cfg
+                            and "shc4096" not in toks_cfg
+                        )
+                    )
                 ):
                     continue
                 chunk_sz = parsed_c
@@ -1136,7 +1149,9 @@ def _start_fetch_bkv_pages(
             bkv_sems.at[slot],
         ).start()
 
-    if cfg.loop_kind == "ring4k" and not interpret_mode:
+    if (
+        cfg.loop_kind == "ring4k" or cfg.loop_kind.startswith("shared")
+    ) and not interpret_mode:
         lax.fori_loop(0, n_pages, _dma_page, None)
         return
 
@@ -3595,21 +3610,8 @@ def _run_rpad_vmem_core(
                     return
                 st = init_new_token_state(q_bf16, q_row)
                 sanitize_slot_v2(slot, rel_first, rel_end, n_pages, 8192 // page_size)
-                if cfg.gear_4k:
-                    for ci in range(2):
-                        st = _step_2k_blk(
-                            slot,
-                            q_bf16,
-                            rel_first,
-                            rel_end,
-                            ci * 4096,
-                            4096,
-                            st,
-                            mask_bounds=(ci > 0 or not cfg.no_mask0),
-                        )
-                else:
-                    for ci in range(4):
-                        st = _step_2k_blk(slot, q_bf16, rel_first, rel_end, ci * 2048, 2048, st)
+                for ci in range(4):
+                    st = _step_2k_blk(slot, q_bf16, rel_first, rel_end, ci * 2048, 2048, st)
                 o_vmem_ref[q_row] = finalize_out(st[1], st[2])
 
             if cfg.gear_4k and max_ring_pages * page_size >= 9216:
@@ -3781,6 +3783,38 @@ def _run_rpad_vmem_core(
                 )
                 return
             elif cfg.loop_kind == "streamdyn" and one_block_per_seq:
+                if (
+                    probe != "nocompute"
+                    and dq == 1
+                    and sliding_window is None
+                    and not cfg.fp8_dots
+                    and cfg.chunk_sz >= 4096
+                    and max_ring_pages * page_size >= 8192
+                ):
+                    @pl.when(rel_end <= 1024)
+                    def _dyn_1k():
+                        o_vmem_ref[q_row] = _one_shot_attn(
+                            slot, q_bf16, q_row, rel_first, rel_end, n_pages, 1024, cfg.pv_bf16, False
+                        )
+
+                    @pl.when((rel_end > 1024) & (rel_end <= 4096))
+                    def _dyn_4k():
+                        o_vmem_ref[q_row] = _one_shot_attn(
+                            slot, q_bf16, q_row, rel_first, rel_end, n_pages, 4096, cfg.pv_bf16, False
+                        )
+
+                    @pl.when((rel_end > 4096) & (rel_end <= 8192))
+                    def _dyn_8k():
+                        o_vmem_ref[q_row] = _one_shot_attn(
+                            slot, q_bf16, q_row, rel_first, rel_end, n_pages, 8192, cfg.pv_bf16, False
+                        )
+
+                    @pl.when(rel_end > 8192)
+                    def _dyn_gt8k():
+                        o_vmem_ref[q_row] = compute_streamdyn(
+                            slot, q_bf16, q_row, rel_first, rel_end, n_pages
+                        )
+                    return
                 out = compute_streamdyn(
                     slot, q_bf16, q_row, rel_first, rel_end, n_pages
                 )
@@ -3875,6 +3909,7 @@ def _run_rpad_vmem_core(
             active_heads=None,
             q_exp2_sc=None,
             blk_width: int | None = None,
+            vmem_sanitized: bool = False,
         ):
             eff_width = max_ring_rows if blk_width is None else blk_width
             heads = q.shape[0]
@@ -3883,7 +3918,7 @@ def _run_rpad_vmem_core(
                 q_tile = tgt_q_tile if heads > tgt_q_tile else heads
             else:
                 q_tile = cfg.shared_q_tile if heads > cfg.shared_q_tile else heads
-            valid_arg = valid if mask_valid else None
+            valid_arg = valid if (mask_valid and not vmem_sanitized) else None
             # Direct non-split matmul/softmax beats 2-half shsplit across DENSE2 and BD4
             # shared blocks (-4% to -11% at B=8/16/64) by halving matmul/exp2/VMEM reads.
             use_split_bd4 = False
@@ -4212,6 +4247,7 @@ def _run_rpad_vmem_core(
             active_heads=None,
             q_exp2_sc=None,
             tight_priv: bool = False,
+            n_pages=None,
         ):
             cands = (512, 1024, 2048) if tight_priv else (2048,)
             tail_widths = [
@@ -4230,6 +4266,9 @@ def _run_rpad_vmem_core(
 
                 @pl.when(cond)
                 def _run_tail_w(w=tw):
+                    use_san = bool(tight_priv and n_pages is not None and probe != "nocompute")
+                    if use_san:
+                        sanitize_slot_v2(slot, 0, valid, n_pages, w // page_size)
                     _accum_shared_or_priv(
                         q,
                         head_offset,
@@ -4239,6 +4278,7 @@ def _run_rpad_vmem_core(
                         active_heads=active_heads,
                         q_exp2_sc=q_exp2_sc,
                         blk_width=w,
+                        vmem_sanitized=use_san,
                     )
 
                 prev_w = tw
@@ -4490,7 +4530,7 @@ def _run_rpad_vmem_core(
                     @pl.when(loc_end < max_ring_rows)
                     def _tail_priv_blk():
                         _accum_tail_shared_or_priv(
-                            q_bf16, head_off, slot, loc_end, tight_priv=True
+                            q_bf16, head_off, slot, loc_end, tight_priv=True, n_pages=cur_pg
                         )
 
                     @pl.when(is_last)

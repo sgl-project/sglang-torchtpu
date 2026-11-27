@@ -2240,7 +2240,7 @@ def resolve_step_c_rpa_plan(
         (not shared_bad)
         and sliding_window is None
         and sh_grp == 0
-        and cfg_rpa.loop_kind in ("w7auto", "ring4k")
+        and cfg_rpa.loop_kind in ("w7auto", "ring4k", "streamdyn")
         and cfg_rpa.num_slots * cfg_rpa.max_ring_pages * phys_page_rows > max_bkv_rows
     ):
         cand_rings = ((4, 8192), (3, 8192), (3, 4096)) if kv_pack_bd4 else ((3, 4096),)
@@ -2293,10 +2293,21 @@ def resolve_step_c_rpa_plan(
             allow_large_b=bool(allow_large_b),
             base_rows=_STEP_C_GROUP_MAX_BKV_ROWS,
         )
-        for cand_grp in (4, 2):
-            if cand_grp > cfg_rpa.swabatch_group_size or (eff_b % cand_grp) != 0:
+        grp_cands = (
+            ((cfg_rpa.num_slots, 4), (3, 4), (cfg_rpa.num_slots, 2))
+            if (kv_pack_bd4 and cfg_rpa.num_slots == 4)
+            else ((cfg_rpa.num_slots, 4), (cfg_rpa.num_slots, 2))
+        )
+        for cand_slots, cand_grp in grp_cands:
+            if (
+                cand_slots > cfg_rpa.num_slots
+                or cand_grp > cfg_rpa.swabatch_group_size
+                or (eff_b % cand_grp) != 0
+            ):
                 continue
-            cand_cfg = dataclasses.replace(cfg_rpa, swabatch_group_size=cand_grp)
+            cand_cfg = dataclasses.replace(
+                cfg_rpa, num_slots=cand_slots, swabatch_group_size=cand_grp
+            )
             if (
                 _uses_swabatch_group(
                     cand_cfg,

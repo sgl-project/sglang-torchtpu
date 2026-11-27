@@ -1343,7 +1343,7 @@ def test_wave11_step_c_rpa_plan_shared_and_large_b():
 
     assert tpu_envs.SGLANG_TPU_MUSE_MK_STEP_C_LARGE_B.default is False
 
-    # TP=16 B=256 BD4 SWA (batch4) fits b2 (5,120 <= 8,192): keeps Step (c) ON by default (#5010).
+    # TP=16 B=256 BD4 SWA (batch4) upgrades from s4_b2 to s3_b4 (7,680 <= 8,192): keeps Step (c) ON at full b4.
     cfg_swa_256_bd4, _, slot_swa_256_bd4, grp_swa_256_bd4, ok_swa_256_bd4 = resolve_step_c_rpa_plan(
         "w8,s4,batchfull,g4k,foldcol,batch4",
         sliding_window=2049,
@@ -1353,8 +1353,9 @@ def test_wave11_step_c_rpa_plan_shared_and_large_b():
         b_tokens=256,
         max_num_seqs=256,
     )
-    assert ok_swa_256_bd4 is True and grp_swa_256_bd4 is True and cfg_swa_256_bd4.swabatch_group_size == 2
-    assert slot_swa_256_bd4 == 10
+    assert ok_swa_256_bd4 is True and grp_swa_256_bd4 is True
+    assert cfg_swa_256_bd4.num_slots == 3 and cfg_swa_256_bd4.swabatch_group_size == 4
+    assert slot_swa_256_bd4 == 20
 
     # TP=8 B=128 DENSE2 stays gated to 2-Scope Step (b) by default (#4962/#5010); LARGE_B=1 unlocks
     # 40*512 bkv (SWA batch4 fits cleanly, while >40*512 SWA still refuses silent grp=1 downgrade).
@@ -2123,3 +2124,69 @@ def test_wave15_step_c_adaptive_1k_opt_in():
             allow_large_b=True,
         )
         assert "_c1024_" not in hlo_b128_d2
+
+
+def test_wave16_step_c_bd4_swa_s3_b4_and_streamdyn_ring8k():
+    """Verify Wave-16 Step (c) BD4 SWA s3_b4, streamdyn->ring8k auto-clamp, & shared64 s4 TPU7x AOT."""
+    from sglang_tpu.muse_megakernel.decode.b1_moe_b2_kernel import (
+        resolve_step_c_rpa_plan,
+    )
+
+    # TP=16 B=256 BD4 8k1k ("tp16,w8,c1024,batchfull,dyn4k", pps=20) upgrades from
+    # streamdyn (12,288 > 8,192 fallback) to Step (c) ring8k (4 * 16 * 128 == 8,192).
+    cfg_dyn_bd4, one_blk_dyn, slot_dyn, grp_dyn, ok_dyn = resolve_step_c_rpa_plan(
+        "tp16,w8,c1024,batchfull,dyn4k",
+        sliding_window=None,
+        pages_per_seq=20,
+        phys_page_rows=128,
+        kv_pack_bd4=True,
+        b_tokens=256,
+        max_num_seqs=256,
+    )
+    assert (ok_dyn, one_blk_dyn, grp_dyn) == (True, False, False)
+    assert (cfg_dyn_bd4.loop_kind, cfg_dyn_bd4.num_slots, cfg_dyn_bd4.chunk_sz, slot_dyn) == (
+        "ring4k",
+        4,
+        8192,
+        16,
+    )
+
+    # TPU7x AOT (<63 MiB VMEM) for BD4 B=256 SWA s3_b4, BD4 B=256 dyn4k->ring8k, & D2 B=64 shared64 s4.
+    hlo_swa_s3_b4 = _compile_step_c_aot(
+        tp=16,
+        B=256,
+        pps=32,
+        sw=2049,
+        mode="tp16,w8,c1024,batchfull,dyn4k,batch4",
+        dense2=False,
+        bd4=True,
+        dist_len=3,
+        has_rope=True,
+    )
+    assert "muse_w9_b1_moe_b2_rpad_b256_tp16_" in hlo_swa_s3_b4
+
+    hlo_dyn_ring8k = _compile_step_c_aot(
+        tp=16,
+        B=256,
+        pps=20,
+        sw=-1,
+        mode="tp16,w8,c1024,batchfull,dyn4k",
+        dense2=False,
+        bd4=True,
+        dist_len=3,
+        has_rope=False,
+    )
+    assert "muse_w9_b1_moe_b2_rpad_b256_tp16_" in hlo_dyn_ring8k
+
+    hlo_sh64_s4 = _compile_step_c_aot(
+        tp=8,
+        B=64,
+        pps=516,
+        sw=-1,
+        mode="w8,c4096,shared64,coal,noz,pbf16,q1024,shfp8,batchfull,foldcol",
+        dense2=True,
+        bd4=False,
+        dist_len=4,
+        has_rope=False,
+    )
+    assert "muse_w9_b1_moe_b2_rpad_b64_tp8_" in hlo_sh64_s4
