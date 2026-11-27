@@ -4053,6 +4053,44 @@ def run_muse_sparse_experts_and_rs_from_vmem(
                 def _wc(_op=op_c):
                     _op.wait_send()
 
+    elif rows_per_rank == 0:
+        if return_sharded or cfg.pair_rs or cfg.bridge_ag:
+            raise ValueError(
+                f"batch_size={batch_size} < ep={ep} requires return_sharded=False, pair_rs=False, bridge_ag=False"
+            )
+        rs_owners = batch_size
+        rs_copies = []
+        for d in range(rs_owners):
+            dst_slot = jnp.where(me < d, me, jnp.maximum(me - 1, 0))
+            copy_op = pltpu.make_async_remote_copy(
+                rs_src_ref.at[pl.ds(d, 1), :, :],
+                rs_recv_3d.at[dst_slot],
+                rs_send_sem.at[d],
+                rs_recv_sem,
+                device_id={ep_axis_name: jnp.int32(d)},
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+            rs_copies.append((d, copy_op))
+
+            @pl.when(me != d)
+            def _start_rs_small(_op=copy_op):
+                _op.start()
+
+        @pl.when(me < rs_owners)
+        def _recv_and_reduce_owner():
+            pltpu.make_async_copy(rs_recv_3d, rs_recv_3d, rs_recv_sem).wait()
+            acc = accum_3d[pl.ds(me, 1), :, :]
+            for src in range(ep - 1):
+                acc = acc + rs_recv_3d[src, :, :, :].astype(jnp.float32)
+            owner_3d[...] = acc.astype(jnp.bfloat16)
+
+        def _finish_rs_sends():
+            for d, copy_op in rs_copies:
+
+                @pl.when(me != d)
+                def _wait_rs_small(_op=copy_op):
+                    _op.wait_send()
+
     else:
         rs_copies = []
         for d in range(ep):
@@ -4117,7 +4155,7 @@ def run_muse_sparse_experts_and_rs_from_vmem(
             if return_sharded:
                 z_rows = min(rows_per_rank, 16)
             else:
-                z_rows = 16
+                z_rows = min(batch_size, 16)
             output_ref[pl.ds(0, z_rows), :] = (
                 owner_3d[pl.ds(0, min(rows_per_rank, z_rows)), :, :].reshape(
                     -1, _H
@@ -4217,6 +4255,60 @@ def run_muse_sparse_experts_and_rs_from_vmem(
             @pl.when(my_chip != c)
             def _wait_s2(_op=op2):
                 _op.wait_send()
+    elif rows_per_rank == 0:
+        # 8C. Partial-owner Flat (B < EP, e.g. B=8 EP=16) All-Gather fan-out.
+        rs_owners = batch_size
+        safe_src_row = jnp.minimum(me, rs_owners - 1)
+
+        @pl.when(me < rs_owners)
+        def _write_local_small():
+            fan_3d_buf[pl.ds(safe_src_row, 1), :, :] = owner_3d[...]
+
+        fan_copies = []
+        for dest in range(ep):
+            fan_op = pltpu.make_async_remote_copy(
+                owner_3d,
+                fan_3d_buf.at[pl.ds(safe_src_row, 1), :, :],
+                fan_send_sem.at[dest],
+                fan_recv_sem,
+                device_id={ep_axis_name: jnp.int32(dest)},
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+            fan_copies.append((dest, fan_op))
+
+            @pl.when((me < rs_owners) & (me != dest))
+            def _start_fan_small(_op=fan_op):
+                _op.start()
+
+        @pl.when(me < rs_owners)
+        def _wait_fan_owner_small():
+            pltpu.make_async_copy(
+                fan_3d_buf.at[pl.ds(0, rs_owners - 1), :, :],
+                fan_3d_buf.at[pl.ds(0, rs_owners - 1), :, :],
+                fan_recv_sem,
+            ).wait()
+
+        @pl.when(me >= rs_owners)
+        def _wait_fan_nonowner_small():
+            pltpu.make_async_copy(
+                fan_3d_buf.at[pl.ds(0, rs_owners), :, :],
+                fan_3d_buf.at[pl.ds(0, rs_owners), :, :],
+                fan_recv_sem,
+            ).wait()
+
+        if write_output_ref and output_ref is not None:
+            out_rc = min(batch_size, 16)
+            for r0 in range(0, batch_size, out_rc):
+                output_ref[pl.ds(r0, out_rc), :] = fan_3d_buf[
+                    pl.ds(r0, out_rc), :, :
+                ].reshape(out_rc, _H)
+
+        for dest, fan_op in fan_copies:
+
+            @pl.when((me < rs_owners) & (me != dest))
+            def _wait_fan_send_small(_op=fan_op):
+                _op.wait_send()
+
     else:
         # 8B. Flat (B, 32, 128) All-Gather fan-out + static whole-width output write.
         my_row_off = me * rows_per_rank
@@ -4593,7 +4685,7 @@ def _sparse_decode_kernel(
 
     def _early_exit_finish() -> None:
         pl.semaphore_wait(barrier_sem, ep)
-        z_rows = min(rows_per_rank, 16) if return_sharded else 16
+        z_rows = min(rows_per_rank, 16) if return_sharded else min(batch_size, 16)
         output_ref[pl.ds(0, z_rows), :] = jnp.zeros(
             (z_rows, _H), dtype=jnp.bfloat16
         )
@@ -4858,6 +4950,11 @@ def build_muse_sparse_scratch_shapes(
 
     rows_per_rank = batch_size // ep
     use_pair_rs = config.pair_rs and (ep in (8, 16))
+    if rows_per_rank == 0 and (return_sharded or use_pair_rs or config.bridge_ag):
+        raise ValueError(
+            f"batch_size={batch_size} < ep={ep} requires return_sharded=False, pair_rs=False, bridge_ag=False"
+        )
+    rows_per_owner = 1 if rows_per_rank == 0 else rows_per_rank
     rs_wire_dtype = jnp.bfloat16 if config.rs_wire_bf16 else jnp.float32
     if config.rs_wire_bf16:
         scratch_shapes.append(vmem((batch_size, 32, 128), jnp.bfloat16))
@@ -4865,23 +4962,23 @@ def build_muse_sparse_scratch_shapes(
         num_chips_rs = ep // 2
         scratch_shapes.extend(
             [
-                vmem((num_chips_rs, rows_per_rank, 32, 128), rs_wire_dtype),
-                vmem((num_chips_rs, rows_per_rank, 32, 128), rs_wire_dtype),
-                vmem((num_chips_rs, rows_per_rank, 32, 128), rs_wire_dtype),
+                vmem((num_chips_rs, rows_per_owner, 32, 128), rs_wire_dtype),
+                vmem((num_chips_rs, rows_per_owner, 32, 128), rs_wire_dtype),
+                vmem((num_chips_rs, rows_per_owner, 32, 128), rs_wire_dtype),
                 sem((num_chips_rs,)),
                 sem((num_chips_rs,)),
                 sem((num_chips_rs,)),
                 sem,
-                vmem((rows_per_rank, 32, 128), jnp.bfloat16),
+                vmem((rows_per_owner, 32, 128), jnp.bfloat16),
             ]
         )
     else:
         scratch_shapes.extend(
             [
-                vmem((ep - 1, rows_per_rank, 32, 128), rs_wire_dtype),
+                vmem((ep - 1, rows_per_owner, 32, 128), rs_wire_dtype),
                 sem((ep,)),
                 sem,
-                vmem((rows_per_rank, 32, 128), jnp.bfloat16),
+                vmem((rows_per_owner, 32, 128), jnp.bfloat16),
             ]
         )
     if not return_sharded:
@@ -4925,9 +5022,9 @@ def fused_decode_sparse_from_logits(
         raise ValueError(
             f"Sparse fused decode requires B in (8, 16, 32, 64, 128, 256, 384), got {batch_size}"
         )
-    if batch_size < ep:
+    if return_sharded and batch_size < ep:
         raise ValueError(
-            f"Sparse fused decode requires batch_size ({batch_size}) >= ep ({ep})"
+            f"Sparse fused decode return_sharded=True requires batch_size ({batch_size}) >= ep ({ep})"
         )
     if logits.shape != (batch_size, _E_TOTAL):
         raise ValueError(

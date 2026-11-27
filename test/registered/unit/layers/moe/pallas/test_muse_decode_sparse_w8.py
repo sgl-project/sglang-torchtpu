@@ -3710,7 +3710,7 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
         try:
             os.environ["SGLANG_TPU_MUSE_KERNEL_DECODE_B8"] = "1"
             self.assertIn(8, op_mod.supported_fuse_all_batches(ep=8))
-            self.assertNotIn(8, op_mod.supported_fuse_all_batches(ep=16))
+            self.assertIn(8, op_mod.supported_fuse_all_batches(ep=16))
         finally:
             if prev_b8 is None:
                 os.environ.pop("SGLANG_TPU_MUSE_KERNEL_DECODE_B8", None)
