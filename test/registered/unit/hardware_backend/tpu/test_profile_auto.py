@@ -144,6 +144,13 @@ class TestArming(_ProfileAutoTestCase):
         with self.assertRaisesRegex(ValueError, "SGLANG_TPU_PROFILE_AUTO_STEPS"):
             self._make_manager(steps=0)
 
+    def test_invalid_profile_options_env_is_rejected(self):
+        with (
+            tpu_envs.SGLANG_TPU_PROFILE_OPTIONS.override("host_tracer_level=3"),
+            self.assertRaisesRegex(ValueError, "SGLANG_TPU_PROFILE_OPTIONS"),
+        ):
+            self._make_manager()
+
     def test_not_armed_under_profile_v2(self):
         with (
             envs.SGLANG_PROFILE_V2.override(True),

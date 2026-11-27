@@ -99,6 +99,11 @@ from sglang_tpu.hooks.pipeline_parallel import (
     skip_spec_op_precompile_without_draft,
 )
 from sglang_tpu.hooks.pp_buffered_kv_budget import reserve_pp_buffered_handoff
+from sglang_tpu.hooks.profiler_options import (
+    init_tpu_profile_options,
+    start_tpu_profile_with_options,
+    stash_profiler_kwargs,
+)
 from sglang_tpu.hooks.row_select import concat_rows as concat_merged_rows
 from sglang_tpu.hooks.row_select import select_rows as select_kept_rows
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
@@ -467,6 +472,21 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.managers.row_select.concat_rows",
         concat_merged_rows,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.managers.scheduler_components.profiler_manager.SchedulerProfilerManager._profile",
+        stash_profiler_kwargs,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.managers.scheduler_components.profiler_manager.SchedulerProfilerManager._init_profile",
+        init_tpu_profile_options,
+        HookType.AROUND,
+    ),
+    (
+        "sglang.srt.managers.scheduler_components.profiler_manager.SchedulerProfilerManager._start_profile",
+        start_tpu_profile_with_options,
         HookType.AROUND,
     ),
 ]
