@@ -609,6 +609,9 @@ class TpuEnvs:
     # Minimum batch size where SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8 activates W4A8
     # (default 256 preserves decode B<=128 BF16; set 64 or 128 to opt into W4A8 decode).
     SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8_MIN_BATCH = EnvInt(256)
+    # Per-expert m_rows threshold where W4A8 LHS FP8 activates when LHS_FP8=1
+    # (-1 = auto: 128 when tile_m>=128 so m<=64 uses BF16+dual, else 0; set 0 for all-bucket W4A8).
+    SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8_MIN_M = EnvInt(-1)
     # Muse Wave-7B: allow DECODE_REPLICA_SLOTS > 0 alongside PREFILL_EPLB_STATS_PATH when
     # PrefillEplbManager._refresh_decode_replicas keeps _fused_decode_rep_* synchronized.
     SGLANG_TPU_MUSE_KERNEL_DECODE_SYNC_PREFILL_EPLB = EnvBool(False)
