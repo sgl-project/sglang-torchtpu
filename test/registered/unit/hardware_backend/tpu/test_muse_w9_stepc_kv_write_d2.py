@@ -1393,7 +1393,7 @@ def test_wave11_step_c_rpa_plan_shared_and_large_b():
     )
     assert ok_swa_128_b1 is True
 
-    # BD4 B=256 Full 8K/1K (pps=32) auto-clamps to ring4k (s3, c4096) cleanly without LARGE_B;
+    # BD4 B=256 Full 8K/1K (pps=32) auto-clamps to ring8k (s4, c8192, nocoal) cleanly without LARGE_B;
     # DENSE2 B=128 Full stays gated by default; 512B B=256 and pps=512 B=256 stay gated to Step (b).
     cfg_full_256, one_full_256, slot_full_256, grp_full_256, ok_full_256 = resolve_step_c_rpa_plan(
         "w8,s4,batchfull,g4k,foldcol",
@@ -1407,10 +1407,11 @@ def test_wave11_step_c_rpa_plan_shared_and_large_b():
     assert ok_full_256 is True and one_full_256 is False and grp_full_256 is False
     assert (cfg_full_256.loop_kind, cfg_full_256.num_slots, cfg_full_256.chunk_sz, slot_full_256) == (
         "ring4k",
-        3,
-        4096,
-        8,
+        4,
+        8192,
+        16,
     )
+    assert cfg_full_256.coalesce_dma is False
 
     _, _, _, _, ok_d2_full_128 = resolve_step_c_rpa_plan(
         "w8,s4,batchfull,g4k,foldcol",
@@ -2044,3 +2045,67 @@ def test_wave13_step_c_write_kv_multi_5d_sublane8_parity_and_aot(
     hlo = compiled.as_text()
     for out_i in range(n_layers):
         assert f"{{{out_i}}}: ({1 + out_i}, {{}}, may-alias)" in hlo
+
+
+def test_wave15_step_c_adaptive_1k_opt_in():
+    """Verify SGLANG_TPU_MUSE_MK_ADAPTIVE_1K defaults False and enables _c1024_ strictly for B=64 512B."""
+    import os
+    from unittest import mock
+
+    from sglang_tpu.envs import envs as tpu_envs
+
+    assert tpu_envs.SGLANG_TPU_MUSE_MK_ADAPTIVE_1K.default is False
+
+    hlo_def = _compile_step_c_aot(
+        tp=8,
+        B=64,
+        pps=32,
+        sw=-1,
+        mode="w8,s4,batchfull,g4k,foldcol,batch4",
+        dense2=False,
+        bd4=False,
+        dist_len=3,
+        has_rope=False,
+    )
+    assert "_c1024_" not in hlo_def
+
+    with mock.patch.dict(os.environ, {"SGLANG_TPU_MUSE_MK_ADAPTIVE_1K": "1"}):
+        hlo_b64_512 = _compile_step_c_aot(
+            tp=8,
+            B=64,
+            pps=32,
+            sw=-1,
+            mode="w8,s4,batchfull,g4k,foldcol,batch4",
+            dense2=False,
+            bd4=False,
+            dist_len=3,
+            has_rope=False,
+        )
+        assert "_c1024_" in hlo_b64_512
+
+        hlo_b256_bd4 = _compile_step_c_aot(
+            tp=16,
+            B=256,
+            pps=32,
+            sw=-1,
+            mode="w8,s4,batchfull,g4k,foldcol,batch4",
+            dense2=False,
+            bd4=True,
+            dist_len=3,
+            has_rope=False,
+        )
+        assert "_c1024_" not in hlo_b256_bd4
+
+        hlo_b128_d2 = _compile_step_c_aot(
+            tp=8,
+            B=128,
+            pps=32,
+            sw=-1,
+            mode="w8,s4,b1,batchfull,g4k,foldcol",
+            dense2=True,
+            bd4=False,
+            dist_len=3,
+            has_rope=False,
+            allow_large_b=True,
+        )
+        assert "_c1024_" not in hlo_b128_d2

@@ -797,6 +797,9 @@ class TpuEnvs:
     # Allow 3-Scope Step (c) (b1_moe_b2_rpad) at B > 64 on DENSE2 (TP=8 B=128; default False
     # because DENSE2 B>64 forces un-overlapped Step (c) while TP=16 BD4 B=256 keeps b2/ring4k).
     SGLANG_TPU_MUSE_MK_STEP_C_LARGE_B = EnvBool(False)
+    # Opt-in adaptive _c1024_ Step (c) fast path strictly for B == 64 uncompressed 512B
+    # (default False keeps 8K/1K 1-binary SWA IMEM dedup; set 1 for <=1K long-ctx pods).
+    SGLANG_TPU_MUSE_MK_ADAPTIVE_1K = EnvBool(False)
     # Route uniform-width speculative TARGET_VERIFY (decode_query_size in 2..8, e.g.
     # DFlash dq=5/6) through RPAd_fast batched [16*dq, 128] single-MXU-pass verify.
     SGLANG_TPU_RPA_V3_DECODE_FAST_VERIFY = EnvBool(False)

@@ -1136,6 +1136,10 @@ def _start_fetch_bkv_pages(
             bkv_sems.at[slot],
         ).start()
 
+    if cfg.loop_kind == "ring4k" and not interpret_mode:
+        lax.fori_loop(0, n_pages, _dma_page, None)
+        return
+
     if (
         cfg.loop_kind in ("w7auto", "swafast", "swafast2")
         or (cfg.loop_kind == "swabatch" and cfg.coalesce_dma)
@@ -3584,6 +3588,11 @@ def _run_rpad_vmem_core(
 
             @pl.when((rel_end > 5120) & (rel_end <= 8192))
             def _mid_8k_2ku():
+                if cfg.gear_4k:
+                    o_vmem_ref[q_row] = _one_shot_attn(
+                        slot, q_bf16, q_row, rel_first, rel_end, n_pages, 8192, cfg.pv_bf16, False
+                    )
+                    return
                 st = init_new_token_state(q_bf16, q_row)
                 sanitize_slot_v2(slot, rel_first, rel_end, n_pages, 8192 // page_size)
                 if cfg.gear_4k:
@@ -4724,27 +4733,34 @@ def _run_rpad_vmem_core(
                 def _full_4k():
                     _exec_ring4k_blk(max_ring_rows, mask_bounds=False)
 
-                if max_ring_rows >= 2048:
-                    @pl.when(loc_end <= 1024)
-                    def _tail_1k():
-                        _exec_ring4k_blk(1024, mask_bounds=True)
+                ring_tiers = [
+                    w
+                    for w in (512, 1024, 2048, 4096)
+                    if w < max_ring_rows and w >= page_size and (w % page_size) == 0
+                ]
+                prev_w = 0
+                for tw in ring_tiers:
+                    cond_t = (
+                        (loc_end > prev_w) & (loc_end <= tw)
+                        if prev_w > 0
+                        else (loc_end <= tw)
+                    )
 
-                    if max_ring_rows >= 4096:
-                        @pl.when((loc_end > 1024) & (loc_end <= 2048))
-                        def _tail_2k():
-                            _exec_ring4k_blk(2048, mask_bounds=True)
+                    @pl.when(cond_t)
+                    def _tail_tier(w_k=tw):
+                        _exec_ring4k_blk(w_k, mask_bounds=True)
 
-                        @pl.when((loc_end > 2048) & (loc_end < max_ring_rows))
-                        def _tail_4k():
-                            _exec_ring4k_blk(max_ring_rows, mask_bounds=True)
-                    else:
-                        @pl.when((loc_end > 1024) & (loc_end < max_ring_rows))
-                        def _tail_2k_rem():
-                            _exec_ring4k_blk(max_ring_rows, mask_bounds=True)
-                else:
-                    @pl.when(loc_end < max_ring_rows)
-                    def _tail_small():
-                        _exec_ring4k_blk(max_ring_rows, mask_bounds=True)
+                    prev_w = tw
+
+                rem_cond = (
+                    ((loc_end > prev_w) & (loc_end < max_ring_rows))
+                    if prev_w > 0
+                    else (loc_end < max_ring_rows)
+                )
+
+                @pl.when(rem_cond)
+                def _tail_rem():
+                    _exec_ring4k_blk(max_ring_rows, mask_bounds=True)
 
             @pl.when(is_last)
             def _fin_4k():

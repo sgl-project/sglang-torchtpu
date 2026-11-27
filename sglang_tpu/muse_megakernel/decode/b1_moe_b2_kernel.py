@@ -2201,7 +2201,7 @@ def resolve_step_c_rpa_plan(
         and cfg_rpa.loop_kind in ("w7auto", "ring4k")
         and cfg_rpa.num_slots * cfg_rpa.max_ring_pages * phys_page_rows > max_bkv_rows
     ):
-        cand_rings = ((3, 4096),)
+        cand_rings = ((4, 8192), (3, 8192), (3, 4096)) if kv_pack_bd4 else ((3, 4096),)
         for c_slots, c_chunk in cand_rings:
             if c_chunk < page_size or (c_chunk % page_size) != 0:
                 continue
@@ -2221,7 +2221,7 @@ def resolve_step_c_rpa_plan(
                     chunk_sz=c_chunk,
                     max_ring_pages=c_ring_pgs,
                     lazy_slot_zero=True,
-                    coalesce_dma=True,
+                    coalesce_dma=False,
                     swabatch_group_size=1,
                 )
                 one_block_per_seq = False
@@ -2350,6 +2350,7 @@ def b1_moe_b2_rpad_chip_sharded_jax(
     interpret: bool = False,
     skip_kv_write: bool = False,
     allow_large_b: bool | None = None,
+    allow_adaptive_1k: bool | None = None,
 ):
     """Fused Step (c) superkernel: ``[chip_b1 + muse_sparse(3d) + chip_b2 + RPAd]``."""
     from jax import lax
@@ -2617,8 +2618,56 @@ def b1_moe_b2_rpad_chip_sharded_jax(
             ),
         )(*call_args)
 
-    # Keep Step (c) Full-Attn unsplit (no jax.lax.cond(is_short_1k, ...)) so XLA dedups
-    # all 45 SWA rope calls into 1 IMEM binary without per-position reloads (#4993/#4994).
+    if allow_adaptive_1k is None:
+        try:
+            from sglang_tpu.envs import envs as tpu_envs
+
+            allow_adaptive_1k = bool(tpu_envs.SGLANG_TPU_MUSE_MK_ADAPTIVE_1K.get())
+        except Exception:
+            allow_adaptive_1k = False
+
+    # Keep Step (c) Full-Attn unsplit by default so XLA dedups all 45 SWA rope calls into
+    # 1 IMEM binary (#4993/#4994); opt-in _c1024_ strictly for B == 64 uncompressed 512B.
+    page_size = (
+        phys_page_rows * 4
+        if kv_pack_bd4
+        else (phys_page_rows * 2 if kv_pack_dense2 else phys_page_rows)
+    )
+    use_adaptive_1k = (
+        bool(allow_adaptive_1k)
+        and rows == 64
+        and not kv_pack_dense2
+        and not kv_pack_bd4
+        and eff_sw is None
+        and shared_group_size == 0
+        and skip_kv_write
+        and cfg_rpa.loop_kind in ("w7auto", "ring4k")
+        and (1024 % page_size == 0)
+        and pages_per_seq > (1024 // page_size)
+    )
+    if use_adaptive_1k:
+        short_cfg, short_one_blk, short_slot_pg, short_grp_vec, short_ok = resolve_step_c_rpa_plan(
+            rpa_mode_str,
+            sliding_window=1024,
+            pages_per_seq=1024 // page_size,
+            phys_page_rows=phys_page_rows,
+            kv_pack_dense2=False,
+            kv_pack_bd4=False,
+            b_tokens=rows,
+            max_num_seqs=max_num_seqs,
+            has_shared_prefix=False,
+        )
+        if short_ok and (world_size != 16 or short_cfg.num_slots <= 4):
+            n_act_s = jnp.clip(distribution[2], 0, max_num_seqs)
+            act_kvl = jnp.where(jnp.arange(max_num_seqs) < n_act_s, kv_lens, jnp.int32(0))
+            is_short_1k = jnp.max(act_kvl) <= jnp.int32(1024)
+            st_ch, next_gated, kv_out = lax.cond(
+                is_short_1k,
+                lambda: _invoke_step_c(short_cfg, short_one_blk, short_slot_pg, short_grp_vec, "_c1024"),
+                lambda: _invoke_step_c(cfg_rpa, one_block_per_seq, bkv_slot_pages, use_grp_vec),
+            )
+            return st_ch, next_gated, kv_out
+
     st_ch, next_gated, kv_out = _invoke_step_c(
         cfg_rpa, one_block_per_seq, bkv_slot_pages, use_grp_vec
     )
