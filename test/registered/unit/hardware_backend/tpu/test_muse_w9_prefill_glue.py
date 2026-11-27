@@ -810,12 +810,23 @@ def test_ep16_sortfree_routing_parity_and_compact_sort_guard():
         eff_hoist_routing=True,
         eff_cm_pipe=True,
     )
-    assert not _allow_pallas_sortfree_routing(
+    assert _allow_pallas_sortfree_routing(
         1,
         sortfree_prefill=True,
         topk=8,
         ep_size=16,
         t_local=128,
+        n_loc_eff=18,
+        has_pad_sentinel=True,
+        eff_hoist_routing=True,
+        eff_cm_pipe=True,
+    )
+    assert not _allow_pallas_sortfree_routing(
+        1,
+        sortfree_prefill=True,
+        topk=8,
+        ep_size=16,
+        t_local=64,
         n_loc_eff=18,
         has_pad_sentinel=True,
         eff_hoist_routing=True,
