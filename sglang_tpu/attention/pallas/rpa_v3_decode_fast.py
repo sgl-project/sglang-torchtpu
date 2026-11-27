@@ -3865,7 +3865,9 @@ def _run_rpad_vmem_core(
             *,
             active_heads=None,
             q_exp2_sc=None,
+            blk_width: int | None = None,
         ):
+            eff_width = max_ring_rows if blk_width is None else blk_width
             heads = q.shape[0]
             if kv_pack_bd4 and q.shape[0] >= 16:
                 tgt_q_tile = cfg.shared_q_tile * 2
@@ -3873,19 +3875,10 @@ def _run_rpad_vmem_core(
             else:
                 q_tile = cfg.shared_q_tile if heads > cfg.shared_q_tile else heads
             valid_arg = valid if mask_valid else None
-            use_split_bd4 = (
-                kv_pack_bd4
-                and cfg.shared_split_dense2
-                and (not mask_valid)
-                and (max_ring_rows % 512 == 0)
-            )
-            use_split = (
-                (not kv_pack_bd4)
-                and cfg.shared_split_dense2
-                and kv_pack_dense2
-                and (not mask_valid)
-                and (max_ring_rows % 256 == 0)
-            )
+            # Direct non-split matmul/softmax beats 2-half shsplit across DENSE2 and BD4
+            # shared blocks (-4% to -11% at B=8/16/64) by halving matmul/exp2/VMEM reads.
+            use_split_bd4 = False
+            use_split = False
             use_fp8_pv = cfg.shared_fp8_qkpv or cfg.shared_fp8_pv_only
 
             def _accum_q_tile(q0: int):
@@ -3934,9 +3927,9 @@ def _run_rpad_vmem_core(
                             ),
                         )
                     else:
-                        width_s = max_ring_rows // 2
+                        width_s = eff_width // 2
                         k_pair = _bkv_fp8_chunk(
-                            slot, 0, max_ring_rows, kind="k", valid_tokens=valid_arg
+                            slot, 0, eff_width, kind="k", valid_tokens=valid_arg
                         )
                         s_e, s_o = _bd4_logits_split(q_s, k_pair, n_seq_t, width_s)
                         if mask_valid:
@@ -4041,7 +4034,7 @@ def _run_rpad_vmem_core(
                         pv = pv01 + pv23
                     else:
                         v_pair = _bkv_fp8_chunk(
-                            slot, 0, max_ring_rows, kind="v", valid_tokens=valid_arg
+                            slot, 0, eff_width, kind="v", valid_tokens=valid_arg
                         )
                         l_sum, pv = _pv_bd4_half(s_e, s_o, v_pair)
                         l_add = l_sum * l_scale
@@ -4090,13 +4083,13 @@ def _run_rpad_vmem_core(
                         jnp.max(s_o, axis=1, keepdims=True),
                     )
                 else:
-                    width_s = max_ring_rows
+                    width_s = eff_width
                     k = _bkv_fp8_chunk(
-                        slot, 0, max_ring_rows, kind="k", valid_tokens=valid_arg
+                        slot, 0, eff_width, kind="k", valid_tokens=valid_arg
                     )
                     scores = jnp.matmul(q_s, k.T, preferred_element_type=jnp.float32)
                     if mask_valid:
-                        valid_col = _col_iota(0, max_ring_rows, q_w) < valid
+                        valid_col = _col_iota(0, eff_width, q_w) < valid
                         scores = jnp.where(valid_col, scores, _MASK_LOGIT)
                     blk_max = jnp.max(
                         _fold128_op(scores, jnp.maximum) if cfg.fold_128 else scores,
@@ -4179,7 +4172,7 @@ def _run_rpad_vmem_core(
                     pv = pv_e + pv_o
                 else:
                     v_full = _bkv_fp8_chunk(
-                        slot, 0, max_ring_rows, kind="v", valid_tokens=valid_arg
+                        slot, 0, eff_width, kind="v", valid_tokens=valid_arg
                     )
                     l_sum, pv = _pv_half(scores, v_full)
                     l_add = l_sum * l_scale
@@ -4200,6 +4193,46 @@ def _run_rpad_vmem_core(
 
                 else:
                     _accum_q_tile(q0)
+
+        def _accum_tail_shared_or_priv(
+            q,
+            head_offset,
+            slot,
+            valid,
+            *,
+            active_heads=None,
+            q_exp2_sc=None,
+            tight_priv: bool = False,
+        ):
+            cands = (512, 1024, 2048) if tight_priv else (2048,)
+            tail_widths = [
+                w
+                for w in cands
+                if w < max_ring_rows and (w % page_size == 0) and (w % 128 == 0)
+            ] + [max_ring_rows]
+            prev_w = 0
+            for tw in tail_widths:
+                if prev_w == 0:
+                    cond = valid <= tw
+                elif tw < max_ring_rows:
+                    cond = (valid > prev_w) & (valid <= tw)
+                else:
+                    cond = valid > prev_w
+
+                @pl.when(cond)
+                def _run_tail_w(w=tw):
+                    _accum_shared_or_priv(
+                        q,
+                        head_offset,
+                        slot,
+                        True,
+                        valid,
+                        active_heads=active_heads,
+                        q_exp2_sc=q_exp2_sc,
+                        blk_width=w,
+                    )
+
+                prev_w = tw
 
         def consume(
             q,
@@ -4256,14 +4289,14 @@ def _run_rpad_vmem_core(
 
                 @pl.when(valid < max_ring_rows)
                 def _tail_blk():
-                    _accum_shared_or_priv(
+                    _accum_tail_shared_or_priv(
                         q,
                         head_offset,
                         slot,
-                        True,
                         valid,
                         active_heads=active_heads,
                         q_exp2_sc=q_exp2_sc,
+                        tight_priv=False,
                     )
 
             last_slot = jnp.maximum(n_blocks - 1, 0) % num_slots
@@ -4447,7 +4480,9 @@ def _run_rpad_vmem_core(
 
                     @pl.when(loc_end < max_ring_rows)
                     def _tail_priv_blk():
-                        _accum_shared_or_priv(q_bf16, head_off, slot, True, loc_end)
+                        _accum_tail_shared_or_priv(
+                            q_bf16, head_off, slot, loc_end, tight_priv=True
+                        )
 
                     @pl.when(is_last)
                     def _fin_priv():
