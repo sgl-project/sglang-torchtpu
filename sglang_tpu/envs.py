@@ -754,6 +754,10 @@ class TpuEnvs:
     # > 0 in (0, 32] e.g. 8.0 or 4.0 folds 1/S into w1_global_scale with zero row-scale AG/dequant;
     # GMM_PREQUANT_LHS_FP8=6 defaults this to 8.0 when unset).
     SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_LHS = EnvFloat(0.0)
+    # Explicit static FP8 scale S for GMM1 -> GMM2 intermediate activation (0.0 = off;
+    # > 0 in (0, 32] folds S into w1_global_scale up-proj and 1/S into w2_global_scale,
+    # writing float8_e4m3fn gmm1_out_ref directly and bypassing GMM2 rowmax/quant/dequant).
+    SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_GMM2_LHS = EnvFloat(0.0)
     # Muse Wave-8 NVFP4 wider compact block scales (0 = off; 512/1024/2048/4096 = requantize at load;
     # -512/-1024/-2048/-4096 = zero-reload in-kernel scale-stride perf probe).
     SGLANG_TPU_MUSE_KERNEL_COMPACT_FP4_QBLOCK = EnvInt(0)

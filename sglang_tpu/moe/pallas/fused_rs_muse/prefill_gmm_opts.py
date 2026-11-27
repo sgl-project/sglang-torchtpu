@@ -77,6 +77,17 @@ def resolve_static_fp8_lhs_scale(
     return _DEFAULT_STATIC_FP8_LHS_SCALE if int(pq_lhs_mode or 0) == 6 else 0.0
 
 
+def resolve_static_fp8_gmm2_scale(raw_scale: float | int | None) -> float:
+    """Resolve static FP8 quantization scale for ``gmm1 -> gmm2`` activations."""
+    val = 0.0 if raw_scale is None else float(raw_scale)
+    if val < 0.0 or val > 32.0:
+        raise ValueError(
+            "SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_GMM2_LHS must be in [0, 32], "
+            f"got {val}"
+        )
+    return val
+
+
 # =============================================================================
 # Pure-NumPy Reference Models (for fast deterministic CPU numerical tests)
 # =============================================================================

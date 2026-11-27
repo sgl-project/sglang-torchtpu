@@ -1647,140 +1647,91 @@ def inner_kernel(
                     and _n_id is not None
                 )
                 if cfgs.fuse_act == "silu":
-                    if (
+                    _out_is_fp8 = jnp.dtype(tiled_out_ref.dtype) == jnp.float8_e4m3fn
+                    _use_dual_scoped = (
                         use_scoped_w4a8_refs
                         and fp4_acc_mode in (2, 3)
                         and not use_eo_strip_fp8
-                    ):
-                        _fuse_g2_amax_dual = _can_fuse_g2_amax and _direct_silu != 2
-                        _g1_m128_bf16_dual = None
+                    )
+                    if _use_dual_scoped or _direct_silu >= 1:
+                        _fuse_g2_amax = _can_fuse_g2_amax and not _out_is_fp8
+                        _g1_m128_bf16 = None
                         for s_n in range(0, half_tile_n, strip_step):
                             e_n = min(half_tile_n, s_n + strip_step)
                             col_w = e_n - s_n
-                            gate_acc, up_acc = _compute_dual_strip_acc(
-                                s_n, e_n, half_tile_n + s_n, half_tile_n + e_n
-                            )
-                            if cfgs.rhs_cfgs.has_scale and gs_gate_ref is not None:
-                                gate_acc = gate_acc * gs_gate_val
+                            if _use_dual_scoped:
+                                gate_acc, up_acc = _compute_dual_strip_acc(
+                                    s_n, e_n, half_tile_n + s_n, half_tile_n + e_n
+                                )
+                                if cfgs.rhs_cfgs.has_scale and gs_gate_ref is not None:
+                                    gate_acc = gate_acc * gs_gate_val
+                            else:
+                                gate_acc = _compute_strip_acc(s_n, e_n)
+                                if cfgs.rhs_cfgs.has_scale and gs_gate_ref is not None:
+                                    gate_acc = gate_acc * gs_gate_val
+                                up_acc = _compute_strip_acc(
+                                    half_tile_n + s_n, half_tile_n + e_n
+                                )
                             if cfgs.rhs_cfgs.has_scale and gs_up_ref is not None:
                                 up_acc = up_acc * gs_up_val
-                            if _direct_silu == 2:
-                                g_bf16 = gate_acc.astype(jnp.bfloat16)
-                                u_bf16 = up_acc.astype(jnp.bfloat16)
-                                sig_bf16 = jax.nn.sigmoid(gate_acc).astype(jnp.bfloat16)
-                                out_s = g_bf16 * sig_bf16 * u_bf16
-                                if not skip_row_mask:
-                                    m_w = (
-                                        jnp.concatenate(
-                                            [mask_col] * (col_w // mxu_size), axis=1
-                                        )
-                                        if col_w > mxu_size
-                                        else mask_col[:, :col_w]
+                            if not skip_row_mask:
+                                m_w = (
+                                    jnp.concatenate(
+                                        [mask_col] * (col_w // mxu_size), axis=1
                                     )
-                                    out_s = jnp.where(m_w, out_s, jnp.bfloat16(0.0))
-                                tiled_out_ref[:, s_n:e_n] = out_s.astype(
-                                    tiled_out_ref.dtype
+                                    if col_w > mxu_size
+                                    else mask_col[:, :col_w]
+                                )
+                            if _direct_silu == 2:
+                                out_s = (
+                                    gate_acc.astype(jnp.bfloat16)
+                                    * jax.nn.sigmoid(gate_acc).astype(jnp.bfloat16)
+                                    * up_acc.astype(jnp.bfloat16)
+                                )
+                                prod = (
+                                    out_s
+                                    if skip_row_mask
+                                    else jnp.where(m_w, out_s, jnp.bfloat16(0.0))
                                 )
                             else:
-                                if skip_row_mask:
-                                    gate_act = jax.nn.silu(gate_acc)
-                                else:
-                                    m_w = (
-                                        jnp.concatenate(
-                                            [mask_col] * (col_w // mxu_size), axis=1
-                                        )
-                                        if col_w > mxu_size
-                                        else mask_col[:, :col_w]
-                                    )
-                                    gate_act = jnp.where(
-                                        m_w, jax.nn.silu(gate_acc), 0.0
-                                    )
+                                gate_act = (
+                                    jax.nn.silu(gate_acc)
+                                    if skip_row_mask
+                                    else jnp.where(m_w, jax.nn.silu(gate_acc), 0.0)
+                                )
                                 if _direct_silu == 1:
                                     prod = gate_act * up_acc
                                 else:
                                     prod = (
-                                        gate_act.astype(tiled_out_ref.dtype).astype(
+                                        gate_act.astype(jnp.bfloat16).astype(
                                             jnp.float32
                                         )
                                         * up_acc
                                     )
-                                prod_out = prod.astype(tiled_out_ref.dtype)
-                                tiled_out_ref[:, s_n:e_n] = prod_out
-                                if _fuse_g2_amax_dual:
-                                    _g1_m128_bf16_dual = _accum_g2_amax_m128(
-                                        _g1_m128_bf16_dual,
-                                        prod_out,
-                                        cfgs.tiles.tile_m,
-                                        prequant_lhs_scale_ref.shape[-1],
-                                    )
-                        if _fuse_g2_amax_dual and _g1_m128_bf16_dual is not None:
-                            _flush_g2_amax_m128(
-                                prequant_lhs_scale_ref,
-                                fused_g2_amax_slot,
-                                _g1_m128_bf16_dual,
-                                _n_id,
-                                _num_n,
-                                cfgs.tiles.tile_m,
-                                prequant_lhs_scale_ref.shape[-1],
-                                merge_prev=True,
-                            )
-                    elif _direct_silu >= 1:
-                        _fuse_g2_amax_ds = _can_fuse_g2_amax and _direct_silu == 1
-                        _g1_m128_bf16_ds = None
-                        for s_n in range(0, half_tile_n, strip_step):
-                            e_n = min(half_tile_n, s_n + strip_step)
-                            col_w = e_n - s_n
-                            gate_acc = _compute_strip_acc(s_n, e_n)
-                            if cfgs.rhs_cfgs.has_scale and gs_gate_ref is not None:
-                                gate_acc = gate_acc * gs_gate_val
-                            up_acc = _compute_strip_acc(
-                                half_tile_n + s_n, half_tile_n + e_n
-                            )
-                            if cfgs.rhs_cfgs.has_scale and gs_up_ref is not None:
-                                up_acc = up_acc * gs_up_val
-                            if _direct_silu == 2:
-                                g_bf16 = gate_acc.astype(jnp.bfloat16)
-                                u_bf16 = up_acc.astype(jnp.bfloat16)
-                                sig_bf16 = jax.nn.sigmoid(gate_acc).astype(jnp.bfloat16)
-                                out_s = g_bf16 * sig_bf16 * u_bf16
-                                if not skip_row_mask:
-                                    m_w = (
-                                        jnp.concatenate(
-                                            [mask_col] * (col_w // mxu_size), axis=1
-                                        )
-                                        if col_w > mxu_size
-                                        else mask_col[:, :col_w]
-                                    )
-                                    out_s = jnp.where(m_w, out_s, jnp.bfloat16(0.0))
-                                prod_out = out_s.astype(tiled_out_ref.dtype)
+                            if _out_is_fp8:
+                                max_fp8 = (
+                                    jnp.bfloat16(448.0)
+                                    if prod.dtype == jnp.bfloat16
+                                    else jnp.float32(448.0)
+                                )
+                                prod_out = jnp.clip(prod, -max_fp8, max_fp8).astype(
+                                    tiled_out_ref.dtype
+                                )
                             else:
-                                if skip_row_mask:
-                                    prod = jax.nn.silu(gate_acc) * up_acc
-                                else:
-                                    m_w = (
-                                        jnp.concatenate(
-                                            [mask_col] * (col_w // mxu_size), axis=1
-                                        )
-                                        if col_w > mxu_size
-                                        else mask_col[:, :col_w]
-                                    )
-                                    prod = jnp.where(
-                                        m_w, jax.nn.silu(gate_acc) * up_acc, 0.0
-                                    )
                                 prod_out = prod.astype(tiled_out_ref.dtype)
                             tiled_out_ref[:, s_n:e_n] = prod_out
-                            if _fuse_g2_amax_ds:
-                                _g1_m128_bf16_ds = _accum_g2_amax_m128(
-                                    _g1_m128_bf16_ds,
+                            if _fuse_g2_amax:
+                                _g1_m128_bf16 = _accum_g2_amax_m128(
+                                    _g1_m128_bf16,
                                     prod_out,
                                     cfgs.tiles.tile_m,
                                     prequant_lhs_scale_ref.shape[-1],
                                 )
-                        if _fuse_g2_amax_ds and _g1_m128_bf16_ds is not None:
+                        if _fuse_g2_amax and _g1_m128_bf16 is not None:
                             _flush_g2_amax_m128(
                                 prequant_lhs_scale_ref,
                                 fused_g2_amax_slot,
-                                _g1_m128_bf16_ds,
+                                _g1_m128_bf16,
                                 _n_id,
                                 _num_n,
                                 cfgs.tiles.tile_m,

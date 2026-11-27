@@ -2046,7 +2046,11 @@ def kernel_main_fused_rs(
     )
     _g2_amax_slot = (
         _req_b_pq
-        if (use_lhs_fp8_vmem and partial_out2_ref.shape[0] > _req_b_pq)
+        if (
+            use_lhs_fp8_vmem
+            and gmm1_out_ref.dtype != jnp.float8_e4m3fn
+            and partial_out2_ref.shape[0] > _req_b_pq
+        )
         else None
     )
 
@@ -2481,6 +2485,11 @@ def kernel_main_fused_rs(
             else shared_acc_ref.at[pl.ds(0, m_rows), pl.ds(0, tile_n2)]
         )
         use_w2_cache = partial_out1_ref.ndim == 3
+        _use_static_gmm2_lhs = (
+            use_lhs_fp8_vmem
+            and use_lhs2_2d_ref
+            and gmm1_out_ref.dtype == jnp.float8_e4m3fn
+        )
         inner_kernel(
             lhs_data,
             WeightsRef(
@@ -2507,7 +2516,11 @@ def kernel_main_fused_rs(
             if use_w2_cache
             else None,
             prequant_lhs_fp8_ref=(
-                partial_out1_ref.at[pl.ds(0, m_rows), pl.ds(0, tile_k2)]
+                (
+                    gmm1_out_ref.at[pl.ds(0, m_rows), pl.ds(k_id * tile_k2, tile_k2)]
+                    if _use_static_gmm2_lhs
+                    else partial_out1_ref.at[pl.ds(0, m_rows), pl.ds(0, tile_k2)]
+                )
                 if use_lhs_fp8_vmem
                 else None
             ),
@@ -2520,7 +2533,7 @@ def kernel_main_fused_rs(
             skip_row_mask=True,
             lhs_2d_vmem_ref=(
                 gmm1_out_ref.at[pl.ds(0, m_rows), pl.ds(k_id * tile_k2, tile_k2)]
-                if use_lhs2_2d_ref
+                if (use_lhs2_2d_ref and not _use_static_gmm2_lhs)
                 else None
             ),
             w2_fp8_cache_ref=(
@@ -2535,6 +2548,8 @@ def kernel_main_fused_rs(
             rhs_fp8_strip_ref=rhs_fp8_strip_ref,
             vectorized_dequant=vectorized_dequant,
             w_strip_fp8_ref=eo_w_strip_fp8_ref,
+            prequant_lhs_ready=_use_static_gmm2_lhs,
+            skip_lhs_scale_mul=_use_static_gmm2_lhs,
         )
 
     gathered_lhs_2x_ref[...] = jnp.zeros_like(gathered_lhs_2x_ref)
@@ -5223,7 +5238,10 @@ def gmm_v2_fused_rs(
         (post_expert_norm_weight is not None) and (not expert_tp) and (not has_bias)
     )
     in_kernel_pn_size = int(post_expert_norm_weight.shape[0]) if use_in_kernel_pn else 0
-    from .prefill_gmm_opts import resolve_static_fp8_rs_scale
+    from .prefill_gmm_opts import (
+        resolve_static_fp8_gmm2_scale,
+        resolve_static_fp8_rs_scale,
+    )
 
     raw_static_fp8_rs, keep_static_fp8_out = (
         resolve_static_fp8_rs_scale(
@@ -5237,7 +5255,65 @@ def gmm_v2_fused_rs(
         if (raw_static_fp8_rs > 0.0 and use_in_kernel_pn and not fp8_direct_write)
         else 0.0
     )
+    _raw_static_fp8_gmm2 = (
+        resolve_static_fp8_gmm2_scale(
+            envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_GMM2_LHS.get()
+        )
+        if size_m > _BLOCKDIAG_MAX_SIZE_M
+        else 0.0
+    )
+    _fp4_acc_g2 = (
+        envs.SGLANG_TPU_MUSE_KERNEL_FP4_ACC_MODE.get()
+        if size_m > _BLOCKDIAG_MAX_SIZE_M
+        else 0
+    )
+    _eo_raw_g2 = (
+        int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_EXPERT_OUTER_FP8.get() or 0)
+        if size_m > _BLOCKDIAG_MAX_SIZE_M
+        else 0
+    )
+    _k256_pre_g2 = (
+        is_quantized
+        and jnp.dtype(w1.dtype) == jnp.dtype(w2.dtype) == jnp.float4_e2m1fn
+        and rhs1_quant_block_size == 256
+        and rhs2_quant_block_size == 256
+        and (
+            envs.SGLANG_TPU_MUSE_KERNEL_BLOCK256_SCALES.get()
+            or envs.SGLANG_TPU_MUSE_KERNEL_K256_PREFILL_TILES.get()
+        )
+    )
+    eff_static_fp8_gmm2 = (
+        _raw_static_fp8_gmm2
+        if (
+            _raw_static_fp8_gmm2 > 0.0
+            and size_m > _BLOCKDIAG_MAX_SIZE_M
+            and is_quantized
+            and not fp8_direct_write
+            and not fp4_w4a16_eff
+            and not fp8_w8a16
+            and not _k256_pre_g2
+            and _eo_raw_g2 == 0
+            and act_fn == "silu"
+            and not use_w2_prequant_cache
+            and use_lhs_fp8_cache
+            and padded_k1 == tile_k1
+            and size_k2 == tile_k2 == (size_n1 // 2)
+            and cfgs1.lhs_cfgs.quant_dtype is not None
+            and cfgs2.lhs_cfgs.quant_dtype == jnp.float8_e4m3fn
+            and rhs1_quant_block_size >= 256
+            and lhs1_quant_block_size >= rhs1_quant_block_size
+            and (lhs1_quant_block_size % rhs1_quant_block_size == 0)
+            and (_fp4_acc_g2 in (2, 3) or _dsilu_val >= 1)
+        )
+        else 0.0
+    )
+    if eff_static_fp8_gmm2 > 0.0:
+        _w1_gs_up = _w1_gs_up * jnp.float32(eff_static_fp8_gmm2)
+        _w2_gs = _w2_gs * jnp.float32(1.0 / eff_static_fp8_gmm2)
     stg_payload_dtype = jnp.float8_e4m3fn if eff_static_fp8_rs > 0.0 else out_dtype
+    gmm1_out_buf_dtype = (
+        jnp.float8_e4m3fn if eff_static_fp8_gmm2 > 0.0 else out_dtype
+    )
     max_k_pq = max(padded_k1, size_k2)
     max_b_pq = max(
         padded_k1 // lhs1_quant_block_size,
@@ -5264,8 +5340,11 @@ def gmm_v2_fused_rs(
         ),
         # gathered_lhs_2x_ref
         pltpu.VMEM((2, tile_m, padded_k1 // num_lanes, num_lanes), lhs_in_dtype),
-        # gmm1_out_ref (out_dtype avoids f32->bf16 VMEM roundtrip in interlude)
-        pltpu.VMEM((tile_m, size_n1 // 2 if act_fn else size_n1), out_dtype),
+        # gmm1_out_ref (out_dtype or static FP8 intermediate for GMM2)
+        pltpu.VMEM(
+            (tile_m, size_n1 // 2 if act_fn else size_n1),
+            gmm1_out_buf_dtype,
+        ),
         # intermediate_ref (unused when size_k2 == gmm1_out cols)
         pltpu.VMEM(
             (1, size_lhs_sublane, num_lanes)
@@ -5302,6 +5381,7 @@ def gmm_v2_fused_rs(
                         1
                         if (
                             size_m > _BLOCKDIAG_MAX_SIZE_M
+                            and eff_static_fp8_gmm2 == 0.0
                             and int(
                                 envs.SGLANG_TPU_MUSE_KERNEL_GMM_FLQ_ZERO_RMW.get() or 0
                             )
@@ -5309,7 +5389,7 @@ def gmm_v2_fused_rs(
                             and int(
                                 envs.SGLANG_TPU_MUSE_KERNEL_GMM_DIRECT_SILU.get() or 0
                             )
-                            in (0, 1)
+                            in (0, 1, 2)
                         )
                         else 0
                     ),
@@ -5857,6 +5937,11 @@ def gmm_v2_fused_rs(
         if eff_static_fp8_rs > 0.0
         else ""
     )
+    _g2s_tag = (
+        f"-g2s{int(eff_static_fp8_gmm2) if eff_static_fp8_gmm2.is_integer() else str(eff_static_fp8_gmm2).replace('.', 'p')}"
+        if eff_static_fp8_gmm2 > 0.0
+        else ""
+    )
     pallas_name = (
         f"gmm_v2_fused_rs-E_{size_group}-M_{size_m}"
         f"-K1_{size_k1}-N1_{size_n1}-K2_{size_k2}-N2_{size_n2}"
@@ -5885,6 +5970,7 @@ def gmm_v2_fused_rs(
         f"{f'-ds{_dsilu_val}' if _dsilu_val > 0 else ''}"
         f"{f'-pql{_pq_lhs_env}' if _pq_lhs_env > 0 else ''}"
         f"{_slh_tag}"
+        f"{_g2s_tag}"
         f"{f'-tlp{_tlp_val}k{_tlp_kstep}' if _tlp_val > 0 else ''}"
         f"{f'-sw{_sw_val}' if _sw_val > 0 else ''}"
         f"{f'-eo{eff_eo_mode}' if eff_eo_mode > 0 else ''}"
@@ -5910,8 +5996,12 @@ def gmm_v2_fused_rs(
         pack_indices=pack_indices,
         defer_writes=True,
         in_kernel_post_norm_size=in_kernel_pn_size,
-        has_w1_gs=(w1_global_scale is not None) or has_static_fp8_lhs,
-        has_w2_gs=w2_global_scale is not None,
+        has_w1_gs=(
+            (w1_global_scale is not None)
+            or has_static_fp8_lhs
+            or (eff_static_fp8_gmm2 > 0.0)
+        ),
+        has_w2_gs=(w2_global_scale is not None) or (eff_static_fp8_gmm2 > 0.0),
         block_scatter=block_scatter,
         vectorized_dequant=vectorized_dequant,
         blockdiag_rows=blockdiag_rows,
