@@ -3190,6 +3190,19 @@ def fused_moe_full_bridge_and_ffn(
                     ep_size * t_local, he_dim // 128, 128
                 )
 
+        d_coal = bool(envs.SGLANG_TPU_MUSE_KERNEL_D_COAL_GATHER.get())
+        d_ik_ag = bool(envs.SGLANG_TPU_MUSE_KERNEL_D_IN_KERNEL_AG.get())
+        w4_wu_qbs = int(envs.SGLANG_TPU_MUSE_KERNEL_W4_WUNPOOL.get() or 0)
+        has_w4_wu = (
+            w4_wu_qbs > 0 and jnp.dtype(wu_fp8.dtype) == jnp.float4_e2m1fn
+        )
+        eff_w4_wu_qbs = w4_wu_qbs if has_w4_wu else 0
+        uses_4slab_scrub = (
+            d_layout == "4slab"
+            and not (d_coal or d_ik_ag or has_w4_wu)
+            and t_local < 256
+        )
+
         with jax.named_scope("stage3_kernel_c_gmm_fused_rs"):
             if ep_tp2_mode:
                 from sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_op import (
@@ -3305,7 +3318,7 @@ def fused_moe_full_bridge_and_ffn(
                         else 0.0
                     ),
                 )
-                if active_cnt_local is not None:
+                if active_cnt_local is not None and not uses_4slab_scrub:
                     safe_rows = min(1024, out_buf_3d.shape[0])
 
                     def _zero_unwritten_head(b):
@@ -3346,11 +3359,6 @@ def fused_moe_full_bridge_and_ffn(
                     fp8_unpool=d_fp8_unpool,
                 )
             )
-            d_coal = bool(envs.SGLANG_TPU_MUSE_KERNEL_D_COAL_GATHER.get())
-            d_ik_ag = bool(envs.SGLANG_TPU_MUSE_KERNEL_D_IN_KERNEL_AG.get())
-            w4_wu_qbs = int(envs.SGLANG_TPU_MUSE_KERNEL_W4_WUNPOOL.get() or 0)
-            has_w4_wu = w4_wu_qbs > 0 and jnp.dtype(wu_fp8.dtype) == jnp.float4_e2m1fn
-            eff_w4_wu_qbs = w4_wu_qbs if has_w4_wu else 0
             if d_layout == "4slab" and (d_coal or d_ik_ag or has_w4_wu):
                 from sglang_tpu.muse_prefill_kernels.prefill_w8_radicals import (
                     pallas_d_radical_4slab,

@@ -1722,6 +1722,40 @@ def _ops(
             return q_k, kv_k, gate_k
 
         def a3_ul_full_body(raw_attn_k, gate_k, wo_in, wo_sc):
+            c_tok, q_loc = raw_attn_k.shape
+            c_k = c_tok // tp_d_ul
+            if (
+                ulysses_async_a2a
+                and not ulysses_rev_bf16
+                and tp_d_ul >= 8
+                and c_k == 1024
+            ):
+                h = c_k // 2
+                ar_3d = raw_attn_k.reshape(tp_d_ul, c_k, q_loc)
+                q3_0 = kernel_a3.pallas_ulysses_norm_fp8_range(
+                    ar_3d,
+                    0,
+                    h,
+                    head_norm_eps=head_norm_eps,
+                    quantize_fp8=True,
+                )
+                a0 = lax.all_to_all(
+                    q3_0, _AXIS, split_axis=0, concat_axis=0, tiled=True
+                ).reshape(tp_d_ul, h, q_loc)
+                a0, ar_3d = lax.optimization_barrier((a0, ar_3d))
+                q3_1 = kernel_a3.pallas_ulysses_norm_fp8_range(
+                    ar_3d,
+                    h,
+                    h,
+                    head_norm_eps=head_norm_eps,
+                    quantize_fp8=True,
+                )
+                a1 = lax.all_to_all(
+                    q3_1, _AXIS, split_axis=0, concat_axis=0, tiled=True
+                ).reshape(tp_d_ul, h, q_loc)
+                qf0 = a3_ul_gate_fuse_body(a0, gate_k[:h])
+                qf1 = a3_ul_gate_fuse_body(a1, gate_k[h:])
+                return kernel_a3.pallas_ulysses_wo_local((qf0, qf1), wo_in, wo_sc)
             attn_3d = a3_ul_rev_a2a_body(raw_attn_k)
             q_fp8 = a3_ul_gate_fuse_body(attn_3d, gate_k)
             return a3_ul_wo_body(q_fp8, wo_in, wo_sc)
@@ -1826,7 +1860,13 @@ def _ops(
             3,
         )
         a3_ulysses_full_op = export(
-            "a3_ulysses_full_e" + eps_sfx + rev_bf16_sfx, a3_ul_full, 4, 1
+            "a3_ulysses_full_e"
+            + eps_sfx
+            + rev_bf16_sfx
+            + ("_2cr" if (ulysses_async_a2a and not ulysses_rev_bf16) else ""),
+            a3_ul_full,
+            4,
+            1,
         )
     if causal_chunk_stream and a1_variant != "v10_sp":
         import jax.numpy as jnp
@@ -4511,7 +4551,9 @@ class MusePrefillKernels(torch.nn.Module):
                 gate_prev = gate_k
                 q3_cur, kv3_cur, x_fp8_cur = q3_next, kv3_next, x_fp8_next
             else:
-                q_parts.append(self.ops.a3_ulysses_gate_fuse_chunk(attn_fp8_k, gate_k))
+                q_parts.append(
+                    self.ops.a3_ulysses_gate_fuse_chunk(attn_fp8_k, gate_k)
+                )
 
         if len(q_parts) == 2 and self.ops.a3_ulysses_wo_2chunk is not None:
             return self.ops.a3_ulysses_wo_2chunk(q_parts[0], q_parts[1], wo, wo_scale)

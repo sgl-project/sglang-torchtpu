@@ -3880,6 +3880,47 @@ def a3_v17_option3d_single_kernel_fused_gate_a2a_wo_3d_sp(
 # -----------------------------------------------------------------------------
 # Wave 9: Static-FP8 Ulysses Sequence-Parallel Attention (`v10_sp`, TP=8 / TP=16)
 # -----------------------------------------------------------------------------
+def _ulysses_norm_quant_tile(
+    attn_ref,
+    out_ref,
+    *,
+    tm_eff: int,
+    q_local: int,
+    head_norm_eps: float,
+    quantize_fp8: bool,
+    is_3d: bool,
+) -> None:
+    sub_r = min(128, tm_eff)
+    lane = lax.broadcasted_iota(jnp.int32, (sub_r, 128), 1)
+    is_lo = lane < 64
+    mask_lo = is_lo.astype(jnp.float32)
+    mask_hi = 1.0 - mask_lo
+    for r0 in range(0, tm_eff, sub_r):
+        r1 = r0 + sub_r
+        for c0 in range(0, q_local, 128):
+            c1 = c0 + 128
+            raw = attn_ref[0, r0:r1, c0:c1] if is_3d else attn_ref[r0:r1, c0:c1]
+            a_norm = _dual_head_rmsnorm_128(
+                raw.astype(jnp.float32),
+                is_lo,
+                mask_lo,
+                mask_hi,
+                1.0,
+                eps=head_norm_eps,
+            )
+            q_val = (
+                jnp.clip(a_norm * STATIC_A3_ACT_MULT, -FP8_MAX, FP8_MAX).astype(
+                    jnp.float8_e4m3fn
+                )
+                if quantize_fp8
+                else a_norm.astype(jnp.bfloat16)
+            )
+            if is_3d:
+                out_ref[0, r0:r1, c0:c1] = q_val
+            else:
+                out_ref[r0:r1, c0:c1] = q_val
+
+
 def pallas_ulysses_norm_fp8_for_rev_a2a(
     raw_attn_out: jax.Array,
     *,
@@ -3894,32 +3935,17 @@ def pallas_ulysses_norm_fp8_for_rev_a2a(
     tm_eff = next(
         t for t in (512, 256, 128, 64, 32, 16, 8) if t <= tm and c_tok % t == 0
     )
-    sub_r = min(128, tm_eff)
 
     def _norm_quant_tile(attn_ref, out_ref):
-        lane = lax.broadcasted_iota(jnp.int32, (sub_r, 128), 1)
-        is_lo = lane < 64
-        mask_lo = is_lo.astype(jnp.float32)
-        mask_hi = 1.0 - mask_lo
-        for r0 in range(0, tm_eff, sub_r):
-            r1 = r0 + sub_r
-            for c0 in range(0, q_local, 128):
-                c1 = c0 + 128
-                a_norm = _dual_head_rmsnorm_128(
-                    attn_ref[r0:r1, c0:c1].astype(jnp.float32),
-                    is_lo,
-                    mask_lo,
-                    mask_hi,
-                    1.0,
-                    eps=head_norm_eps,
-                )
-                out_ref[r0:r1, c0:c1] = (
-                    jnp.clip(a_norm * STATIC_A3_ACT_MULT, -FP8_MAX, FP8_MAX).astype(
-                        jnp.float8_e4m3fn
-                    )
-                    if quantize_fp8
-                    else a_norm.astype(jnp.bfloat16)
-                )
+        _ulysses_norm_quant_tile(
+            attn_ref,
+            out_ref,
+            tm_eff=tm_eff,
+            q_local=q_local,
+            head_norm_eps=head_norm_eps,
+            quantize_fp8=quantize_fp8,
+            is_3d=False,
+        )
 
     out_dtype = jnp.float8_e4m3fn if quantize_fp8 else jnp.bfloat16
     return pl.pallas_call(
@@ -3934,6 +3960,56 @@ def pallas_ulysses_norm_fp8_for_rev_a2a(
         ),
         name=f"pallas_ulysses_norm_{'fp8' if quantize_fp8 else 'bf16'}_c{c_tok}_q{q_local}_tm{tm_eff}",
     )(raw_attn_out)
+
+
+def pallas_ulysses_norm_fp8_range(
+    raw_3d: jax.Array,
+    row_start: int,
+    row_count: int,
+    *,
+    head_norm_eps: float = 1e-5,
+    quantize_fp8: bool = True,
+    tm: int = 512,
+    vmem_limit_mb: int = 32,
+) -> jax.Array:
+    """Zero-copy row-range `[row_start : row_start + row_count]` per-head RMSNorm (+ FP8)."""
+    tp_deg, c_k, q_local = raw_3d.shape
+    assert q_local % 128 == 0 and 0 <= row_start and row_start + row_count <= c_k
+    tm_eff = next(
+        t
+        for t in (512, 256, 128, 64, 32, 16, 8)
+        if t <= tm and row_start % t == 0 and row_count % t == 0
+    )
+    blk_off = row_start // tm_eff
+
+    def _norm_quant_tile(attn_ref, out_ref):
+        _ulysses_norm_quant_tile(
+            attn_ref,
+            out_ref,
+            tm_eff=tm_eff,
+            q_local=q_local,
+            head_norm_eps=head_norm_eps,
+            quantize_fp8=quantize_fp8,
+            is_3d=True,
+        )
+
+    out_dtype = jnp.float8_e4m3fn if quantize_fp8 else jnp.bfloat16
+    return pl.pallas_call(
+        _norm_quant_tile,
+        grid=(tp_deg, row_count // tm_eff),
+        in_specs=[pl.BlockSpec((1, tm_eff, q_local), lambda tp_i, r_i: (tp_i, blk_off + r_i, 0))],
+        out_specs=pl.BlockSpec((1, tm_eff, q_local), lambda tp_i, r_i: (tp_i, r_i, 0)),
+        out_shape=jax.ShapeDtypeStruct((tp_deg, row_count, q_local), out_dtype),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel"),
+            vmem_limit_bytes=vmem_limit_mb * (1 << 20),
+        ),
+        name=(
+            f"pallas_ulysses_norm_fp8_range_tp{tp_deg}_r{row_count}_tm{tm_eff}"
+            if quantize_fp8
+            else f"pallas_ulysses_norm_bf16_range_tp{tp_deg}_r{row_count}_tm{tm_eff}"
+        ),
+    )(raw_3d)
 
 
 def pallas_ulysses_gate_fuse(

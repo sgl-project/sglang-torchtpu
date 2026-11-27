@@ -1758,3 +1758,112 @@ def test_v10_sp_a1_qkv_gate_async_a2a_interpret_and_aot():
                 np.asarray(lax.bitcast_convert_type(kv3r, jnp.uint8)),
             )
             np.testing.assert_array_equal(np.asarray(gf, dtype=np.float32), np.asarray(gr, dtype=np.float32))
+
+
+def test_v10_sp_a3_2chunk_norm_range_rev_a2a_interpret_and_aot():
+    """Verify 2-chunk `row_range` A3 rev-A2A overlap (`c_k == 1024` only when `ulysses_async_a2a=True`):
+    1. `tpu7x=2x2x2` offline AOT export + HLO op name & kernel presence across `c_k={512,1024,1536}`.
+    2. 16-dev CPU eager+race+NaN Interpret bit-exact 0-ULP parity vs 1-chunk reference.
+    """
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    torch = pytest.importorskip("torch")
+    from jax import lax
+    from jax.experimental import pallas as pl
+    from jax.experimental import topologies
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+    if len(jax.devices("cpu")) < _TP:
+        pytest.skip(f"Need {_TP} CPU devices (got {len(jax.devices('cpu'))})")
+
+    from sglang_tpu.muse_prefill_kernels import integration
+    from sglang_tpu.muse_prefill_kernels.attn_kernels import kernel_a3
+
+    topo = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x=2x2x2")
+    mesh_aot = Mesh(np.array(topo.devices).reshape(_TP), (_AXIS,))
+    ql_aot = 512
+    for aa2a in (True, False):
+        integration._ops.cache_clear()
+        with mock.patch("sglang_tpu.moe.pallas.fused_moe_rs_op._get_mesh", return_value=mesh_aot):
+            ops = integration._ops(
+                8, 1, "v10_sp", "v16", True, 1e-5,
+                a1_rpa_layout=True, causal_chunk_stream=True,
+                causal_chunk_spec="le1536:1;256,512", ulysses_async_a2a=aa2a,
+            )
+        if aa2a:
+            assert "_2cr" in ops.a3_ulysses_full._name
+        else:
+            assert "_2cr" not in ops.a3_ulysses_full._name
+        for ck_aot in (512, 1024, 1536):
+            ct_aot = _TP * ck_aot
+            _assert_tpu7x_spmd_export_and_compile(
+                ops.a3_ulysses_full,
+                (
+                    torch.empty((ct_aot, ql_aot), dtype=torch.bfloat16, device="meta"),
+                    torch.empty((ck_aot, 8192), dtype=torch.bfloat16, device="meta"),
+                    torch.empty((8192, 8192), dtype=torch.float8_e4m3fn, device="meta"),
+                    torch.empty((1, 8192), dtype=torch.float32, device="meta"),
+                ),
+            )
+
+    devs = jax.devices("cpu")[:_TP]
+    mesh16 = Mesh(np.array(devs), (_AXIS,))
+    ck, hd, ql_d = 128, 256, 128
+    # Note: pallas_ulysses_wo_local expects k_dim = TP * ql_d; scale small to keep 16-dev Interpret fast.
+    n_full = _TP * ql_d
+    h_ck = ck // 2
+    rng = np.random.default_rng(2029)
+
+    def _put16(arr, dt):
+        return jax.device_put(jnp.asarray(arr, dtype=dt), NamedSharding(mesh16, P(_AXIS)))
+
+    real_pallas = pl.pallas_call
+
+    def _eager_interpret(*args, **kwargs):
+        kwargs["interpret"] = pltpu.InterpretParams(
+            dma_execution_mode="eager", detect_races=True, uninitialized_memory="nan"
+        )
+        return real_pallas(*args, **kwargs)
+
+    with (
+        mock.patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+        tpu_info_for_cpu_export(),
+        mock.patch("sglang_tpu.attention.pallas.util.get_tpu_version", return_value=7),
+        mock.patch.object(pl, "pallas_call", _eager_interpret),
+        jax.default_device(jax.devices("cpu")[0]),
+    ):
+        ra_d = _put16(rng.standard_normal((_TP, _TP * ck, ql_d)) * 0.3, jnp.bfloat16)
+        gk_d = _put16(rng.standard_normal((_TP, ck, n_full)) * 0.3, jnp.bfloat16)
+        wo_d = _put16(rng.standard_normal((_TP, n_full, hd)) * 0.15, jnp.float8_e4m3fn)
+        wos_d = _put16(np.full((_TP, 1, hd), 0.02), jnp.float32)
+
+        def _cmp_a3(ra, gk, wo, wos):
+            q_ref = kernel_a3.pallas_ulysses_norm_fp8_for_rev_a2a(
+                ra[0], head_norm_eps=1e-5, quantize_fp8=True
+            ).reshape(_TP, ck, ql_d)
+            a_ref = lax.all_to_all(q_ref, _AXIS, 0, 0, tiled=True).reshape(_TP, ck, ql_d)
+            qf_ref = kernel_a3.pallas_ulysses_gate_fuse(a_ref, gk[0], input_is_prescaled=True)
+            out_ref = kernel_a3.pallas_ulysses_wo_local(qf_ref, wo[0], wos[0], bn=hd)
+
+            ar_3d = ra[0].reshape(_TP, ck, ql_d)
+            q0 = kernel_a3.pallas_ulysses_norm_fp8_range(
+                ar_3d, 0, h_ck, head_norm_eps=1e-5, quantize_fp8=True
+            )
+            a0 = lax.all_to_all(q0, _AXIS, 0, 0, tiled=True).reshape(_TP, h_ck, ql_d)
+            a0, ar_3d = lax.optimization_barrier((a0, ar_3d))
+            q1 = kernel_a3.pallas_ulysses_norm_fp8_range(
+                ar_3d, h_ck, h_ck, head_norm_eps=1e-5, quantize_fp8=True
+            )
+            a1 = lax.all_to_all(q1, _AXIS, 0, 0, tiled=True).reshape(_TP, h_ck, ql_d)
+            qf0 = kernel_a3.pallas_ulysses_gate_fuse(a0, gk[0, :h_ck], input_is_prescaled=True)
+            qf1 = kernel_a3.pallas_ulysses_gate_fuse(a1, gk[0, h_ck:], input_is_prescaled=True)
+            out_2c = kernel_a3.pallas_ulysses_wo_local((qf0, qf1), wo[0], wos[0], bn=hd)
+            return out_ref[None], out_2c[None]
+
+        out_r, out_2 = jax.block_until_ready(
+            jax.shard_map(
+                _cmp_a3, mesh=mesh16, in_specs=(P(_AXIS),) * 4, out_specs=(P(_AXIS),) * 2, check_vma=False
+            )(ra_d, gk_d, wo_d, wos_d)
+        )
+        np.testing.assert_array_equal(np.asarray(out_2, dtype=np.float32), np.asarray(out_r, dtype=np.float32))

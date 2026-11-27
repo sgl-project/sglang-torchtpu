@@ -202,6 +202,17 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
         else jnp.bfloat16
     )
 
+    def _scrub_vals(val):
+        if not scrub_mxu_nan:
+            return val
+        if in_buf_is_fp8:
+            # float8_e4m3fn has no Inf (only 0x7F/0xFF NaN); bf16 self-compare avoids the f32 cast tax.
+            return jnp.where(val == val, val, jnp.bfloat16(0.0))
+        # Scrub NaN/Inf on bfloat16 inputs so 0.0 * NaN/Inf cannot propagate on padded rows.
+        return jnp.where(
+            jnp.isfinite(val.astype(jnp.float32)), val, jnp.bfloat16(0.0)
+        )
+
     def _combine_fp8_phase1(buf_2x_ref, slot, w_vmem_ref, u_scratch_ref):
         r_step = 16 if tok_tile_eff % 16 == 0 else 8
         c_step = 8 if (r_step == 16 and n2_cols % 8 == 0) else n2_cols
@@ -215,7 +226,7 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                     w_sub = w_vmem_ref[r0 + ts : r0 + ts + ts_chunk, :topk].reshape(
                         ts_chunk, topk, 1, 1
                     )
-                    vals_sub = (
+                    vals_sub = _scrub_vals(
                         buf_2x_ref[slot, m0:m1, c0 : c0 + c_step, :]
                         .astype(jnp.bfloat16)
                         .reshape(ts_chunk, topk, c_step, lanes)
@@ -233,15 +244,7 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
         vals_raw = buf_2x_ref[slot, m0:m1, c0:c1, :]
         if in_buf_is_fp8:
             vals_raw = vals_raw.astype(jnp.bfloat16)
-            if scrub_mxu_nan:
-                # float8_e4m3fn has no Inf (only 0x7F/0xFF NaN); bf16 self-compare avoids the f32 cast tax.
-                vals_raw = jnp.where(vals_raw == vals_raw, vals_raw, jnp.bfloat16(0.0))
-        elif scrub_mxu_nan:
-            # Scrub NaN/Inf on bfloat16 inputs so 0.0 * NaN/Inf cannot propagate within a 16-row block.
-            vals_raw = jnp.where(
-                jnp.isfinite(vals_raw.astype(jnp.float32)), vals_raw, jnp.bfloat16(0.0)
-            )
-        return vals_raw.reshape(16 * topk, c_grp * lanes)
+        return _scrub_vals(vals_raw).reshape(16 * topk, c_grp * lanes)
 
     if use_zero_spill:
         t_sub = min(32, tok_tile_eff)
@@ -402,27 +405,27 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                             w0 = w_vmem_ref[t0:t1, 0:1][:, :, None]
                             w1 = w_vmem_ref[t0:t1, 1:2][:, :, None]
                             s01 = (
-                                buf_2x_ref[slot, 0, t0:t1, c0:c1, :].astype(jnp.bfloat16) * w0
-                                + buf_2x_ref[slot, 1, t0:t1, c0:c1, :].astype(jnp.bfloat16) * w1
+                                _scrub_vals(buf_2x_ref[slot, 0, t0:t1, c0:c1, :].astype(jnp.bfloat16)) * w0
+                                + _scrub_vals(buf_2x_ref[slot, 1, t0:t1, c0:c1, :].astype(jnp.bfloat16)) * w1
                             )
                             w2 = w_vmem_ref[t0:t1, 2:3][:, :, None]
                             w3 = w_vmem_ref[t0:t1, 3:4][:, :, None]
                             s23 = (
-                                buf_2x_ref[slot, 2, t0:t1, c0:c1, :].astype(jnp.bfloat16) * w2
-                                + buf_2x_ref[slot, 3, t0:t1, c0:c1, :].astype(jnp.bfloat16) * w3
+                                _scrub_vals(buf_2x_ref[slot, 2, t0:t1, c0:c1, :].astype(jnp.bfloat16)) * w2
+                                + _scrub_vals(buf_2x_ref[slot, 3, t0:t1, c0:c1, :].astype(jnp.bfloat16)) * w3
                             )
                             s03 = s01 + s23
                             w4 = w_vmem_ref[t0:t1, 4:5][:, :, None]
                             w5 = w_vmem_ref[t0:t1, 5:6][:, :, None]
                             s45 = (
-                                buf_2x_ref[slot, 4, t0:t1, c0:c1, :].astype(jnp.bfloat16) * w4
-                                + buf_2x_ref[slot, 5, t0:t1, c0:c1, :].astype(jnp.bfloat16) * w5
+                                _scrub_vals(buf_2x_ref[slot, 4, t0:t1, c0:c1, :].astype(jnp.bfloat16)) * w4
+                                + _scrub_vals(buf_2x_ref[slot, 5, t0:t1, c0:c1, :].astype(jnp.bfloat16)) * w5
                             )
                             w6 = w_vmem_ref[t0:t1, 6:7][:, :, None]
                             w7 = w_vmem_ref[t0:t1, 7:8][:, :, None]
                             s67 = (
-                                buf_2x_ref[slot, 6, t0:t1, c0:c1, :].astype(jnp.bfloat16) * w6
-                                + buf_2x_ref[slot, 7, t0:t1, c0:c1, :].astype(jnp.bfloat16) * w7
+                                _scrub_vals(buf_2x_ref[slot, 6, t0:t1, c0:c1, :].astype(jnp.bfloat16)) * w6
+                                + _scrub_vals(buf_2x_ref[slot, 7, t0:t1, c0:c1, :].astype(jnp.bfloat16)) * w7
                             )
                             u_sub = (s03 + (s45 + s67)).reshape(
                                 t_sub, c_step_zs * lanes
@@ -430,8 +433,10 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                         else:
                             b0, b1 = tb * (t_sub * topk), (tb + 1) * (t_sub * topk)
                             w_tok = w_vmem_ref[t0:t1, :topk].reshape(t_sub, topk, 1, 1)
-                            vals_sub = buf_2x_ref[slot, b0:b1, c0:c1, :].reshape(
-                                t_sub, topk, c_step_zs, lanes
+                            vals_sub = _scrub_vals(
+                                buf_2x_ref[slot, b0:b1, c0:c1, :].reshape(
+                                    t_sub, topk, c_step_zs, lanes
+                                )
                             )
                             u_sub = jnp.sum(vals_sub * w_tok, axis=1).reshape(
                                 t_sub, c_step_zs * lanes
@@ -850,8 +855,10 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                 w_h = w_tok[r0:r1]
                 for c_blk in range(2):
                     c0, c1 = c_blk * 16, (c_blk + 1) * 16
-                    vals_sub = buf_2x_ref[slot, m0:m1, c0:c1, :].reshape(
-                        32, topk, 16, lanes
+                    vals_sub = _scrub_vals(
+                        buf_2x_ref[slot, m0:m1, c0:c1, :].reshape(
+                            32, topk, 16, lanes
+                        )
                     )
                     u_sub = jnp.sum(vals_sub * w_h, axis=1).reshape(32, 16 * lanes)
                     u_scratch_ref[r0:r1, c0 * lanes : c1 * lanes] = u_sub
@@ -868,8 +875,10 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
             w_tok = w_vmem_ref[:, :topk].reshape(tok_tile_eff, topk, 1, 1)
             for c_blk in range(n2_cols // t64_c_step):
                 c0, c1 = c_blk * t64_c_step, (c_blk + 1) * t64_c_step
-                vals_sub = buf_2x_ref[slot, :, c0:c1, :].reshape(
-                    tok_tile_eff, topk, t64_c_step, lanes
+                vals_sub = _scrub_vals(
+                    buf_2x_ref[slot, :, c0:c1, :].reshape(
+                        tok_tile_eff, topk, t64_c_step, lanes
+                    )
                 )
                 u_sub = jnp.sum(vals_sub * w_tok, axis=1).reshape(
                     tok_tile_eff, t64_c_step * lanes
