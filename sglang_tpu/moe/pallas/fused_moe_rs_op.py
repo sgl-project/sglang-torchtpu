@@ -65,6 +65,20 @@ def pad_moe_tokens(hidden_states, topk_weights, topk_ids, *, padded_tokens: int)
 _ONESHOT_ALL_GATHER_MAX_SHARD_BYTES = 256 * 1024
 
 
+def _set_rank_buffer(layer: torch.nn.Module, name: str, value: int) -> None:
+    # A reload refills the buffer in place: direct_compile keeps the first object,
+    # and WeightChecker._reset_tensors randomizes buffers between loads.
+    buffer = layer._buffers.get(name)
+    if buffer is None:
+        layer.register_buffer(
+            name,
+            torch.tensor([value], dtype=torch.int32, device=layer.w13_weight.device),
+            persistent=False,
+        )
+    else:
+        buffer.fill_(value)
+
+
 def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
     """Prepare logical expert ownership before Dynamo captures the MoE layer."""
     from sglang.srt.runtime_context import get_parallel
@@ -77,12 +91,9 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
     # The kernel derives its rank from this offset. Expert TP addresses rank r's
     # slices as virtual experts [r * E_local, (r + 1) * E_local).
     rank = parallel.moe_tp_rank if expert_tp else parallel.moe_ep_rank
-    group_offset = torch.tensor(
-        [rank * layer.num_local_experts],
-        dtype=torch.int32,
-        device=layer.w13_weight.device,
+    _set_rank_buffer(
+        layer, "_tpu_fused_rs_group_offset", rank * layer.num_local_experts
     )
-    layer.register_buffer("_tpu_fused_rs_group_offset", group_offset, persistent=False)
 
     # Expert TP gathers each decode step's small output shard with the one-shot
     # Pallas all-gather; larger shards still take XLA's (fused_moe_rs_gather).
@@ -93,13 +104,7 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
 
         # The one-shot all-gather writes its shard at this TP rank's slot; the
         # rank must be a graph input, not a tensor built while tracing.
-        layer.register_buffer(
-            "_tpu_oneshot_rank",
-            torch.tensor(
-                [parallel.tp_rank], dtype=torch.int32, device=layer.w13_weight.device
-            ),
-            persistent=False,
-        )
+        _set_rank_buffer(layer, "_tpu_oneshot_rank", parallel.tp_rank)
         get_oneshot_all_gather_op(parallel.tp_size)
     _build_fused_moe_rs_op()
 

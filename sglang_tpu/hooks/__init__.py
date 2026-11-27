@@ -36,9 +36,7 @@ from sglang_tpu.hooks.draft_kv_pool import (
 )
 from sglang_tpu.hooks.dsa_kv_pool import size_tpu_dsa_kv_pool
 from sglang_tpu.hooks.dsv4 import hook_specs as dsv4_hooks
-from sglang_tpu.hooks.dsv4 import (
-    register_tpu_dsv4_resolution_hooks,
-)
+from sglang_tpu.hooks.dsv4 import register_tpu_dsv4_resolution_hooks
 from sglang_tpu.hooks.encoder import (
     bootstrap_encoder_worker,
     encode_indices_within_patch_budget,
@@ -114,6 +112,7 @@ from sglang_tpu.hooks.twolevel_allreduce import (
 )
 from sglang_tpu.kv_pool_host import register_unified_hicache_strategy
 from sglang_tpu.models.deepseek_v41.hooks import hook_specs as dsv41_hooks
+from sglang_tpu.rl.fp8_reload import hook_specs as fp8_reload_hooks
 
 logger = logging.getLogger(__name__)
 
@@ -484,6 +483,8 @@ HOOKS.extend(hook_specs())
 HOOKS.extend(padded_logits_sampling_hooks())
 
 HOOKS.extend(logprob_grid_hooks())
+
+HOOKS.extend(fp8_reload_hooks())
 
 if envs.SGLANG_TPU_ENABLE_TRUE_ON_POLICY.get():
     # Imported only with the mode on: the package registers its Pallas kernels at import.

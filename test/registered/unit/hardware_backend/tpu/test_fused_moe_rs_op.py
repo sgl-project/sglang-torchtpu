@@ -197,6 +197,42 @@ class TestFusedMoeRsOp(CustomTestCase):
             layer._tpu_fused_rs_group_offset, torch.tensor([768], dtype=torch.int32)
         )
 
+    def test_reload_refills_rank_buffers_in_place(self):
+        """A weight reload must restore the rank buffers WeightChecker randomized,
+        without replacing the objects direct_compile already captured."""
+        layer = torch.nn.Module()
+        layer.num_local_experts = 256
+        layer.w13_weight = torch.empty(1)
+        parallel = Mock(
+            moe_ep_size=1,
+            moe_ep_rank=0,
+            moe_tp_size=8,
+            moe_tp_rank=3,
+            tp_size=8,
+            tp_rank=3,
+        )
+
+        with (
+            patch("sglang.srt.runtime_context.get_parallel", return_value=parallel),
+            patch(
+                "sglang.srt.layers.moe.get_moe_runner_backend",
+                return_value=MoeRunnerBackend.PALLAS_TPU_FUSED_RS,
+            ),
+            patch.object(fused_moe_rs_op, "_build_fused_moe_rs_op"),
+            patch("sglang_tpu.oneshot_collectives.get_oneshot_all_gather_op"),
+        ):
+            fused_moe_rs_op.prepare_fused_moe_rs(layer)
+            group_offset = layer._tpu_fused_rs_group_offset
+            oneshot_rank = layer._tpu_oneshot_rank
+            group_offset.fill_(-12345)
+            oneshot_rank.fill_(-12345)
+            fused_moe_rs_op.prepare_fused_moe_rs(layer)
+
+        self.assertIs(layer._tpu_fused_rs_group_offset, group_offset)
+        self.assertIs(layer._tpu_oneshot_rank, oneshot_rank)
+        torch.testing.assert_close(group_offset, torch.tensor([768], dtype=torch.int32))
+        torch.testing.assert_close(oneshot_rank, torch.tensor([3], dtype=torch.int32))
+
     def test_expert_tp_routing_matches_virtual_expert_sort(self):
         import jax.numpy as jnp
         import numpy as np
