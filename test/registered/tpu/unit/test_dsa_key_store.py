@@ -2,7 +2,7 @@
 """Checks the Pallas DSA index-key writer against the XLA path, byte for byte.
 
 ``store_keys_pallas`` (decode-sized batches) must leave the index-key cache
-exactly as ``quantize_fp8_ue8m0`` + ``_store_keys`` do: same records at the
+exactly as the XLA writer does: same records at the
 same (page, row, byte), nothing else changed, padded rows not stored. Batches
 cover one token per request, several tokens of a request sharing a cache row
 (speculative verify / short extends), and padded requests.
@@ -30,20 +30,14 @@ import numpy as np
 
 from sglang.test.test_utils import CustomTestCase
 from sglang_tpu.attention.pallas.dsa_index_topk import (
-    _store_keys,
     index_key_cache_shape,
+    store_index_keys,
 )
 from sglang_tpu.attention.pallas.dsa_key_store import store_keys_pallas
-from sglang_tpu.attention.pallas.util import quantize_fp8_ue8m0
 
 _PAGE = 128
 _HEAD_DIM = 128
 _NUM_PAGES = 512
-
-
-def _xla_store(cache, key, kv, pg, cu, dist):
-    k_fp8, _, scale_byte = quantize_fp8_ue8m0(key)
-    return _store_keys(cache, k_fp8, scale_byte, kv, pg, cu, dist)
 
 
 def _pallas_store(cache, key, kv, pg, cu, dist):
@@ -76,7 +70,7 @@ class TestDsaKeyStore(CustomTestCase):
     def test_matches_xla_store(self):
         rng = np.random.default_rng(0)
         shape = index_key_cache_shape(_NUM_PAGES, _PAGE, _HEAD_DIM)
-        xla = jax.jit(_xla_store)
+        xla = jax.jit(store_index_keys)
         pallas = jax.jit(_pallas_store)
         cases = [
             (1, [1], 1),

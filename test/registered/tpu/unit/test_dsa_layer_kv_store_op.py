@@ -7,11 +7,10 @@ indexer op take, and run one registered op that updates the layer's caches in
 place. Each case drives both routes through the backend's own methods and the
 real ops on TPU tensors, from the same stale caches, and compares every cache
 byte for byte. That covers the store JAX, the op's registration and in-place
-update, its operand order, and the latent store form and scale; both index-key
-writers run through the op. Cases run the attention through the per-query op
-and through the q-block prefill op. One plain and one pooled case also run the
-store op inside a fullgraph torch.compile, where its in-place update must
-survive functionalization.
+update, its operand order, and the latent store form and scale. Cases run the
+attention through the per-query op and the q-block prefill op. One plain and
+one pooled case also run the store op inside a fullgraph torch.compile,
+where its in-place update must survive functionalization.
 
 Needs a TPU (torch_tpu); skipped otherwise. The attention / indexer token
 splits need several chips, and the pooled indexer's raw ring is off by
@@ -59,8 +58,7 @@ def _step(lens, *, token_bucket, is_decode, padded_rows, zero_rope, kpool):
     0's first page, a slot no real token of these cases writes, so a padded
     row that stored anything would change it.
     """
-    from sglang_tpu.attention.pallas.dsa_index_topk import index_key_cache_shape
-    from sglang_tpu.attention.pallas.dsa_kpool_topk import pooled_record_bytes
+    from sglang_tpu.kv_pool import TpuSplitMLATokenToKVPool
 
     gen = torch.Generator().manual_seed(len(lens) * 7 + token_bucket + kpool)
     num_active = len(lens)
@@ -103,18 +101,22 @@ def _step(lens, *, token_bucket, is_decode, padded_rows, zero_rope, kpool):
         if zero_rope
         else stale(num_pages, _PAGE_SIZE // 4, 4, 128),
     }
-    if kpool == 1:
-        record = index_key_cache_shape(num_pages, _PAGE_SIZE, _INDEX_DIM)[-1]
-        caches["index_k"] = stale(num_pages, _PAGE_SIZE // 4, 4, record)
-    else:
+    layout, index_shape = TpuSplitMLATokenToKVPool._index_key_cache_spec(
+        num_pages, _PAGE_SIZE, _INDEX_DIM, kpool
+    )
+    # Arbitrary bytes in a packed FP32 scale can be NaN.
+    caches["index_k"] = (
+        torch.zeros(index_shape, dtype=torch.uint8)
+        if layout == "packed"
+        else stale(*index_shape)
+    )
+    if kpool > 1:
         caches["raw"] = stale(
             num_pages, _PAGE_SIZE, 2 * _INDEX_DIM, dtype=torch.bfloat16
         )
-        caches["index_k"] = stale(
-            num_pages, _PAGE_SIZE // kpool // 4, 4, pooled_record_bytes(_INDEX_DIM)
-        )
     return SimpleNamespace(
         kpool=kpool,
+        index_key_layout=layout,
         zero_rope=zero_rope,
         aliased_page=int(table[0, 0]),
         metadata=SimpleNamespace(
@@ -186,6 +188,7 @@ def _backend(step, *, qblock_prefill):
         kv_cache_quant_dtype=_FP8,
         forward_metadata=step.metadata,
         token_to_kv_pool=SimpleNamespace(
+            index_key_layout=step.index_key_layout,
             get_nope_cache=functools.partial(cache, "nope", expected=_ATTENTION_LAYER),
             get_rope_cache=functools.partial(cache, "rope", expected=_ATTENTION_LAYER),
             get_index_key_cache=functools.partial(
@@ -223,9 +226,12 @@ def _backend(step, *, qblock_prefill):
     return backend, caches
 
 
-def _store_compiled(backend, step, *, layer, key_store):
+def _store_compiled(backend, step, *, layer):
     """The store op of ``backend``'s route, called inside a fullgraph compile."""
-    from sglang_tpu.attention_pallas_mla_sparse import _kpool_query_bound
+    from sglang_tpu.attention_pallas_mla_sparse import (
+        _index_key_writer,
+        _kpool_query_bound,
+    )
     from sglang_tpu.dsa_layer_kv_store_op import (
         call_op,
         plain_store_op_name,
@@ -263,6 +269,7 @@ def _store_compiled(backend, step, *, layer, key_store):
             md.kv_lens,  # raw_page_base stand-in without a raw ring
         )
     else:
+        key_store = _index_key_writer(pool, step.index_keys, None)
 
         def run(*args):
             call_op(plain_store_op_name(key_store, write_rope=write_rope), *args)
@@ -281,9 +288,7 @@ def _store_compiled(backend, step, *, layer, key_store):
 
 @unittest.skipIf(_no_tpu(), "needs torch_tpu and a TPU")
 class TestStoreLayerKv(CustomTestCase):
-    def _assert_same_caches(
-        self, step, *, key_store="xla", qblock_prefill=False, compiled=False
-    ):
+    def _assert_same_caches(self, step, *, qblock_prefill=False, compiled=False):
         from sglang_tpu.attention_pallas_mla_sparse import (
             TpuPallasSparseMlaAttnBackend as Backend,
         )
@@ -316,9 +321,7 @@ class TestStoreLayerKv(CustomTestCase):
                 kpool=step.kpool,
             )
         else:
-            Backend.index_topk(
-                full, **index_args, key=step.index_keys, key_store=key_store
-            )
+            Backend.index_topk(full, **index_args, key=step.index_keys)
         Backend._forward_mla(
             full,
             step.q,
@@ -339,15 +342,13 @@ class TestStoreLayerKv(CustomTestCase):
             k_rope=step.k_rope,
         )
         if compiled:
-            _store_compiled(only, step, layer=layer, key_store=key_store)
+            _store_compiled(only, step, layer=layer)
         elif step.kpool > 1:
             Backend.store_layer_kv_pooled(
                 only, **store_args, keys=step.index_keys, gates=step.gates, ape=step.ape
             )
         else:
-            Backend.store_layer_kv(
-                only, **store_args, index_keys=step.index_keys, key_store=key_store
-            )
+            Backend.store_layer_kv(only, **store_args, index_keys=step.index_keys)
 
         for name, before in step.caches.items():
             want, got = full_caches[name].cpu(), only_caches[name].cpu()
@@ -361,7 +362,9 @@ class TestStoreLayerKv(CustomTestCase):
         page = step.aliased_page
         slot0 = {"nope": (page, 0), "rope": (page, 0, 0), "raw": (page, 0)}
         if step.kpool == 1:
-            slot0["index_k"] = (page, 0, 0)
+            slot0["index_k"] = (
+                (page, ..., 0) if step.index_key_layout == "packed" else (page, 0, 0)
+            )
         if step.zero_rope:
             del slot0["rope"]
         if step.kpool == 1:
@@ -396,19 +399,6 @@ class TestStoreLayerKv(CustomTestCase):
             kpool=1,
         )
         self._assert_same_caches(step, qblock_prefill=True)
-
-    def test_plain_decode_on_either_key_writer(self):
-        step = _step(
-            [(1, 300), (1, 37)],
-            token_bucket=4,
-            is_decode=True,
-            padded_rows=2,
-            zero_rope=False,
-            kpool=1,
-        )
-        for key_store in ("xla", "pallas"):
-            with self.subTest(key_store=key_store):
-                self._assert_same_caches(step, key_store=key_store)
 
     def test_pooled_indexer_without_rope(self):
         # GLM-5.3-Flash's draft layer: pooled indexer (kpool 4), no rope lane.

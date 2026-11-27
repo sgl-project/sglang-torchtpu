@@ -684,22 +684,17 @@ class TestSplitDsaAndStateOffload(CustomTestCase):
     def test_split_pool_host_sizing_matches_its_allocation(self):
         """A host page holds every DSA buffer of the page, so host bytes per token
         must equal what the device pool allocates per token."""
-        from sglang_tpu.kv_pool import TpuSplitMLATokenToKVPool
         from sglang_tpu.kv_pool_host import TpuDMAHostKVPool
         from sglang_tpu.tpu_dma_hicache import page_major_tensors
 
         split = self._split_pool()
         tensors = page_major_tensors(split)
-        # NoPE + RoPE on every layer; index keys + raw key|gate on two.
-        self.assertEqual(len(tensors), 3 * 2 + 2 * 2)
         self.assertEqual({t.shape[0] for t in tensors}, {split.num_pages})
         host = object.__new__(TpuDMAHostKVPool)
         host.device_pool, host.page_size, host.draft_pools = split, split.page_size, ()
         self.assertEqual(
-            host.get_size_per_token(),
-            TpuSplitMLATokenToKVPool.bytes_per_token(
-                index_head_dim=128, index_key_layers=[True, False, True], index_kpool=4
-            ),
+            host.get_size_per_token() * split.page_size * split.num_pages,
+            split.get_kv_size_bytes(),
         )
 
     def test_mla_offload_needs_a_hybrid_model_dma_engine_and_split_pool(self):

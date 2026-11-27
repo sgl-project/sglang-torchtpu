@@ -327,6 +327,24 @@ def _split_pool(pool):
     return pool.full_kv_pool if isinstance(pool, HybridLinearKVPool) else pool
 
 
+_PALLAS_KEY_STORE_MAX_TOKENS = 16
+
+
+def _index_key_writer(pool, keys: torch.Tensor, record_writer: str | None) -> str:
+    if _split_pool(pool).index_key_layout == "packed":
+        return "packed"
+    if record_writer is not None:
+        return record_writer
+    # The record Pallas writer walks the tokens serially (~1 us per token).
+    if (
+        keys.shape[0] <= _PALLAS_KEY_STORE_MAX_TOKENS
+        and keys.shape[-1] % 128 == 0
+        and tpu_envs.SGLANG_TPU_DSA_PALLAS_KEY_STORE.get()
+    ):
+        return "pallas"
+    return "xla"
+
+
 class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
     """``pallas_tpu_mla`` with sparse attention: it runs the DSA indexer too."""
 
@@ -579,7 +597,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         key: torch.Tensor,  # [num_tokens, index_head_dim]
         head_weights: torch.Tensor,  # [num_tokens, index_n_heads]
         weight_scale: float,
-        key_store: str = "xla",
+        key_store: str | None = None,
     ) -> torch.Tensor:
         """Run one layer's indexer: store its index keys, return its top-k rows.
 
@@ -588,6 +606,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         positions, counted from the start of the token's own sequence. The
         chosen positions come first and the rest of the row is ``-1``.
         """
+        key_store = _index_key_writer(self.token_to_kv_pool, key, key_store)
         metadata = self.forward_metadata
         num_tokens = query.shape[0]
         split_rows = self._indexer_split_rows(forward_batch, num_tokens)
@@ -914,7 +933,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         k: torch.Tensor,  # [num_tokens, 1, kv_lora_rank], as _forward_mla's k
         k_rope: torch.Tensor,  # [num_tokens, 1, rope_dim], as _forward_mla's k_rope
         index_keys: torch.Tensor,  # [num_tokens, index_head_dim], as index_topk's key
-        key_store: str,
+        key_store: str | None = None,
     ) -> None:
         """Plain DSA: store one layer's latents and index keys, without
         attending or scoring.
@@ -927,6 +946,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             raise NotImplementedError(
                 "the pooled indexer stores through store_layer_kv_pooled"
             )
+        key_store = _index_key_writer(self.token_to_kv_pool, index_keys, key_store)
         new_kv_c, new_k_pe = self._latents_for_store(layer=layer, k=k, k_rope=k_rope)
         metadata = self.forward_metadata
         call_op(

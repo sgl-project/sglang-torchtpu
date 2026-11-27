@@ -778,6 +778,7 @@ def _validate_dsa(server_args) -> None:
     from sglang.srt.arg_groups.overrides import resolving_view
     from sglang.srt.configs.model_config import is_deepseek_dsa
     from sglang.srt.hf_transformers.config import get_config
+    from sglang_tpu.envs import envs as tpu_envs
 
     cfg = resolving_view(server_args)
     try:
@@ -809,6 +810,20 @@ def _validate_dsa(server_args) -> None:
         raise ValueError(
             "DSA on TPU does not support index_init_tokens or index_local_tokens "
             f"yet; the checkpoint sets them to {init_tokens} and {local_tokens}."
+        )
+    if (
+        tpu_envs.SGLANG_TPU_DSA_PACKED_INDEX_CACHE.get()
+        and cfg.page_size in (128, 256)
+        and getattr(hf_config, "index_head_dim", None) == 128
+        and getattr(hf_config, "index_kpool", 1) == 1
+        and (
+            getattr(hf_config, "index_n_heads", None) != 32
+            or tpu_envs.SGLANG_TPU_ENABLE_K3_DECODE_MEGAKERNEL.get()
+        )
+    ):
+        raise ValueError(
+            "SGLANG_TPU_DSA_PACKED_INDEX_CACHE requires 32 index heads and "
+            "the Pallas DSA indexer. The K3 megakernel reads record pages."
         )
     _validate_kpool_raw_ring(cfg)
 

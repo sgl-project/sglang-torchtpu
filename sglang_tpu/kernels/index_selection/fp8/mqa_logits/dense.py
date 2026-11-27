@@ -1,5 +1,4 @@
 # Adapted from vllm-project/vllm-torchtpu (Apache-2.0).
-# Source: src/vllm_torchtpu/kernels/deepseek_v41/index_selection/fp8/dense_logits.py
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Paged FP8 MQA logits for TPU v7."""
@@ -14,19 +13,18 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang_tpu.kernels.index_selection.fp8.cache import (
-    PAGE_RECORDS,
-    PAGE_ROWS,
-    PackedFP8Layout,
-)
 from sglang_tpu.kernels.index_selection.fp8.mqa_logits.utils import (
     QueryTile,
-    _dma_rows,
-    _head_order,
-    _next_query_tile,
-    _reduce_heads,
-    _reduce_on_mxu,
-    _weighted_selector,
+    dma_rows,
+    head_order,
+    next_query_tile,
+    reduce_heads,
+    reduce_on_mxu,
+    weighted_selector,
+)
+from sglang_tpu.kernels.index_selection.fp8.pages import (
+    TOKENS_PER_ROW,
+    page_rows,
 )
 from sglang_tpu.kernels.index_selection.fp8.tuned import (
     PACKED_FP8_MQA_CONFIG,
@@ -39,15 +37,12 @@ from sglang_tpu.kernels.index_selection.fp8.tuned import (
 _ISSUE_DEPTH = 8
 
 
-def _encode_page_table(page_ids, layout, first_bank_rows):
-    """Records hold the bank-local row << 2, a valid bit and the bank bit."""
-    valid = (page_ids >= 0) & (page_ids < layout.pages)
+def _encode_page_table(page_ids, pages, rows):
+    """Records hold the page's first word row << 1 and a valid bit."""
+    valid = (page_ids >= 0) & (page_ids < pages)
     # Spread masked reads: repeating page zero serializes a partially filled tile.
-    safe = jnp.where(valid, page_ids, jnp.arange(page_ids.shape[-1]) % layout.pages)
-    global_rows = layout.page_offset + safe * layout.page_stride
-    bank = (global_rows >= first_bank_rows).astype(jnp.int32)
-    local_rows = global_rows - bank * first_bank_rows
-    return (local_rows << 2) | (valid.astype(jnp.int32) << 1) | bank
+    safe = jnp.where(valid, page_ids, jnp.arange(page_ids.shape[-1]) % pages)
+    return ((safe * rows) << 1) | valid.astype(jnp.int32)
 
 
 def _pick(future, ends, values):
@@ -61,12 +56,19 @@ def _pick(future, ends, values):
 class _DenseKernel:
     """Refs and static tiling of one call."""
 
-    def __init__(self, smem, inputs, refs, config, info, layout, reuse_keys):
+    def __init__(self, smem, inputs, refs, config, info, reuse_keys, skip_tail_padding):
         self.out, scratch = refs
         self.offsets, self.lengths, query_start = smem
-        self.config, self.layout, self.reuse_keys = config, layout, reuse_keys
+        self.config, self.reuse_keys = config, reuse_keys
+        self.skip_tail_padding = skip_tail_padding
         self.mxu_size, self.sublanes = info.mxu_column_size, info.num_sublanes
-        self.q, weights, self.pool, self.table = inputs
+        self.q, weights, cache, self.table = inputs
+        _, fields, _, page_size = cache.shape
+        self.page_size, self.page_rows = page_size, page_rows(cache.shape)
+        self.key_words = fields - 1
+        self.pool = cache.bitcast(jnp.int32).reshape(
+            cache.shape[0] * self.page_rows, TOKENS_PER_ROW
+        )
         buffers, semaphores = scratch
         self.queries, keys, self.scores, self.counts, self.pages, self.padding = (
             buffers[:6]
@@ -81,7 +83,7 @@ class _DenseKernel:
         self.end = self.begin + self.out.shape[0]
         self.q_tile, self.key_tile = config.query_tile, config.key_tile
         self.page_count = self.table.shape[-1]
-        self.tile_pages = self.key_tile // layout.page_size
+        self.tile_pages = self.key_tile // page_size
         self.tiles = self.out.shape[1] // self.key_tile
         self.fragments = self.key_tile // self.mxu_size
         # Partial tiles whose rows all end in the first half score only that
@@ -89,12 +91,12 @@ class _DenseKernel:
         self.half = pl.cdiv(pl.cdiv(self.fragments, 2), 4) * 4
         # Pages past a half tile's live part issue from a dynamic loop:
         # unrolling them all costs code size and scalar issue slots.
-        half_pages = pl.cdiv(self.half * self.mxu_size, layout.page_size)
+        half_pages = pl.cdiv(self.half * self.mxu_size, page_size)
         self.half_pages = half_pages if self.half < self.fragments else self.tile_pages
         self.rest_pages = self.tile_pages - self.half_pages
         self.rest_chunk = next(c for c in (8, 6, 4, 2, 1) if self.rest_pages % c == 0)
         owners = jnp.repeat(jnp.arange(self.q_tile), self.heads)[:, None]
-        owners = _head_order(owners, self.q_tile, self.sublanes)[:, 0]
+        owners = head_order(owners, self.q_tile, self.sublanes)[:, 0]
         selector = jnp.arange(self.q_tile)[:, None] == owners[None, :]
         self.selector = selector.astype(jnp.bfloat16)
 
@@ -107,32 +109,24 @@ class _DenseKernel:
         if zero:
             dst[...] = jnp.zeros(dst.shape, dst.dtype)
         sem = self.q_sem.at[slot]
-        _dma_rows(self.q, dst, sem, query.count, wait, src_start=query.start)
+        dma_rows(self.q, dst, sem, query.count, wait, src_start=query.start)
 
     def release_outputs(self, pair):
         # counts: rows pending per score slot [0, 4), [4, 6) unused and
         # -inf padding row copies [6, 8) per query slot.
         for slot in (2 * pair, 2 * pair + 1)[: self.tiles]:
             src = self.scores.at[slot]
-            _dma_rows(src, src, self.write_sem.at[slot], self.counts[slot], wait=True)
+            dma_rows(src, src, self.write_sem.at[slot], self.counts[slot], wait=True)
         src = self.padding.at[pl.ds(0, 1)]
         dst = self.out.at[pl.ds(0, 1), pl.ds(0, self.key_tile)]
         row = pltpu.make_async_copy(src, dst, self.pad_sem.at[pair])
         lax.fori_loop(0, self.counts[6 + pair], lambda i, _: row.wait(), None)
 
     def load_page(self, i, page_slot, slot):
-        record = self.page_record(i, page_slot)
-        address = lax.shift_right_logical(record, jnp.int32(2))
-        loads = [partial(self._start_load, b, address, i, slot) for b in (0, 1)]
-        if len(self.pool) == 1:
-            loads[0]()
-        else:
-            lax.cond((record & 1) == 0, *loads)
-
-    def _start_load(self, bank, address, i, slot):
-        rows = self.layout.page_rows
+        address = lax.shift_right_logical(self.page_record(i, page_slot), jnp.int32(1))
+        rows = self.page_rows
         pltpu.make_async_copy(
-            self.pool[bank].at[pl.ds(address, rows)],
+            self.pool.at[pl.ds(address, rows)],
             self.keys.at[slot, pl.ds(i * rows, rows)],
             self.read_sem.at[slot],
         ).start()
@@ -157,7 +151,7 @@ class _DenseKernel:
         pltpu.make_async_copy(src, src, self.read_sem.at[slot]).wait()
 
     def next_query(self, query):
-        return _next_query_tile(query, self.offsets, self.q_tile, self.end)
+        return next_query_tile(query, self.offsets, self.q_tile, self.end)
 
     def row_ids(self, query):
         last = self.tokens - 1
@@ -223,7 +217,7 @@ class _QueryBlock:
         k, slot = self.k, self.output_slot(tile)
         src, sem = k.scores.at[slot], k.write_sem.at[slot]
         dst = k.out.at[:, pl.ds(tile * k.key_tile, k.key_tile)]
-        _dma_rows(src, dst, sem, self.query.count, wait, dst_start=self.first_row)
+        dma_rows(src, dst, sem, self.query.count, wait, dst_start=self.first_row)
 
     def owner(self, future):
         """Request row and local tile of a future tile."""
@@ -258,34 +252,34 @@ class _QueryBlock:
         part's fields are a sublane-strided load and need no relayout.
         """
         k = self.k
-        parts = k.layout.page_size // PAGE_RECORDS
+        parts = k.page_size // TOKENS_PER_ROW
         page, part = divmod(part, parts)
-        start = page * k.layout.page_rows + field * parts + part
+        start = page * k.page_rows + field * parts + part
         rows = pl.ds(start, count, None if parts == 1 else parts)
         return k.keys[self.key_slot(tile), rows]
 
     def qk(self, tile, fragment):
         k = self.k
-        per_fragment = k.mxu_size // PAGE_RECORDS
+        per_fragment = k.mxu_size // TOKENS_PER_ROW
         pages = range(fragment * per_fragment, (fragment + 1) * per_fragment)
-        rows = [self.key_rows(tile, p, 0, PAGE_ROWS - 1) for p in pages]
+        rows = [self.key_rows(tile, p, 0, k.key_words) for p in pages]
         rhs = jnp.concatenate([pltpu.bitcast(r, k.q.dtype) for r in rows], axis=1)
         logits = lax.dot(self.lhs, rhs, preferred_element_type=jnp.float32)
         return jnp.maximum(logits.astype(jnp.bfloat16), jnp.bfloat16(0))
 
     def store(self, tile, fragment, values, remaining):
         k = self.k
-        for offset in range(0, k.mxu_size, PAGE_RECORDS):
-            local_page = (fragment * k.mxu_size + offset) // PAGE_RECORDS
-            page = local_page // (k.layout.page_size // PAGE_RECORDS)
-            valid = (k.page_record(page, self.page_slot(tile)) & 2) != 0
-            scale = self.key_rows(tile, local_page, PAGE_ROWS - 1, 1)
+        for offset in range(0, k.mxu_size, TOKENS_PER_ROW):
+            local_page = (fragment * k.mxu_size + offset) // TOKENS_PER_ROW
+            page = local_page // (k.page_size // TOKENS_PER_ROW)
+            valid = (k.page_record(page, self.page_slot(tile)) & 1) != 0
+            scale = self.key_rows(tile, local_page, k.key_words, 1)
             scale = lax.bitcast_convert_type(scale, jnp.float32)
-            scaled = values[:, offset : offset + PAGE_RECORDS] * scale
-            column = local_page * PAGE_RECORDS
+            scaled = values[:, offset : offset + TOKENS_PER_ROW] * scale
+            column = local_page * TOKENS_PER_ROW
             bound = jnp.where(valid, column, jnp.iinfo(jnp.int32).max)
             scaled = jnp.where(remaining > bound, scaled, -jnp.inf)
-            k.scores[self.output_slot(tile), :, pl.ds(column, PAGE_RECORDS)] = scaled
+            k.scores[self.output_slot(tile), :, pl.ds(column, TOKENS_PER_ROW)] = scaled
 
     def emit_tile(self, tile, prefetch, count):
         """Score the first `count` fragments of `tile`; the rest are -inf."""
@@ -293,7 +287,7 @@ class _QueryBlock:
         metadata, following = self.page_slot(tile + 2), self.key_slot(tile + 2)
         if prefetch:
             self.load_table(tile + 2, wait=True)
-        base = tile * k.key_tile + jnp.arange(PAGE_RECORDS)
+        base = tile * k.key_tile + jnp.arange(TOKENS_PER_ROW)
         remaining = jnp.maximum(self.lengths_vector, 0)[:, None] - base[None, :]
         pending, depth = {}, k.config.issue_depth
         # Half tiles interleave only the first half of the next tile's
@@ -301,7 +295,7 @@ class _QueryBlock:
         split = count < k.fragments
         inline_pages = k.half_pages if split else k.tile_pages
         stages = count + depth if split else max(count + depth, k.fragments)
-        page_size = k.layout.page_size
+        page_size = k.page_size
         for stage in range(stages):
             first = min(pl.cdiv(stage * k.mxu_size, page_size), inline_pages)
             last = min(pl.cdiv((stage + 1) * k.mxu_size, page_size), inline_pages)
@@ -315,9 +309,9 @@ class _QueryBlock:
                 # Keyed to the tuned depth, so another issue depth keeps each
                 # fragment's head-sum arithmetic.
                 tuned = fragment + PACKED_FP8_MQA_CONFIG.issue_depth
-                mxu = _reduce_on_mxu(fragment, tuned, count, every=4, drain=4)
+                mxu = reduce_on_mxu(fragment, tuned, count, every=4, drain=4)
                 products = pending.pop(fragment)
-                values = _reduce_heads(
+                values = reduce_heads(
                     products, *self.reduction, sublanes=k.sublanes, use_mxu=mxu
                 )
                 self.store(tile, fragment, values, remaining)
@@ -364,7 +358,7 @@ class _QueryBlock:
         k = self.k
         dst = k.out.at[:, pl.ds(tile * k.key_tile, k.key_tile)]
         sem = k.pad_sem.at[self.q_slot]
-        _dma_rows(k.padding, dst, sem, self.query.count, dst_start=self.first_row)
+        dma_rows(k.padding, dst, sem, self.query.count, dst_start=self.first_row)
 
     def run(self):
         k, query, q_slot = self.k, self.query, self.q_slot
@@ -389,11 +383,11 @@ class _QueryBlock:
         k.copy_queries(query, q_slot, wait=True)
         rows = k.row_ids(query)
         weight = jnp.concatenate([k.weights[r][:, None] for r in rows])
-        selector = _weighted_selector(k.selector, k.weights, rows, sublanes=k.sublanes)
-        self.reduction = (_head_order(weight, k.q_tile, k.sublanes), selector)
+        selector = weighted_selector(k.selector, k.weights, rows, sublanes=k.sublanes)
+        self.reduction = (head_order(weight, k.q_tile, k.sublanes), selector)
         queries = k.queries[pl.ds(q_slot * k.q_tile, k.q_tile)]
         queries = queries.reshape(k.q_tile * k.heads, k.dim)
-        self.lhs = _head_order(queries, k.q_tile, k.sublanes)
+        self.lhs = head_order(queries, k.q_tile, k.sublanes)
         if k.tiles == 1:
             pl.when(scored)(partial(self.step_tile, jnp.int32(0), None))
         else:
@@ -404,8 +398,9 @@ class _QueryBlock:
         for local in range(min(k.tiles, 2)):
             live = jnp.where(self.tile_count > local, query.count, 0)
             k.counts[2 * q_slot + local] = live
-        lax.fori_loop(self.tile_count, k.tiles, self.pad_tile, None)
-        k.counts[6 + q_slot] = (k.tiles - self.tile_count) * query.count
+        if not k.skip_tail_padding:
+            lax.fori_loop(self.tile_count, k.tiles, self.pad_tile, None)
+            k.counts[6 + q_slot] = (k.tiles - self.tile_count) * query.count
 
         ready = jnp.minimum(2, self.next_tiles + self.ahead_tiles)
         if k.reuse_keys:
@@ -422,16 +417,16 @@ def _kernel(static, offsets, lengths, query_start, inputs, *refs):
 
 @jax.jit(
     static_argnames=(
-        "cache_layout",
         "max_model_len",
         "query_size",
         "query_count",
         "reuse_keys",
+        "skip_tail_padding",
     )
 )
 def fp8_paged_mqa_logits(
     q: jax.Array,
-    kv_cache: jax.Array | tuple[jax.Array, jax.Array],
+    kv_cache: jax.Array,
     weights: jax.Array,
     context_lens: jax.Array,
     block_table: jax.Array,
@@ -440,16 +435,16 @@ def fp8_paged_mqa_logits(
     max_model_len: int,
     q_scale: jax.Array,
     query_size: int,
-    cache_layout: PackedFP8Layout | None = None,
     query_start: jax.Array | int = 0,
     query_count: int | None = None,
     reuse_keys: bool = False,
+    skip_tail_padding: bool = False,
 ) -> jax.Array:
-    """Return FP32 scores for the query window, with invalid positions set to -inf.
+    """Return FP32 scores for the query window (invalid positions default to -inf).
 
     Args:
         q: FP8 E4M3FN [T,32,128], in request order.
-        kv_cache: One or two int32 [rows,128] banks in fp8.cache format.
+        kv_cache: Uint8 [pages,33,4,page_size] cache in fp8.pages format.
         weights: FP32 [T,32]; weighted BF16 products must be finite.
         context_lens: Int32 [T] visible index-key counts, zero for padding.
         block_table: Int32 [G,P] page IDs covering the requested output width.
@@ -457,24 +452,19 @@ def fp8_paged_mqa_logits(
         max_model_len: Nonnegative output width in index keys.
         q_scale: FP32 [T,32] query scales; K scales reside inside each page.
         query_size: Static query-tile bound, normally speculative tokens+1.
-        cache_layout: Shared cache placement; None means tightly packed pages.
         query_start: First query to read from the full input arrays and offsets.
         query_count: Output rows; defaults to the full query batch.
         reuse_keys: Keep a single complete K tile resident across query groups
             belonging to the same request. Multi-tile outputs retain prefetching.
+        skip_tail_padding: Leave fully out-of-range key tiles unwritten when
+            the consumer masks scores using the same context lengths.
     """
     tokens, heads, dim = q.shape
     tokens = tokens if query_count is None else query_count
-    banks = kv_cache if isinstance(kv_cache, tuple) else (kv_cache,)
-    bank_rows = tuple(bank.shape[0] for bank in banks)
-    layout = cache_layout or PackedFP8Layout(sum(bank_rows) // PAGE_ROWS)
-    layout.validate(bank_rows)
-    if layout.page_size % PAGE_RECORDS:
-        raise ValueError(
-            f"Dense FP8 scoring requires pages of whole {PAGE_RECORDS}-record parts"
-        )
+    pages, _, _, page_size = kv_cache.shape
+    rows_per_page = page_rows(kv_cache.shape)
     tile, config = paged_mqa_query_tile(query_size, heads), PACKED_FP8_MQA_CONFIG
-    key_tile = paged_mqa_key_tile(max_model_len, layout.page_size, config.key_tile)
+    key_tile = paged_mqa_key_tile(max_model_len, page_size, config.key_tile)
     config = replace(
         config, query_tile=tile, key_tile=key_tile, issue_depth=_ISSUE_DEPTH
     )
@@ -482,16 +472,16 @@ def fp8_paged_mqa_logits(
     if tokens == 0 or width == 0:
         return jnp.empty((tokens, max_model_len), jnp.float32)
     info = cast(pltpu.TpuInfo, pltpu.get_tpu_info())
-    page_count = width // layout.page_size
-    tile_pages = config.key_tile // layout.page_size
+    page_count = width // page_size
+    tile_pages = config.key_tile // page_size
     page_ids = block_table[:, :page_count]
     pad = ((0, 0), (0, page_count - page_ids.shape[1]))
     page_ids = jnp.pad(page_ids, pad, constant_values=-1)
-    table = _encode_page_table(page_ids, layout, banks[0].shape[0])
+    table = _encode_page_table(page_ids, pages, rows_per_page)
     page_count = pl.cdiv(tile_pages, info.num_lanes) * info.num_lanes
     table = table.reshape(page_ids.shape[0], -1, tile_pages)
     table = jnp.pad(table, ((0, 0), (0, 0), (0, page_count - tile_pages)))
-    dma, key_rows = pltpu.SemaphoreType.DMA, tile_pages * layout.page_rows
+    dma, key_rows = pltpu.SemaphoreType.DMA, tile_pages * rows_per_page
     scratch = (
         (
             pltpu.VMEM((2 * tile, heads, dim), q.dtype),
@@ -504,9 +494,9 @@ def fp8_paged_mqa_logits(
         tuple(dma(s) for s in ((config.key_buffers,), (4, tile), (2,), (4,), (2,))),
     )
     hbm, vmem = (pl.BlockSpec(memory_space=s) for s in (pltpu.HBM, pltpu.VMEM))
-    inputs = (q, weights * q_scale, banks, table)
+    inputs = (q, weights * q_scale, kv_cache, table)
     reuse_keys = reuse_keys and width == config.key_tile
-    kernel = partial(_kernel, (config, info, layout, reuse_keys))
+    kernel = partial(_kernel, (config, info, reuse_keys, skip_tail_padding))
     out_shape = jax.ShapeDtypeStruct((tokens, width), jnp.float32)
     result = pl.pallas_call(
         kernel,
@@ -514,7 +504,7 @@ def fp8_paged_mqa_logits(
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
             grid=(1,),
-            in_specs=((hbm, vmem, tuple(hbm for _ in banks), hbm),),
+            in_specs=((hbm, vmem, hbm, hbm),),
             out_specs=hbm,
             scratch_shapes=(scratch,),
         ),

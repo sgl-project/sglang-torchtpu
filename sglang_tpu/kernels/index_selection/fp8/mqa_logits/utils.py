@@ -1,5 +1,4 @@
 # Adapted from vllm-project/vllm-torchtpu (Apache-2.0).
-# Source: src/vllm_torchtpu/kernels/deepseek_v41/index_selection/fp8/common.py
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Query grouping and packed head reductions shared by FP8 MQA kernels."""
@@ -20,7 +19,7 @@ class QueryTile(NamedTuple):
     page_row: jax.Array
 
 
-def _next_query_tile(query, offsets, tile_size, end):
+def next_query_tile(query, offsets, tile_size, end):
     start = query.start + query.count
     request = lax.while_loop(
         lambda r: (r < offsets.shape[0] - 2) & (start >= offsets[r + 1]),
@@ -43,7 +42,7 @@ def _head_groups(queries, heads, sublanes):
         start += count
 
 
-def _head_order(x, queries, sublanes):
+def head_order(x, queries, sublanes):
     heads, width = x.shape[0] // queries, x.shape[-1]
     x = x.reshape(queries, heads, width)
     parts = []
@@ -62,7 +61,7 @@ def _head_order(x, queries, sublanes):
 
 
 def _head_columns(queries, heads, sublanes):
-    """Head index of each head-ordered row, matching `_head_order`.
+    """Head index of each head-ordered row, matching `head_order`.
 
     Built from iota arithmetic so Pallas kernels capture no constants.
     """
@@ -80,7 +79,7 @@ def _head_columns(queries, heads, sublanes):
     return columns
 
 
-def _weighted_selector(selector, weights, rows, *, sublanes):
+def weighted_selector(selector, weights, rows, *, sublanes):
     """Fold per-query head weights into the MXU head-reduction selector."""
     queries, heads = selector.shape[0], weights.shape[-1]
     columns = _head_columns(queries, heads, sublanes)
@@ -96,14 +95,14 @@ def _weighted_selector(selector, weights, rows, *, sublanes):
     return (selector.astype(jnp.float32) * expanded).astype(jnp.bfloat16)
 
 
-def _reduce_on_mxu(fragment, stage, count, *, every, drain=0):
+def reduce_on_mxu(fragment, stage, count, *, every, drain=0):
     """Every `every`-th fragment, and the first `drain` drain stages, use the MXU."""
     if stage < count:
         return fragment % every == every - 1
     return stage - count < drain
 
 
-def _reduce_heads(products, weights, selector, *, sublanes, use_mxu):
+def reduce_heads(products, weights, selector, *, sublanes, use_mxu):
     """Weighted head sums; MXU fragments take weights from ``selector``."""
     if use_mxu:
         return lax.dot(selector, products, preferred_element_type=jnp.float32)
@@ -132,7 +131,7 @@ def _reduce_heads(products, weights, selector, *, sublanes, use_mxu):
     return cast(jax.Array, values)[:queries]
 
 
-def _dma_rows(src, dst, sem, count, wait=False, src_start=0, dst_start=0):
+def dma_rows(src, dst, sem, count, wait=False, src_start=0, dst_start=0):
     for local in range(min(src.shape[0], dst.shape[0])):
 
         @pl.when(local < count)

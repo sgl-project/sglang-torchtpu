@@ -5,7 +5,7 @@ size_tpu_dsa_kv_pool
   Why: DefaultPoolConfigurator sizes a DSA pool with the GPU layout (an
        FP8-scaled MLA latent and a 132-byte index key per layer). The TPU split
        pool stores a rope row padded to one lane (none for a model without
-       rope dims), a 256-byte index-key record
+       rope dims), a 256-byte index-key record (132 bytes when packed)
        and, for a pooled indexer, a bf16 key + gate per token. Sized from free
        memory, the pool then oversubscribes HBM (2.1x for GLM-5.3-Flash) and the
        first compile runs out of memory.
@@ -43,6 +43,7 @@ def _split_pool_bytes(kvc, *, layer_ids, all_index_layers: bool) -> int:
     hf_config = kvc.model_config.hf_config
     kpool = get_dsa_index_kpool(hf_config)
     return TpuSplitMLATokenToKVPool.bytes_per_token(
+        page_size=kvc.pool_page_size,
         index_head_dim=get_dsa_index_head_dim(hf_config),
         # As the pool builders: a draft computes its own top-k.
         index_key_layers=[

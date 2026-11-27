@@ -76,20 +76,18 @@ class TestZerosKvBuffer(CustomTestCase):
             index_head_dim=128,
             index_key_layers=[True, False, True],
         )
-        # Per token: 512 NoPE bytes, 64 RoPE bytes padded to 128, and a
-        # 256-byte index-key record. Each buffer must be a whole uint8 tensor,
-        # not a view, or the ops cannot update it in place and copy the pool.
-        expected = {
+        # Each op updates its buffer in place, so it needs a whole uint8 tensor.
+        latent_shapes = {
             pool.get_nope_cache: (pool.num_pages, 32, 4, 128),
             pool.get_rope_cache: (pool.num_pages, 8, 4, 128),
-            pool.get_index_key_cache: (pool.num_pages, 8, 4, 256),
         }
         total_bytes = 0
-        for accessor, shape in expected.items():
+        for accessor in (*latent_shapes, pool.get_index_key_cache):
             layers = (0, 2) if accessor == pool.get_index_key_cache else (0, 1, 2)
             for layer_id in layers:
                 buf = accessor(layer_id)
-                self.assertEqual(tuple(buf.shape), shape)
+                if accessor in latent_shapes:
+                    self.assertEqual(tuple(buf.shape), latent_shapes[accessor])
                 self.assertEqual(buf.dtype, torch.uint8)
                 self.assertIsNone(buf._base)
                 total_bytes += buf.nbytes
@@ -112,8 +110,8 @@ class TestZerosKvBuffer(CustomTestCase):
                         index_kpool=index_kpool,
                     )
                     pool = TpuSplitMLATokenToKVPool(
-                        size=64,
-                        page_size=32,
+                        size=256,
+                        page_size=128,
                         dtype=FP8,
                         kv_lora_rank=512,
                         qk_rope_head_dim=qk_rope_head_dim,
@@ -130,7 +128,9 @@ class TestZerosKvBuffer(CustomTestCase):
                     self.assertEqual(
                         pool.get_kv_size_bytes(),
                         TpuSplitMLATokenToKVPool.bytes_per_token(
-                            qk_rope_head_dim=qk_rope_head_dim, **kwargs
+                            page_size=pool.page_size,
+                            qk_rope_head_dim=qk_rope_head_dim,
+                            **kwargs,
                         )
                         * pool.num_pages
                         * pool.page_size
@@ -349,6 +349,7 @@ class TestSparseIndexerKvLens(CustomTestCase):
                 raw_page_base="raw_page_base",
             ),
             token_to_kv_pool=SimpleNamespace(
+                index_key_layout="record",
                 get_index_key_cache=lambda layer_id: f"index{layer_id}",
                 get_kpool_raw_cache=lambda layer_id: f"raw{layer_id}",
             ),

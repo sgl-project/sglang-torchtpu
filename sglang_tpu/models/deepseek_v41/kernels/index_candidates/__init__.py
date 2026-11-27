@@ -1,5 +1,7 @@
-# Adapted from vllm-project/vllm-torchtpu (Apache-2.0).
-# Source: src/vllm_torchtpu/kernels/deepseek_v41/__init__.py
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Native DeepSeek V4.1 kernels."""
+"""DeepSeek-V4.1 candidate blocks over the packed FP8 index keys.
+
+Candidate-source layers publish each query's best token blocks; later layers
+gather and score only those blocks. Dense scoring and top-k are shared from
+``sglang_tpu.kernels.index_selection``.
+"""
