@@ -831,15 +831,15 @@ def _invoke_v3_kernel(
                     else 0
                 )
                 extra["_prefill_topk_in_kernel"] = True
-                extra["_prefill_topk_gqa_batch"] = 4
+                extra["_prefill_topk_gqa_batch"] = 8 if topk_qstride == 16 else 4
                 extra["_prefill_topk_k_pair"] = (
                     k_pair_val
                     if k_pair_val > 0
-                    else (4 if topk_qstride == 4 else 2)
+                    else (4 if topk_qstride in (4, 8, 16) else 2)
                 )
                 if k1_bq_val > 0:
                     extra["_prefill_topk_k1_bq"] = k1_bq_val
-                elif topk_qstride == 4:
+                elif topk_qstride in (4, 8, 16):
                     extra["_prefill_topk_k1_bq"] = 16384
     else:
         if mixed_blocks:
