@@ -8,6 +8,7 @@ import functools
 import ipaddress
 import logging
 import math
+import os
 import random
 import urllib
 import warnings
@@ -258,7 +259,12 @@ class MiniLoadBalancer:
                 format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
                 force=True,
             )
-        uvicorn.run(app, host=self.host, port=self.port)
+        uvicorn.run(
+            app,
+            host=self.host,
+            port=self.port,
+            timeout_keep_alive=int(os.environ.get("SGLANG_TIMEOUT_KEEP_ALIVE", "900")),
+        )
 
     def start_load_polling(self) -> Optional[asyncio.Task]:
         """Poll engine loads only when session affinity is enabled."""
@@ -967,9 +973,13 @@ async def get_model_info():
 
 @app.post("/generate")
 async def handle_generate_request(
-    request_data: dict, x_routing_key: Optional[str] = Header(default=None)
+    request_data: dict,
+    x_routing_key: Optional[str] = Header(default=None),
+    x_correlation_id: Optional[str] = Header(default=None),
 ):
-    return await _forward_to_backend(request_data, "generate", x_routing_key)
+    return await _forward_to_backend(
+        request_data, "generate", x_routing_key or x_correlation_id
+    )
 
 
 async def _forward_to_backend(
@@ -1025,16 +1035,24 @@ async def _forward_to_backend(
 
 @app.post("/v1/chat/completions")
 async def handle_chat_completion_request(
-    request_data: dict, x_routing_key: Optional[str] = Header(default=None)
+    request_data: dict,
+    x_routing_key: Optional[str] = Header(default=None),
+    x_correlation_id: Optional[str] = Header(default=None),
 ):
-    return await _forward_to_backend(request_data, "v1/chat/completions", x_routing_key)
+    return await _forward_to_backend(
+        request_data, "v1/chat/completions", x_routing_key or x_correlation_id
+    )
 
 
 @app.post("/v1/completions")
 async def handle_completion_request(
-    request_data: dict, x_routing_key: Optional[str] = Header(default=None)
+    request_data: dict,
+    x_routing_key: Optional[str] = Header(default=None),
+    x_correlation_id: Optional[str] = Header(default=None),
 ):
-    return await _forward_to_backend(request_data, "v1/completions", x_routing_key)
+    return await _forward_to_backend(
+        request_data, "v1/completions", x_routing_key or x_correlation_id
+    )
 
 
 def _generate_bootstrap_room():

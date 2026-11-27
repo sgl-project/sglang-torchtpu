@@ -249,8 +249,32 @@ def test_routing_key_header_reaches_the_policy(monkeypatch):
             json={"messages": []},
             headers={"x-routing-key": "s-42"},
         )
+        corr_chat = client.post(
+            "/v1/chat/completions",
+            json={"messages": []},
+            headers={"x-correlation-id": "conv-7"},
+        )
+        corr_comp = client.post(
+            "/v1/completions",
+            json={"prompt": "hi"},
+            headers={"x-correlation-id": "conv-8"},
+        )
+        corr_gen = client.post(
+            "/generate",
+            json={"text": "hi"},
+            headers={"x-correlation-id": "conv-9"},
+        )
+        both = client.post(
+            "/v1/chat/completions",
+            json={"messages": []},
+            headers={"x-routing-key": "rk-1", "x-correlation-id": "conv-ignored"},
+        )
     assert response.status_code == 429
-    assert seen_keys == ["s-42"]
+    assert corr_chat.status_code == 429
+    assert corr_comp.status_code == 429
+    assert corr_gen.status_code == 429
+    assert both.status_code == 429
+    assert seen_keys == ["s-42", "conv-7", "conv-8", "conv-9", "rk-1"]
 
 
 @pytest.mark.unit
@@ -511,3 +535,47 @@ def test_empty_batch_bootstrap_arrays_stay_aligned(monkeypatch, stream):
         "bootstrap_port": [],
         "bootstrap_room": [],
     }
+
+
+@pytest.mark.unit
+def test_start_passes_default_keep_alive_timeout_to_uvicorn(monkeypatch):
+    monkeypatch.delenv("SGLANG_TIMEOUT_KEEP_ALIVE", raising=False)
+    balancer = _lb([P1], [D1])
+    captured = {}
+
+    def fake_run(app, **kwargs):
+        captured["app"] = app
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(mini_lb.uvicorn, "run", fake_run)
+    balancer.start()
+
+    assert captured["app"] is mini_lb.app
+    assert captured["kwargs"] == {
+        "host": balancer.host,
+        "port": balancer.port,
+        "timeout_keep_alive": 900,
+    }
+    assert type(captured["kwargs"]["timeout_keep_alive"]) is int
+
+
+@pytest.mark.unit
+def test_start_honors_sglang_timeout_keep_alive_env_override(monkeypatch):
+    monkeypatch.setenv("SGLANG_TIMEOUT_KEEP_ALIVE", "120")
+    balancer = _lb([P1], [D1])
+    captured = {}
+
+    def fake_run(app, **kwargs):
+        captured["app"] = app
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(mini_lb.uvicorn, "run", fake_run)
+    balancer.start()
+
+    assert captured["app"] is mini_lb.app
+    assert captured["kwargs"] == {
+        "host": balancer.host,
+        "port": balancer.port,
+        "timeout_keep_alive": 120,
+    }
+    assert type(captured["kwargs"]["timeout_keep_alive"]) is int
