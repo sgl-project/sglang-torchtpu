@@ -2651,10 +2651,12 @@ class CommonKVSender(BaseKVSender):
     def abort(self):
         if self.kv_mgr.deferred_bootstrap is not None and not self._owns_bootstrap_room:
             return
-        self.kv_mgr.record_failure(
-            self.bootstrap_room,
-            "Aborted by AbortReq.",
-        )
+        # A room that already failed on this rank keeps its recorded cause for
+        # failure_exception(), polled or not.
+        with self.kv_mgr.failure_lock:
+            self.kv_mgr.failure_records.setdefault(
+                self.bootstrap_room, "Aborted by AbortReq."
+            )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
         # Some abort paths release the request without ever clearing the
