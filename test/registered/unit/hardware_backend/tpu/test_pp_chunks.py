@@ -162,9 +162,25 @@ def test_a_fixed_target_below_the_top_step_rises_to_it():
     """A kernel slower than the pinned target still runs full top-bucket steps."""
     top = BUCKETS[-1]
     full_step = _linear(top) + ATTN * top * top / 2
-    model = StepCostModel.fit([_stage()], 0.1, 4096, target_ms=50.0)
+    # The slack is ignored, so a negative one is not an error here.
+    model = StepCostModel.fit([_stage()], -0.1, 4096, target_ms=50.0)
     assert model.target_ms == pytest.approx(full_step)
     assert model.chunk(0, top, 0, 0.0, 0.0) == top
+
+
+def test_a_chunk_that_fits_the_target_exactly_is_admitted_whole():
+    """Solving for the chunk through a square root can round an exact fit
+    down by a token, which the granule then turns into a whole granule."""
+    linear = {b: _linear(b) for b in BUCKETS}
+    # Slopes whose exact full step the root rounds down to 16383 tokens.
+    for attn in (2.409436547441535e-07, 1.1376725643485542e-07, 5.7086869130501574e-08):
+        full_step = linear[16384] + attn * 16384 * 16384 / 2
+        model = StepCostModel(BUCKETS, linear, attn, full_step, 4096)
+        assert model.step_ms(16384, 0, 16384 * 16384) <= full_step
+        assert model.chunk(0, 16384, 0, 0.0, 0.0) == 16384
+    # A target far above any step admits whole chunks without solving for one.
+    model = StepCostModel(BUCKETS, linear, ATTN, 1e302, 4096)
+    assert model.chunk(98304, 16384, 0, 0.0, 0.0) == 16384
 
 
 def test_step_time_adds_the_causal_term_of_each_chunk():

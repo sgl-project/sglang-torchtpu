@@ -246,10 +246,13 @@ capacity, so few requests get small steps and later chunks of a long prompt
 shrink with their attention cost. `SGLANG_TPU_PP_DYNAMIC_CHUNKS=0` keeps
 fixed token budgets; `SGLANG_TPU_PP_CHUNK_SLACK` (default `0.1`) is the slack
 above the profiled full-step time. `SGLANG_TPU_PP_CHUNK_TARGET_MS` sets the
-step target in ms instead, raised to the profiled prefix-free top-bucket step
-when that is slower, and ignores the slack. The profile then cannot lower the
-target, so a faster kernel or a fast startup sample never shrinks the chunks
-behind long prefixes. The value is set per deployment from its startup profile.
+step target in ms instead, raised to the modeled prefix-free top-bucket step
+when that is slower, and ignores the slack. While the value covers that step,
+the profile cannot move the target, so a kernel speedup that lowers the fitted
+costs never shrinks the chunks behind long prefixes. The value is set per
+deployment from its startup profile, above the modeled top-bucket step that the
+`TPU pipeline chunks` log line implies (the 8192 entry plus attention × 8192² / 2 with
+`--chunked-prefill-size 8192`).
 Startup fails on every rank if the ranks disagree on it.
 
 ## Notes

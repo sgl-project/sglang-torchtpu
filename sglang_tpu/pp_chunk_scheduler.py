@@ -238,14 +238,15 @@ def profile_and_install_cost_model(scheduler: Scheduler) -> None:
         return
     if not get_exec().graph.enable_torch_compile:
         raise ValueError("TPU pipeline dynamic chunks require --enable-torch-compile.")
-    if envs.SGLANG_TPU_PP_CHUNK_SLACK.get() < 0:
+    # Agreed before any rank-local check can stop one rank short of it.
+    target_ms = _agreed_target_ms(world_group=scheduler.world_group)
+    if target_ms is None and envs.SGLANG_TPU_PP_CHUNK_SLACK.get() < 0:
         raise ValueError("SGLANG_TPU_PP_CHUNK_SLACK must be nonnegative.")
     policy = runner.compile_policy
     granularity = chunk_granularity(
         scheduler.page_size, scheduler.chunked_prefill_size, True
     )
     buckets = policy.t_bucketer.buckets
-    target_ms = _agreed_target_ms(world_group=scheduler.world_group)
     if buckets[-1] > runner.model_config.context_len:
         raise ValueError(
             "TPU pipeline dynamic chunks require --chunked-prefill-size "
@@ -298,6 +299,14 @@ def profile_and_install_cost_model(scheduler: Scheduler) -> None:
                 f"{granularity}-token chunk of prompts up to {longest} tokens; "
                 f"lower --context-length from {context_len} to {longest}."
             )
+    if target_ms is not None and cost.target_ms > target_ms:
+        logger.warning(
+            "SGLANG_TPU_PP_CHUNK_TARGET_MS=%s is below the modeled prefix-free "
+            "top-bucket step (slowest ladder entry plus largest attention slope "
+            "over the stages); the step target is %.1f ms.",
+            target_ms,
+            cost.target_ms,
+        )
     scheduler._tpu_pp_chunk_cost = cost
     # Cached prefix tokens of each waiting request, matched once.
     scheduler._tpu_pp_cached_prefix = {}

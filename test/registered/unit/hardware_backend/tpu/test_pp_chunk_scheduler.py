@@ -3,6 +3,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import contextlib
+import logging
 from types import SimpleNamespace as NS
 from unittest.mock import MagicMock
 
@@ -385,6 +386,12 @@ def test_continuation_does_not_count_loaded_host_prefix_twice(monkeypatch):
 def test_profile_requires_resolved_compiler_setting(monkeypatch):
     monkeypatch.setenv("SGLANG_TPU_PP_DYNAMIC_CHUNKS", "1")
     monkeypatch.setenv("SGLANG_TPU_PP_CHUNK_SLACK", "-1")
+    monkeypatch.delenv("SGLANG_TPU_PP_CHUNK_TARGET_MS", raising=False)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda out, obj, group: out.__setitem__(slice(None), [obj] * len(out)),
+    )
     with get_context().override_server_args(
         device="tpu",
         pp_size=8,
@@ -392,7 +399,10 @@ def test_profile_requires_resolved_compiler_setting(monkeypatch):
         chunked_prefill_size=16384,
         enable_torch_compile=True,
     ) as raw:
-        scheduler = NS(tp_worker=NS(model_runner=NS(server_args=raw)))
+        scheduler = NS(
+            tp_worker=NS(model_runner=NS(server_args=raw)),
+            world_group=NS(world_size=1, cpu_group=None),
+        )
         assert not raw.enable_torch_compile
         with pytest.raises(ValueError, match="SLACK must be nonnegative"):
             profile_and_install_cost_model(scheduler)
@@ -419,7 +429,7 @@ def test_a_malformed_step_target_fails_startup(monkeypatch):
         assert pp_chunk_scheduler._agreed_target_ms(world_group=group) is None
 
 
-def test_devices_of_a_stage_fit_one_cost_model(monkeypatch):
+def test_devices_of_a_stage_fit_one_cost_model(monkeypatch, caplog):
     """The devices of a multi-device stage must size chunks alike even when
     they time the profile differently; diverging sizes deadlock the stage."""
     points = [(2048, 0), (2048, 2048), (4096, 0), (4096, 4096)]
@@ -477,6 +487,13 @@ def test_devices_of_a_stage_fit_one_cost_model(monkeypatch):
     target_views.update(dict.fromkeys(range(4), (5000.0, None)))
     profile_and_install_cost_model(scheduler)
     assert scheduler._tpu_pp_chunk_cost.target_ms == 5000.0
+    # A step target below the modeled top-bucket step is raised to it, and said so.
+    monkeypatch.setenv("SGLANG_TPU_PP_CHUNK_TARGET_MS", "1")
+    target_views.update(dict.fromkeys(range(4), (1.0, None)))
+    with caplog.at_level(logging.WARNING, logger=pp_chunk_scheduler.logger.name):
+        profile_and_install_cost_model(scheduler)
+    assert scheduler._tpu_pp_chunk_cost.target_ms > 1.0
+    assert "TARGET_MS=1.0 is below the modeled" in caplog.text
     # A step target set on one rank only would size that rank's chunks apart;
     # every rank rejects it before profiling.
     target_views[0] = (None, None)

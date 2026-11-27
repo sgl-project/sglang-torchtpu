@@ -13,6 +13,8 @@ from statistics import median
 
 # Buckets below a quarter of the largest one are timed without a prefix only.
 _PREFIX_PROFILE_MIN_DIVISOR = 4
+# Float rounding allowed when a chunk is checked against the target.
+_FIT_TOLERANCE_MS = 1e-6
 
 
 def chunk_granularity(block_size: int, max_tokens: int, block_aligned: bool) -> int:
@@ -117,10 +119,12 @@ class StepCostModel:
         stage. Every stage yields a ladder and a slope; the model keeps the
         slowest ladder entry per bucket and the largest slope. The target is
         a prefix-free top-bucket step plus ``slack``. A fixed ``target_ms``
-        replaces it, and the slack, and is raised to the prefix-free
-        top-bucket step when that step is slower; profiled costs then never
-        lower the target, so a faster kernel never shrinks a chunk."""
-        if slack < 0:
+        replaces it and ignores the slack; it is raised to the modeled
+        prefix-free top-bucket step (slowest ladder entry plus largest slope)
+        when that is slower, so a full chunk always fits. While ``target_ms``
+        covers that step, profiled costs never move the target, and a kernel
+        speedup that lowers the fitted ladder or slope never shrinks a chunk."""
+        if target_ms is None and slack < 0:
             raise ValueError(f"the chunk slack must not be negative: {slack}")
         if not stage_samples:
             raise ValueError("no stage reported step timings")
@@ -206,6 +210,10 @@ class StepCostModel:
         fits."""
         best = 0
         attn = self.attn_ms_per_token_pair
+
+        def attn_ms(tokens: int) -> float:
+            return attn * (tokens * prefix + tokens * tokens / 2)
+
         floor = min(remaining, self.buckets[-1] // 4)
         for bucket in self.buckets:
             if step_limit is not None and bucket > step_limit:
@@ -217,11 +225,15 @@ class StepCostModel:
             if spare < 0:
                 continue
             fit = min(remaining, room)
-            if attn > 0:
-                # attn * (x * prefix + x^2 / 2) <= spare
+            budget = spare + _FIT_TOLERANCE_MS
+            if attn_ms(fit) > budget:
+                # attn * (x * prefix + x^2 / 2) <= spare; the root can round an
+                # exact fit down by a token.
                 fit = min(
                     fit, int(-prefix + math.sqrt(prefix * prefix + 2 * spare / attn))
                 )
+                if attn_ms(fit + 1) <= budget:
+                    fit += 1
             if fit < remaining:
                 fit = min(max(fit, floor), room)
             if fit < remaining:
