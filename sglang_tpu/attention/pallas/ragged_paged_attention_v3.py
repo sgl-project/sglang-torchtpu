@@ -379,6 +379,7 @@ def _stationary_q_v2_process(
     cu_qgrps_ref=None,
     prefix_topk_ref=None,
     prefix_topk_slices: int = 0,
+    prefix_topk_sink_slices: int = 0,
     prefix_q_grp_sz: int = 1024,
     prefix_max_bkv: int = 16,
 ):
@@ -3416,7 +3417,10 @@ def _stationary_q_v2_process(
 
                             @pl.when(is_first_bkv)
                             def _exec_prefix_dense_sink():
-                                _exec_prefix_pass(static_first=True, with_topk=False)
+                                _exec_prefix_pass(
+                                    static_first=True,
+                                    with_topk=(prefix_topk_sink_slices > 0),
+                                )
 
                             @pl.when(jnp.logical_not(is_first_bkv))
                             def _exec_prefix_topk_sparse():
@@ -3577,6 +3581,7 @@ def _prefix_score_kernel(
     topk_in_kernel: bool = False,
     topk_gqa_batch: int = 1,
     topk_k_pair: int = 1,
+    topk_sink_slices: int = 0,
 ):
     """Stage-1 prefix All-QK scorer (read-only on Q and KV cache)."""
     start_seq_idx, end_seq_idx = case.get_range(distribution_ref)
@@ -3760,6 +3765,12 @@ def _prefix_score_kernel(
     col_iota_64w = lax.broadcasted_iota(jnp.int32, (64, w_q), 1)
     tk_iota_128 = lax.broadcasted_iota(jnp.int32, (8, 128), 1)
     tk_valid_mask = tk_iota_128 < num_h_per_bkv
+    bkv_start_k1 = 0 if topk_sink_slices > 0 else 1
+    if topk_sink_slices > 0:
+        sink_pin_vals = (
+            jnp.float32(1e30)
+            - tk_iota_128.astype(jnp.float32) * jnp.float32(1e25)
+        )
 
     @pl.loop(start_seq_idx, end_seq_idx)
     def _k1_seq(seq_idx):
@@ -3784,7 +3795,7 @@ def _prefix_score_kernel(
             valid_bq_rows = jnp.clip(q_len - bq_idx * actual_bq_sz, 0, actual_bq_sz)
             valid_qgrps = cdiv(valid_bq_rows, q_grp_sz)
 
-            @pl.when((tail_bkv_start > 1) & (valid_qgrps > 0))
+            @pl.when((tail_bkv_start > bkv_start_k1) & (valid_qgrps > 0))
             def _k1_run_bq():
                 q_row_base = q_start + bq_idx * actual_bq_sz
                 if qstride == 4:
@@ -4101,11 +4112,11 @@ def _prefix_score_kernel(
                             wait,
                         )
 
-                _fetch_bkv_k1(seq_idx, 1, 0, wait=False)
+                _fetch_bkv_k1(seq_idx, bkv_start_k1, 0, wait=False)
 
-                @pl.loop(1, tail_bkv_start, unroll=False)
+                @pl.loop(bkv_start_k1, tail_bkv_start, unroll=False)
                 def _k1_bkv(bkv_idx):
-                    bkv_slot = (bkv_idx - 1) & 1
+                    bkv_slot = (bkv_idx - bkv_start_k1) & 1
                     nxt_bkv = bkv_idx + 1
 
                     @pl.when(nxt_bkv < tail_bkv_start)
@@ -4115,9 +4126,9 @@ def _prefix_score_kernel(
                     _fetch_bkv_k1(seq_idx, bkv_idx, bkv_slot, wait=True)
                     _unpack_k_only(bkv_slot)
 
-                    sc_slot = (bkv_idx - 1) & 1
+                    sc_slot = (bkv_idx - bkv_start_k1) & 1
 
-                    @pl.when(bkv_idx >= 3)
+                    @pl.when(bkv_idx >= bkv_start_k1 + 2)
                     def _wait_prev_sc():
                         _sc_dma(bkv_idx - 2, sc_slot, wait=True)
 
@@ -4256,14 +4267,9 @@ def _prefix_score_kernel(
                                     m_8, axis=1, keepdims=True
                                 ) * jnp.float32(1.0 / float(num_h_per_bkv))
                                 s_vec = jnp.max(m_8 - mean_8, axis=0)
-                                if topk_in_kernel:
-                                    sc_pair_f32 = jnp.where(
-                                        q_h_iota == kv_h, s_vec[None, :], sc_pair_f32
-                                    )
-                                else:
-                                    sc_out_vmem[
-                                        sc_slot, g_idx, kv_h : kv_h + 1, :
-                                    ] = s_vec[None, :]
+                                sc_pair_f32 = jnp.where(
+                                    q_h_iota == kv_h, s_vec[None, :], sc_pair_f32
+                                )
                         else:
                             for kv_h in range(sq_kv_heads):
 
@@ -4325,14 +4331,17 @@ def _prefix_score_kernel(
                                     m_8, axis=1, keepdims=True
                                 ) * jnp.float32(1.0 / float(num_h_per_bkv))
                                 s_vec = jnp.max(m_8 - mean_8, axis=0)
-                                if topk_in_kernel:
-                                    sc_pair_f32 = jnp.where(
-                                        q_h_iota == kv_h, s_vec[None, :], sc_pair_f32
-                                    )
-                                else:
-                                    sc_out_vmem[
-                                        sc_slot, g_idx, kv_h : kv_h + 1, :
-                                    ] = s_vec[None, :]
+                                sc_pair_f32 = jnp.where(
+                                    q_h_iota == kv_h, s_vec[None, :], sc_pair_f32
+                                )
+                        if topk_sink_slices > 0:
+                            sc_pair_f32 = jnp.where(
+                                jnp.logical_and(
+                                    bkv_idx == 0, tk_iota_128 < topk_sink_slices
+                                ),
+                                sink_pin_vals,
+                                sc_pair_f32,
+                            )
                         if topk_in_kernel:
                             x_tk = jnp.where(
                                 tk_valid_mask, sc_pair_f32, jnp.float32(-1e30)
@@ -4373,17 +4382,23 @@ def _prefix_score_kernel(
                                 unroll=False,
                             )
                             sc_out_vmem[sc_slot, g_idx] = out_tk
+                        else:
+                            sc_out_vmem[sc_slot, g_idx] = sc_pair_f32
 
                     _sc_dma(bkv_idx, sc_slot, wait=False)
 
                 _sc_dma(
-                    tail_bkv_start - 1, (tail_bkv_start - 2) & 1, wait=True
+                    tail_bkv_start - 1,
+                    (tail_bkv_start - 1 - bkv_start_k1) & 1,
+                    wait=True,
                 )
 
-                @pl.when(tail_bkv_start > 2)
+                @pl.when(tail_bkv_start > bkv_start_k1 + 1)
                 def _wait_sc_penult():
                     _sc_dma(
-                        tail_bkv_start - 2, (tail_bkv_start - 3) & 1, wait=True
+                        tail_bkv_start - 2,
+                        (tail_bkv_start - 2 - bkv_start_k1) & 1,
+                        wait=True,
                     )
 
 
@@ -4518,6 +4533,7 @@ def _ragged_paged_attention_kernel_loop(
     cu_qgrps_ref=None,
     prefix_topk_ref=None,
     prefix_topk_slices: int = 0,
+    prefix_topk_sink_slices: int = 0,
     prefix_q_grp_sz: int = 1024,
     prefix_max_bkv: int = 16,
     causal: bool = True,
@@ -5964,6 +5980,7 @@ def _ragged_paged_attention_kernel_loop(
                 cu_qgrps_ref=cu_qgrps_ref,
                 prefix_topk_ref=prefix_topk_ref,
                 prefix_topk_slices=prefix_topk_slices,
+                prefix_topk_sink_slices=prefix_topk_sink_slices,
                 prefix_q_grp_sz=prefix_q_grp_sz,
                 prefix_max_bkv=prefix_max_bkv,
             )
@@ -8067,6 +8084,7 @@ def get_vmem_limit():
         "_prefill_topk_gqa_batch",
         "_prefill_topk_k_pair",
         "_prefill_topk_k1_bq",
+        "_prefill_topk_sink_slices",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache_fused"),
 )
@@ -8159,6 +8177,7 @@ def ragged_paged_attention(
     _prefill_topk_gqa_batch: int = 1,
     _prefill_topk_k_pair: int = 1,
     _prefill_topk_k1_bq: int = 0,
+    _prefill_topk_sink_slices: int = 0,
 ):
     """Ragged paged attention with fused KV cache.
 
@@ -8849,7 +8868,13 @@ def ragged_paged_attention(
 
         extra_sp_count = 0
         prefix_topk_slices_eff = 0
+        prefix_topk_sink_slices_eff = 0
         if use_prefix_topk:
+            topk_sink_slices_eff = (
+                _prefill_topk_sink_slices
+                if (0 < _prefill_topk_sink_slices <= _prefill_topk_slices)
+                else 0
+            )
             q_lens_topk = cu_q_lens[1:] - cu_q_lens[:-1]
             qgrps_per_seq = (q_lens_topk + q_grp_sz_topk - 1) // q_grp_sz_topk
             cu_qgrps = jnp.concatenate(
@@ -8908,6 +8933,7 @@ def ragged_paged_attention(
                     topk_in_kernel=topk_in_kernel_eff,
                     topk_gqa_batch=_prefill_topk_gqa_batch,
                     topk_k_pair=_prefill_topk_k_pair,
+                    topk_sink_slices=topk_sink_slices_eff,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=6,
@@ -8980,12 +9006,18 @@ def ragged_paged_attention(
             scalar_prefetches = scalar_prefetches + (cu_qgrps, prefix_topk_packed)
             extra_sp_count = 2
             prefix_topk_slices_eff = _prefill_topk_slices
+            prefix_topk_sink_slices_eff = topk_sink_slices_eff
             scope_name += (
                 f"-ptk{_prefill_topk_slices}_qs{_prefill_topk_qstride}"
                 + (
                     f"_ik_g{_prefill_topk_gqa_batch}_kp{_prefill_topk_k_pair}"
                     + (f"_k1b{bq_sz_k1}" if _prefill_topk_k1_bq > 0 else "")
                     if topk_in_kernel_eff
+                    else ""
+                )
+                + (
+                    f"_sk{topk_sink_slices_eff}"
+                    if topk_sink_slices_eff > 0
                     else ""
                 )
             )
@@ -9045,6 +9077,7 @@ def ragged_paged_attention(
                 valid_lane_dim=valid_lane_dim,
                 extra_sp_count=extra_sp_count,
                 prefix_topk_slices=prefix_topk_slices_eff,
+                prefix_topk_sink_slices=prefix_topk_sink_slices_eff,
                 prefix_q_grp_sz=q_grp_sz_topk,
                 prefix_max_bkv=max_bkv_topk,
             ),
