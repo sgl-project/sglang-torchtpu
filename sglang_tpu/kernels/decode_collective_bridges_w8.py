@@ -4624,6 +4624,38 @@ def moe_post_tok_sharded_final_norm_jax(
 # =============================================================================
 # 5b. Wave-9 Chip-Granularity Stream Bridges (`stream [B//(TP//2), 8192]`, TP=8 & TP=16)
 # =============================================================================
+def _run_ag_ici_step(
+    specs,
+    ici_send,
+    ici_recv,
+    *,
+    sem_base: int,
+    n_r: int,
+    overlap_fn=None,
+) -> None:
+    """Issue one parallel multi-slab ICI doubling step and optionally overlap work."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    ops = [
+        pltpu.make_async_remote_copy(
+            slab.at[pl.ds(pl.multiple_of(r0, 16), n_r), :],
+            slab.at[pl.ds(pl.multiple_of(r0, 16), n_r), :],
+            ici_send.at[sem_base + idx],
+            ici_recv.at[sem_base + idx],
+            device_id=(peer,),
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+        for idx, (slab, r0, peer) in enumerate(specs)
+    ]
+    for op in ops:
+        op.start()
+    if overlap_fn is not None:
+        overlap_fn()
+    for op in ops:
+        op.wait()
+
+
 def _use_tp16_parallel_xyz_ag(
     *,
     world_size: int,
@@ -4648,6 +4680,33 @@ def _use_tp16_parallel_xyz_ag(
     )
 
 
+def _use_tp8_parallel_xy_ag(
+    *,
+    world_size: int,
+    is_3d_out: bool,
+    r_pair: int,
+    half_h: int,
+    n_ici_sems: int = 5,
+) -> bool:
+    """Return True when 2-slab parallel XY doubling beats 3-peer AG on TP=8 silicon.
+
+    Verified bit-exact on 2x2x1 TPU7x for ``B >= 256, H >= 8192`` (``r_pair >= 64,
+    half_h >= 4096``: ``-11.0%`` on isolated ``ag_capture``, ``-4.0%`` on standalone
+    ``ChipB2 B=256``). Smaller ``B=64/128`` batches stay on 3-peer because fused
+    ``Step (b)/(c)`` overlap regressed under 2-slab VPU permute + ``op_dx`` overhead.
+    Requires ``>= 5`` ICI send/recv semaphores (Steps 1-2 disjoint + ``op_dx``).
+    """
+    return (
+        world_size == 8
+        and not is_3d_out
+        and n_ici_sems >= 5
+        and r_pair >= 64
+        and (r_pair % 16 == 0)
+        and half_h >= 4096
+        and (half_h % 128 == 0)
+    )
+
+
 def _tp16_parallel_xyz_ag(
     pair_ref,
     out_full_ref,
@@ -4667,12 +4726,14 @@ def _tp16_parallel_xyz_ag(
     during_ici_fn,
     during_d2d2_fn,
     copy_local_from_pair: bool,
+    during_ici_early: bool = False,
 ) -> None:
     """3-slab parallel XYZ doubling all-gather for TP=16 (``-42%`` link volume, ``0`` extra VMEM).
 
     Keeps ``slab_z`` in place on ``side_c0`` and stages permuted ``slab_y`` / ``slab_x`` in the
     dead ``other_c0`` half during ICI. After unpacking into ``side_c0``, swaps ``slab_z`` over
     ``ici[6]`` before ``d2d2_yx`` on ``d2d2[0]`` so mate completes unpack before overwrite.
+    Pass ``during_ici_early=True`` for async DMA pre-starts (e.g. RPAd ``bkv``) to span all 3 hops.
     """
     import jax.numpy as jnp
     from jax.experimental import pallas as pl
@@ -4745,45 +4806,33 @@ def _tp16_parallel_xyz_ag(
                 cs = pl.ds(pl.multiple_of(off, 128), cw)
                 slab_x[rs_qx, cs] = slab_x_dst[rs_src, cs]
 
-    def _run_step(specs, sem_base: int, n_r: int, overlap_fn=None) -> None:
-        ops = [
-            pltpu.make_async_remote_copy(
-                slab.at[pl.ds(pl.multiple_of(r0, 16), n_r), :],
-                slab.at[pl.ds(pl.multiple_of(r0, 16), n_r), :],
-                ici_send.at[sem_base + idx],
-                ici_recv.at[sem_base + idx],
-                device_id=(peer,),
-                device_id_type=pl.DeviceIdType.MESH,
-            )
-            for idx, (slab, r0, peer) in enumerate(specs)
-        ]
-        for op in ops:
-            op.start()
-        if overlap_fn is not None:
-            overlap_fn()
-        for op in ops:
-            op.wait()
-
-    _run_step(
+    _run_ag_ici_step(
         ((slab_z, chip * r_pair, peer_x), (slab_y, q_y * r_pair, peer_y), (slab_x, q_x * r_pair, peer_z)),
-        0,
-        r_pair,
+        ici_send,
+        ici_recv,
+        sem_base=0,
+        n_r=r_pair,
+        overlap_fn=(during_ici_fn if during_ici_early else None),
     )
-    _run_step(
+    _run_ag_ici_step(
         (
             (slab_z, ((chip >> jnp.int32(1)) << jnp.int32(1)) * r_pair, peer_y),
             (slab_y, ((q_y >> jnp.int32(1)) << jnp.int32(1)) * r_pair, peer_z),
             (slab_x, ((q_x >> jnp.int32(1)) << jnp.int32(1)) * r_pair, peer_x),
         ),
-        3,
-        2 * r_pair,
+        ici_send,
+        ici_recv,
+        sem_base=3,
+        n_r=2 * r_pair,
     )
     # Step 2 wait clears peers X/Y/Z before Step 3 reuses semaphores 0..2.
-    _run_step(
+    _run_ag_ici_step(
         ((slab_z, cz * (4 * r_pair), peer_z), (slab_y, cx * (4 * r_pair), peer_x), (slab_x, cy * (4 * r_pair), peer_y)),
-        0,
-        4 * r_pair,
-        overlap_fn=during_ici_fn,
+        ici_send,
+        ici_recv,
+        sem_base=0,
+        n_r=4 * r_pair,
+        overlap_fn=(None if during_ici_early else during_ici_fn),
     )
 
     perm_y = (0, 2, 4, 6, 1, 3, 5, 7)
@@ -4830,6 +4879,130 @@ def _tp16_parallel_xyz_ag(
     op_dyx.wait()
 
 
+def _tp8_parallel_xy_ag(
+    pair_ref,
+    out_full_ref,
+    ici_send,
+    ici_recv,
+    d2d2_send,
+    d2d2_recv,
+    *,
+    me,
+    mate,
+    side,
+    other_side,
+    chip,
+    r_pair: int,
+    half_h: int,
+    side_c0,
+    during_ici_fn,
+    during_d2d2_fn,
+    copy_local_from_pair: bool,
+) -> None:
+    """2-slab parallel XY doubling all-gather for TP=8 (``0`` extra VMEM, ``0`` extra sems)."""
+    import jax.numpy as jnp
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    cx = chip & jnp.int32(1)
+    cy = (chip >> jnp.int32(1)) & jnp.int32(1)
+    peer_x = me ^ jnp.int32(2)
+    peer_y = me ^ jnp.int32(4)
+    other_c0 = pl.multiple_of(other_side * half_h, 128)
+    chip_r0 = pl.multiple_of(chip * r_pair, 16)
+
+    n_tiles = half_h // 128
+    t_x = n_tiles // 2
+    t_y = n_tiles - t_x
+    w_x, w_y = t_x * 128, t_y * 128
+    q_y = (cx << jnp.int32(1)) | cy
+    qy_r0 = pl.multiple_of(q_y * r_pair, 16)
+
+    slab_x = out_full_ref.at[:, pl.ds(pl.multiple_of(side_c0, 128), w_x)]
+    slab_y_dst = out_full_ref.at[:, pl.ds(pl.multiple_of(side_c0 + w_x, 128), w_y)]
+    slab_y = out_full_ref.at[:, pl.ds(pl.multiple_of(other_c0 + w_x, 128), w_y)]
+
+    bm = _pick_strip(r_pair, 32)
+    max_step = 1024 if r_pair <= 16 else 512
+    spans_x = _tile_spans(w_x, max_step)
+    spans_y = _tile_spans(w_y, max_step)
+
+    if copy_local_from_pair:
+        assert pair_ref is not None
+        for r0 in range(0, r_pair, bm):
+            rs_l = pl.ds(r0, bm)
+            rs_ch = pl.ds(pl.multiple_of(chip_r0 + r0, 16), bm)
+            rs_qy = pl.ds(pl.multiple_of(qy_r0 + r0, 16), bm)
+            for off, cw in spans_x:
+                slab_x[rs_ch, pl.ds(pl.multiple_of(off, 128), cw)] = pair_ref[
+                    rs_l, pl.ds(pl.multiple_of(side_c0 + off, 128), cw)
+                ]
+            for off, cw in spans_y:
+                slab_y[rs_qy, pl.ds(pl.multiple_of(off, 128), cw)] = pair_ref[
+                    rs_l, pl.ds(pl.multiple_of(side_c0 + w_x + off, 128), cw)
+                ]
+    else:
+        for r0 in range(0, r_pair, bm):
+            rs_src = pl.ds(pl.multiple_of(chip_r0 + r0, 16), bm)
+            rs_qy = pl.ds(pl.multiple_of(qy_r0 + r0, 16), bm)
+            for off, cw in spans_y:
+                cs = pl.ds(pl.multiple_of(off, 128), cw)
+                slab_y[rs_qy, cs] = slab_y_dst[rs_src, cs]
+
+    _run_ag_ici_step(
+        ((slab_x, chip * r_pair, peer_x), (slab_y, q_y * r_pair, peer_y)),
+        ici_send,
+        ici_recv,
+        sem_base=0,
+        n_r=r_pair,
+    )
+    # Disjoint Step-2 semaphores (2..3) avoid racing diagonal peer Step-1 signals under skew.
+    _run_ag_ici_step(
+        ((slab_x, cy * (2 * r_pair), peer_y), (slab_y, cx * (2 * r_pair), peer_x)),
+        ici_send,
+        ici_recv,
+        sem_base=2,
+        n_r=2 * r_pair,
+        overlap_fn=during_ici_fn,
+    )
+
+    perm_y = (0, 2, 1, 3)
+    for q in range(4):
+        cy_dst = perm_y[q] * r_pair
+        q_r0 = q * r_pair
+        for r0 in range(0, r_pair, bm):
+            rs_q = pl.ds(pl.multiple_of(q_r0 + r0, 16), bm)
+            rs_yd = pl.ds(pl.multiple_of(cy_dst + r0, 16), bm)
+            for off, cw in spans_y:
+                cs = pl.ds(pl.multiple_of(off, 128), cw)
+                slab_y_dst[rs_yd, cs] = slab_y[rs_q, cs]
+
+    # Swap slab_x first on disjoint ici[4] so wait(op_dx) syncs mate before op_dy overwrites other_c0[w_x:].
+    op_dx = pltpu.make_async_remote_copy(
+        slab_x,
+        slab_x,
+        ici_send.at[4],
+        ici_recv.at[4],
+        device_id=(mate,),
+        device_id_type=pl.DeviceIdType.MESH,
+    )
+    op_dx.start()
+    op_dx.wait()
+
+    op_dy = pltpu.make_async_remote_copy(
+        slab_y_dst,
+        slab_y_dst,
+        d2d2_send.at[0],
+        d2d2_recv.at[0],
+        device_id=(mate,),
+        device_id_type=pl.DeviceIdType.MESH,
+    )
+    op_dy.start()
+    if during_d2d2_fn is not None:
+        during_d2d2_fn()
+    op_dy.wait()
+
+
 def _ag_chip_sharded_half_col_xor1(
     pair_ref,
     out_full_ref,
@@ -4845,6 +5018,7 @@ def _ag_chip_sharded_half_col_xor1(
     during_d2d2_fn=None,
     r_pair_in: int | None = None,
     copy_local_from_pair: bool = True,
+    during_ici_early: bool = False,
 ) -> None:
     """Zero-`d2d1` half-column `XOR=1` All-Gather (`[B//(TP//2), H] -> [B, H] bf16`, `-50%` ICI).
 
@@ -4852,7 +5026,8 @@ def _ag_chip_sharded_half_col_xor1(
     gathers columns `0:H/2` and `side=1` gathers `H/2:H` directly over inter-chip ICI with
     ZERO pre-ICI D2D, finishing with a single `733 GB/s` D2D swap. Uses `ag_3d_buf [n_chips, 8, H/2]`
     when `r_pair == 8` (`TP=8 B=32` / `TP=16 B=64`) to respect TPU7x `(16, 128)` `bf16` VMEM tiling,
-    and dispatches TP=16 large 2D payloads (`r_pair * half_h >= 65536`) to 3-slab parallel XYZ.
+    dispatches TP=16 large 2D payloads (`r_pair * half_h >= 65536`) to 3-slab parallel XYZ, and
+    dispatches TP=8 ``B>=256, H>=8192`` 2D payloads to 2-slab parallel XY.
     """
     import jax.numpy as jnp
     from jax.experimental import pallas as pl
@@ -4880,6 +5055,35 @@ def _ag_chip_sharded_half_col_xor1(
         half_h=half_h,
     ):
         _tp16_parallel_xyz_ag(
+            pair_ref,
+            out_full_ref,
+            ici_send,
+            ici_recv,
+            d2d2_send,
+            d2d2_recv,
+            me=me,
+            mate=mate,
+            side=side,
+            other_side=other_side,
+            chip=chip,
+            r_pair=r_pair,
+            half_h=half_h,
+            side_c0=side_c0,
+            during_ici_fn=during_ici_fn,
+            during_d2d2_fn=during_d2d2_fn,
+            copy_local_from_pair=copy_local_from_pair,
+            during_ici_early=during_ici_early,
+        )
+        return
+
+    if _use_tp8_parallel_xy_ag(
+        world_size=world_size,
+        is_3d_out=is_3d_out,
+        r_pair=r_pair,
+        half_h=half_h,
+        n_ici_sems=min(int(ici_send.shape[0]), int(ici_recv.shape[0])),
+    ):
+        _tp8_parallel_xy_ag(
             pair_ref,
             out_full_ref,
             ici_send,
@@ -5278,8 +5482,8 @@ def decode_vocab_embed_chip_sharded_jax(
             sem((n_chips - 1,)),
             sem((1,)),
             sem((1,)),
-            sem((n_chips - 1,)),
-            sem((n_chips - 1,)),
+            sem((5 if world_size == 8 else n_chips - 1,)),
+            sem((5 if world_size == 8 else n_chips - 1,)),
             sem((1,)),
             sem((1,)),
             sem((1,)),
@@ -6736,8 +6940,8 @@ def attn_to_moe_chip_sharded_bridge_jax(
             sem((1,)),
             sem((1,)),
             sem((1,)),
-            sem((n_chips - 1,)),
-            sem((n_chips - 1,)),
+            sem((5 if world_size == 8 else n_chips - 1,)),
+            sem((5 if world_size == 8 else n_chips - 1,)),
             sem((1,)),
             sem((1,)),
             sem((n_chips - 1,)),
@@ -7350,6 +7554,8 @@ def _run_chip_b2_vmem_core(
     gate_dst_ref=None,
     after_qkv_epi_fn=None,
     defer_stream_store_wait: bool = False,
+    during_in_ici_fn=None,
+    during_in_ici_early: bool = False,
 ) -> None:
     """Reusable VMEM-resident Wave-9 chip-sharded Bridge 2b core (`standalone` & `b1+MoE+b2`).
 
@@ -7411,9 +7617,11 @@ def _run_chip_b2_vmem_core(
         next_in_pair if r_pair == 8 else None, next_in_vmem,
         in_ici_send, in_ici_recv, in_d2d2_send, in_d2d2_recv,
         me=me, world_size=world_size, ag_3d_buf=ag_3d_buf,
+        during_ici_fn=during_in_ici_fn,
         during_d2d2_fn=lambda: _dma_wait(w_qkv_buf, w_qkv_sem.at[0]),
         r_pair_in=r_pair,
         copy_local_from_pair=(r_pair == 8),
+        during_ici_early=during_in_ici_early,
     )
 
     qkv_dst = qkv_vmem if fuse_qkv_epi else out_qkv_or_q_ref
@@ -7629,8 +7837,8 @@ def moe_to_attn_chip_sharded_bridge_jax(
             sem((1,)),
             sem((n_chips - 1,)),
             sem((n_chips - 1,)),
-            sem((n_chips - 1,)),
-            sem((n_chips - 1,)),
+            sem((5 if world_size == 8 else n_chips - 1,)),
+            sem((5 if world_size == 8 else n_chips - 1,)),
             sem((1,)),
             sem((1,)),
         ],
@@ -7859,8 +8067,8 @@ def moe_post_chip_sharded_final_norm_jax(
             sem((1,)),
             sem((n_chips - 1,)),
             sem((n_chips - 1,)),
-            sem((n_chips - 1,)),
-            sem((n_chips - 1,)),
+            sem((5 if world_size == 8 else n_chips - 1,)),
+            sem((5 if world_size == 8 else n_chips - 1,)),
             sem((1,)),
             sem((1,)),
         ],
@@ -7953,8 +8161,8 @@ def ag_chip_sharded_capture_jax(
         out_specs=v_sp,
         scratch_shapes=[
             vmem((n_chips, 8, half_cols) if r_pair == 8 else (8, 128), jnp.bfloat16),
-            sem((n_chips - 1,)),
-            sem((n_chips - 1,)),
+            sem((5 if world_size == 8 else n_chips - 1,)),
+            sem((5 if world_size == 8 else n_chips - 1,)),
             sem((1,)),
             sem((1,)),
         ],
