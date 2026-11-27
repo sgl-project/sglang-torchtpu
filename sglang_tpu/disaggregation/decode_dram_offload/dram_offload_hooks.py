@@ -195,24 +195,25 @@ def _move_bootstrapped(upstream: Callable, queue: Any, *args, **kwargs) -> Any:
     )
     # Intake and queue moves are synchronized across attention-TP ranks. Only
     # their shared idle state can skip selection without a pressure vote.
-    # With bootstrap requests, piggyback the vote on recall-status agreement.
+    # With bootstrap requests, piggyback the vote on recall-status agreement;
+    # on empty-bootstrap active steps, pass None so the pusher can gate on its
+    # rank-replicated _selection_dirty state.
     selection_agreed = extension.recall.advance(
         queue.queue,
         waiting_reqs=scheduler.waiting_queue,
-        push_under_pressure=extension.push._under_host_pressure()
-        if queue.queue
-        else None,
+        push_under_pressure=extension.push.can_select_victim() if queue.queue else None,
     )
     extension.push.advance(
-        serving=serving, selection_agreed=selection_agreed if queue.queue else True
+        serving=serving, selection_agreed=selection_agreed if queue.queue else None
     )
     bootstrapped = upstream(queue, *args, **kwargs)
     # Core all-reduces the polls, so every rank bootstraps and drops the same
     # requests in a step and the tree inserts below are in step.
     for req in bootstrapped:
-        extension.push.note_decode_of(
-            req, recalled=extension.recall.insert_recalled_host_prefix(req)
-        )
+        recalled = extension.recall.insert_recalled_host_prefix(req)
+        if not recalled and _is_installed and hasattr(req, "__dict__"):
+            req._pd_defer_leaf_match = True
+        extension.push.note_decode_of(req, recalled=recalled)
     extension.recall.drop_departed(queue.queue)
     return bootstrapped
 
@@ -335,9 +336,50 @@ def _evict_device_leaf(upstream: Callable, cache: Any, node_id: Any, tracker: An
     return upstream(cache, node_id, tracker)
 
 
+def _match_prefix(upstream, cache, params, *args, **kwargs):
+    """Wraps ``UnifiedRadixCache.match_prefix``: once admission matches a
+    request whose bootstrap-exit leaf match was deferred, route its matched
+    leaf without a duplicate tree walk."""
+    result = upstream(cache, params, *args, **kwargs)
+    req = params.req
+    if req is not None and getattr(req, "_pd_defer_leaf_match", False):
+        req._pd_defer_leaf_match = False
+        extension = _extension(cache)
+        if isinstance(extension, PrefillDramOffloadExtension):
+            extension.push.track_matched_leaf(req, result.best_match_node)
+    return result
+
+
+def _evict_cache(upstream, cache, *args, **kwargs):
+    """Wraps ``UnifiedRadixCache._evict``: a device eviction can back up cold
+    leaves into host RAM and increase host pressure, re-arming victim push."""
+    result = upstream(cache, *args, **kwargs)
+    extension = _extension(cache)
+    if isinstance(extension, PrefillDramOffloadExtension):
+        extension.push.mark_selection_dirty()
+    return result
+
+
+def _writing_check(upstream, cache, *args, **kwargs):
+    """Wraps ``UnifiedRadixCache.writing_check``: completed write-through acks
+    (popped in MIN-reduced lockstep across ranks) make pending host leaves
+    pushable."""
+    write_back = args[0] if args else kwargs.get("write_back", False)
+    cc = cache.cache_controller
+    before = len(cc.ack_write_queue) if not write_back and cc is not None else 0
+    result = upstream(cache, *args, **kwargs)
+    if not write_back and cc is not None and len(cc.ack_write_queue) < before:
+        extension = _extension(cache)
+        if isinstance(extension, PrefillDramOffloadExtension):
+            extension.push.mark_selection_dirty()
+    return result
+
+
 def _checkpoint(upstream, cache, req, **kwargs):
     """Wraps ``UnifiedRadixCache.checkpoint``: route the request's leaf to
     the decode that served it."""
+    if getattr(req, "_pd_defer_leaf_match", False):
+        req._pd_defer_leaf_match = False
     result = upstream(cache, req, **kwargs)
     extension = _extension(cache)
     if isinstance(extension, PrefillDramOffloadExtension):
@@ -364,8 +406,11 @@ def _patch_targets() -> tuple[tuple[Any, str, Callable], ...]:
 
     return (
         (UnifiedRadixCache, "reset", _reset_cache),
+        (UnifiedRadixCache, "match_prefix", _match_prefix),
         (UnifiedRadixCache, "checkpoint", _checkpoint),
+        (UnifiedRadixCache, "_evict", _evict_cache),
         (UnifiedRadixCache, "_evict_device_leaf", _evict_device_leaf),
+        (UnifiedRadixCache, "writing_check", _writing_check),
         (DecodePreallocQueue, "add", _decode_add),
         (DecodePreallocQueue, "_init_kv_manager", _decode_init_kv_manager),
         (DecodePreallocQueue, "_send_kv_metadata", _send_kv_metadata),

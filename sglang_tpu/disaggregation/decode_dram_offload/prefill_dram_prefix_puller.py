@@ -384,6 +384,8 @@ class PrefillDramPrefixPuller:
         )
         inserted = node is not None
         if inserted:
+            if hasattr(req, "__dict__"):
+                req._pd_recalled_node = node
             swa_tokens = len(plan.swa_remote) * self._page_size
             self._pins[req.bootstrap_room] = _RecalledPrefixPin(
                 req=req,
