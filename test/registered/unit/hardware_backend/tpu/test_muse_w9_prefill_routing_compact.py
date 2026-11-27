@@ -738,3 +738,142 @@ def test_macro_vec_qblock_coarse48_parity_and_tpu7x_aot():
         eff_hoist_routing=True,
         eff_cm_pipe=False,
     )
+
+
+def test_fori_part_b_ep16_and_ep8_parity_and_tpu7x_aot():
+    """Verify lax.fori_loop Part B in pallas_local_inv_perm_and_counts (EP=16/8)."""
+    jax = pytest.importorskip("jax")
+    import jax.numpy as jnp
+    from jax.experimental import topologies
+    from jax.experimental.pallas import tpu as pltpu
+
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.pipeline import (
+        _allow_pallas_sortfree_routing,
+    )
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.routing_pallas import (
+        pallas_local_inv_perm_and_counts,
+    )
+
+    eager_interp = pltpu.InterpretParams(
+        dma_execution_mode="eager",
+        detect_races=True,
+        uninitialized_memory="nan",
+    )
+    rng = np.random.default_rng(20261127)
+    cases = (
+        # (ep, tl, n_loc, rk, has_pad, rnp, zls)
+        (16, 128, 18, 0, True, False, True),
+        (16, 128, 18, 15, True, True, True),
+        (16, 256, 16, 3, False, False, True),
+        (16, 256, 16, 7, False, True, False),
+        (16, 256, 18, 0, True, False, True),
+        (16, 256, 18, 11, True, True, True),
+        (16, 256, 32, 15, True, True, False),
+        (16, 512, 22, 9, True, True, True),
+        (8, 256, 36, 4, True, True, False),
+    )
+    with _tpu7x_cpu_context(interpret=False):
+        for ep_size, t_local, n_loc, rk, has_pad, rnp, zls in cases:
+            t_glob = ep_size * t_local
+            n_exp = ep_size * n_loc
+            nb = n_exp + (1 if has_pad else 0)
+            g_np = rng.integers(0, n_exp, size=(t_glob, 8), dtype=np.int32)
+            if has_pad:
+                vt = max(1, (rk + 1) * t_local - 37)
+                g_np[vt:] = n_exp
+            l_np = g_np[rk * t_local : (rk + 1) * t_local]
+            ip, gs, gst, tr = pallas_local_inv_perm_and_counts(
+                jnp.asarray(l_np),
+                jnp.asarray(g_np),
+                jnp.int32(rk * n_loc),
+                jnp.int32(rk),
+                ep_size=ep_size,
+                num_local_experts=n_loc,
+                total_id_buckets=nb,
+                has_pad_sentinel=has_pad,
+                zero_local_start=zls,
+                native_pack=rnp,
+                interpret=eager_interp,
+            )
+            exp_ip = (
+                np.argsort(np.argsort(l_np.reshape(-1), kind="stable"))
+                .reshape(t_local, 8)
+                .astype(np.int32)
+            )
+            assert np.array_equal(np.asarray(ip), exp_ip)
+            g_chips = g_np.reshape(ep_size, t_local * 8)
+            exp_bef = np.sum(g_chips < (rk * n_loc), axis=1).astype(np.int32)
+            exp_ce = np.stack(
+                [np.sum(g_chips == (rk * n_loc + e), axis=1) for e in range(n_loc)],
+                axis=0,
+            ).astype(np.int32)
+            exp_ls = np.int32(0) if zls else np.int32(exp_bef.sum())
+            act_rk = int(np.sum(g_chips[rk] < n_exp)) if has_pad else (t_local * 8)
+            exp_tr = np.int32(act_rk - int(exp_ce[:, rk].sum()))
+            exp_hdr = np.concatenate(
+                [
+                    np.asarray([exp_ls, exp_tr], dtype=np.int32),
+                    exp_bef,
+                    exp_ce.reshape(-1),
+                ]
+            )
+            exp_gs_loc = np.sum(exp_ce, axis=1).astype(np.int32)
+            assert np.array_equal(
+                np.asarray(gs)[rk * n_loc : (rk + 1) * n_loc], exp_gs_loc
+            )
+            assert np.array_equal(np.asarray(gst), exp_hdr)
+            assert int(tr) == int(exp_tr)
+
+        orig_cp = pltpu.CompilerParams
+        with mock.patch.object(
+            pltpu,
+            "CompilerParams",
+            lambda *a, **kw: orig_cp(*a, **{**kw, "disable_bounds_checks": False}),
+        ):
+            for topo_name, ep_size, tl, n_loc, rnp in (
+                ("tpu7x=2x2x2", 16, 256, 16, False),
+                ("tpu7x=2x2x2", 16, 256, 18, True),
+                ("tpu7x=2x2x2", 16, 512, 22, True),
+                ("tpu7x=2x2x2", 16, 1536, 32, True),
+                ("tpu7x=2x2x1", 8, 256, 36, True),
+            ):
+                topo = topologies.get_topology_desc(platform="tpu", topology_name=topo_name)
+                shd = jax.sharding.SingleDeviceSharding(topo.devices[0])
+                fn_aot = (
+                    lambda l_, g_, go_, m_, _ep=ep_size, _nl=n_loc, _r=rnp: (
+                        pallas_local_inv_perm_and_counts(
+                            l_,
+                            g_,
+                            go_,
+                            m_,
+                            ep_size=_ep,
+                            num_local_experts=_nl,
+                            total_id_buckets=_ep * _nl + 1,
+                            has_pad_sentinel=True,
+                            zero_local_start=True,
+                            native_pack=_r,
+                        )
+                    )
+                )
+                comp = (
+                    jax.jit(fn_aot)
+                    .trace(
+                        jax.ShapeDtypeStruct((tl, 8), jnp.int32, sharding=shd),
+                        jax.ShapeDtypeStruct((ep_size * tl, 8), jnp.int32, sharding=shd),
+                        jax.ShapeDtypeStruct((), jnp.int32, sharding=shd),
+                        jax.ShapeDtypeStruct((), jnp.int32, sharding=shd),
+                    )
+                    .lower()
+                    .compile()
+                )
+                assert comp is not None
+
+    for pad in (False, True):
+        assert _allow_pallas_sortfree_routing(
+            1, sortfree_prefill=True, topk=8, ep_size=16, t_local=256,
+            n_loc_eff=22, has_pad_sentinel=pad, eff_hoist_routing=True, eff_cm_pipe=False,
+        )
+    assert not _allow_pallas_sortfree_routing(
+        1, sortfree_prefill=True, topk=8, ep_size=16, t_local=128,
+        n_loc_eff=18, has_pad_sentinel=True, eff_hoist_routing=True, eff_cm_pipe=True,
+    )
