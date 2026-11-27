@@ -1729,7 +1729,7 @@ def _reshape_x_to_3d(
 ) -> None:
     """Reshape ``x_in_ref [B, 4096]`` into sublane-tiled ``x_3d_buf [B, 32, 128]``."""
     if (cfg.fast_b64_epi_pro and batch_size <= 64) or (
-        cfg.fast_gs and batch_size <= 128
+        cfg.fast_gs and batch_size <= 256
     ):
         x_chunk = min(batch_size, 32)
         for r0 in range(0, batch_size, x_chunk):
@@ -1778,7 +1778,7 @@ def zero_and_pack_muse_sparse_from_vmem(
         return
 
     if (cfg.fast_b64_epi_pro and batch_size <= 64) or (
-        cfg.fast_gs and batch_size <= 128
+        cfg.fast_gs and batch_size <= 256
     ):
         z_chunk = min(batch_size, 32)
         z_acc = jnp.zeros((z_chunk, 32, 128), dtype=jnp.float32)
@@ -2232,6 +2232,9 @@ def run_muse_sparse_experts_and_rs_from_vmem(
     exec_slot_smem = plan_res.exec_slot_smem
     tile_m = cfg.tile_m
     rows_per_rank = batch_size // ep
+    # Unrolling n_strips=4 across all m_buckets (16..128) when tile_m>=128 bloats IMEM (~6 MiB)
+    # and thrashes ICache on TPU7x; keep strip unrolling active only for tile_m < 128.
+    max_strip_unroll = 4 if (cfg.unroll_strips and tile_m < 128) else 2
 
     start_s3_part = plan_res.dma_ops.start_s3_part
     wait_s3_part = plan_res.dma_ops.wait_s3_part
@@ -2314,7 +2317,7 @@ def run_muse_sparse_experts_and_rs_from_vmem(
             return carry
 
         n_strips = width // nc
-        max_unr = 4 if cfg.unroll_strips else 2
+        max_unr = max_strip_unroll
         if n_strips <= max_unr:
             for jj in range(n_strips):
                 _strip(jj, 0)
@@ -2422,7 +2425,7 @@ def run_muse_sparse_experts_and_rs_from_vmem(
             return carry
 
         n_s1 = _I // nc
-        max_unr1 = 4 if cfg.unroll_strips else 2
+        max_unr1 = max_strip_unroll
         if n_s1 <= max_unr1:
             for jj in range(n_s1):
                 _strip_k1(jj, 0)
@@ -2530,7 +2533,7 @@ def run_muse_sparse_experts_and_rs_from_vmem(
             return carry
 
         n_strips = width // nc
-        max_unr = 4 if cfg.unroll_strips else 2
+        max_unr = max_strip_unroll
         if n_strips <= max_unr:
             for jj in range(n_strips):
                 _strip(jj, 0)
@@ -2595,7 +2598,7 @@ def run_muse_sparse_experts_and_rs_from_vmem(
             return sq_acc
 
         n_strips = width // nc
-        max_unr = 4 if cfg.unroll_strips else 2
+        max_unr = max_strip_unroll
         if n_strips <= max_unr:
             for jj in range(n_strips):
                 sq_sum = _strip(jj, sq_sum)
@@ -4026,7 +4029,7 @@ def run_muse_sparse_experts_and_rs_from_vmem(
     # 7. Contiguous EP-1 multi-row Reduce-Scatter.
     if cfg.rs_wire_bf16:
         if (cfg.fast_b64_epi_pro and batch_size <= 64) or (
-            cfg.fast_gs and batch_size <= 128
+            cfg.fast_gs and batch_size <= 256
         ):
             cast_step = min(batch_size, 32)
             for r0 in range(0, batch_size, cast_step):
