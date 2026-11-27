@@ -3,7 +3,6 @@
 
 import torch
 
-from sglang_tpu.envs import envs
 from sglang_tpu.moe.pallas.fused_moe_op import _build_fused_moe_op
 from sglang_tpu.rl.true_on_policy.common import refuse_flags
 
@@ -34,17 +33,18 @@ def moe_experts(
     topk_ids [M, k] int32, in the router's slot order. Forward only.
     """
     refuse_moe_rounding_flags()
-    with envs.SGLANG_TPU_ENABLE_SINGLE_TOKEN_MOE_KERNEL.override(False):
-        return _fused_moe(
-            hidden_states,
-            w1,
-            w2,
-            topk_weights,
-            topk_ids,
-            topk=topk_ids.shape[1],
-            activation=activation,
-            global_num_experts=w1.shape[0],
-            use_sc_gather=0,
-            permute_dense_threshold=0,
-            gather_permute_with_sc_combine=0,
-        )
+    # No SGLANG_TPU_ENABLE_SINGLE_TOKEN_MOE_KERNEL override: that kernel takes packed MXFP4 weights only, and the
+    # trainer calls this op inside a compiled activation checkpoint, where an os.environ write cannot be traced.
+    return _fused_moe(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        topk=topk_ids.shape[1],
+        activation=activation,
+        global_num_experts=w1.shape[0],
+        use_sc_gather=0,
+        permute_dense_threshold=0,
+        gather_permute_with_sc_combine=0,
+    )

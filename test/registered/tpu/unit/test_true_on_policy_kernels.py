@@ -317,6 +317,31 @@ class TestTrueOnPolicyKernels(CustomTestCase):
         out = moe(*(a[:n].clone() for a in args)).cpu().float()
         self.assertLess((out - ref).abs().max().item(), 0.05)
 
+    def test_moe_experts_compiles_without_a_graph_break(self):
+        """moe_experts traces as one graph and matches eager: the trainer calls it inside a compiled
+        activation checkpoint, where any graph break (an os.environ write is one) is an error."""
+        hidden, inter, experts, topk, rows = 512, 256, 16, 4, 8
+        x = _rnd(rows, hidden)
+        w1 = _rnd(experts, hidden, 2 * inter, scale=hidden**-0.5, seed=1)
+        w2 = _rnd(experts, inter, hidden, scale=inter**-0.5, seed=2)
+        g = torch.Generator().manual_seed(3)
+        ids = torch.stack(
+            [torch.randperm(experts, generator=g)[:topk] for _ in range(rows)]
+        )
+        weights = torch.softmax(torch.randn(rows, topk, generator=g), dim=-1)
+        args = (
+            x,
+            w1,
+            w2,
+            weights.to(torch.bfloat16).to("tpu"),
+            ids.to(torch.int32).to("tpu"),
+        )
+
+        compiled = torch.compile(self.k.moe_experts, fullgraph=True)
+        self.assertTrue(
+            torch.equal(compiled(*args).cpu(), self.k.moe_experts(*args).cpu())
+        )
+
     def test_moe_refuses_flags_that_change_rounding(self):
         from sglang_tpu.envs import envs
 
