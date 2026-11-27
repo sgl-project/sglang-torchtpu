@@ -583,6 +583,41 @@ def _select_fused_rs_block_sizes(
     # Both the caller's max_num_gm sizing and the kernel call this helper, so they agree.
     prefill_tiles = envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_GMM_TILES.get()
     if (
+        not prefill_tiles
+        and not hot_interleave
+        and not fp8_direct_write
+        and is_quantized
+        and jax.dtypes.itemsize_bits(w1_dtype) in (4, 32)
+        and (size_k1, aligned_n1, padded_k2, aligned_n2) == (4096, 8192, 4096, 4096)
+        and quant_block_size is not None
+        and quant_block_size >= 256
+        # Preserve M<=32768 tile_m=128 (inter32=12 IMEM budget); upgrade >=8K prefill (M>=65536).
+        and size_m >= 65536
+        and not envs.SGLANG_TPU_MUSE_KERNEL_K256_PREFILL_TILES.get()
+        and int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_EXPERT_OUTER_FP8.get() or 0) < 3
+        and int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_WEIGHT_LOOKAHEAD.get() or 0) == 2
+    ):
+        from .prefill_gmm_opts import resolve_static_fp8_lhs_scale
+
+        if (
+            resolve_static_fp8_lhs_scale(
+                envs.SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8.get(),
+                envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_LHS.get(),
+            )
+            > 0.0
+        ):
+            # FP8 LHS (-2 MiB VMEM) + wla=2: full out-N (2,1) unlocks wla=2 caching
+            # and beats pipeline's n2048 (2,2) across 4K..24K (-4.5%..-8.9% ABAB).
+            tile_m, tile_k1, tile_n1, tile_k2, tile_n2, num_w1_bufs, num_w2_bufs = (
+                256,
+                4096,
+                4096,
+                4096,
+                4096,
+                2,
+                1,
+            )
+    if (
         prefill_tiles
         and is_quantized
         and not fp8_direct_write
@@ -1203,6 +1238,7 @@ def kernel_main_fused_rs(
     inter32_enabled: bool = False,
     tile_idx_smem_ref=None,
     static_fp8_lhs: bool = False,
+    w4a8_k_chain: int = 0,
 ):
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write kernel.
 
@@ -2412,6 +2448,7 @@ def kernel_main_fused_rs(
                 w_strip_fp8_ref=eo_w_strip_fp8_ref,
                 prequant_lhs_ready=has_ext_pq_lhs,
                 skip_lhs_scale_mul=static_fp8_lhs,
+                w4a8_k_chain_override=w4a8_k_chain,
             )
 
         if hot_interleave:
@@ -2550,6 +2587,7 @@ def kernel_main_fused_rs(
             w_strip_fp8_ref=eo_w_strip_fp8_ref,
             prequant_lhs_ready=_use_static_gmm2_lhs,
             skip_lhs_scale_mul=_use_static_gmm2_lhs,
+            w4a8_k_chain_override=w4a8_k_chain,
         )
 
     gathered_lhs_2x_ref[...] = jnp.zeros_like(gathered_lhs_2x_ref)
@@ -5154,16 +5192,59 @@ def gmm_v2_fused_rs(
         resolve_w4a8_k_chain,
     )
 
+    _sw_val = (
+        int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_SCOPED_W4A8.get() or 0)
+        if size_m > _BLOCKDIAG_MAX_SIZE_M
+        else 0
+    )
+    _eo_raw = (
+        int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_EXPERT_OUTER_FP8.get() or 0)
+        if size_m > _BLOCKDIAG_MAX_SIZE_M
+        else 0
+    )
+    _out_n1_full = size_n1 // 2 if act_fn else size_n1
     _w4a8_kc_raw = resolve_w4a8_k_chain(
         envs.SGLANG_TPU_MUSE_KERNEL_GMM_W4A8_K_CHAIN.get()
     )
     _w4a8_kc_val = _w4a8_kc_raw if size_m > _BLOCKDIAG_MAX_SIZE_M else 0
+    _w4a8_kc_eff = (
+        _w4a8_kc_val
+        if (
+            _w4a8_kc_val > 0
+            and size_m > _BLOCKDIAG_MAX_SIZE_M
+            and is_quantized
+            and not fp4_w4a16_eff
+            and not fp8_w8a16
+            and jnp.dtype(w1.dtype) == jnp.float4_e2m1fn
+            and rhs1_quant_block_size == 256
+            and rhs2_quant_block_size == 256
+            and _sw_val >= 4
+            and _eo_raw == 0
+            and tile_m >= 256
+            and tile_n1 >= _out_n1_full
+            and tile_n2 >= size_n2
+            and cfgs1.lhs_cfgs.quant_dtype is not None
+            and (
+                (
+                    _w4a8_kc_val > rhs1_quant_block_size
+                    and total_scale_blocks1 >= 8
+                    and total_scale_blocks1 % 8 == 0
+                )
+                or (
+                    _w4a8_kc_val > rhs2_quant_block_size
+                    and total_scale_blocks2 >= 8
+                    and total_scale_blocks2 % 8 == 0
+                )
+            )
+        )
+        else 0
+    )
     use_dedicated_w2_fp8_cache = (
         int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_W2_FP8_CACHE.get() or 0) >= 1
         and is_quantized
         and not fp8_direct_write
         and not use_w2_prequant_cache
-        and _w4a8_kc_val == 0
+        and _w4a8_kc_eff == 0
         and size_m >= _PREFILL_TILES_MIN_SIZE_M
         and jnp.dtype(w2.dtype) == jnp.float4_e2m1fn
         and rhs2_quant_block_size >= 256
@@ -5199,7 +5280,7 @@ def gmm_v2_fused_rs(
             or envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_STRIP_N.get() > 0
             or int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_SCOPED_W4A8.get() or 0) > 0
             or int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_EXPERT_OUTER_FP8.get() or 0) > 0
-            or _w4a8_kc_val > 0
+            or _w4a8_kc_eff > 0
         )
         and cfgs1.lhs_cfgs.quant_dtype is not None
         and cfgs2.lhs_cfgs.quant_dtype is not None
@@ -5864,17 +5945,6 @@ def gmm_v2_fused_rs(
         else 0
     )
     _rb_active = _rb_val in (1, 3, 4) or (_rb_val == 2 and tile_m <= 128)
-    _sw_val = (
-        int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_SCOPED_W4A8.get() or 0)
-        if size_m > _BLOCKDIAG_MAX_SIZE_M
-        else 0
-    )
-    _eo_raw = (
-        int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_EXPERT_OUTER_FP8.get() or 0)
-        if size_m > _BLOCKDIAG_MAX_SIZE_M
-        else 0
-    )
-    _out_n1_full = size_n1 // 2 if act_fn else size_n1
     _can_cache_full_expert = num_w1_bufs >= (
         _out_n1_full // tile_n1
     ) and num_w2_bufs >= (size_n2 // tile_n2)
@@ -5938,34 +6008,6 @@ def gmm_v2_fused_rs(
         f"-g2s{int(eff_static_fp8_gmm2) if eff_static_fp8_gmm2.is_integer() else str(eff_static_fp8_gmm2).replace('.', 'p')}"
         if eff_static_fp8_gmm2 > 0.0
         else ""
-    )
-    _w4a8_kc_eff = (
-        _w4a8_kc_val
-        if (
-            _w4a8_kc_val > 0
-            and size_m > _BLOCKDIAG_MAX_SIZE_M
-            and is_quantized
-            and not fp4_w4a16_eff
-            and not fp8_w8a16
-            and jnp.dtype(w1.dtype) == jnp.float4_e2m1fn
-            and rhs1_quant_block_size >= 256
-            and _sw_val >= 4
-            and _eo_raw == 0
-            and cfgs1.lhs_cfgs.quant_dtype is not None
-            and (
-                (
-                    _w4a8_kc_val > rhs1_quant_block_size
-                    and total_scale_blocks1 >= 8
-                    and total_scale_blocks1 % 8 == 0
-                )
-                or (
-                    _w4a8_kc_val > rhs2_quant_block_size
-                    and total_scale_blocks2 >= 8
-                    and total_scale_blocks2 % 8 == 0
-                )
-            )
-        )
-        else 0
     )
     _kc_tag = f"-kc{_w4a8_kc_eff}" if _w4a8_kc_eff > 0 else ""
     pallas_name = (
@@ -6337,6 +6379,7 @@ def gmm_v2_fused_rs(
                 w8_refs=w8_bundle,
                 eo_refs=eo_bundle,
                 tile_idx_smem_ref=tile_idx_smem_r,
+                w4a8_k_chain=_w4a8_kc_eff,
                 **kernel_kwargs,
             )
 
@@ -6362,7 +6405,9 @@ def gmm_v2_fused_rs(
         return result.reshape(chunk_size * top_k, aligned_n2)[:, :size_n2]
 
     result = pl.pallas_call(
-        functools.partial(kernel_main_fused_rs, **kernel_kwargs),
+        functools.partial(
+            kernel_main_fused_rs, w4a8_k_chain=_w4a8_kc_eff, **kernel_kwargs
+        ),
         out_shape=out_buf_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=9,
