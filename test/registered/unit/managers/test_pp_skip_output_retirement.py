@@ -195,6 +195,63 @@ class TestReceivedOutputRetirement(CustomTestCase):
         self.assertEqual(stage.device_module.current.waited, [])
 
 
+class TestHostOutputRetirement(CustomTestCase):
+    """Over the TPU stage hand-off the outputs arrive on the host and the device
+    has one queue, so an event recorded at the receive (before this iteration's
+    launch, under any async batch depth) covers the stage's previous forward
+    too, and every result point waited for it."""
+
+    def setUp(self):
+        _route_accelerator_stream(self)
+
+    def _receive(self, logits_output=None):
+        stage = _Stage()
+        # The single-queue path: no forward/copy streams.
+        stage.use_overlap_streams = False
+        stage.copy_stream_ctx = contextlib.nullcontext()
+        stage._pp_wave = object()
+        stage._pp_send_output_to_next_stage = lambda *args: []
+        stage._pp_recv_dict_from_prev_stage = lambda: ({}, None)
+        batch_result = SimpleNamespace(
+            logits_output=logits_output, copy_to_cpu=mock.Mock()
+        )
+        stage._pp_prep_batch_result = lambda batch, meta, outputs: batch_result
+        forward_done = _Event()
+        meta = PPBatchMetadata(can_run_cuda_graph=False, forward_done=forward_done)
+        target = SimpleNamespace(forward_mode=ForwardMode.EXTEND, return_logprob=False)
+        with (
+            mock.patch.object(
+                scheduler_pp_mixin,
+                "get_parallel",
+                return_value=SimpleNamespace(pp_rank=0, pp_size=2),
+            ),
+            mock.patch.object(scheduler_pp_mixin, "_is_npu", False),
+            mock.patch.object(
+                scheduler_pp_mixin, "_pp_can_skip_output_comm", return_value=False
+            ),
+        ):
+            _, result, completion, _ = (
+                stage._pp_send_recv_and_preprocess_output_tensors(
+                    0, 0, [target], [meta], deque(), None
+                )
+            )
+        return stage, result, completion, forward_done
+
+    def test_completion_is_the_micro_batch_forward(self):
+        stage, _, completion, forward_done = self._receive()
+        self.assertIs(completion, forward_done)
+        self.assertIsNone(forward_done.stream)
+
+    def test_host_copies_keep_their_own_event(self):
+        """`copy_to_cpu` records `copy_done` again, so it must not be the
+        forward's event, which the KV free fence and the last stage also hold."""
+        logits_output = SimpleNamespace(sampling_mask_output=object())
+        _, result, completion, forward_done = self._receive(logits_output)
+        self.assertIsNot(completion, forward_done)
+        self.assertIs(result.copy_done, completion)
+        result.copy_to_cpu.assert_called_once()
+
+
 class TestPrebuiltInnerForward(CustomTestCase):
     def setUp(self):
         _route_accelerator_stream(self)

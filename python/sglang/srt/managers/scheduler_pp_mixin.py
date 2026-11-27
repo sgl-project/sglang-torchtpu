@@ -1496,8 +1496,6 @@ class SchedulerPPMixin:
     def _pp_recv_dict_from_prev_stage(
         self: Scheduler,
     ) -> Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]:
-        # Over the wave the outputs stay on the host: every stage reads them
-        # there and relays them on without another copy off the device.
         return self._pp_recv_typed_dict(
             expected_kind="output",
             all_gather_group=(
@@ -1507,8 +1505,13 @@ class SchedulerPPMixin:
                 and self.pp_group.is_first_rank
                 else self._pp_tensor_dict_shard_group()
             ),
-            keep_on_host=self._pp_wave is not None,
+            keep_on_host=self._pp_outputs_on_host(),
         )
+
+    def _pp_outputs_on_host(self: Scheduler) -> bool:
+        """Over the wave the outputs stay on the host: every stage reads them
+        there and relays them on without another copy off the device."""
+        return self._pp_wave is not None
 
     def _pp_make_skip_output_result(
         self: Scheduler,
@@ -1542,12 +1545,17 @@ class SchedulerPPMixin:
         mb_metadata: Optional[PPBatchMetadata],
         *,
         side_stream: bool = False,
+        reuse_forward_done: bool = False,
     ) -> torch.Event:
         """An event recorded after this rank's forward of the micro-batch, which
         processing the result retires. ``side_stream`` keeps the current stream
-        from waiting on it."""
+        from waiting on it. ``reuse_forward_done`` returns the forward's own
+        event when the result reads no device work queued after it: on a
+        single-queue device a new event also covers every later forward."""
         stream = torch.accelerator.current_stream()
         forward_done = mb_metadata.forward_done if mb_metadata else None
+        if forward_done is not None and reuse_forward_done:
+            return forward_done
         if forward_done is not None:
             if side_stream:
                 if self._pp_skip_output_stream is None:
@@ -2132,11 +2140,18 @@ class SchedulerPPMixin:
                 batch_result = self._pp_prep_batch_result(
                     target, mb_metadata[next_mb_id], next_pp_outputs
                 )
-                d2h_event = self._pp_result_done_event(mb_metadata[next_mb_id])
-                if (
+                copies_to_host = (
                     batch_result.logits_output is not None
                     and batch_result.logits_output.sampling_mask_output is not None
-                ):
+                )
+                d2h_event = self._pp_result_done_event(
+                    mb_metadata[next_mb_id],
+                    # Host outputs leave the result nothing to copy, so it waits
+                    # for this micro-batch's forward only, not the ones since.
+                    reuse_forward_done=self._pp_outputs_on_host()
+                    and not copies_to_host,
+                )
+                if copies_to_host:
                     # `copy_to_cpu` records it again behind its copies.
                     batch_result.copy_done = d2h_event
                     batch_result.copy_to_cpu(
