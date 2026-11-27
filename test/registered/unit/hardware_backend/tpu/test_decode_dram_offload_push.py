@@ -822,5 +822,123 @@ class TestEvictionWalkSkipsDeletedLeaves(CustomTestCase):
         )
 
 
+class TestThrashingFixes(PrefillPusherFixture, CustomTestCase):
+    def test_evict_stored_first_defaults_false_and_opts_in(self):
+        from sglang_tpu.envs import envs as tpu_envs
+
+        self.assertFalse(tpu_envs.SGLANG_PD_OFFLOAD_EVICT_STORED_FIRST.get())
+        for opt_in in (False, True):
+            with self.subTest(opt_in=opt_in):
+                self.setUp()
+                with (
+                    patch.object(
+                        tpu_envs.SGLANG_PD_OFFLOAD_EVICT_STORED_FIRST,
+                        "get",
+                        return_value=opt_in,
+                    ),
+                    patch.object(
+                        prefill_dram_victim_pusher,
+                        "mark_next_victim",
+                        wraps=prefill_dram_victim_pusher.mark_next_victim,
+                    ) as mark_mock,
+                ):
+                    sent = self.offer_once()
+                    self.replies[sent["seq"]] = True
+                    self.host.transfer.complete("sent")
+                    self.pusher.advance(serving=True)
+                    self.assertEqual(self.pusher.stats["stored"], 1)
+                    if opt_in:
+                        mark_mock.assert_called_once()
+                    else:
+                        mark_mock.assert_not_called()
+
+    def test_push_free_tokens_env_overrides_pressure_threshold(self):
+        from sglang_tpu.envs import envs as tpu_envs
+
+        with patch.object(
+            tpu_envs.SGLANG_PD_OFFLOAD_PUSH_FREE_TOKENS, "get", return_value=1
+        ):
+            self.assertFalse(self.pusher._under_host_pressure())
+        with patch.object(
+            tpu_envs.SGLANG_PD_OFFLOAD_PUSH_FREE_TOKENS, "get", return_value=1024
+        ):
+            self.assertTrue(self.pusher._under_host_pressure())
+
+    def test_write_through_host_only_push_skips_device_resident_leaf(self):
+        cache, allocator = full_cache(kv_size=16, host_capacity=32)
+        cache.tree_core.is_write_back = cache.is_write_back = False
+        cache.cache_controller.write_policy = "write_through"
+        cache.write_through_threshold = 1
+        channel = push_channel(cache.cache_controller.host)
+        channel.decode_peer.return_value = ("10.0.0.1", 5001)
+        pusher = prefill_dram_victim_pusher.PrefillDramVictimPusher(
+            offload_context(cache=cache, channel=channel)
+        )
+        seq = list(range(100, 108))
+        insert_tokens(cache, allocator, seq)
+        cache.cache_controller.start_writing()
+        cache.writing_check()
+        req = pushed_req(room=1, tokens=seq)
+        pusher.note_decode_of(req, recalled=False)
+        self.assertTrue(pusher._host_only_push_only())
+        pusher.advance(serving=True)
+        channel.send_victim_push.assert_not_called()
+        cache.evict(EvictParams(num_tokens=8))
+        pusher.advance(serving=True)
+        channel.send_victim_push.assert_called_once()
+
+
+class TestDeltaLanding(DecodeReceiverFixture, CustomTestCase):
+    def test_decode_delta_landing_reads_and_allocates_only_missing_suffix(self):
+        self.pushes.clear()
+        p1 = list(range(500, 508))
+        p2 = list(range(500, 512))
+        push1 = VictimPush(
+            prefill="p0",
+            seq=1,
+            ack_endpoint="tcp://10.0.0.1:6001",
+            tokens=p1,
+            blocks=list(range(10, 18)),
+            swa_blocks=[],
+            uuid=111,
+            address="tcp://10.0.0.1:7001",
+            swa_address="",
+            page_metadata=[f"m{i}".encode() for i in range(8)],
+            swa_page_metadata=[],
+        )
+        self.pushes[("p0", 1)] = push1
+        self.round()
+        self.host.transfer.complete("received")
+        self.round()
+        self.assertEqual(self.receiver.stats["landed"], 1)
+        self.assertEqual(self.receiver.stats["landed_tokens"], 8)
+        self.assertEqual(host_hit(self.cache, p1), 8)
+        self.host.transfer.reads.clear()
+        push2 = VictimPush(
+            prefill="p0",
+            seq=2,
+            ack_endpoint="tcp://10.0.0.1:6001",
+            tokens=p2,
+            blocks=list(range(10, 22)),
+            swa_blocks=[],
+            uuid=222,
+            address="tcp://10.0.0.1:7001",
+            swa_address="",
+            page_metadata=[f"m{i}".encode() for i in range(12)],
+            swa_page_metadata=[],
+        )
+        self.pushes[("p0", 2)] = push2
+        self.round()
+        self.assertEqual(len(self.host.transfer.reads), 1)
+        read = next(iter(self.host.transfer.reads.values()))
+        self.assertEqual(read["remote_block_ids"], list(range(18, 22)))
+        self.assertEqual(len(read["local_block_ids"]), 4)
+        self.host.transfer.complete("received")
+        self.round()
+        self.assertEqual(self.receiver.stats["landed"], 2)
+        self.assertEqual(self.receiver.stats["landed_tokens"], 12)
+        self.assertEqual(host_hit(self.cache, p2), 12)
+
+
 if __name__ == "__main__":
     unittest.main()
