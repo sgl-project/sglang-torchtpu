@@ -129,6 +129,43 @@ class TpuEnvs:
     # Vision: run single-sequence "tpu" vision attention through block-skipping splash
     # (attention/vision_splash.py); False keeps the segment-id flash op.
     SGLANG_TPU_ENABLE_VISION_SPLASH_ATTENTION = EnvBool(False)
+    # Wan2.2-A14B: every transformer block of a DiT forward in one Pallas kernel
+    # (multimodal_gen/wan_megakernel); False keeps sglang's blocks.
+    SGLANG_TPU_ENABLE_WAN_MEGAKERNEL = EnvBool(False)
+    # Wan megakernel: build each shape's per-step constants once (the tiling,
+    # the op and the real-row count on the device, uploaded without waiting),
+    # so a denoising step makes no host-to-device copy. Off: the count is
+    # uploaded every step by a blocking copy, which returns only once the TPU
+    # queue has drained. Same kernel inputs either way.
+    SGLANG_TPU_ENABLE_WAN_MEGAKERNEL_STEP_CONSTANTS = EnvBool(False)
+    # Wan megakernel code layout, each the same bits (wan_megakernel/tiling.py):
+    # PIPELINED_EPILOGUES runs each phase C projection tile's and MLP up tile's
+    # epilogue in the next tile's step; SKIP_BOUNDS_CHECKS compiles the kernel
+    # without Mosaic's DMA bounds checks (traps on an out-of-bounds copy, scalar
+    # work at every copy). Off: the current layout and checks.
+    SGLANG_TPU_OPT_WAN_MEGAKERNEL_PIPELINED_EPILOGUES = EnvBool(False)
+    SGLANG_TPU_OPT_WAN_MEGAKERNEL_SKIP_BOUNDS_CHECKS = EnvBool(False)
+    # More layout options, each the same bits (wan_megakernel/tiling.py):
+    # SKIP_SEMAPHORE_CHECKS compiles without Mosaic's semaphore checks;
+    # MASK_SCORES has the key tile holding the last real row subtract a per-key
+    # column (0 or +inf) on the fixed path instead of selecting its scores;
+    # ZERO_AHEAD zeroes each attention item's sum and output in the item
+    # before's epilogue.
+    SGLANG_TPU_OPT_WAN_MEGAKERNEL_SKIP_SEMAPHORE_CHECKS = EnvBool(False)
+    SGLANG_TPU_OPT_WAN_MEGAKERNEL_MASK_SCORES = EnvBool(False)
+    SGLANG_TPU_OPT_WAN_MEGAKERNEL_ZERO_AHEAD = EnvBool(False)
+    # Row chunks of each MLP up-projection step's matmul, with
+    # PIPELINED_EPILOGUES (wan_megakernel/tiling.py Tiling.up_chunks; 8 at the
+    # recipes' 1,024-row tiles): the same bits; unset: one dot a step.
+    SGLANG_TPU_OPT_WAN_MEGAKERNEL_UP_ROW_CHUNKS = EnvInt(1)
+    # Wan megakernel forward around the kernel, the same kernel inputs:
+    # ROW_EMBED takes the patch embedding's rows as the linear makes them (no
+    # channels-first copy and transpose back) and pads only this rank's rows;
+    # NONBLOCKING_KEYS uploads the cross-attention key counts without waiting,
+    # so a new request's or expert's first forward does not stall the host
+    # until the TPU queue has drained (sglang_tpu/host_upload.py).
+    SGLANG_TPU_OPT_WAN_MEGAKERNEL_ROW_EMBED = EnvBool(False)
+    SGLANG_TPU_OPT_WAN_MEGAKERNEL_NONBLOCKING_KEYS = EnvBool(False)
     # Launch-time xprof capture (see profile_auto.py): each stage once, without
     # /start_profile. Keep the step count small: each chip's trace is hundreds
     # of MB.

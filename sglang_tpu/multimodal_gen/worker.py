@@ -18,6 +18,15 @@ def install_runtime_patches() -> None:
     rope.install()
     minimax_h3.install()
 
+    from sglang_tpu.envs import envs
+
+    # Only a worker with the kernel enabled imports the megakernel package
+    # (and JAX).
+    if envs.SGLANG_TPU_ENABLE_WAN_MEGAKERNEL.get():
+        from sglang_tpu.multimodal_gen.wan_megakernel import hook as wan_megakernel
+
+        wan_megakernel.install()
+
 
 def configure_compile_cache() -> None:
     """Scope persisted torch.compile artifacts to what FX graphs cannot see.
