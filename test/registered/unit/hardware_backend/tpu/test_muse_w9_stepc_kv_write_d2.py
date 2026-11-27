@@ -976,7 +976,8 @@ def test_wave10_step_c_full_attn_adaptive_1k_and_8k1k_aot(tp: int):
             )
         ).lower(*abstract)
     hlo_txt = lowered.as_text()
-    assert "_c1024_rope" in hlo_txt, f"Missing adaptive 1K branch in lowered HLO for TP={tp}"
+    assert f"muse_w9_b1_moe_b2_rpad_b64_tp{tp}_" in hlo_txt
+    assert "_c1024_" not in hlo_txt, f"Unexpected adaptive 1K lax.cond split in lowered HLO for TP={tp}"
     assert lowered.compile() is not None
 
 
@@ -991,6 +992,7 @@ def _compile_step_c_aot(
     bd4: bool,
     dist_len: int = 3,
     has_rope: bool = False,
+    allow_large_b: bool | None = None,
 ):
     """Lower and AOT-compile b1_moe_b2_rpad_chip_sharded_jax for TPU7x and assert <63 MiB VMEM."""
     import gc
@@ -1067,6 +1069,7 @@ def _compile_step_c_aot(
             kv_pack_bd4=bd4,
             replica_cost_mode="tiles",
             skip_kv_write=True,
+            allow_large_b=allow_large_b,
         )
 
     with mock.patch("sglang_tpu.attention.pallas.util.get_torch_tpu_device_kind", return_value="TPU v7"):
@@ -1100,17 +1103,18 @@ def _compile_step_c_aot(
 def test_wave11_step_c_b128_b256_3scope_swa_aot(
     tp: int, B: int, dense2: bool, bd4: bool, has_rope: bool
 ):
-    """Verify 3-scope Step (c) compiles <63 MiB VMEM on TPU7x for valid B=128/256 SWA (_dfp, rope/nope)."""
+    """Verify 3-scope Step (c) compiles <63 MiB VMEM on TPU7x (BD4 b2 by default; DENSE2 explicit b1 opt-in)."""
     hlo = _compile_step_c_aot(
         tp=tp,
         B=B,
         pps=4,
         sw=2049,
-        mode="w8,s4,batchfull,g4k,foldcol,shared16",
+        mode="w8,s4,b1,batchfull,g4k,foldcol,shared16" if dense2 else "w8,s4,batchfull,g4k,foldcol,shared16",
         dense2=dense2,
         bd4=bd4,
         dist_len=3,
         has_rope=has_rope,
+        allow_large_b=dense2,
     )
     assert f"muse_w9_b1_moe_b2_rpad_b{B}_tp{tp}_" in hlo
 
@@ -1241,7 +1245,7 @@ def test_wave11_step_c_interpret_parity_vs_step_b(case: str):
         shared_p = None
         dist = jnp.asarray([B, B, B], jnp.int32)
         sw = 2049
-        mode = "w8,s4,batchfull,g4k,foldcol"
+        mode = "w8,s4,b1,batchfull,g4k,foldcol"
 
     kvc_base = jax.lax.bitcast_convert_type(
         jnp.asarray(np.full((nb, phys_rows, 1, 4, 128), 0x38, dtype=np.uint8), jnp.uint8),
@@ -1297,6 +1301,7 @@ def test_wave11_step_c_interpret_parity_vs_step_b(case: str):
             rpa_sm_scale=64.0**-0.5, rpa_sliding_window=sw,
             rpa_mode_str=mode, kv_pack_dense2=True, replica_cost_mode="tiles",
             config=cfg, skip_kv_write=True, interpret=ip_race,
+            allow_large_b=(not is_lc),
         )
         kvc_o = write_decode_kv_merged_jax(
             kvm, kvc_, kvl_, pi_, cq_, ckv_, dt_, kv_pack_dense2=True, interpret=ip_race,
@@ -1330,14 +1335,17 @@ def test_wave11_step_c_interpret_parity_vs_step_b(case: str):
 
 
 def test_wave11_step_c_rpa_plan_shared_and_large_b():
-    """Verify resolve_step_c_rpa_plan accepts LC shared_group_size>0 at B<=64 and SWA <=16*512 at B=128/256."""
+    """Verify resolve_step_c_rpa_plan keeps BD4 B=256 b2 ON, gates DENSE2 B>64 off, and blocks grp=1 downgrade."""
+    from sglang_tpu.envs import envs as tpu_envs
     from sglang_tpu.muse_megakernel.decode.b1_moe_b2_kernel import (
         resolve_step_c_rpa_plan,
     )
 
-    # B=128/256 SWA fits 16*512 Limit; Full 8K/1K >16*512 stays gated to Step (b).
-    _, _, _, _, ok_swa_256 = resolve_step_c_rpa_plan(
-        "w8,s4,batchfull,g4k,foldcol",
+    assert tpu_envs.SGLANG_TPU_MUSE_MK_STEP_C_LARGE_B.default is False
+
+    # TP=16 B=256 BD4 SWA (batch4) fits b2 (5,120 <= 8,192): keeps Step (c) ON by default (#5010).
+    cfg_swa_256_bd4, _, slot_swa_256_bd4, grp_swa_256_bd4, ok_swa_256_bd4 = resolve_step_c_rpa_plan(
+        "w8,s4,batchfull,g4k,foldcol,batch4",
         sliding_window=2049,
         pages_per_seq=4,
         phys_page_rows=128,
@@ -1345,10 +1353,48 @@ def test_wave11_step_c_rpa_plan_shared_and_large_b():
         b_tokens=256,
         max_num_seqs=256,
     )
-    assert ok_swa_256 is True
+    assert ok_swa_256_bd4 is True and grp_swa_256_bd4 is True and cfg_swa_256_bd4.swabatch_group_size == 2
+    assert slot_swa_256_bd4 == 10
 
-    # B=128/256 BD4/DENSE2 Full 8K/1K (pps=32) auto-clamps to ring4k (s3, c4096 -> <= 16*512 rows & < 960 KiB SMEM);
-    # 512B B=128/256 (s3, c4096 = 24*512 > 16*512) and pps=512 B=256 (>960 KiB SMEM) stay gated to Step (b).
+    # TP=8 B=128 DENSE2 stays gated to 2-Scope Step (b) by default (#4962/#5010), and with LARGE_B=1
+    # SWA batch4 still refuses silent grp=1 downgrade unless explicit b1 is passed.
+    _, _, _, _, ok_swa_128_def = resolve_step_c_rpa_plan(
+        "w8,s4,batchfull,g4k,foldcol,batch4",
+        sliding_window=2049,
+        pages_per_seq=4,
+        phys_page_rows=256,
+        kv_pack_dense2=True,
+        b_tokens=128,
+        max_num_seqs=128,
+    )
+    assert ok_swa_128_def is False
+
+    _, _, _, _, ok_swa_128_b4 = resolve_step_c_rpa_plan(
+        "w8,s4,batchfull,g4k,foldcol,batch4,d2grp",
+        sliding_window=2049,
+        pages_per_seq=32,
+        phys_page_rows=256,
+        kv_pack_dense2=True,
+        b_tokens=128,
+        max_num_seqs=128,
+        allow_large_b=True,
+    )
+    assert ok_swa_128_b4 is False
+
+    _, _, _, _, ok_swa_128_b1 = resolve_step_c_rpa_plan(
+        "w8,s4,b1,batchfull,g4k,foldcol",
+        sliding_window=2049,
+        pages_per_seq=4,
+        phys_page_rows=256,
+        kv_pack_dense2=True,
+        b_tokens=128,
+        max_num_seqs=128,
+        allow_large_b=True,
+    )
+    assert ok_swa_128_b1 is True
+
+    # BD4 B=256 Full 8K/1K (pps=32) auto-clamps to ring4k (s3, c4096) cleanly without LARGE_B;
+    # DENSE2 B=128 Full stays gated by default; 512B B=256 and pps=512 B=256 stay gated to Step (b).
     cfg_full_256, one_full_256, slot_full_256, grp_full_256, ok_full_256 = resolve_step_c_rpa_plan(
         "w8,s4,batchfull,g4k,foldcol",
         sliding_window=None,
@@ -1365,6 +1411,17 @@ def test_wave11_step_c_rpa_plan_shared_and_large_b():
         4096,
         8,
     )
+
+    _, _, _, _, ok_d2_full_128 = resolve_step_c_rpa_plan(
+        "w8,s4,batchfull,g4k,foldcol",
+        sliding_window=None,
+        pages_per_seq=32,
+        phys_page_rows=256,
+        kv_pack_dense2=True,
+        b_tokens=128,
+        max_num_seqs=128,
+    )
+    assert ok_d2_full_128 is False
 
     _, _, _, _, ok_512_256 = resolve_step_c_rpa_plan(
         "w8,s4,batchfull,g4k,foldcol",
@@ -1444,6 +1501,7 @@ def test_wave11_muse_spark_step_c_b128_b256_and_lc_full_dispatch():
         rpa_mode: str,
         lc_full_env: str,
         lc_swa_env: str = "1",
+        large_b_env: str = "0",
     ):
         r_pair = batch // (tp // 2)
         qkv_cols = 640 if tp == 16 else 1280
@@ -1573,6 +1631,7 @@ def test_wave11_muse_spark_step_c_b128_b256_and_lc_full_dispatch():
             "SGLANG_TPU_MUSE_DECODE_TP16_QKV_EPI": "1" if tp == 16 else "0",
             "SGLANG_TPU_MUSE_MK_STEP_C_LC_SWA": lc_swa_env,
             "SGLANG_TPU_MUSE_MK_STEP_C_LC_FULL": lc_full_env,
+            "SGLANG_TPU_MUSE_MK_STEP_C_LARGE_B": large_b_env,
             "SGLANG_TPU_RPA_V3_DECODE_FAST": rpa_mode,
         }
         with (
@@ -1637,16 +1696,19 @@ def test_wave11_muse_spark_step_c_b128_b256_and_lc_full_dispatch():
             )
         return calls, len(pending)
 
-    # Target 1: B=128 TP=8 & B=256 TP=16 SWA dispatch Step (c) and queue StepC_write_kv_multi.
-    assert _run_case(tp=8, batch=128, sw=2049, pps=4, dist_len=3, rpa_mode="w8,s4,batchfull,g4k,foldcol", lc_full_env="0") == (["step_c"], 1)
-    assert _run_case(tp=16, batch=256, sw=2049, pps=4, dist_len=3, rpa_mode="w8,s4,batchfull,g4k,foldcol", lc_full_env="0") == (["step_c"], 1)
+    # Wave 13 (#5010): B=128 TP=8 DENSE2 stays gated to 2-Scope Step (b) by default (and 8K/1K pps=32 batch4 refuses grp=1 downgrade);
+    # B=256 TP=16 BD4 keeps Step (c) via b2 (5,120 <= 8,192).
+    assert _run_case(tp=8, batch=128, sw=2049, pps=32, dist_len=3, rpa_mode="w8,s4,batchfull,g4k,foldcol,batch4", lc_full_env="0") == (["step_b"], 0)
+    assert _run_case(tp=16, batch=256, sw=2049, pps=32, dist_len=3, rpa_mode="w8,s4,batchfull,g4k,foldcol,batch4", lc_full_env="0") == (["step_c"], 1)
+    assert _run_case(tp=8, batch=128, sw=2049, pps=32, dist_len=3, rpa_mode="w8,s4,batchfull,g4k,foldcol,batch4,d2grp", lc_full_env="0", large_b_env="1") == (["step_b"], 0)
+    assert _run_case(tp=8, batch=128, sw=2049, pps=32, dist_len=3, rpa_mode="w8,s4,b1,batchfull,g4k,foldcol", lc_full_env="0", large_b_env="1") == (["step_c"], 1)
 
     # Target 2: LC Full shared64 stays gated to Step (b) by default (LC_FULL=0) and enters Step (c) only with LC_FULL=1.
     lc_mode = "w8,s4,c4096,shared64,coal,noz,pbf16,q1024,shfp8,batchfull,foldcol"
     assert _run_case(tp=16, batch=64, sw=None, pps=512, dist_len=4, rpa_mode=lc_mode, lc_full_env="0") == (["step_b"], 0)
     assert _run_case(tp=16, batch=64, sw=None, pps=512, dist_len=4, rpa_mode=lc_mode, lc_full_env="1") == (["step_c"], 1)
 
-    # Wave 12: 512B B=64 pps=32 & BD4 B=256 pps=32 Full-Attn auto-clamp to ring4k and enter Step (c).
+    # Wave 12/13: 512B B=64 pps=32 & BD4 B=256 pps=32 Full-Attn enter Step (c) via ring4k auto-clamp.
     assert _run_case(tp=16, batch=64, sw=None, pps=32, dist_len=3, rpa_mode="w8,s4,batchfull,g4k,foldcol", lc_full_env="0") == (["step_c"], 1)
     assert _run_case(tp=16, batch=256, sw=None, pps=32, dist_len=3, rpa_mode="w8,s4,batchfull,g4k,foldcol", lc_full_env="0") == (["step_c"], 1)
 
@@ -1663,20 +1725,21 @@ def test_wave11_muse_spark_step_c_b128_b256_and_lc_full_dispatch():
 def test_wave12_step_c_ring4k_autoclamp_and_adaptive_1k_aot(
     tp: int, B: int, dense2: bool, bd4: bool, pps: int
 ):
-    """Verify ring4k auto-clamp + adaptive 1K (_c1024_nope) compiles <63 MiB VMEM on TPU7x across 512B & B=128/256."""
+    """Verify ring4k auto-clamp compiles <63 MiB VMEM on TPU7x without lax.cond _c1024_ split."""
     hlo = _compile_step_c_aot(
         tp=tp,
         B=B,
         pps=pps,
         sw=-1,
-        mode="w8,s4,batchfull,g4k,foldcol,shared16",
+        mode="w8,s4,b1,batchfull,g4k,foldcol,shared16" if dense2 else "w8,s4,batchfull,g4k,foldcol,shared16",
         dense2=dense2,
         bd4=bd4,
         dist_len=3,
         has_rope=False,
+        allow_large_b=dense2,
     )
     assert f"muse_w9_b1_moe_b2_rpad_b{B}_tp{tp}_" in hlo
-    assert "_c1024_nope" in hlo
+    assert "_c1024_" not in hlo
 
 
 @pytest.mark.parametrize("case", ["b64_512b_adaptive_1k", "b64_512b_ring4k_8k", "b128_d2_ring4k_8k"])
@@ -1775,7 +1838,7 @@ def test_wave12_step_c_ring4k_and_adaptive_1k_interpret_parity(case: str):
     cuq = jnp.arange(B + 1, dtype=jnp.int32)
     cukv = jnp.arange(B + 1, dtype=jnp.int32) * (pps * 512)
     dist = jnp.asarray([B, B, B], jnp.int32)
-    mode_sc = "w8,s4,batchfull,g4k,foldcol,shared16"
+    mode_sc = "w8,s4,b1,batchfull,g4k,foldcol,shared16" if is_b128 else "w8,s4,batchfull,g4k,foldcol,shared16"
     mode_sb = "w8,s3,ring4k,c4096,batchfull,g4k,foldcol"
 
     base_args = (
@@ -1823,6 +1886,7 @@ def test_wave12_step_c_ring4k_and_adaptive_1k_interpret_parity(case: str):
             rpa_sm_scale=64.0**-0.5, rpa_sliding_window=-1,
             rpa_mode_str=mode_sc, kv_pack_dense2=dense2, replica_cost_mode="tiles",
             config=cfg, skip_kv_write=True, interpret=ip_race,
+            allow_large_b=is_b128,
         )
         kvc_o = write_decode_kv_merged_jax(
             kvm, kvc_, kvl_, pi_, cq_, ckv_, dt_, kv_pack_dense2=dense2, interpret=ip_race,
@@ -1853,3 +1917,130 @@ def test_wave12_step_c_ring4k_and_adaptive_1k_interpret_parity(case: str):
         cos = float(np.dot(x, y) / (np.linalg.norm(x) * np.linalg.norm(y) + 1e-12))
         assert cos > 0.9999, f"{case} {nm} cos={cos}"
     assert np.array_equal(ref_kv_u8, fast_kv_u8)
+
+
+@pytest.mark.parametrize(
+    "n_layers,bd4,dense2",
+    [
+        (8, True, False),
+        (5, True, False),
+        (8, False, True),
+    ],
+)
+def test_wave13_step_c_write_kv_multi_5d_sublane8_parity_and_aot(
+    n_layers: int, bd4: bool, dense2: bool
+):
+    """Verify sublane-vectorized 5D StepC_write_kv_multi eager race/NaN Interpret parity & TPU7x AOT aliasing."""
+    from unittest import mock
+
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import topologies
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    from sglang_tpu.muse_megakernel.decode.b1_moe_b2_kernel import (
+        write_decode_kv_merged_jax,
+        write_decode_kv_multi_layer_jax,
+    )
+
+    ip_race = pltpu.InterpretParams(
+        dma_execution_mode="eager",
+        detect_races=True,
+        uninitialized_memory="nan",
+    )
+    rng = np.random.default_rng(20262400 + n_layers + (10 if bd4 else 0))
+    B, pps = 16, 4
+    pack_factor = 4 if bd4 else 2
+    phys_rows = 512 // pack_factor
+    nb = B * pps + 4
+    n_live = 11
+
+    kvc_u8 = np.full((n_layers, nb, phys_rows, 1, 4, 128), 0x7F, dtype=np.uint8)
+    kvl_np = np.array([10, 11, 12, 13, 512, 513, 514, 515, 256, 257, 300, 0, 0, 0, 0, 0], dtype=np.int32)
+    pg_mat = rng.permutation(nb)[: B * pps].reshape(B, pps).astype(np.int32)
+    for b_i in range(n_live):
+        tok = int(kvl_np[b_i]) - 1
+        pg = int(pg_mat[b_i, tok // 512])
+        pr = (tok % 512) // pack_factor
+        for s_prev in range(tok & (pack_factor - 1)):
+            c_pair = (0 if s_prev < 2 else 2) if bd4 else (0 if s_prev == 0 else 2)
+            l0, l1 = ((0, 64) if (s_prev & 1) == 0 else (64, 128)) if bd4 else (0, 128)
+            kvc_u8[:, pg, pr, 0, c_pair : c_pair + 2, l0:l1] = rng.integers(
+                0x30, 0x3D, size=(n_layers, 2, l1 - l0), dtype=np.uint8
+            )
+    caches_5d = tuple(
+        jax.lax.bitcast_convert_type(jnp.asarray(kvc_u8[li], jnp.uint8), jnp.float8_e4m3fn)
+        for li in range(n_layers)
+    )
+    kv_new_u8 = np.full((n_layers, B, 1, 4, 128), 0x7F, dtype=np.uint8)
+    cols_valid = 64 if bd4 else 128
+    kv_new_u8[:, :n_live, 0, :2, :cols_valid] = rng.integers(
+        0x30, 0x3D, size=(n_layers, n_live, 2, cols_valid), dtype=np.uint8
+    )
+    kv_new_layers = jax.lax.bitcast_convert_type(
+        jnp.asarray(kv_new_u8, jnp.uint8), jnp.float8_e4m3fn
+    )
+    kvl_j = jnp.asarray(kvl_np, jnp.int32)
+    pg_j = jnp.asarray(pg_mat.reshape(-1), jnp.int32)
+    cq = jnp.asarray(
+        np.concatenate([np.arange(n_live + 1), np.full((B - n_live,), n_live)], dtype=np.int32)
+    )
+    ckv = jnp.arange(B + 1, dtype=jnp.int32) * (pps * 512)
+    dist = jnp.asarray([n_live, n_live, n_live], jnp.int32)
+
+    got = write_decode_kv_multi_layer_jax(
+        kv_new_layers, caches_5d, kvl_j, pg_j, cq, ckv, dist,
+        kv_pack_dense2=dense2, kv_pack_bd4=bd4, interpret=ip_race,
+    )
+    for li in range(n_layers):
+        ref_li = write_decode_kv_merged_jax(
+            kv_new_layers[li], caches_5d[li], kvl_j, pg_j, cq, ckv, dist,
+            kv_pack_dense2=dense2, kv_pack_bd4=bd4, interpret=True,
+        )
+        assert np.array_equal(
+            np.asarray(ref_li).view(np.uint8), np.asarray(got[li]).view(np.uint8)
+        ), f"5D sublane8 mismatch at layer {li} (n_layers={n_layers}, bd4={bd4})"
+
+    # Verify q_len > 1 fallback parity cleanly matches per-layer writer.
+    cq_mq = cq.at[1:].set(cq[1:] + 1)
+    kvl_mq = kvl_j.at[0].set(102)
+    got_mq = write_decode_kv_multi_layer_jax(
+        kv_new_layers, caches_5d, kvl_mq, pg_j, cq_mq, ckv, dist,
+        kv_pack_dense2=dense2, kv_pack_bd4=bd4, interpret=ip_race,
+    )
+    ref_mq0 = write_decode_kv_merged_jax(
+        kv_new_layers[0], caches_5d[0], kvl_mq, pg_j, cq_mq, ckv, dist,
+        kv_pack_dense2=dense2, kv_pack_bd4=bd4, interpret=True,
+    )
+    assert np.array_equal(np.asarray(ref_mq0).view(np.uint8), np.asarray(got_mq[0]).view(np.uint8))
+
+    # TPU7x AOT HLO input-output aliasing + zero cache copies for n_layers in {5, 8}.
+    tpu_devs = topologies.get_topology_desc("tpu7x:2x2x2" if bd4 else "tpu7x:2x2x1", platform="tpu").devices
+    mesh = Mesh(np.array(tpu_devs[:1]), ("x",))
+    s = lambda sh, dt: jax.ShapeDtypeStruct(sh, dt)
+    abs_args = (
+        s((n_layers, 64, 1, 4, 128), jnp.float8_e4m3fn),
+        tuple(s((nb, phys_rows, 1, 4, 128), jnp.float8_e4m3fn) for _ in range(n_layers)),
+        s((64,), jnp.int32),
+        s((64 * pps,), jnp.int32),
+        s((65,), jnp.int32),
+        s((65,), jnp.int32),
+        s((3,), jnp.int32),
+    )
+    with mock.patch("sglang_tpu.attention.pallas.util.get_tpu_version", return_value=7):
+        compiled = jax.jit(
+            jax.shard_map(
+                lambda kn, cs, kl, p, q, ck, d: write_decode_kv_multi_layer_jax(
+                    kn, cs, kl, p, q, ck, d, kv_pack_dense2=dense2, kv_pack_bd4=bd4
+                ),
+                mesh=mesh,
+                in_specs=(P(), tuple(P() for _ in range(n_layers)), P(), P(), P(), P(), P()),
+                out_specs=tuple(P() for _ in range(n_layers)),
+                check_vma=False,
+            ),
+            donate_argnums=(1,),
+        ).lower(*abs_args).compile()
+    hlo = compiled.as_text()
+    for out_i in range(n_layers):
+        assert f"{{{out_i}}}: ({1 + out_i}, {{}}, may-alias)" in hlo

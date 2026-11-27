@@ -2137,6 +2137,7 @@ def resolve_step_c_rpa_plan(
     max_num_seqs: int | None = None,
     shared_group_size: int = 0,
     has_shared_prefix: bool = False,
+    allow_large_b: bool | None = None,
 ):
     """Resolve Step (c) RPAd config, ``one_block_per_seq``, ``bkv_slot_pages``, and ``use_grp_vec``."""
     from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
@@ -2155,6 +2156,13 @@ def resolve_step_c_rpa_plan(
     eff_b = int(b_tokens) if b_tokens is not None else 64
     eff_seqs = int(max_num_seqs) if max_num_seqs is not None else eff_b
     max_bkv_rows = _STEP_C_LARGE_B_MAX_BKV_ROWS if eff_b > 64 else _STEP_C_BASE_MAX_BKV_ROWS
+    if allow_large_b is None:
+        try:
+            from sglang_tpu.envs import envs as tpu_envs
+
+            allow_large_b = bool(tpu_envs.SGLANG_TPU_MUSE_MK_STEP_C_LARGE_B.get())
+        except Exception:
+            allow_large_b = False
 
     if shared_group_size > 0:
         eff_shared_grp = int(shared_group_size)
@@ -2178,6 +2186,8 @@ def resolve_step_c_rpa_plan(
         if cfg_rpa.loop_kind == "ring4k"
         else (True if sliding_window is not None else (pages_per_seq <= cfg_rpa.max_ring_pages))
     )
+    if eff_b > 64 and kv_pack_dense2 and not allow_large_b:
+        return cfg_rpa, one_block_per_seq, cfg_rpa.max_ring_pages, False, False
     sh_grp = cfg_rpa.shared_group_size or (16 if cfg_rpa.loop_kind == "shared16" else 0)
     shared_bad = (
         (has_shared_prefix and shared_group_size <= 0)
@@ -2256,6 +2266,8 @@ def resolve_step_c_rpa_plan(
                 eff_grp = cand_grp
                 use_grp_vec = True
                 break
+        if eff_b > 64 and not use_grp_vec:
+            return cfg_rpa, one_block_per_seq, cfg_rpa.max_ring_pages, False, False
     if not use_grp_vec:
         cfg_rpa = dataclasses.replace(cfg_rpa, swabatch_group_size=1)
 
@@ -2337,6 +2349,7 @@ def b1_moe_b2_rpad_chip_sharded_jax(
     collective_id: int = _W8_CID_BASE + 22,
     interpret: bool = False,
     skip_kv_write: bool = False,
+    allow_large_b: bool | None = None,
 ):
     """Fused Step (c) superkernel: ``[chip_b1 + muse_sparse(3d) + chip_b2 + RPAd]``."""
     from jax import lax
@@ -2407,6 +2420,7 @@ def b1_moe_b2_rpad_chip_sharded_jax(
         max_num_seqs=max_num_seqs,
         shared_group_size=shared_group_size,
         has_shared_prefix=has_shared_prefix,
+        allow_large_b=allow_large_b,
     )
     if not is_ok:
         raise ValueError(
@@ -2603,42 +2617,8 @@ def b1_moe_b2_rpad_chip_sharded_jax(
             ),
         )(*call_args)
 
-    page_size = (
-        phys_page_rows * 4
-        if kv_pack_bd4
-        else (phys_page_rows * 2 if kv_pack_dense2 else phys_page_rows)
-    )
-    use_adaptive_1k = (
-        eff_sw is None
-        and shared_group_size == 0
-        and skip_kv_write
-        and cfg_rpa.loop_kind in ("w7auto", "ring4k")
-        and (1024 % page_size == 0)
-        and pages_per_seq > (1024 // page_size)
-    )
-    if use_adaptive_1k:
-        short_cfg, short_one_blk, short_slot_pg, short_grp_vec, short_ok = resolve_step_c_rpa_plan(
-            rpa_mode_str,
-            sliding_window=1024,
-            pages_per_seq=1024 // page_size,
-            phys_page_rows=phys_page_rows,
-            kv_pack_dense2=kv_pack_dense2,
-            kv_pack_bd4=kv_pack_bd4,
-            b_tokens=rows,
-            max_num_seqs=max_num_seqs,
-            has_shared_prefix=False,
-        )
-        if short_ok and (world_size != 16 or short_cfg.num_slots <= 4):
-            n_act_s = jnp.clip(distribution[2], 0, max_num_seqs)
-            act_kvl = jnp.where(jnp.arange(max_num_seqs) < n_act_s, kv_lens, jnp.int32(0))
-            is_short_1k = jnp.max(act_kvl) <= jnp.int32(1024)
-            st_ch, next_gated, kv_out = lax.cond(
-                is_short_1k,
-                lambda: _invoke_step_c(short_cfg, short_one_blk, short_slot_pg, short_grp_vec, "_c1024"),
-                lambda: _invoke_step_c(cfg_rpa, one_block_per_seq, bkv_slot_pages, use_grp_vec),
-            )
-            return st_ch, next_gated, kv_out
-
+    # Keep Step (c) Full-Attn unsplit (no jax.lax.cond(is_short_1k, ...)) so XLA dedups
+    # all 45 SWA rope calls into 1 IMEM binary without per-position reloads (#4993/#4994).
     st_ch, next_gated, kv_out = _invoke_step_c(
         cfg_rpa, one_block_per_seq, bkv_slot_pages, use_grp_vec
     )
@@ -3181,6 +3161,77 @@ def write_decode_kv_merged_jax(
     return updated.reshape(kv_cache_fused.shape)
 
 
+def _read_vmem_8_u32(rmw_vmem, seq_idx, *, interpret_mode: bool):
+    """Read 8-sublane ``(8, 128)`` uint32 chunk from ``rmw_vmem[seq_idx]``."""
+    from jax import lax
+
+    if interpret_mode:
+        old_u8 = lax.bitcast_convert_type(rmw_vmem[seq_idx, :, 0], jnp.uint8)
+        return (
+            old_u8[:, 0, :].astype(jnp.uint32)
+            | (old_u8[:, 1, :].astype(jnp.uint32) << jnp.uint32(8))
+            | (old_u8[:, 2, :].astype(jnp.uint32) << jnp.uint32(16))
+            | (old_u8[:, 3, :].astype(jnp.uint32) << jnp.uint32(24))
+        )
+    rmw_u32_ref = rmw_vmem.bitcast(jnp.uint32).reshape(rmw_vmem.shape[0], 8, 128)
+    return rmw_u32_ref[seq_idx]
+
+
+def _store_vmem_8_u32(w_vmem, w_idx, packed_u32, *, interpret_mode: bool):
+    """Store 8-sublane ``(8, 128)`` uint32 chunk into ``w_vmem[w_idx]``."""
+    from jax import lax
+
+    if interpret_mode:
+        b0 = packed_u32.astype(jnp.uint8)
+        b1 = (packed_u32 >> jnp.uint32(8)).astype(jnp.uint8)
+        b2 = (packed_u32 >> jnp.uint32(16)).astype(jnp.uint8)
+        b3 = (packed_u32 >> jnp.uint32(24)).astype(jnp.uint8)
+        w_vmem[w_idx] = lax.bitcast_convert_type(
+            jnp.stack([b0, b1, b2, b3], axis=1)[:, None, :, :],
+            jnp.float8_e4m3fn,
+        )
+        return
+    w_u32_ref = w_vmem.bitcast(jnp.uint32).reshape(w_vmem.shape[0], 8, 128)
+    w_u32_ref[w_idx] = packed_u32
+
+
+def _load_layers_kv_u16(
+    kv_chunk_vmem,
+    q_start,
+    n_wr_layers: int,
+    t_tokens: int,
+    r_sub8,
+    *,
+    interpret_mode: bool,
+):
+    """Pack ``kv_new`` low-16-bit entries for ``0..n_wr_layers-1`` into ``(8, 128)`` uint32."""
+    from jax.experimental import pallas as pl
+    from sglang_tpu.attention.pallas.rpa_v3_decode_fast import _load_new_kv_1row_u16
+
+    acc_ev = jnp.zeros((8, 128), jnp.uint32)
+    if interpret_mode:
+        for li in range(n_wr_layers):
+            v1 = _load_new_kv_1row_u16(
+                kv_chunk_vmem, li * t_tokens + q_start, interpret_mode=True
+            )
+            acc_ev = jnp.where(r_sub8 == li, v1, acc_ev)
+        return acc_ev
+
+    kv_u32_ref = kv_chunk_vmem.bitcast(jnp.uint32).reshape(kv_chunk_vmem.shape[0], 128)
+    aligned8 = (q_start // 8) * 8
+    tok_mask = r_sub8 == (q_start - aligned8)
+    for li in range(n_wr_layers):
+        row_idx = li * t_tokens + aligned8
+        blk = kv_u32_ref[pl.ds(pl.multiple_of(row_idx, 8), 8)] & jnp.uint32(0xFFFF)
+        v1 = jnp.sum(
+            jnp.where(tok_mask, blk.astype(jnp.int32), jnp.int32(0)),
+            axis=0,
+            keepdims=True,
+        ).astype(jnp.uint32)
+        acc_ev = jnp.where(r_sub8 == li, v1, acc_ev)
+    return acc_ev
+
+
 def write_decode_kv_multi_layer_jax(
     kv_new_layers: jax.Array,
     kv_caches: jax.Array | tuple[jax.Array, ...] | list[jax.Array],
@@ -3342,9 +3393,12 @@ def write_decode_kv_multi_layer_jax(
     pack_factor = 4 if kv_pack_bd4 else (2 if kv_pack_dense2 else 1)
     pack_mask = pack_factor - 1
     page_size = phys_page_size * pack_factor
+    use_sublane8 = (not is_bundle) and is_packed
     layer_chunk = (8 if t_tokens > 128 else 24) if is_bundle else n_wr_layers
     t_pad = align_to(max(t_tokens, 1), 8)
     seq_pad = align_to(max(max_num_seqs, 1), 8)
+    rmw_rows = seq_pad if use_sublane8 else layer_chunk * seq_pad
+    w_rows = t_pad if use_sublane8 else layer_chunk * t_pad
 
     off_pg = max_num_seqs
     off_cq = off_pg + num_page_indices
@@ -3472,13 +3526,16 @@ def write_decode_kv_multi_layer_jax(
                                 for li in range(n_wr_layers):
                                     pltpu.make_async_copy(
                                         src_ref=cache_in_refs[li].at[pl.ds(dst_row, 1)],
-                                        dst_ref=rmw_vmem.at[
-                                            li * seq_pad + seq_idx, pl.ds(0, 1)
-                                        ],
+                                        dst_ref=(
+                                            rmw_vmem.at[seq_idx, pl.ds(li, 1)]
+                                            if use_sublane8
+                                            else rmw_vmem.at[li * seq_pad + seq_idx, pl.ds(0, 1)]
+                                        ),
                                         sem=rmw_sem.at[0],
                                     ).start()
 
-                        return r_cnt + jnp.where(need_rmw, l_cnt, jnp.int32(0))
+                        r_inc = jnp.int32(1) if use_sublane8 else l_cnt
+                        return r_cnt + jnp.where(need_rmw, r_inc, jnp.int32(0))
 
                     cnt_smem[0] = lax.fori_loop(
                         0, n_seqs, _rmw_seq, jnp.int32(0)
@@ -3498,8 +3555,55 @@ def write_decode_kv_multi_layer_jax(
 
                     @pl.when(r_tot > 0)
                     def _wait_rmw():
-                        w_ref = rmw_vmem.at[pl.ds(0, r_tot), pl.ds(0, 1)]
+                        w_ref = (
+                            rmw_vmem.at[pl.ds(0, r_tot), pl.ds(0, n_wr_layers)]
+                            if use_sublane8
+                            else rmw_vmem.at[pl.ds(0, r_tot), pl.ds(0, 1)]
+                        )
                         pltpu.make_async_copy(w_ref, w_ref, rmw_sem.at[0]).wait()
+
+                def _emit_sublane8_seq(seq_idx, w_cur, q_start, pos, pg, row_in_pg):
+                    dst_row = pg * phys_page_size + row_in_pg
+                    slot = pos & pack_mask
+                    raw_ev = _load_layers_kv_u16(
+                        kv_chunk_vmem, q_start, n_wr_layers, t_tokens, r_sub8,
+                        interpret_mode=interpret_mode,
+                    )
+                    u16_ev = (
+                        jnp.where(lane_lt_64, raw_ev, jnp.uint32(0))
+                        if kv_pack_bd4
+                        else raw_ev
+                    )
+
+                    @pl.when(slot == 0)
+                    def _s0_8():
+                        _store_vmem_8_u32(
+                            w_vmem, w_cur, u16_ev, interpret_mode=interpret_mode
+                        )
+
+                    @pl.when(slot != 0)
+                    def _srmw_8():
+                        old_u32 = _read_vmem_8_u32(
+                            rmw_vmem, seq_idx, interpret_mode=interpret_mode
+                        )
+                        packed = _pack_kv_slot_rmw_u32(
+                            old_u32,
+                            u16_ev,
+                            slot,
+                            lane_lt_64,
+                            kv_pack_bd4=kv_pack_bd4,
+                            interpret_mode=interpret_mode,
+                        )
+                        _store_vmem_8_u32(
+                            w_vmem, w_cur, packed, interpret_mode=interpret_mode
+                        )
+
+                    for li in range(n_wr_layers):
+                        pltpu.make_async_copy(
+                            src_ref=w_vmem.at[w_cur, pl.ds(li, 1)],
+                            dst_ref=cache_out_refs[li].at[pl.ds(dst_row, 1)],
+                            sem=out_sem.at[0],
+                        ).start()
 
                 def _emit_one_layer(seq_idx, li, w_cur, q_start, pos, pg, row_in_pg, dst_out_ref):
                     kv_row = li * t_tokens + q_start
@@ -3578,14 +3682,20 @@ def write_decode_kv_multi_layer_jax(
                                     seq_idx, li, w_cur, q_start, pos, pg, row_in_pg, cache_out_refs[0]
                                 )
 
+                        elif use_sublane8:
+                            _emit_sublane8_seq(
+                                seq_idx, w_cur, q_start, pos, pg, row_in_pg
+                            )
+
                         else:
                             for li in range(n_wr_layers):
                                 _emit_one_layer(
                                     seq_idx, li, w_cur, q_start, pos, pg, row_in_pg, cache_out_refs[li]
                                 )
 
+                    w_inc = jnp.int32(1) if use_sublane8 else l_cnt
                     return w_cur + jnp.where(
-                        active & (q_len == 1), l_cnt, jnp.int32(0)
+                        active & (q_len == 1), w_inc, jnp.int32(0)
                     )
 
                 cnt_smem[1] = lax.fori_loop(0, n_seqs, _wr_seq, jnp.int32(0))
@@ -3593,7 +3703,9 @@ def write_decode_kv_multi_layer_jax(
 
                 @pl.when(w_tot > 0)
                 def _wait_out():
-                    if is_packed:
+                    if use_sublane8:
+                        src = w_vmem.at[pl.ds(0, w_tot), pl.ds(0, n_wr_layers)]
+                    elif is_packed:
                         src = w_vmem.at[pl.ds(0, w_tot), pl.ds(0, 1)]
                     else:
                         src = kv_chunk_vmem.at[pl.ds(0, w_tot)]
@@ -3610,8 +3722,8 @@ def write_decode_kv_multi_layer_jax(
             pltpu.VMEM((layer_chunk * t_pad, *kv_new_layers.shape[2:]), cache_dtype),
             *(
                 [
-                    pltpu.VMEM((layer_chunk * seq_pad, 8, 1, 4, 128), cache_dtype),
-                    pltpu.VMEM((layer_chunk * t_pad, 8, 1, 4, 128), cache_dtype),
+                    pltpu.VMEM((rmw_rows, 8, 1, 4, 128), cache_dtype),
+                    pltpu.VMEM((w_rows, 8, 1, 4, 128), cache_dtype),
                     pltpu.SemaphoreType.DMA((1,)),
                 ]
                 if is_packed
