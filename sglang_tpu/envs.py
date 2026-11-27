@@ -789,6 +789,10 @@ class TpuEnvs:
     # calculate_tiling instead of the tuned-table lookup, which has no float4 entry and
     # falls back to tk512/tn1280. Same outputs; one K x N step per expert at V4.1's shapes.
     SGLANG_TPU_FP4_GMM2_CALC_TILING = EnvBool(False)
+    # /metrics renders in a helper process, off the serving event loop
+    # (sglang_tpu/hooks/metrics_offloop.py). A render slower than this is answered
+    # 503 and the helper restarted.
+    SGLANG_TPU_METRICS_RENDER_TIMEOUT_S = EnvFloat(10.0)
     # DeepSeek-V4.1: the target's attention output projection (wo_a, then wo_b)
     # as one Pallas call (models/deepseek_v41/output_projection.py). wo_a is
     # requantized to per-channel FP8 at load and its BF16 copy released. Read

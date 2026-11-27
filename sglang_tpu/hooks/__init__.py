@@ -80,6 +80,7 @@ from sglang_tpu.hooks.kimi_k3_vision import (
     pass_through_projected_features,
 )
 from sglang_tpu.hooks.logprob_grid import hook_specs as logprob_grid_hooks
+from sglang_tpu.hooks.metrics_offloop import hook_specs as metrics_offloop_hooks
 from sglang_tpu.hooks.mhc import (
     hc_ffn_post_pre,
     hc_post,
@@ -482,6 +483,8 @@ HOOKS.extend(host_padding_hooks())
 HOOKS.extend(hicache_swa_metrics_hooks())
 
 HOOKS.extend(swa_miss_metrics_hooks())
+
+HOOKS.extend(metrics_offloop_hooks())
 
 HOOKS.extend(hook_specs())
 
