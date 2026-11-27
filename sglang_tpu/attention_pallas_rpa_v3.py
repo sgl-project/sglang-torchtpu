@@ -545,7 +545,6 @@ def _invoke_v3_kernel(
                 eff_lc_toks.add("staged_qo")
             if (
                 not is_tp16_sq_target
-                and not use_dense2
                 and "nogqa8" not in eff_lc_toks
                 and "nogqa8" not in raw_all_toks
             ):
@@ -628,8 +627,6 @@ def _invoke_v3_kernel(
                 bkv_sz = 2048
             bkv_csz = max(256, logical_page_size)
             bkv_sz = max(bkv_sz, bkv_csz)
-            if use_dense2:
-                bkv_sz = min(bkv_sz, max(8192, bkv_csz))
             if is_lc_full and not is_tp16_sq_target and bq_sz >= 8192 and bkv_sz >= 8192:
                 raise ValueError(
                     f"TP=8 LC RPAm (bq_sz={bq_sz}, bkv_sz={bkv_sz}) exceeds 64 MiB VMEM; "
