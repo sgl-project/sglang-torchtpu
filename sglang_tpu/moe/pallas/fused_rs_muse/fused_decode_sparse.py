@@ -89,6 +89,7 @@ class SparseDecodeConfig:
     fast_plan: int = 0  # 0 = stock; 1 = branchless 0-scf.if planner; 2 = 1 + unrolled k_rep<=64
     fast_gs: bool = False  # opt-in: 0-sbr branchless <=8-row gather/scatter (+1 trash row) + unrolled prologue/RS
     lhs_fp8: bool = False  # W4A8: online K256 FP8 activation quant
+    lhs_fp8_min_m: int = 0  # per-bucket m_rows threshold for W4A8 (smaller buckets use BF16+dual)
     rs_wire_bf16: bool = False
     pair_rs: bool = False  # 2-stage intra-chip XOR=1 paired Reduce-Scatter (halves off-chip ICI!)
     bridge_ag: bool = False  # 2-stage chipmate-bridge All-Gather (halves ICI fan-out bytes!)
@@ -270,6 +271,23 @@ def _read_lhs_fp8_min_batch() -> int:
     except Exception:
         pass
     return 256
+
+
+def _read_lhs_fp8_min_m() -> int:
+    import os
+
+    raw = os.environ.get("SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8_MIN_M")
+    if raw is not None and raw.strip() != "":
+        return int(raw)
+    try:
+        from sglang_tpu.envs import envs
+
+        ev = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8_MIN_M", None)
+        if ev is not None:
+            return int(ev.get())
+    except Exception:
+        pass
+    return -1
 
 
 def _read_sparse_env_overrides() -> (
@@ -497,6 +515,7 @@ def default_sparse_decode_config(
             fast_b64_epi_pro=(fast_b64 >= 1),
             **route_kw,
         )
+    raw_min_m = _read_lhs_fp8_min_m()
     if batch_size <= 64:
         is_b16 = batch_size <= 16
         w_m = (
@@ -527,6 +546,7 @@ def default_sparse_decode_config(
             bridge_ag=use_ep16_bridge_ag or (False if is_b16 else use_br64),
             norm_f32_stage=True,
             lhs_fp8=w4a8_eligible and not is_b16,
+            lhs_fp8_min_m=(0 if raw_min_m < 0 else raw_min_m),
             route_chunk_rows=min(batch_size, 16) if is_b16 else (batch_size if fast_b64 >= 1 else 32),
             static_holder_mask=static_mask,
             spec_prime_parts=spec_eff,
@@ -548,6 +568,11 @@ def default_sparse_decode_config(
         if use_v_tm128
         else ((16, 32) if b128_w4a8 else (16, 32, 64))
     )
+    lhs_fp8_min_m_eff = (
+        (128 if (w4a8_eligible and tile_m_large >= 128) else 0)
+        if raw_min_m < 0
+        else raw_min_m
+    )
     return SparseDecodeConfig(
         row_mode="sparse",
         weight_mode="half_n",
@@ -558,6 +583,7 @@ def default_sparse_decode_config(
         k256_strip_mode=eff_strip,
         k256_dual_mode="hybrid",
         lhs_fp8=w4a8_eligible,
+        lhs_fp8_min_m=lhs_fp8_min_m_eff,
         rs_wire_bf16=True,
         pair_rs=use_pair_rs,
         bridge_ag=(ep == 8) or use_ep16_bridge_ag,
@@ -2239,8 +2265,10 @@ def run_muse_sparse_experts_and_rs_from_vmem(
         m_rows: int,
         is_up: bool,
         act_buf=None,
+        use_fp8_lhs: bool | None = None,
     ):
         """Used by stream3: run full gate (is_up=False) or full up (is_up=True)."""
+        eff_fp8 = use_lhs_fp8 if use_fp8_lhs is None else use_fp8_lhs
         act_dst = act_2d_buf if act_buf is None else act_buf
         nc = (
             _pick_k256_nc(m_rows, width, cfg.k256_strip_mode)
@@ -2248,8 +2276,8 @@ def run_muse_sparse_experts_and_rs_from_vmem(
             else min(cfg.k16_strip_nc, width)
         )
         write_m = 16 if m_rows == 8 else m_rows
-        lhs_eff = lhs_fp8_buf if use_lhs_fp8 else x_src_ref
-        sc_eff = lhs_sc_buf if use_lhs_fp8 else None
+        lhs_eff = lhs_fp8_buf if eff_fp8 else x_src_ref
+        sc_eff = lhs_sc_buf if eff_fp8 else None
 
         def _strip(j, carry):
             n0 = pl.multiple_of(j * nc, nc)
@@ -2302,8 +2330,10 @@ def run_muse_sparse_experts_and_rs_from_vmem(
         m_rows: int,
         act_buf=None,
         acc_buf=None,
+        use_fp8_lhs: bool | None = None,
     ):
         """Used by stream3_k2: part 0 accumulates K[0:2048]; part 1 finishes K[2048:4096] + SiLU."""
+        eff_fp8 = use_lhs_fp8 if use_fp8_lhs is None else use_fp8_lhs
         act_dst = act_2d_buf if act_buf is None else act_buf
         acc_dst = w1_acc_buf if acc_buf is None else acc_buf
         nc = (
@@ -2312,8 +2342,8 @@ def run_muse_sparse_experts_and_rs_from_vmem(
             else min(cfg.k16_strip_nc, _I)
         )
         write_m = 16 if m_rows == 8 else m_rows
-        lhs_eff = lhs_fp8_buf if use_lhs_fp8 else x_src_ref
-        sc_eff = lhs_sc_buf if use_lhs_fp8 else None
+        lhs_eff = lhs_fp8_buf if eff_fp8 else x_src_ref
+        sc_eff = lhs_sc_buf if eff_fp8 else None
         half_k = _H // 2
         if part_id == 0:
             def _strip_k0(j, carry):
@@ -2408,7 +2438,9 @@ def run_muse_sparse_experts_and_rs_from_vmem(
         width: int,
         m_rows: int,
         act_buf=None,
+        use_fp8_lhs: bool | None = None,
     ):
+        eff_fp8 = use_lhs_fp8 if use_fp8_lhs is None else use_fp8_lhs
         act_dst = act_2d_buf if act_buf is None else act_buf
         nc = (
             _pick_k256_nc(m_rows, width, cfg.k256_strip_mode)
@@ -2418,7 +2450,7 @@ def run_muse_sparse_experts_and_rs_from_vmem(
         dual_fits_vregs = (m_rows * nc) // 1024 <= 16
         use_dual = (
             is_k256
-            and (not use_lhs_fp8)
+            and (not eff_fp8)
             and dual_fits_vregs
             and (
                 cfg.k256_dual_mode == "dual"
@@ -2427,8 +2459,8 @@ def run_muse_sparse_experts_and_rs_from_vmem(
         )
         write_m = 16 if m_rows == 8 else m_rows
         up_base = width
-        lhs_eff = lhs_fp8_buf if use_lhs_fp8 else x_src_ref
-        sc_eff = lhs_sc_buf if use_lhs_fp8 else None
+        lhs_eff = lhs_fp8_buf if eff_fp8 else x_src_ref
+        sc_eff = lhs_sc_buf if eff_fp8 else None
 
         def _strip(j, carry):
             n0 = pl.multiple_of(j * nc, nc)
@@ -2514,7 +2546,9 @@ def run_muse_sparse_experts_and_rs_from_vmem(
         m_rows: int,
         sq_sum,
         act_buf=None,
+        use_fp8_lhs: bool | None = None,
     ):
+        eff_fp8 = use_lhs_fp8 if use_fp8_lhs is None else use_fp8_lhs
         act_src = act_2d_buf if act_buf is None else act_buf
         nc = (
             _pick_k256_nc(m_rows, width, cfg.k256_strip_mode)
@@ -2522,9 +2556,9 @@ def run_muse_sparse_experts_and_rs_from_vmem(
             else min(cfg.k16_strip_nc, width)
         )
         write_m = m_rows if cfg.norm_f32_stage else (16 if m_rows == 8 else m_rows)
-        act_eff = lhs_fp8_buf if use_lhs_fp8 else act_src
-        sc_eff = lhs_sc_buf if use_lhs_fp8 else None
-        if use_lhs_fp8 and col_offset == 0:
+        act_eff = lhs_fp8_buf if eff_fp8 else act_src
+        sc_eff = lhs_sc_buf if eff_fp8 else None
+        if eff_fp8 and col_offset == 0:
             _prequant_lhs_k256(act_src, lhs_fp8_buf, lhs_sc_buf, m_rows)
 
         def _strip(j, sq_acc):
@@ -3538,8 +3572,9 @@ def run_muse_sparse_experts_and_rs_from_vmem(
 
                 return
 
+            tile_fp8 = use_lhs_fp8 and (m_rows >= cfg.lhs_fp8_min_m)
             _copy_io_3d_to_lhs_2d_at(0, m_rows)
-            if use_lhs_fp8:
+            if tile_fp8:
                 _prequant_lhs_k256(lhs_2d_buf, lhs_fp8_buf, lhs_sc_buf, m_rows)
             sq_sum = jnp.zeros((m_rows, 1), dtype=jnp.float32)
 
@@ -3551,11 +3586,11 @@ def run_muse_sparse_experts_and_rs_from_vmem(
 
                 if w_mode == "stream3_k2":
                     _run_k2_proj_half(
-                        lhs_2d_buf, w1_buf.at[0], s1_buf.at[0], 0, m_rows
+                        lhs_2d_buf, w1_buf.at[0], s1_buf.at[0], 0, m_rows, use_fp8_lhs=tile_fp8
                     )
                 else:
                     _run_proj_only_slice(
-                        lhs_2d_buf, w1_buf.at[0], s1_buf.at[0], _I, m_rows, False
+                        lhs_2d_buf, w1_buf.at[0], s1_buf.at[0], _I, m_rows, False, use_fp8_lhs=tile_fp8
                     )
 
                 @pl.when(do_pf_next)
@@ -3568,11 +3603,11 @@ def run_muse_sparse_experts_and_rs_from_vmem(
 
                 if w_mode == "stream3_k2":
                     _run_k2_proj_half(
-                        lhs_2d_buf, w1_buf.at[1], s1_buf.at[1], 1, m_rows
+                        lhs_2d_buf, w1_buf.at[1], s1_buf.at[1], 1, m_rows, use_fp8_lhs=tile_fp8
                     )
                 else:
                     _run_proj_only_slice(
-                        lhs_2d_buf, w1_buf.at[1], s1_buf.at[1], _I, m_rows, True
+                        lhs_2d_buf, w1_buf.at[1], s1_buf.at[1], _I, m_rows, True, use_fp8_lhs=tile_fp8
                     )
 
                 @pl.when(do_pf_next)
@@ -3584,7 +3619,7 @@ def run_muse_sparse_experts_and_rs_from_vmem(
                     wait_s3_down()
 
                 sq_sum = _run_gmm2_slice(
-                    w2_buf, s2_buf, 0, _H, m_rows, sq_sum
+                    w2_buf, s2_buf, 0, _H, m_rows, sq_sum, use_fp8_lhs=tile_fp8
                 )
 
                 @pl.when(do_pf_next)
@@ -3599,7 +3634,7 @@ def run_muse_sparse_experts_and_rs_from_vmem(
                     wait_w1_slot(b_idx)
 
                 _run_gmm1_slice(
-                    lhs_2d_buf, w1_buf.at[b_idx], s1_buf.at[b_idx], 0, _I, m_rows
+                    lhs_2d_buf, w1_buf.at[b_idx], s1_buf.at[b_idx], 0, _I, m_rows, use_fp8_lhs=tile_fp8
                 )
 
                 @pl.when(do_pf_k2)
@@ -3611,7 +3646,7 @@ def run_muse_sparse_experts_and_rs_from_vmem(
                     wait_w2_slot(b_idx)
 
                 sq_sum = _run_gmm2_slice(
-                    w2_buf.at[b_idx], s2_buf.at[b_idx], 0, _H, m_rows, sq_sum
+                    w2_buf.at[b_idx], s2_buf.at[b_idx], 0, _H, m_rows, sq_sum, use_fp8_lhs=tile_fp8
                 )
 
                 @pl.when(do_pf_k2)
@@ -3626,7 +3661,7 @@ def run_muse_sparse_experts_and_rs_from_vmem(
                     wait_w1_slot(b_idx)
 
                 _run_gmm1_slice(
-                    lhs_2d_buf, w1_buf.at[b_idx], s1_buf.at[b_idx], 0, _I, m_rows
+                    lhs_2d_buf, w1_buf.at[b_idx], s1_buf.at[b_idx], 0, _I, m_rows, use_fp8_lhs=tile_fp8
                 )
 
                 @pl.when(do_pf_k2)
@@ -3638,7 +3673,7 @@ def run_muse_sparse_experts_and_rs_from_vmem(
                     wait_w2_1x()
 
                 sq_sum = _run_gmm2_slice(
-                    w2_buf, s2_buf, 0, _H, m_rows, sq_sum
+                    w2_buf, s2_buf, 0, _H, m_rows, sq_sum, use_fp8_lhs=tile_fp8
                 )
 
                 @pl.when(do_pf_next)
@@ -3652,7 +3687,7 @@ def run_muse_sparse_experts_and_rs_from_vmem(
                     wait_w1_half(0)
 
                 _run_gmm1_slice(
-                    lhs_2d_buf, w1_buf.at[0], s1_buf.at[0], 0, _I // 2, m_rows
+                    lhs_2d_buf, w1_buf.at[0], s1_buf.at[0], 0, _I // 2, m_rows, use_fp8_lhs=tile_fp8
                 )
 
                 @pl.when(do_pf_next)
@@ -3670,6 +3705,7 @@ def run_muse_sparse_experts_and_rs_from_vmem(
                     _I // 2,
                     _I // 2,
                     m_rows,
+                    use_fp8_lhs=tile_fp8,
                 )
 
                 @pl.when(do_pf_next)
@@ -3681,7 +3717,7 @@ def run_muse_sparse_experts_and_rs_from_vmem(
                     wait_w2_half(0)
 
                 sq_sum = _run_gmm2_slice(
-                    w2_buf.at[0], s2_buf.at[0], 0, _H // 2, m_rows, sq_sum
+                    w2_buf.at[0], s2_buf.at[0], 0, _H // 2, m_rows, sq_sum, use_fp8_lhs=tile_fp8
                 )
 
                 @pl.when(do_pf_next)
@@ -3693,7 +3729,7 @@ def run_muse_sparse_experts_and_rs_from_vmem(
                     wait_w2_half(1)
 
                 sq_sum = _run_gmm2_slice(
-                    w2_buf.at[1], s2_buf.at[1], _H // 2, _H // 2, m_rows, sq_sum
+                    w2_buf.at[1], s2_buf.at[1], _H // 2, _H // 2, m_rows, sq_sum, use_fp8_lhs=tile_fp8
                 )
 
                 @pl.when(do_pf_next)
@@ -5245,6 +5281,7 @@ def fused_decode_sparse_from_logits(
         f"{'_us1' if config.unroll_strips else ''}"
         f"{'_fgs1' if config.fast_gs else ''}"
         f"{f'_rc{config.free_rank_cap}' if config.free_rank_cap else ''}"
+        f"{f'_lmm{config.lhs_fp8_min_m}' if (config.lhs_fp8 and config.lhs_fp8_min_m > 0) else ''}"
         f"{'_dfp' if has_free_params_arg else ''}"
     )
     return pl.pallas_call(

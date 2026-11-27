@@ -925,14 +925,15 @@ def get_step_c_kv_write_multi_5d_op(
             from sglang_tpu.pallas_export import tpu_info_for_cpu_export
 
             op_name = f"sglang_tpu_pallas::muse_w9_step_c_write_kv_multi_5d_l{num_layers}{suffix}"
+            kv_names = tuple(f"kv{i}" for i in range(num_layers))
             cache_names = tuple(f"c{i}" for i in range(num_layers))
             meta_names = ("kv_lens", "page_indices", "cu_q_lens", "cu_kv_lens", "distribution")
-            arg_names = ("kv_new_layers",) + cache_names + meta_names
+            arg_names = kv_names + cache_names + meta_names
 
             def _wrapped_5d(*args):
-                kv_new_layers = args[0]
-                caches = args[1 : 1 + num_layers]
-                kv_lens, page_indices, cu_q_lens, cu_kv_lens, distribution = args[1 + num_layers :]
+                kv_new_layers = args[:num_layers]
+                caches = args[num_layers : 2 * num_layers]
+                kv_lens, page_indices, cu_q_lens, cu_kv_lens, distribution = args[2 * num_layers :]
                 return write_decode_kv_multi_layer_jax(
                     kv_new_layers,
                     caches,
@@ -961,8 +962,8 @@ def get_step_c_kv_write_multi_5d_op(
                 _wrapped_5d,
                 name=f"jax_{op_name}",
                 static_argnums=(),
-                donate_argnums=tuple(range(1, 1 + num_layers)),
-                input_output_aliases={1 + i: i for i in range(num_layers)},
+                donate_argnums=tuple(range(num_layers, 2 * num_layers)),
+                input_output_aliases={num_layers + i: i for i in range(num_layers)},
                 warn_deprecated=False,
             )
 
@@ -1093,11 +1094,10 @@ def flush_pending_step_c_kv_writes(pending_writes: list) -> None:
                     None,
                 )
             else:
-                stacked = torch.stack([e[7] for e in ch], dim=0)
                 get_step_c_kv_write_multi_5d_op(
                     len(ch), kv_pack_dense2=dense2, kv_pack_bd4=bd4
                 )(
-                    stacked,
+                    *(e[7] for e in ch),
                     *(e[0] for e in ch),
                     kv_lens,
                     page_indices,

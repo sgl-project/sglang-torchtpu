@@ -246,10 +246,12 @@ def emit_xor1_ag_phases(
 
         def _xy_p3():
             me, mate, px, py, pxy = _xy_peers()
-            for c in _xy_s2_inter(me, px, py):
-                c.wait_recv()
-            for cd in _xy_s3_ops(mate, px, py, pxy):
-                cd.start()
+            s2 = _xy_s2_inter(me, px, py)
+            s3 = _xy_s3_ops(mate, px, py, pxy)
+            # Start direct-peer D2D (s3[0], s3[2]) immediately underneath forwarded Stage-2 ICI (s2[1], s2[3]).
+            for idx in (0, 2, 1, 3):
+                s2[idx].wait_recv()
+                s3[idx].start()
 
         def _xy_drain():
             me, mate, px, py, pxy = _xy_peers()
@@ -265,6 +267,7 @@ def emit_xor1_ag_phases(
     if kind == "xyz":
         r0, r1, r2 = part_rows
         parts = (pl.ds(0, r0), pl.ds(r0, r1), pl.ds(r0 + r1, r2))
+        pipe_xyz = int(inter_send_sems.shape[0]) >= 21
 
         def _xyz_peers():
             me, mate = _me_and_mate()
@@ -289,16 +292,17 @@ def emit_xor1_ag_phases(
 
         def _xyz_s2_inter(me, px, py, pz):
             inter = []
-            for sem_i, (h_sl, dst_peer, owners) in enumerate(
+            sem_i = 3
+            for slab_idx, (h_sl, dst_peer, owners) in enumerate(
                 (
                     (parts[0], py, (None, px)),
                     (parts[1], pz, (None, py)),
                     (parts[2], px, (None, pz)),
-                ),
-                start=3,
+                )
             ):
                 for owner in owners:
-                    inter.append(_slice_inter(sem_i, me, owner, h_sl, dst_peer))
+                    inter.append(_slice_inter(sem_i if pipe_xyz else (3 + slab_idx), me, owner, h_sl, dst_peer))
+                    sem_i += 1
             return tuple(inter)
 
         def _xyz_s1_d2d(mate, px, py, pz):
@@ -307,7 +311,28 @@ def emit_xor1_ag_phases(
                 for idx, peer in enumerate((px, py, pz))
             )
 
-        def _xyz_s3_inter(me, px, py, pz, pxy, pxz, pyz):
+        def _xyz_s3_specs(me, px, py, pz, pxy, pxz, pyz, pxyz):
+            return (
+                (9, None, parts[0], pz, pz),
+                (10, py, parts[0], pz, pyz),
+                (11, px, parts[0], pz, pxz),
+                (12, pxy, parts[0], pz, pxyz),
+                (13, None, parts[1], px, px),
+                (14, pz, parts[1], px, pxz),
+                (15, py, parts[1], px, pxy),
+                (16, pyz, parts[1], px, pxyz),
+                (17, None, parts[2], py, py),
+                (18, px, parts[2], py, pxy),
+                (19, pz, parts[2], py, pyz),
+                (20, pxz, parts[2], py, pxyz),
+            )
+
+        def _xyz_s3_inter(me, px, py, pz, pxy, pxz, pyz, pxyz=None):
+            if pipe_xyz:
+                return tuple(
+                    _slice_inter(si, me, ow, sl, dst)
+                    for si, ow, sl, dst, _ in _xyz_s3_specs(me, px, py, pz, pxy, pxz, pyz, pxyz)
+                )
             inter = []
             for sem_i, (h_sl, dst_peer, owners) in enumerate(
                 (
@@ -355,17 +380,28 @@ def emit_xor1_ag_phases(
                 c.start()
 
         def _xyz_p3():
-            me, mate, px, py, pz, pxy, pxz, pyz, _ = _xyz_peers()
+            me, mate, px, py, pz, pxy, pxz, pyz, pxyz = _xyz_peers()
             for c in _xyz_s2_inter(me, px, py, pz):
                 c.wait_recv()
             for c in (
-                *_xyz_s3_inter(me, px, py, pz, pxy, pxz, pyz),
+                *_xyz_s3_inter(me, px, py, pz, pxy, pxz, pyz, pxyz),
                 *_xyz_s2_d2d(mate, px, py, pz, pxy, pxz, pyz),
             ):
                 c.start()
 
         def _xyz_p4():
             me, mate, px, py, pz, pxy, pxz, pyz, pxyz = _xyz_peers()
+            if pipe_xyz:
+                specs = _xyz_s3_specs(me, px, py, pz, pxy, pxz, pyz, pxyz)
+                s3_ops = _xyz_s3_inter(me, px, py, pz, pxy, pxz, pyz, pxyz)
+                # Forward each Stage-3 wave over D2D immediately so 75% of Stage-4 D2D hides under Stage-3 ICI.
+                for w_idx in range(4):
+                    for slab_idx in range(3):
+                        idx = slab_idx * 4 + w_idx
+                        s3_ops[idx].wait_recv()
+                        src_ow = specs[idx][4]
+                        _slice_d2d(7 + slab_idx, mate, src_ow, parts[slab_idx]).start()
+                return
             for c in _xyz_s3_inter(me, px, py, pz, pxy, pxz, pyz):
                 c.wait_recv()
             for cd in _xyz_s4_ops(mate, px, py, pz, pxy, pxz, pyz, pxyz):
@@ -377,7 +413,7 @@ def emit_xor1_ag_phases(
             for c in (
                 *_xyz_s1_ops(me, px, py, pz),
                 *_xyz_s2_inter(me, px, py, pz),
-                *_xyz_s3_inter(me, px, py, pz, pxy, pxz, pyz),
+                *_xyz_s3_inter(me, px, py, pz, pxy, pxz, pyz, pxyz),
             ):
                 c.wait_send()
             for cd in (
@@ -693,8 +729,8 @@ def xor1_bridge_all_gather(
                 out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
                 scratch_shapes=(
                     pltpu.SemaphoreType.DMA((1,)),
-                    pltpu.SemaphoreType.DMA((9,)),
-                    pltpu.SemaphoreType.DMA((9,)),
+                    pltpu.SemaphoreType.DMA((21,)),
+                    pltpu.SemaphoreType.DMA((21,)),
                     pltpu.SemaphoreType.DMA((10,)),
                     pltpu.SemaphoreType.DMA((10,)),
                 ),

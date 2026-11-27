@@ -3252,3 +3252,233 @@ def test_a3_wo_ring2_tm1024_parity_and_aot():
                 assert "pad_maximum_fusion" not in hlo_txt
                 assert "_bn2048" in hlo_txt
                 assert "_r2" in hlo_txt
+
+
+def test_w16_l61_moe_spmd_entry_exit_and_pruned_layer_routing():
+    """Verify Wave-16 SPMD `l61_moe_in` / `l61_moe_out` ops keep L61 MoE opaque to XLA DCE
+    on Ranks 1..15 under `le1536:1`, and `_layer_l61_pruned` routes through them cleanly."""
+    from types import SimpleNamespace
+    from unittest import mock
+    from unittest.mock import patch
+
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    import torch
+    import torch.nn as nn
+    from jax import lax
+    from jax.experimental import topologies
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    from sglang_tpu.muse_prefill_kernels.attn_kernels import kernel_a1
+    from sglang_tpu.muse_prefill_kernels.integration import MusePrefillKernels
+    from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+    with (
+        mock.patch(
+            "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+        ),
+        tpu_info_for_cpu_export(),
+    ):
+        topo_222 = topologies.get_topology_desc(
+            platform="tpu", topology_name="tpu7x=2x2x2"
+        )
+        mesh = Mesh(np.array(topo_222.devices).reshape(16), ("model",))
+        tp_d = 16
+
+        def _in_body(attn_128, res_128):
+            me = kernel_a1.pallas_axis_index_1d("model")[0]
+            is_r0 = me == 0
+            return (
+                jnp.where(is_r0, attn_128, jnp.zeros_like(attn_128)),
+                jnp.where(is_r0, res_128, jnp.zeros_like(res_128)),
+            )
+
+        def _out_body(moe_out_shard):
+            me = kernel_a1.pallas_axis_index_1d("model")[0]
+            return lax.psum(
+                jnp.where(me == 0, moe_out_shard, jnp.zeros_like(moe_out_shard)),
+                "model",
+            )
+
+        in_sm = jax.shard_map(
+            _in_body,
+            mesh=mesh,
+            in_specs=(P("model"), P("model")),
+            out_specs=(P("model"), P("model")),
+            check_vma=False,
+        )
+        out_sm = jax.shard_map(
+            _out_body,
+            mesh=mesh,
+            in_specs=(P("model"),),
+            out_specs=P("model"),
+            check_vma=False,
+        )
+        # TPU7x AOT HLO check: opaque Pallas axis_index + all-reduce prevent per-rank DCE.
+        in_hlo = (
+            jax.jit(in_sm)
+            .trace(
+                jax.ShapeDtypeStruct((tp_d * 128, 256), jnp.bfloat16),
+                jax.ShapeDtypeStruct((tp_d * 128, 256), jnp.float32),
+            )
+            .lower(lowering_platforms=("tpu",))
+            .compile()
+            .as_text()
+        )
+        out_hlo = (
+            jax.jit(out_sm)
+            .trace(jax.ShapeDtypeStruct((tp_d * 128, 256), jnp.float32))
+            .lower(lowering_platforms=("tpu",))
+            .compile()
+            .as_text()
+        )
+        assert "custom-call" in in_hlo and "select" in in_hlo
+        assert "custom-call" in out_hlo and "all-reduce" in out_hlo
+
+    # PyTorch `_layer_l61_pruned` wiring check with `l61_moe_in` + `l61_moe_out`
+    bs, hidden = 64, 128
+    pk = MusePrefillKernels.__new__(MusePrefillKernels)
+    nn.Module.__init__(pk)
+    pk.tp_size = 16
+    pk.tp_rank = 7  # non-zero rank previously folded to zeros + DCE'd `_moe_op`
+    pk.a1_variant = "v6"
+    pk.a1_rpa_layout = True
+    pk._a1_skip = False
+    pk.tp16_owner_a1 = False
+    pk.causal_chunk_stream = True
+    pk.causal_chunk_spec = "le1536:1;256,512"
+    pk.ep_tp2_mode = False
+    pk.eplb_moe_op = None
+    pk._cur_real_tokens_t = None
+    pk.no_next_norm = torch.zeros(hidden)
+
+    seen = {"in": [], "moe": [], "out": [], "sum": 0}
+
+    def _fake_a1(x, w, sc, c, s):
+        t = x.shape[0]
+        return (
+            torch.zeros((1, t, 4, 2, 128), dtype=torch.bfloat16),
+            torch.zeros((t, 512), dtype=torch.bfloat16),
+            torch.zeros((t, 1, 4, 128), dtype=torch.float8_e4m3fn),
+        )
+
+    def _fake_sum(rows):
+        seen["sum"] += 1
+        return torch.ones((rows.shape[0], hidden), dtype=torch.float32) * 3.0
+
+    def _fake_l61_in(a128, r128):
+        seen["in"].append((tuple(a128.shape), tuple(r128.shape)))
+        return a128, r128
+
+    def _fake_moe(a_sh, r_sh, *args):
+        seen["moe"].append((tuple(a_sh.shape), tuple(r_sh.shape)))
+        return (torch.arange(128, dtype=torch.float32)[:, None].expand(128, hidden) + 10.0), None
+
+    def _fake_l61_out(m_sh):
+        seen["out"].append(tuple(m_sh.shape))
+        return m_sh
+
+    pk.ops = SimpleNamespace(
+        a1=_fake_a1,
+        sum_stream=_fake_sum,
+        moe=_fake_moe,
+        moe_fp8=None,
+        l61_moe_in=_fake_l61_in,
+        l61_moe_out=_fake_l61_out,
+    )
+    be = SimpleNamespace(
+        forward_metadata=SimpleNamespace(
+            kv_lens=torch.ones(bs, dtype=torch.int32),
+            cu_kv_lens=torch.zeros(bs + 1, dtype=torch.int32),
+            page_indices=torch.zeros(bs, dtype=torch.int32),
+            swa_page_indices=None,
+            swa_group_page_indices=None,
+        ),
+        write_kv_only=lambda kv, lyr, fb, chunk_meta=None: None,
+        forward_prepared=lambda q, kv, lyr, fb, chunk_meta=None: torch.zeros(
+            (128, 512), dtype=torch.bfloat16
+        ),
+    )
+    layer = SimpleNamespace(
+        self_attn=SimpleNamespace(
+            attn="mock",
+            num_heads=8,
+            _per_head_normalize=lambda x: x[:, :512],
+            _forward_o_proj=lambda x, fb: torch.ones((x.shape[0], hidden), dtype=torch.bfloat16),
+        ),
+        mlp=SimpleNamespace(
+            e_score_correction_bias=torch.empty(0),
+            pre_expert_norm=SimpleNamespace(weight=torch.empty(0)),
+            post_expert_norm=SimpleNamespace(weight=torch.empty(0)),
+            experts=SimpleNamespace(
+                w13_weight=torch.empty(0, dtype=torch.bfloat16),
+                w2_weight=torch.empty(0, dtype=torch.bfloat16),
+                w13_weight_scale=torch.empty(0),
+                w2_weight_scale=torch.empty(0),
+                _tpu_fused_rs_group_offset=torch.empty(0),
+            ),
+        ),
+        post_attention_residual_gate=SimpleNamespace(alpha=torch.empty(0), beta=torch.empty(0)),
+        pre_feedforward_layernorm=SimpleNamespace(weight=torch.empty(0)),
+        post_feedforward_layernorm=SimpleNamespace(weight=torch.empty(0)),
+        post_feedforward_residual_gate=SimpleNamespace(alpha=torch.empty(0), beta=torch.empty(0)),
+    )
+    weights = SimpleNamespace(
+        wqkvg=torch.empty(0),
+        wqkvg_scale=torch.empty(0),
+        wrouter=torch.empty(0),
+        wpool=torch.empty(0),
+        wpool_scale=torch.empty(0),
+        wunpool=torch.empty(0),
+        wunpool_scale=torch.empty(0),
+    )
+    ext = torch.ones(bs, dtype=torch.int32) * 8
+    exit_idx = torch.arange(bs, dtype=torch.int32)
+    with patch(
+        "sglang_tpu.muse_prefill_kernels.integration.get_attn_backend",
+        return_value=be,
+    ):
+        out = pk._layer_l61_pruned(
+            layer=layer,
+            weights=weights,
+            rope=(torch.zeros((2048, 128)), torch.zeros((2048, 128))),
+            stream_shard=torch.zeros((128, hidden)),
+            attn_in=torch.zeros((128, hidden), dtype=torch.bfloat16),
+            forward_batch=SimpleNamespace(extend_seq_lens=ext),
+            exit_last_index=exit_idx,
+            t_shard=128,
+            t_total=2048,
+        )
+    assert seen["in"] == [((128, hidden), (128, hidden))]
+    assert seen["moe"] == [((128, hidden), (128, hidden))]
+    assert seen["out"] == [(128, hidden)]
+    # Only residual_bs uses sum_stream when l61_moe_in/out handle L61 MoE entry/exit.
+    assert seen["sum"] == 1
+    assert out.shape == (bs, hidden)
+    assert out[0, 0].item() == 10.0 and out[-1, 0].item() == 10.0 + bs - 1
+
+    # When CAUSAL_CHUNK_SPEC="256,512" yields chunks_128=(64, 64), perm_128/inv_128 + sum_stream
+    # MUST stay active so 65<=bs<=128 stays chunk-major aligned with pipeline._finish_stage2_routing.
+    pk.causal_chunk_spec = "256,512"
+    pk.tp_rank = 1
+    seen.update({"in": [], "moe": [], "out": [], "sum": 0})
+    with patch(
+        "sglang_tpu.muse_prefill_kernels.integration.get_attn_backend",
+        return_value=be,
+    ):
+        out_256 = pk._layer_l61_pruned(
+            layer=layer,
+            weights=weights,
+            rope=(torch.zeros((2048, 128)), torch.zeros((2048, 128))),
+            stream_shard=torch.zeros((128, hidden)),
+            attn_in=torch.zeros((128, hidden), dtype=torch.bfloat16),
+            forward_batch=SimpleNamespace(extend_seq_lens=ext),
+            exit_last_index=exit_idx,
+            t_shard=128,
+            t_total=2048,
+        )
+    assert seen["in"] == [] and seen["out"] == []
+    assert seen["moe"] == [((128, hidden), (128, hidden))]
+    assert seen["sum"] == 2
+    assert out_256.shape == (bs, hidden)

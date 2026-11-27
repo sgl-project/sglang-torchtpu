@@ -609,6 +609,9 @@ class TpuEnvs:
     # Minimum batch size where SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8 activates W4A8
     # (default 256 preserves decode B<=128 BF16; set 64 or 128 to opt into W4A8 decode).
     SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8_MIN_BATCH = EnvInt(256)
+    # Per-expert m_rows threshold where W4A8 LHS FP8 activates when LHS_FP8=1
+    # (-1 = auto: 128 when tile_m>=128 so m<=64 uses BF16+dual, else 0; set 0 for all-bucket W4A8).
+    SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8_MIN_M = EnvInt(-1)
     # Muse Wave-7B: allow DECODE_REPLICA_SLOTS > 0 alongside PREFILL_EPLB_STATS_PATH when
     # PrefillEplbManager._refresh_decode_replicas keeps _fused_decode_rep_* synchronized.
     SGLANG_TPU_MUSE_KERNEL_DECODE_SYNC_PREFILL_EPLB = EnvBool(False)
@@ -1169,6 +1172,9 @@ class TpuEnvs:
     # Optional pinned sink half-slices in bkv=0 (0 = keep full bkv=0 dense; >0 = apply top-k
     # to bkv=0 while pinning its first N 128-token half-slices, e.g. 4 = 512 sink tokens).
     SGLANG_TPU_RPA_V3_PREFILL_TOPK_SINK_SLICES = EnvInt(0)
+    # Optional dense local window (in tokens, e.g. 2048) for sparse tail pruning in Stage-2
+    # (0 = disabled, legacy dense tail; >0 = apply top-k to unmasked tail slices older than N).
+    SGLANG_TPU_RPA_V3_PREFILL_TOPK_TAIL_LOCAL = EnvInt(0)
     # Muse prefill kernel path with SGLANG_TPU_KV_PACK_HEADS: A1 (two-half bf16 variants)
     # writes q and kv in RPA v3's packed layout, dropping the XLA expand/repack glue.
     SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT = EnvBool(False)

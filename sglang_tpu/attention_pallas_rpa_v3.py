@@ -534,7 +534,15 @@ def _invoke_v3_kernel(
             )
             if not (
                 eff_lc_toks
-                & {"bkv4096", "bkv8192", "bkv16384", "bkv16k", "nobkv8192"}
+                & {
+                    "bkv4096",
+                    "bkv8192",
+                    "bkv16384",
+                    "bkv16k",
+                    "bkv32768",
+                    "bkv32k",
+                    "nobkv8192",
+                }
             ) and not tp8_bq8k:
                 eff_lc_toks.add("bkv8192")
             if not (eff_lc_toks & {"s3", "mixed_s3"}):
@@ -605,7 +613,19 @@ def _invoke_v3_kernel(
                     bq_sz = 1024
             if (
                 is_lc_full
-                and ("bkv16384" in eff_lc_toks or "bkv16k" in eff_lc_toks)
+                and ("bkv32768" in eff_lc_toks or "bkv32k" in eff_lc_toks)
+                and (use_dense2 or use_bd4 or is_tp16_sq_target)
+                and num_q_tokens >= 512
+            ):
+                bkv_sz = 32768
+            elif (
+                is_lc_full
+                and (
+                    "bkv16384" in eff_lc_toks
+                    or "bkv16k" in eff_lc_toks
+                    or "bkv32768" in eff_lc_toks
+                    or "bkv32k" in eff_lc_toks
+                )
                 and num_q_tokens >= 512
             ):
                 bkv_sz = 16384
@@ -807,6 +827,9 @@ def _invoke_v3_kernel(
         topk_sink_env = getattr(
             envs, "SGLANG_TPU_RPA_V3_PREFILL_TOPK_SINK_SLICES", None
         )
+        topk_tail_local_env = getattr(
+            envs, "SGLANG_TPU_RPA_V3_PREFILL_TOPK_TAIL_LOCAL", None
+        )
         if (
             topk_slices > 0
             and is_lc_full
@@ -819,6 +842,13 @@ def _invoke_v3_kernel(
             )
             if topk_sink_val > 0:
                 extra["_prefill_topk_sink_slices"] = topk_sink_val
+            topk_tail_local_val = (
+                int(topk_tail_local_env.get())
+                if topk_tail_local_env is not None
+                else 0
+            )
+            if topk_tail_local_val > 0:
+                extra["_prefill_topk_tail_local"] = topk_tail_local_val
             if topk_fast_env is not None and topk_fast_env.get():
                 k_pair_val = (
                     int(topk_k_pair_env.get())

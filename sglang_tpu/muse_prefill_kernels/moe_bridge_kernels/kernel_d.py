@@ -165,7 +165,9 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
     d_opt_env = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_D_OPT", None)
     eff_d_opt = int(d_opt_env.get()) if d_opt_env is not None else 0
     d_fast_dma = (eff_d_opt & 1) != 0
-    d_fuse_p34 = ((eff_d_opt & 2) != 0) and not emit_fp8_attn_in
+    d_fuse_p34 = (
+        ((eff_d_opt & 2) != 0) and not emit_fp8_attn_in and tok_tile_eff <= 64
+    )
     d_mxu_env = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_D_MXU_COMBINE", None)
     eff_mxu_combine = (
         bool(d_mxu_env is not None and d_mxu_env.get())
@@ -249,6 +251,9 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
     if use_zero_spill:
         t_sub = min(32, tok_tile_eff)
         vecs_3d = vecs_8x8192.reshape(8, num_slabs, slab_w).swapaxes(0, 1)
+        smid_slots = num_slabs
+        if tok_tile_eff >= 128 and p34_col_step == 512:
+            p34_col_step = 256
 
         def _d_4slab_zs_kernel(
             inv_perm_ref,
@@ -350,7 +355,7 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                 def _prefetch_next():
                     _start_step(step + 1, 1 - slot)
 
-            for s_pre in range(2):
+            for s_pre in range(smid_slots):
                 pltpu.make_async_copy(
                     src_ref=stream_mid_hbm_ref.at[
                         pl.ds(base_tok, tok_tile_eff), pl.ds(s_pre * slab_w, slab_w)
@@ -545,14 +550,13 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                 + jnp.float32(post_norm_eps)
             )
 
-            # Phase 3: Double-buffered slab-streamed gated residual + next_in variance
+            # Phase 3: Prefetched 4-slab stream_mid gated residual + next_in variance
             sq_next_128 = jnp.zeros((tok_tile_eff, LANE), dtype=jnp.float32)
             for s in range(num_slabs):
-                s_slot = s % 2
                 pltpu.make_async_copy(
-                    src_ref=smid_2x_ref.at[s_slot],
-                    dst_ref=smid_2x_ref.at[s_slot],
-                    sem=smid_sem_ref.at[s_slot],
+                    src_ref=smid_2x_ref.at[s],
+                    dst_ref=smid_2x_ref.at[s],
+                    sem=smid_sem_ref.at[s],
                 ).wait()
 
                 for sub in range(slab_w // p34_col_step):
@@ -562,7 +566,7 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                         (fw_s * inv_rms_ffn).astype(jnp.bfloat16).astype(jnp.float32)
                     )
                     new_s = (
-                        vecs_3d_ref[s, 2:3, cn0:cn1] * smid_2x_ref[s_slot, :, cn0:cn1]
+                        vecs_3d_ref[s, 2:3, cn0:cn1] * smid_2x_ref[s, :, cn0:cn1]
                         + vecs_3d_ref[s, 3:4, cn0:cn1] * branch_s
                     )
                     fw_buf_ref[s, :, cn0:cn1] = new_s
@@ -571,16 +575,6 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                         if p34_col_step == LANE
                         else vpu_tree_sum_128(new_s * new_s)
                     )
-
-                if s + 2 < num_slabs:
-                    pltpu.make_async_copy(
-                        src_ref=stream_mid_hbm_ref.at[
-                            pl.ds(base_tok, tok_tile_eff),
-                            pl.ds((s + 2) * slab_w, slab_w),
-                        ],
-                        dst_ref=smid_2x_ref.at[s_slot],
-                        sem=smid_sem_ref.at[s_slot],
-                    ).start()
 
                 pltpu.make_async_copy(
                     src_ref=fw_buf_ref.at[s],
@@ -710,8 +704,8 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                     if loop_slabs
                     else pltpu.SemaphoreType.DMA((num_slabs,)),
                     pltpu.VMEM((num_slabs, tok_tile_eff, slab_w), jnp.float32),
-                    pltpu.VMEM((2, tok_tile_eff, slab_w), jnp.float32),
-                    pltpu.SemaphoreType.DMA((2,)),
+                    pltpu.VMEM((smid_slots, tok_tile_eff, slab_w), jnp.float32),
+                    pltpu.SemaphoreType.DMA((smid_slots,)),
                     pltpu.VMEM((2, tok_tile_eff, slab_w), next_in_dtype),
                     pltpu.SemaphoreType.DMA((2,)),
                     pltpu.SemaphoreType.DMA((num_slabs,)),
@@ -722,7 +716,7 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                 vmem_limit_bytes=62 * 1024 * 1024,
             ),
             input_output_aliases=zs_aliases,
-            name=f"pallas_d_combine_4slab_v3_t{tok_tile_eff}_sn{sub_n_dot}_p{p34_col_step}{km_tag}{ls_tag}{ud_tag}{fp8_tag}{sfp8_tag}{fast_tag}{do_tag}{mxu_tag}",
+            name=f"pallas_d_combine_4slab_v3_t{tok_tile_eff}_sn{sub_n_dot}_p{p34_col_step}{km_tag}{ls_tag}{ud_tag}{fp8_tag}{sfp8_tag}{fast_tag}{do_tag}{mxu_tag}_sm4",
         )(*zs_call_args)
 
     def _d_4slab_kernel(

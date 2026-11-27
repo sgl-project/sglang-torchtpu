@@ -3485,10 +3485,10 @@ def test_tp16_parallel_xyz_rs_large_batch_interpret_and_aot():
     )
     w_rt = jnp.asarray((rng.standard_normal((H, 256)) * 0.03).astype(np.float32), dtype=jnp.bfloat16)
 
-    assert w8._tp16_parallel_rs_enabled(r_pair=8) is False
+    assert w8._tp16_parallel_rs_enabled(r_pair=8) is True
     assert w8._tp16_parallel_rs_enabled(r_pair=24) is False
     assert w8._tp16_parallel_rs_enabled(r_pair=40) is False
-    for r_p in (16, 32, 48):
+    for r_p in (8, 16, 32, 48):
         assert w8._tp16_parallel_rs_enabled(r_pair=r_p) is True
     with envs.SGLANG_TPU_MUSE_DECODE_TP16_PARALLEL_RS.override(False):
         for r_p in (8, 16, 24, 32, 48):
@@ -4581,3 +4581,244 @@ def test_chip_b2_during_in_ici_hooks_interpret_races_and_aot():
             )
         ).trace(jax.ShapeDtypeStruct((r_pair, 8192), jnp.bfloat16)).lower(lowering_platforms=("tpu",)).compile()
         assert "tpu_custom_call" in c_aot.as_text()
+
+
+def test_w16_vocab_embed_tail_on_wait_and_aot():
+    """Verify Muse Spark v_shard % 2 == 0 & tail-8 fix under on_wait + TPU7x production AOT."""
+    import jax
+
+    if len(jax.devices("cpu")) < 16:
+        pytest.skip("Requires XLA_FLAGS=--xla_force_host_platform_device_count=16")
+
+    import jax.numpy as jnp
+    from jax.experimental import topologies
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, PartitionSpec as P
+    from sglang_tpu.kernels import decode_collective_bridges_w8 as w8
+
+    ip_on_wait = pltpu.InterpretParams(
+        dma_execution_mode="on_wait",
+        detect_races=True,
+        uninitialized_memory="nan",
+    )
+    devs = jax.devices("cpu")
+    mesh8 = Mesh(np.array(devs[:8]), ("model",))
+    mesh16 = Mesh(np.array(devs[:16]), ("model",))
+    rng = np.random.default_rng(20261127)
+    H = 1024
+
+    # 1. Negative guards: odd v_shard & <16 rejected.
+    with pytest.raises(ValueError, match="Unsupported decode_vocab_embed"):
+        w8.decode_vocab_embed_norm_jax(
+            jnp.zeros((16,), jnp.int32), jnp.zeros((25, H), jnp.bfloat16), world_size=8, interpret=ip_on_wait
+        )
+    with pytest.raises(ValueError, match="Unsupported decode_vocab_embed"):
+        w8.decode_vocab_embed_chip_sharded_jax(
+            jnp.zeros((64,), jnp.int32), jnp.zeros((14, H), jnp.bfloat16), jnp.ones((H,), jnp.float32),
+            world_size=16, interpret=ip_on_wait,
+        )
+
+    # 2. Norm & Tok-sharded on TP=8 across tail_len in (0, 2, 4, 6) hitting last 8 rows + empty groups.
+    for v_sh in (18, 20, 22, 24):
+        emb_np = (rng.standard_normal((8 * v_sh, H)) * 0.25).astype(np.float32)
+        emb_bf16 = jnp.asarray(emb_np, dtype=jnp.bfloat16)
+        ids_np = rng.integers(0, 8 * v_sh, size=(32,), dtype=np.int32)
+        ids_np[0], ids_np[1], ids_np[2], ids_np[3] = v_sh - 8, v_sh - 1, 2 * v_sh - 1, 8 * v_sh - 1
+        # Keep group 16..31 focused on rank 0 so remote ranks exercise empty-group skip.
+        ids_np[16:32] = np.arange(16, dtype=np.int32)
+        out_norm = jax.shard_map(
+            lambda i, e: w8.decode_vocab_embed_norm_jax(i, e, world_size=8, norm_eps=1e-5, interpret=ip_on_wait),
+            mesh=mesh8, in_specs=(P(), P("model", None)), out_specs=P(), check_vma=False,
+        )(jnp.asarray(ids_np[:8] if v_sh == 18 else ids_np), emb_bf16)
+        n_tok = 8 if v_sh == 18 else 32
+        ref_n = np.asarray(
+            jnp.asarray(_rms_norm_np(np.asarray(emb_bf16[ids_np[:n_tok]], np.float32), np.ones((H,), np.float32), 1e-5, False), dtype=jnp.bfloat16),
+            dtype=np.float32,
+        )
+        np.testing.assert_allclose(np.asarray(out_norm, np.float32), ref_n, rtol=1e-2, atol=1e-2)
+
+    # Tok-sharded TP=8 B=64 v_sh=24 (tail-8 bug repro) & v_sh=20 (%8==4).
+    for v_sh in (20, 24):
+        emb_np = (rng.standard_normal((8 * v_sh, H)) * 0.25).astype(np.float32)
+        emb_bf16 = jnp.asarray(emb_np, dtype=jnp.bfloat16)
+        ids_np = rng.integers(0, 8 * v_sh, size=(64,), dtype=np.int32)
+        ids_np[0], ids_np[1], ids_np[2], ids_np[3] = v_sh - 8, v_sh - 1, 8 * v_sh - 2, 8 * v_sh - 1
+        l0_g = np.ones((H,), np.float32) * 1.04
+        st_tk, ai_tk = jax.shard_map(
+            lambda i, e, g: w8.decode_vocab_embed_tok_sharded_jax(i, e, g, world_size=8, interpret=ip_on_wait),
+            mesh=mesh8, in_specs=(P(), P("model", None), P()), out_specs=(P("model", None), P("model", None)), check_vma=False,
+        )(jnp.asarray(ids_np), emb_bf16, jnp.asarray(l0_g))
+        st_ref = np.asarray(
+            jnp.asarray(_rms_norm_np(np.asarray(emb_bf16[ids_np], np.float32), np.ones((H,), np.float32), 1e-5, False), dtype=jnp.bfloat16),
+            dtype=np.float32,
+        )
+        ai_ref = _rms_norm_np(st_ref, l0_g, 1e-5, False)
+        np.testing.assert_allclose(np.asarray(st_tk, np.float32).reshape(64, H), st_ref, rtol=1e-2, atol=1e-2)
+        np.testing.assert_allclose(np.asarray(ai_tk, np.float32).reshape(8, 64, H)[0], ai_ref, rtol=1e-2, atol=1e-2)
+
+    # 3. Chip-sharded TP=16 v_sh=20 (%8==4 tail-4 like 12628) & TP=8 v_sh=24 (%8==0 tail-8 like 25256).
+    for tp_w, b_cur, v_sh in ((16, 64, 20), (8, 64, 24)):
+        mesh_c = mesh16 if tp_w == 16 else mesh8
+        emb_bf16 = jnp.asarray((rng.standard_normal((tp_w * v_sh, H)) * 0.25).astype(np.float32), dtype=jnp.bfloat16)
+        ids_np = rng.integers(0, tp_w * v_sh, size=(b_cur,), dtype=np.int32)
+        ids_np[0], ids_np[1], ids_np[2], ids_np[3] = v_sh - 8, v_sh - 4, v_sh - 1, tp_w * v_sh - 1
+        l0_g = np.ones((H,), np.float32) * 1.07
+        st_c, ai_c = jax.shard_map(
+            lambda i, e, g, _tw=tp_w: w8.decode_vocab_embed_chip_sharded_jax(i, e, g, world_size=_tw, interpret=ip_on_wait),
+            mesh=mesh_c, in_specs=(P(), P("model", None), P()), out_specs=(P("model", None), P("model", None)), check_vma=False,
+        )(jnp.asarray(ids_np), emb_bf16, jnp.asarray(l0_g))
+        st_ref = np.asarray(
+            jnp.asarray(_rms_norm_np(np.asarray(emb_bf16[ids_np], np.float32), np.ones((H,), np.float32), 1e-5, False), dtype=jnp.bfloat16),
+            dtype=np.float32,
+        )
+        ai_ref = _rms_norm_np(st_ref, l0_g, 1e-5, False)
+        r_pair = b_cur // (tp_w // 2)
+        st_np = np.asarray(st_c).reshape(tp_w, r_pair, H)
+        st_reasm = np.concatenate([st_np[2 * c] for c in range(tp_w // 2)], axis=0)
+        np.testing.assert_allclose(st_reasm, st_ref, rtol=1e-2, atol=1e-2)
+        np.testing.assert_allclose(np.asarray(ai_c, np.float32).reshape(tp_w, b_cur, H)[0], ai_ref, rtol=1e-2, atol=1e-2)
+
+    # 4. Source guard for MuseSpark model dispatch (% 2 == 0).
+    muse_src = (_REPO_ROOT / "sglang_tpu/models/muse_spark.py").read_text()
+    assert "emb_w.shape[0] % 2 == 0" in muse_src
+
+    # 5. Offline TPU7x AOT for exact production v_shard=12628 (TP=16) & v_shard=25256 (TP=8) + TP=8 B=256 ChipB2.
+    for topo_name, tp_w, v_sh, batches in (
+        ("tpu7x=2x2x2", 16, 12628, (64, 128, 256)),
+        ("tpu7x=2x2x1", 8, 25256, (64, 256)),
+    ):
+        tpu_devs = topologies.get_topology_desc(platform="tpu", topology_name=topo_name).devices
+        aot_mesh = Mesh(np.array(sorted(tpu_devs, key=lambda d: (d.coords[1], d.coords[0], d.core_on_chip))), ("model",))
+        for b_cur in batches:
+            c_e = jax.jit(
+                jax.shard_map(
+                    lambda i, e, g, _tw=tp_w: w8.decode_vocab_embed_chip_sharded_jax(i, e, g, world_size=_tw),
+                    mesh=aot_mesh, in_specs=(P(), P(), P()), out_specs=(P(), P()), check_vma=False,
+                )
+            ).trace(
+                jax.ShapeDtypeStruct((b_cur,), jnp.int32),
+                jax.ShapeDtypeStruct((v_sh, 8192), jnp.bfloat16),
+                jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            ).lower(lowering_platforms=("tpu",)).compile()
+            assert "tpu_custom_call" in c_e.as_text()
+
+    tpu8_devs = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x=2x2x1").devices
+    aot_m8 = Mesh(np.array(sorted(tpu8_devs, key=lambda d: (d.coords[1], d.coords[0], d.core_on_chip))), ("model",))
+    c_b2 = jax.jit(
+        jax.shard_map(
+            lambda *a: w8.moe_to_attn_chip_sharded_bridge_jax(*a, world_size=8, sharded_moe_in=True, fuse_qkv_epi=True),
+            mesh=aot_m8, in_specs=tuple(P() for _ in range(13)), out_specs=(P(), P(), P(), P()), check_vma=False,
+        )
+    ).trace(
+        jax.ShapeDtypeStruct((64, 8192), jnp.float32),
+        jax.ShapeDtypeStruct((32, 4096), jnp.bfloat16),
+        jax.ShapeDtypeStruct((4096, 4096), jnp.float8_e4m3fn),
+        jax.ShapeDtypeStruct((1, 4096), jnp.float32),
+        jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+        jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+        jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+        jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+        jax.ShapeDtypeStruct((8192, 1280), jnp.float8_e4m3fn),
+        jax.ShapeDtypeStruct((1, 1280), jnp.float32),
+        jax.ShapeDtypeStruct((8192, 1024), jnp.float8_e4m3fn),
+        jax.ShapeDtypeStruct((1, 1024), jnp.float32),
+        jax.ShapeDtypeStruct((256, 2, 128), jnp.float32),
+    ).lower(lowering_platforms=("tpu",)).compile()
+    assert "tpu_custom_call" in c_b2.as_text()
+
+
+def test_w16_xor1_xyz_pipelined_on_wait_and_aot():
+    """Verify 21-sem pipelined TP=16 XOR1 xyz AG under on_wait + AOT while keeping spec at 9 sems."""
+    import jax
+
+    if len(jax.devices("cpu")) < 16:
+        pytest.skip("Requires XLA_FLAGS=--xla_force_host_platform_device_count=16")
+
+    import jax.numpy as jnp
+    from jax.experimental import topologies
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, PartitionSpec as P
+    from sglang_tpu.kernels.xor1_bridge_all_gather import (
+        xor1_ag_schedule_spec,
+        xor1_bridge_all_gather,
+    )
+
+    # Preserve kernel_a1's fused schedule semaphore count (9 inter sems -> sum+6 <= 64).
+    assert xor1_ag_schedule_spec(16, 512, 1, xy_torus=True)[2] == (1, 9, 9, 10, 10)
+
+    ip_on_wait = pltpu.InterpretParams(
+        dma_execution_mode="on_wait",
+        detect_races=True,
+        uninitialized_memory="nan",
+    )
+    mesh16 = Mesh(np.array(jax.devices("cpu")[:16]), ("model",))
+    rng = np.random.default_rng(20261128)
+    for dt, rows, cols in ((jnp.int8, 96, 256), (jnp.bfloat16, 48, 256)):
+        x_arr = jax.device_put(
+            jnp.asarray(rng.integers(-40, 40, size=(16 * rows, cols), dtype=np.int8)).astype(dt),
+            jax.sharding.NamedSharding(mesh16, P("model", None)),
+        )
+        from jax.experimental import pallas as pl
+
+        orig_pc = pl.pallas_call
+        with mock.patch.object(pl, "pallas_call", lambda *a, **kw: orig_pc(*a, **{**kw, "interpret": ip_on_wait})):
+            got = jax.jit(
+                jax.shard_map(
+                    lambda x: xor1_bridge_all_gather(x, axis_name="model", tiled=True, xy_torus=True),
+                    mesh=mesh16, in_specs=(P("model", None),), out_specs=P(), check_vma=False,
+                )
+            )(x_arr)
+        ref = jax.jit(
+            jax.shard_map(
+                lambda x: jax.lax.all_gather(x, "model", axis=0, tiled=True),
+                mesh=mesh16, in_specs=(P("model", None),), out_specs=P(), check_vma=False,
+            )
+        )(x_arr)
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
+
+    tpu_devs = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x=2x2x2").devices
+    aot_mesh = Mesh(np.array(sorted(tpu_devs, key=lambda d: (d.coords[1], d.coords[0], d.core_on_chip))), ("model",))
+    for rows, cols, dt in ((256, 4096, jnp.int8), (512, 8192, jnp.bfloat16)):
+        c_ag = jax.jit(
+            jax.shard_map(
+                lambda x: xor1_bridge_all_gather(x, axis_name="model", tiled=True, xy_torus=True),
+                mesh=aot_mesh, in_specs=(P(),), out_specs=P(), check_vma=False,
+            )
+        ).trace(jax.ShapeDtypeStruct((rows, cols), dt)).lower(lowering_platforms=("tpu",)).compile()
+        hlo = c_ag.as_text()
+        assert "xor1_xyztorus_ag_tp16" in hlo and "tpu_custom_call" in hlo
+
+    # Also verify TP=8 wave-pipelined xy_torus under on_wait + 2x2x1 AOT (0 extra sems).
+    assert xor1_ag_schedule_spec(8, 512, 1, xy_torus=True)[2] == (1, 6, 6, 7, 7)
+    mesh8 = Mesh(np.array(jax.devices("cpu")[:8]), ("model",))
+    for dt, rows, cols in ((jnp.int8, 64, 256), (jnp.bfloat16, 32, 256)):
+        x_arr8 = jax.device_put(
+            jnp.asarray(rng.integers(-40, 40, size=(8 * rows, cols), dtype=np.int8)).astype(dt),
+            jax.sharding.NamedSharding(mesh8, P("model", None)),
+        )
+        with mock.patch.object(pl, "pallas_call", lambda *a, **kw: orig_pc(*a, **{**kw, "interpret": ip_on_wait})):
+            got8 = jax.jit(
+                jax.shard_map(
+                    lambda x: xor1_bridge_all_gather(x, axis_name="model", tiled=True, xy_torus=True),
+                    mesh=mesh8, in_specs=(P("model", None),), out_specs=P(), check_vma=False,
+                )
+            )(x_arr8)
+        ref8 = jax.jit(
+            jax.shard_map(
+                lambda x: jax.lax.all_gather(x, "model", axis=0, tiled=True),
+                mesh=mesh8, in_specs=(P("model", None),), out_specs=P(), check_vma=False,
+            )
+        )(x_arr8)
+        np.testing.assert_array_equal(np.asarray(got8), np.asarray(ref8))
+
+    tpu_devs8 = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x=2x2x1").devices
+    aot_mesh8 = Mesh(np.array(sorted(tpu_devs8, key=lambda d: (d.coords[1], d.coords[0], d.core_on_chip))), ("model",))
+    for rows, cols, dt in ((512, 4096, jnp.int8), (1024, 8192, jnp.bfloat16)):
+        c_ag8 = jax.jit(
+            jax.shard_map(
+                lambda x: xor1_bridge_all_gather(x, axis_name="model", tiled=True, xy_torus=True),
+                mesh=aot_mesh8, in_specs=(P(),), out_specs=P(), check_vma=False,
+            )
+        ).trace(jax.ShapeDtypeStruct((rows, cols), dt)).lower(lowering_platforms=("tpu",)).compile()
+        hlo8 = c_ag8.as_text()
+        assert "xor1_xytorus_ag_tp8" in hlo8 and "tpu_custom_call" in hlo8
