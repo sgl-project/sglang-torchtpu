@@ -1458,9 +1458,13 @@ def _ops(
         + (f"_kf{kp_fp8}" if kp_fp8 > 0 else "")
         + (f"_knc{kp_nc}" if kp_nc > 0 else "")
         + (
-            f"_xagm{xor1_moe_mode}"
-            if xor1_moe_mode > 0
-            else (f"_xag{xor1_ag_mode}" if xor1_ag_mode >= 2 else "")
+            "_xagma"
+            if (xor1_moe_mode < 0 and xor1_ag_mode < 2)
+            else (
+                f"_xagm{xor1_moe_mode}"
+                if xor1_moe_mode > 0
+                else (f"_xag{xor1_ag_mode}" if xor1_ag_mode >= 2 else "")
+            )
         )
         + ("_xagd" if xor1_under_d_mode else "")
         + (
@@ -1555,10 +1559,14 @@ def _ops(
         + ("_fbk" if finer_bkt else "")
         + a1_parts_tag
         + (
-            f"_xagc{xor1_chunk_mode}"
-            if xor1_chunk_mode > 0
+            "_xagca"
+            if (xor1_chunk_mode < 0 and xor1_ag_mode not in (1, 2, 3))
             else (
-                f"_xag{xor1_ag_mode}" if xor1_ag_mode in (1, 2, 3) else ""
+                f"_xagc{xor1_chunk_mode}"
+                if xor1_chunk_mode > 0
+                else (
+                    f"_xag{xor1_ag_mode}" if xor1_ag_mode in (1, 2, 3) else ""
+                )
             )
         )
         + a1_w8_tag
@@ -1918,6 +1926,12 @@ def _ops(
             if xor1_chunk_mode > 0
             else (xor1_ag_mode if xor1_ag_mode in (1, 2, 3) else 0)
         )
+        auto_tp8_ccs_ag = (
+            xor1_chunk_mode < 0
+            and ccs_ag_mode == 0
+            and ccs_fuse_ag_a1 != 2
+            and mesh.shape[_AXIS] == 8
+        )
         use_xor1_ccs_ag = (ccs_ag_mode >= 1) or (ccs_fuse_ag_a1 == 2)
 
         def _prep_ccs_fp8_slice(x_slice):
@@ -1940,6 +1954,13 @@ def _ops(
                     axis_name=_AXIS,
                     tiled=False,
                     xy_torus=(ccs_ag_mode >= 3),
+                )
+            if auto_tp8_ccs_ag and x_fp8.shape[0] >= 64:
+                return xor1_bridge_all_gather(
+                    x_fp8,
+                    axis_name=_AXIS,
+                    tiled=False,
+                    xy_torus=True,
                 )
             return lax.all_gather(x_fp8, _AXIS, axis=0, tiled=False)
 
@@ -2001,9 +2022,13 @@ def _ops(
             return a1_chunk_sm(ag_k, wqkvg, wqkvg_scale, cos_k, sin_k)
 
         ccs_ag_sfx = (
-            f"_xag{ccs_ag_mode}"
-            if ccs_ag_mode > 0
-            else ("_xagccs" if use_xor1_ccs_ag else "")
+            "_xagca"
+            if auto_tp8_ccs_ag
+            else (
+                f"_xag{ccs_ag_mode}"
+                if ccs_ag_mode > 0
+                else ("_xagccs" if use_xor1_ccs_ag else "")
+            )
         )
         rpal_sfx = "_rpal" if a1_rpa_layout else "_unpk"
         ag_chunk_op = export(

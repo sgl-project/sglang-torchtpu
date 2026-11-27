@@ -696,10 +696,12 @@ class TpuEnvs:
     # keeping A1, chunk, exit, and split Kernel D on overlapped SparseCore lax.all_gather).
     SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG = EnvInt(0)
     # Per-call-site opt-in overrides (all default off so XOR1_BRIDGE_AG=0 keeps SparseCore):
-    # MoE-internal B2 ag_i8 all-gather in pipeline.py (0 = off; 1/2 = flat; 3 = xy/xyz torus).
-    SGLANG_TPU_MUSE_KERNEL_XOR1_AG_MOE = EnvInt(0)
-    # Chunk/A1 entry all-gather in integration.py (0 = off; 1/2 = flat; 3 = xy/xyz torus).
-    SGLANG_TPU_MUSE_KERNEL_XOR1_AG_CHUNK = EnvInt(0)
+    # MoE-internal B2 ag_i8 all-gather in pipeline.py (-1 = auto size-gated xy/xyz torus [<=4.25 MiB
+    # on TP=8, <=2.125 MiB on TP=16]; 0 = force SparseCore lax.all_gather; 1/2 = flat; 3 = xy/xyz torus).
+    SGLANG_TPU_MUSE_KERNEL_XOR1_AG_MOE = EnvInt(-1)
+    # Chunk/A1 entry all-gather in integration.py (-1 = auto xy_torus on TP=8 c_k>=64; 0 = off;
+    # 1/2 = flat; 3 = xy/xyz torus).
+    SGLANG_TPU_MUSE_KERNEL_XOR1_AG_CHUNK = EnvInt(-1)
     # Opt-in: also run xor1_bridge_all_gather inside split _d_with_next_in_gather (False keeps
     # SparseCore jax.lax.all_gather so it overlaps under Kernel D Part 2 on TensorCore).
     SGLANG_TPU_MUSE_KERNEL_XOR1_AG_UNDER_D = EnvBool(False)
