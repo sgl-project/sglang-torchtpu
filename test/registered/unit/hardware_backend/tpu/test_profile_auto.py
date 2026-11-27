@@ -5,11 +5,14 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import contextlib
+import json
 import tempfile
 import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+import torch
 
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
@@ -79,6 +82,12 @@ class _ProfileAutoTestCase(CustomTestCase):
         stack.enter_context(get_disagg().override(disaggregation_mode="null"))
         self.tmp = stack.enter_context(tempfile.TemporaryDirectory())
         stack.enter_context(envs.SGLANG_PROFILE_V2.override(False))
+        stack.enter_context(
+            tpu_envs.SGLANG_TPU_PROFILE_AUTO_DECODE_STEPS_TO_SKIP.override(0)
+        )
+        stack.enter_context(
+            tpu_envs.SGLANG_TPU_PROFILE_AUTO_DECODE_KV_LEN_THRESHOLD.override(-1)
+        )
         stack.enter_context(
             patch.dict("os.environ", {"SGLANG_TORCH_PROFILER_DIR": self.tmp})
         )
@@ -263,6 +272,92 @@ class TestCompletion(_ProfileAutoTestCase):
         self._run_stage(mgr, ForwardMode.DECODE)
 
         self.assertEqual(_markers(self.tmp), [])
+
+
+class TestDecodeGatesAndBatchStatsJsonl(_ProfileAutoTestCase):
+    def test_invalid_decode_gate_envs_rejected(self):
+        with (
+            tpu_envs.SGLANG_TPU_PROFILE_AUTO_DECODE_STEPS_TO_SKIP.override(-1),
+            self.assertRaisesRegex(
+                ValueError, "SGLANG_TPU_PROFILE_AUTO_DECODE_STEPS_TO_SKIP"
+            ),
+        ):
+            self._make_manager()
+        with (
+            tpu_envs.SGLANG_TPU_PROFILE_AUTO_DECODE_KV_LEN_THRESHOLD.override(-2),
+            self.assertRaisesRegex(
+                ValueError, "SGLANG_TPU_PROFILE_AUTO_DECODE_KV_LEN_THRESHOLD"
+            ),
+        ):
+            self._make_manager()
+
+    def test_decode_skip_and_kv_threshold_write_matching_jsonl_and_batch_id(self):
+        from sglang_tpu import profile_batch_stats
+
+        forward_ct = [10]
+        with (
+            tpu_envs.SGLANG_TPU_ENABLE_PROFILE_AUTO.override(True),
+            tpu_envs.SGLANG_TPU_PROFILE_AUTO_STEPS.override(2),
+            tpu_envs.SGLANG_TPU_PROFILE_AUTO_DECODE_STEPS_TO_SKIP.override(2),
+            tpu_envs.SGLANG_TPU_PROFILE_AUTO_DECODE_KV_LEN_THRESHOLD.override(16),
+            get_disagg().override(disaggregation_mode="decode"),
+        ):
+            mgr = SchedulerProfilerManager(get_forward_ct=lambda: forward_ct[0])
+
+            def _fake_start(stage=None):
+                mgr.profile_in_progress = True
+
+            self.enterContext(
+                patch.object(mgr, "_start_profile", side_effect=_fake_start)
+            )
+
+            def _step(kv_lens):
+                forward_ct[0] += 1
+                batch = types.SimpleNamespace(
+                    forward_mode=ForwardMode.DECODE,
+                    batch_size=len(kv_lens),
+                    seq_lens_cpu=torch.tensor(kv_lens),
+                    spec_info=None,
+                )
+                mgr._profile_batch_predicate(batch)
+
+            # First 2 decode steps skipped by DECODE_STEPS_TO_SKIP (forward_ct 11, 12).
+            _step([32, 32])
+            self.assertFalse(mgr.profile_in_progress)
+            _step([32, 32])
+            self.assertFalse(mgr.profile_in_progress)
+
+            # Step 3 skipped because min KV len 8 < threshold 16 (forward_ct 13).
+            _step([8, 24])
+            self.assertFalse(mgr.profile_in_progress)
+            self.assertIsNone(profile_batch_stats.consume_active_batch_id())
+
+            # Step 4 opens decode capture (forward_ct 14) -> JSONL line 1 + batch_id=14.
+            _step([16, 32])
+            self.assertTrue(mgr.profile_in_progress)
+            self.assertEqual(profile_batch_stats.consume_active_batch_id(), 14)
+
+            # Step 5 is step 2/2 of decode capture (forward_ct 15) -> JSONL line 2 + batch_id=15.
+            _step([17, 33])
+            self.assertTrue(mgr.profile_in_progress)
+            self.assertEqual(profile_batch_stats.consume_active_batch_id(), 15)
+
+            # Step 6 closes capture (forward_ct 16) -> no extra JSONL line, active batch_id cleared.
+            _step([18, 34])
+            self.assertFalse(mgr.profile_in_progress)
+            self.assertIsNone(profile_batch_stats.consume_active_batch_id())
+
+        stats_path = Path(self.tmp) / "batch_composition_stats_decode_TP-0.json"
+        self.assertTrue(stats_path.exists())
+        rows = [
+            json.loads(line)
+            for line in stats_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([r["batch_id"] for r in rows], [14, 15])
+        self.assertEqual([r["min_kv_len"] for r in rows], [16, 17])
+        self.assertEqual([r["phase"] for r in rows], ["DECODE_ONLY", "DECODE_ONLY"])
 
 
 class TestInstall(CustomTestCase):

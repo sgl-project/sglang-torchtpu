@@ -104,6 +104,7 @@ from sglang_tpu.hooks.row_select import select_rows as select_kept_rows
 from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
 from sglang_tpu.hooks.spec_tp_sync import broadcast_undeferred
 from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
+from sglang_tpu.hooks.step_span_batch_stats import append_batch_stats_to_step_span
 from sglang_tpu.hooks.swa_miss_metrics import hook_specs as swa_miss_metrics_hooks
 from sglang_tpu.hooks.twolevel_allreduce import all_reduce as twolevel_all_reduce
 from sglang_tpu.hooks.twolevel_allreduce import (
@@ -468,6 +469,11 @@ HOOKS: list[tuple] = [
         "sglang.srt.managers.row_select.concat_rows",
         concat_merged_rows,
         HookType.AROUND,
+    ),
+    (
+        "sglang.srt.observability.profile_utils.build_step_span_name",
+        append_batch_stats_to_step_span,
+        HookType.AFTER,
     ),
 ]
 
