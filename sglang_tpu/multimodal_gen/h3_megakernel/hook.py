@@ -60,7 +60,7 @@ Runtime patch, tracked debt:
   fallback, with seams for platform-provided sequence padding and
   per-request denoise hooks (``begin_request`` / ``end_request``). These
   hooks move onto it.
-  TODO: link the tracking issue.
+  Tracking issue: https://github.com/sgl-project/sglang-torchtpu/issues/2498
 - Remove when: the torch_tpu block path reaches the kernel's speed, or that
   seam lands.
 """
