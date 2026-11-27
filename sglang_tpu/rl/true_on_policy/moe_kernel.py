@@ -33,8 +33,6 @@ def moe_experts(
     topk_ids [M, k] int32, in the router's slot order. Forward only.
     """
     refuse_moe_rounding_flags()
-    # No SGLANG_TPU_ENABLE_SINGLE_TOKEN_MOE_KERNEL override: that kernel takes packed MXFP4 weights only, and the
-    # trainer calls this op inside a compiled activation checkpoint, where an os.environ write cannot be traced.
     return _fused_moe(
         hidden_states,
         w1,

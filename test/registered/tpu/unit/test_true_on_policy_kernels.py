@@ -318,8 +318,7 @@ class TestTrueOnPolicyKernels(CustomTestCase):
         self.assertLess((out - ref).abs().max().item(), 0.05)
 
     def test_moe_experts_compiles_without_a_graph_break(self):
-        """moe_experts traces as one graph and matches eager: the trainer calls it inside a compiled
-        activation checkpoint, where any graph break (an os.environ write is one) is an error."""
+        """The trainer compiles moe_experts inside an activation checkpoint, where a graph break is an error."""
         hidden, inter, experts, topk, rows = 512, 256, 16, 4, 8
         x = _rnd(rows, hidden)
         w1 = _rnd(experts, hidden, 2 * inter, scale=hidden**-0.5, seed=1)
