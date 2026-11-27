@@ -2123,14 +2123,19 @@ def b1_moe_b2_chip_sharded_jax(
 _STEP_C_BASE_MAX_BKV_ROWS = 80 * 512
 _STEP_C_GROUP_MAX_BKV_ROWS = 80 * 512
 _STEP_C_LARGE_B_MAX_BKV_ROWS = 16 * 512
-_STEP_C_B128_UNCOMPRESSED_MAX_BKV_ROWS = 40 * 512
+_STEP_C_B128_MAX_BKV_ROWS = 40 * 512
 
 
 def _step_c_max_bkv_rows(
-    eff_b: int, *, kv_pack_dense2: bool, kv_pack_bd4: bool, base_rows: int
+    eff_b: int,
+    *,
+    kv_pack_dense2: bool,
+    kv_pack_bd4: bool,
+    allow_large_b: bool,
+    base_rows: int,
 ) -> int:
-    if eff_b == 128 and not kv_pack_dense2 and not kv_pack_bd4:
-        return _STEP_C_B128_UNCOMPRESSED_MAX_BKV_ROWS
+    if eff_b == 128 and not kv_pack_bd4 and (not kv_pack_dense2 or allow_large_b):
+        return _STEP_C_B128_MAX_BKV_ROWS
     return _STEP_C_LARGE_B_MAX_BKV_ROWS if eff_b > 64 else base_rows
 
 
@@ -2164,7 +2169,6 @@ def resolve_step_c_rpa_plan(
     )
     eff_b = int(b_tokens) if b_tokens is not None else 64
     eff_seqs = int(max_num_seqs) if max_num_seqs is not None else eff_b
-    max_bkv_rows = _STEP_C_LARGE_B_MAX_BKV_ROWS if eff_b > 64 else _STEP_C_BASE_MAX_BKV_ROWS
     if allow_large_b is None:
         try:
             from sglang_tpu.envs import envs as tpu_envs
@@ -2207,8 +2211,22 @@ def resolve_step_c_rpa_plan(
         eff_b,
         kv_pack_dense2=kv_pack_dense2,
         kv_pack_bd4=kv_pack_bd4,
+        allow_large_b=bool(allow_large_b),
         base_rows=_STEP_C_BASE_MAX_BKV_ROWS,
     )
+    if (
+        (not shared_bad)
+        and sliding_window is None
+        and sh_grp == 0
+        and eff_b == 128
+        and kv_pack_dense2
+        and allow_large_b
+        and cfg_rpa.loop_kind == "w7auto"
+        and cfg_rpa.num_slots > 2
+        and cfg_rpa.num_slots * cfg_rpa.max_ring_pages * phys_page_rows > max_bkv_rows
+        and 2 * cfg_rpa.max_ring_pages * phys_page_rows <= max_bkv_rows
+    ):
+        cfg_rpa = dataclasses.replace(cfg_rpa, num_slots=2)
     if (
         (not shared_bad)
         and sliding_window is None
@@ -2263,6 +2281,7 @@ def resolve_step_c_rpa_plan(
             eff_b,
             kv_pack_dense2=kv_pack_dense2,
             kv_pack_bd4=kv_pack_bd4,
+            allow_large_b=bool(allow_large_b),
             base_rows=_STEP_C_GROUP_MAX_BKV_ROWS,
         )
         for cand_grp in (4, 2):

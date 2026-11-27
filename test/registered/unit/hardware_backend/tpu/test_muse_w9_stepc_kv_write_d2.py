@@ -1356,8 +1356,8 @@ def test_wave11_step_c_rpa_plan_shared_and_large_b():
     assert ok_swa_256_bd4 is True and grp_swa_256_bd4 is True and cfg_swa_256_bd4.swabatch_group_size == 2
     assert slot_swa_256_bd4 == 10
 
-    # TP=8 B=128 DENSE2 stays gated to 2-Scope Step (b) by default (#4962/#5010), and with LARGE_B=1
-    # SWA batch4 still refuses silent grp=1 downgrade unless explicit b1 is passed.
+    # TP=8 B=128 DENSE2 stays gated to 2-Scope Step (b) by default (#4962/#5010); LARGE_B=1 unlocks
+    # 40*512 bkv (SWA batch4 fits cleanly, while >40*512 SWA still refuses silent grp=1 downgrade).
     _, _, _, _, ok_swa_128_def = resolve_step_c_rpa_plan(
         "w8,s4,batchfull,g4k,foldcol,batch4",
         sliding_window=2049,
@@ -1369,7 +1369,7 @@ def test_wave11_step_c_rpa_plan_shared_and_large_b():
     )
     assert ok_swa_128_def is False
 
-    _, _, _, _, ok_swa_128_b4 = resolve_step_c_rpa_plan(
+    cfg_swa_128_b4, _, slot_swa_128_b4, grp_swa_128_b4, ok_swa_128_b4 = resolve_step_c_rpa_plan(
         "w8,s4,batchfull,g4k,foldcol,batch4,d2grp",
         sliding_window=2049,
         pages_per_seq=32,
@@ -1379,7 +1379,20 @@ def test_wave11_step_c_rpa_plan_shared_and_large_b():
         max_num_seqs=128,
         allow_large_b=True,
     )
-    assert ok_swa_128_b4 is False
+    assert ok_swa_128_b4 is True and grp_swa_128_b4 is True and cfg_swa_128_b4.swabatch_group_size == 4
+    assert slot_swa_128_b4 == 20
+
+    _, _, _, _, ok_swa_128_over = resolve_step_c_rpa_plan(
+        "w8,s12,batchfull,g4k,foldcol,batch4,d2grp",
+        sliding_window=2049,
+        pages_per_seq=32,
+        phys_page_rows=256,
+        kv_pack_dense2=True,
+        b_tokens=128,
+        max_num_seqs=128,
+        allow_large_b=True,
+    )
+    assert ok_swa_128_over is False
 
     _, _, _, _, ok_swa_128_b1 = resolve_step_c_rpa_plan(
         "w8,s4,b1,batchfull,g4k,foldcol",
@@ -1696,11 +1709,12 @@ def test_wave11_muse_spark_step_c_b128_b256_and_lc_full_dispatch():
             )
         return calls, len(pending)
 
-    # Wave 13 (#5010): B=128 TP=8 DENSE2 stays gated to 2-Scope Step (b) by default (and 8K/1K pps=32 batch4 refuses grp=1 downgrade);
+    # Wave 15: B=128 TP=8 DENSE2 stays gated by default; LARGE_B=1 unlocks SWA batch4 (40*512) while >40*512 refuses grp=1 downgrade;
     # B=256 TP=16 BD4 keeps Step (c) via b2 (5,120 <= 8,192).
     assert _run_case(tp=8, batch=128, sw=2049, pps=32, dist_len=3, rpa_mode="w8,s4,batchfull,g4k,foldcol,batch4", lc_full_env="0") == (["step_b"], 0)
     assert _run_case(tp=16, batch=256, sw=2049, pps=32, dist_len=3, rpa_mode="w8,s4,batchfull,g4k,foldcol,batch4", lc_full_env="0") == (["step_c"], 1)
-    assert _run_case(tp=8, batch=128, sw=2049, pps=32, dist_len=3, rpa_mode="w8,s4,batchfull,g4k,foldcol,batch4,d2grp", lc_full_env="0", large_b_env="1") == (["step_b"], 0)
+    assert _run_case(tp=8, batch=128, sw=2049, pps=32, dist_len=3, rpa_mode="w8,s4,batchfull,g4k,foldcol,batch4,d2grp", lc_full_env="0", large_b_env="1") == (["step_c"], 1)
+    assert _run_case(tp=8, batch=128, sw=2049, pps=32, dist_len=3, rpa_mode="w8,s12,batchfull,g4k,foldcol,batch4,d2grp", lc_full_env="0", large_b_env="1") == (["step_b"], 0)
     assert _run_case(tp=8, batch=128, sw=2049, pps=32, dist_len=3, rpa_mode="w8,s4,b1,batchfull,g4k,foldcol", lc_full_env="0", large_b_env="1") == (["step_c"], 1)
 
     # Target 2: LC Full shared64 stays gated to Step (b) by default (LC_FULL=0) and enters Step (c) only with LC_FULL=1.
