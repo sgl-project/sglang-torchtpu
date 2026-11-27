@@ -52,6 +52,9 @@ _PUSH_FULL_FREE_TOKENS = 65536
 # Arbitrary: on a hybrid model, also once the SWA host pool could take only
 # this many more windows.
 _PUSH_SWA_FREE_WINDOWS = 4
+# Bounded wait for decode's preflight VictimOfferAck before retiring a lost
+# control-socket offer without registering any native host reads.
+OFFER_ACK_TIMEOUT_S = 5.0
 # Arbitrary, well past one RAM-to-RAM push of a session and the decode's
 # agreement rounds.
 _ACK_TIMEOUT_S = 60.0
@@ -82,6 +85,13 @@ class _PushInFlight(msgspec.Struct):
     leaf: Any
     locks: List[Any]
     sent_at: float
+    decode: Tuple[str, int] = ("", 0)
+    tokens: List[int] = msgspec.field(default_factory=list)
+    pages: List[int] = msgspec.field(default_factory=list)
+    swa_pages: List[int] = msgspec.field(default_factory=list)
+    # "offer" while awaiting preflight VictimOfferAck; "transfer" once accepted
+    # and native host reads are registered.
+    phase: str = "offer"
     # The accepted native registrations of the leaf's pages (full, then the
     # window of a hybrid model); ``registered`` once all were accepted.
     read_ids: List[str] = msgspec.field(default_factory=list)
@@ -208,6 +218,7 @@ class PrefillDramVictimPusher:
         clock. Pushes start only while the engine serves requests: an engine
         left alone settles the pushes in flight and goes idle, so that it can
         be flushed."""
+        self._advance_pending_offers()
         self.retire_settled_pushes()
         self._start_push_if_agreed(serving=serving)
         log_offload_stats(self.stats, "push", self._last_log)
@@ -236,13 +247,84 @@ class PrefillDramVictimPusher:
         self._covered.clear()
         self._pushed_len.clear()
 
+    def _advance_pending_offers(self) -> None:
+        """Advance preflight offers awaiting decode's VictimOfferAck."""
+        pending = [p for p in self._pushes.values() if p.phase == "offer"]
+        if not pending:
+            return
+        now = time.monotonic()
+        rows = []
+        for push in pending:
+            ack = self._channel.victim_offer_reply(push.seq)
+            if ack is None:
+                if push.stored is False or now - push.sent_at > OFFER_ACK_TIMEOUT_S:
+                    rows.append([1, 0, 0, 0])
+                else:
+                    rows.append([0, 0, 0, 0])
+            else:
+                skip_pages = max(0, min(int(ack.skip_prefix_pages), len(push.pages)))
+                rows.append([1, int(bool(ack.accepted)), skip_pages, int(ack.skip_swa)])
+        agreed = self._lockstep.reduce(rows, dist.ReduceOp.MIN)
+        for push, (answered, accepted, skip_prefix_pages, skip_swa) in zip(
+            pending, agreed
+        ):
+            if not answered:
+                continue
+            if not accepted:
+                # Retired immediately with 0 native register_host_read calls.
+                self.stats["declined"] += 1
+                self._finish_push(push, stored=False)
+                continue
+            self._on_offer_accepted(
+                push,
+                skip_prefix_pages=int(skip_prefix_pages),
+                skip_swa=bool(skip_swa),
+            )
+
+    def _on_offer_accepted(
+        self, push: _PushInFlight, *, skip_prefix_pages: int, skip_swa: bool
+    ) -> None:
+        """Register only the unbacked delta suffix and send VictimPush."""
+        push.phase = "transfer"
+        push.sent_at = time.monotonic()
+        delta_pages = push.pages[skip_prefix_pages:]
+        delta_swa = [] if skip_swa else push.swa_pages
+        uuid = _transfer_uuid(self._namespace, push.seq)
+        metadata = swa_metadata = None
+        try:
+            metadata = self._channel.export_host_metadata(delta_pages)
+            swa_metadata = self._channel.export_host_metadata(delta_swa, swa=True)
+        except Exception:  # noqa: BLE001 - all ranks decline before registering
+            logger.exception("Cannot export host metadata for victim push %s", push.seq)
+        if not self._lockstep.all(metadata is not None and swa_metadata is not None):
+            push.stored = False
+            return
+        push.registered = self._register_leaf_pages(push, uuid, delta_pages, delta_swa)
+        if not self._lockstep.all(push.registered) or not (
+            self._channel.send_victim_push(
+                decode=push.decode,
+                prefill=self._namespace,
+                seq=push.seq,
+                tokens=push.tokens,
+                blocks=delta_pages,
+                swa_blocks=delta_swa,
+                uuid=uuid,
+                extra_key=push.leaf.key.extra_key,
+                cache_salt=push.leaf.key.cache_salt,
+                page_metadata=metadata,
+                swa_page_metadata=swa_metadata,
+                skip_prefix_pages=skip_prefix_pages,
+            )
+        ):
+            push.stored = False
+
     def retire_settled_pushes(self) -> None:
         """Retire the pushes whose outcome every rank has."""
-        if not self._pushes:
+        pushes = [p for p in self._pushes.values() if p.phase == "transfer"]
+        if not pushes:
             return
         self._channel.drain_host_reads()
         now = time.monotonic()
-        pushes = list(self._pushes.values())
         rows = []
         for push in pushes:
             if push.stored is None:
@@ -250,8 +332,10 @@ class PrefillDramVictimPusher:
                 if push.stored is None and now - push.sent_at > _ACK_TIMEOUT_S:
                     push.stored = False
             # Accepted registrations drain even when another one was refused.
-            sent = self._channel.poll_host_reads(push.read_ids)
-            if sent is not None and not push.registered:
+            sent = (
+                self._channel.poll_host_reads(push.read_ids) if push.read_ids else True
+            )
+            if sent is not None and not push.registered and push.read_ids:
                 sent = False
             if sent is False:
                 push.stored = False
@@ -269,6 +353,7 @@ class PrefillDramVictimPusher:
         self._channel.forget_host_reads(push.read_ids)
         del self._pushes[push.seq]
         unlock_host_path(self._cache, push.locks)
+        self._channel.forget_victim_offer(push.seq)
         self._channel.forget_victim(push.seq)
         if stored:
             try:
@@ -284,8 +369,9 @@ class PrefillDramVictimPusher:
                     )
 
     def _start_push_if_agreed(self, *, serving: bool) -> None:
-        """Start a push in a step where every rank serves requests, is under
-        host pressure, picked the same leaf and holds it whole in host RAM."""
+        """Start a preflight offer in a step where every rank serves requests,
+        is under host pressure, picked the same leaf and holds it whole in host
+        RAM. Native host reads are registered only after decode accepts."""
         picked = (
             self._pick_coldest_host_leaf()
             if serving
@@ -312,42 +398,30 @@ class PrefillDramVictimPusher:
         self._pushed_len[leaf] = len(path)
         seq = self._next_seq
         self._next_seq += 1
-        uuid = _transfer_uuid(self._namespace, seq)
         push = _PushInFlight(
             seq=seq,
             leaf=leaf,
             locks=lock_host_path(self._cache, leaf),
             sent_at=time.monotonic(),
+            decode=decode,
+            tokens=path,
+            pages=pages,
+            swa_pages=swa_pages,
+            phase="offer",
         )
         self._pushes[seq] = push
         self.stats["started"] += 1
-        # Snapshot under the same host pin as the KV read. A metadata owner may
-        # need to resolve an outstanding seal before the page can leave.
-        metadata = swa_metadata = None
-        try:
-            metadata = self._channel.export_host_metadata(pages)
-            swa_metadata = self._channel.export_host_metadata(swa_pages, swa=True)
-        except Exception:  # noqa: BLE001 - all ranks decline before registering
-            logger.exception("Cannot export host metadata for victim push %s", seq)
-        if not self._lockstep.all(metadata is not None and swa_metadata is not None):
-            push.stored = False
-            return
-        push.registered = self._register_leaf_pages(push, uuid, pages, swa_pages)
-        if not self._lockstep.all(push.registered) or not (
-            self._channel.send_victim_push(
-                decode=decode,
-                prefill=self._namespace,
-                seq=seq,
-                tokens=path,
-                blocks=pages,
-                swa_blocks=swa_pages,
-                uuid=uuid,
-                extra_key=leaf.key.extra_key,
-                cache_salt=leaf.key.cache_salt,
-                page_metadata=metadata,
-                swa_page_metadata=swa_metadata,
-            )
-        ):
+        sent = self._channel.send_victim_offer(
+            decode=decode,
+            prefill=self._namespace,
+            seq=seq,
+            tokens=path,
+            num_blocks=len(pages),
+            num_swa_blocks=len(swa_pages),
+            extra_key=leaf.key.extra_key,
+            cache_salt=leaf.key.cache_salt,
+        )
+        if not self._lockstep.all(sent):
             push.stored = False
 
     def _register_leaf_pages(

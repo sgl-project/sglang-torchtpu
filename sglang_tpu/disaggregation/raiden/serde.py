@@ -52,6 +52,10 @@ class MessageTag(bytes, enum.Enum):
 
     # Victim push: the prefill hands a session it is about to evict to the decode
     # that served it (decode_dram_offload/prefill_dram_victim_pusher.py).
+    VICTIM_OFFER = b"RAIDEN_VICTIM_OFFER"  # prefill -> decode: preflight offer
+    VICTIM_OFFER_ACK = (
+        b"RAIDEN_VICTIM_OFFER_ACK"  # decode -> prefill: accepted + skip_prefix_pages
+    )
     VICTIM_PUSH = b"RAIDEN_VICTIM_PUSH"  # prefill -> decode: host pages offered
     VICTIM_ACK = b"RAIDEN_VICTIM_ACK"  # decode -> prefill: stored, or declined
 
@@ -140,14 +144,41 @@ class PrefixReady(WireMessage, omit_defaults=True):
         require_non_negative(self.swa_uuid, "swa_uuid")
 
 
+class VictimOffer(WireMessage, omit_defaults=True):
+    """Preflight victim-push offer sent before the prefill registers host pages
+    for a native Raiden read, so declined pushes incur zero 60s await_pull hold."""
+
+    TAG: ClassVar[bytes] = MessageTag.VICTIM_OFFER
+    prefill: str
+    seq: int
+    ack_endpoint: str
+    tokens: list[int]
+    num_blocks: int
+    num_swa_blocks: int = 0
+    extra_key: Optional[str] = None
+    cache_salt: Optional[str] = None
+
+
+class VictimOfferAck(WireMessage, omit_defaults=True):
+    """Decode's preflight answer to a ``VictimOffer``: whether it reserved room
+    for the missing delta suffix and how many full prefix pages can be skipped."""
+
+    TAG: ClassVar[bytes] = MessageTag.VICTIM_OFFER_ACK
+    seq: int
+    accepted: bool
+    skip_prefix_pages: int = 0
+    skip_swa: bool = False
+
+
 class VictimPush(WireMessage, omit_defaults=True):
     """A host-resident session the prefill is about to evict. Defaults stay off
     the wire: a full-only model's push reads on a decode from before the
     window fields.
 
-    ``tokens`` are the session's first ``len(blocks) * page_size`` token ids
-    and ``blocks`` the host page ids holding their full KV on this rank;
-    ``prefill`` and ``seq`` are the same on every rank of the prefill engine.
+    ``tokens`` are the session's first ``(skip_prefix_pages + len(blocks)) * page_size``
+    token ids and ``blocks`` the host page ids holding the registered suffix's
+    full KV on this rank; ``prefill`` and ``seq`` are the same on every rank of
+    the prefill engine.
     """
 
     TAG: ClassVar[bytes] = MessageTag.VICTIM_PUSH
@@ -167,6 +198,7 @@ class VictimPush(WireMessage, omit_defaults=True):
     cache_salt: Optional[str] = None
     page_metadata: list[bytes] = msgspec.field(default_factory=list)
     swa_page_metadata: list[bytes] = msgspec.field(default_factory=list)
+    skip_prefix_pages: int = 0
 
 
 class VictimAck(WireMessage):
