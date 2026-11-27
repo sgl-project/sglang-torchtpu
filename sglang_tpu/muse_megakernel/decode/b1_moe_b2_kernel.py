@@ -3330,7 +3330,7 @@ def _load_layers_kv_u16(
 
 
 def write_decode_kv_multi_layer_jax(
-    kv_new_layers: jax.Array,
+    kv_new_layers: jax.Array | tuple[jax.Array, ...] | list[jax.Array],
     kv_caches: jax.Array | tuple[jax.Array, ...] | list[jax.Array],
     kv_lens: jax.Array,
     page_indices: jax.Array,
@@ -3352,12 +3352,32 @@ def write_decode_kv_multi_layer_jax(
     if kv_pack_bd4:
         kv_pack_dense2 = False
     is_packed = kv_pack_bd4 or kv_pack_dense2
-    if kv_new_layers.ndim != 5:
-        raise ValueError(
-            f"Expected 5D kv_new_layers (L, T, 1, 4, 128), got {kv_new_layers.shape}"
-        )
+    kv_in_is_seq = not isinstance(kv_new_layers, jax.Array)
+    if kv_in_is_seq:
+        kv_seq = tuple(kv_new_layers)
+        if len(kv_seq) == 0 or kv_seq[0].ndim != 4:
+            raise ValueError(
+                f"Expected non-empty sequence of 4D kv_new (T, 1, 4, 128), got {len(kv_seq)} arrays"
+            )
+        ref_kv_shape, kv_dtype = kv_seq[0].shape, kv_seq[0].dtype
+        for idx, k in enumerate(kv_seq):
+            if k.shape != ref_kv_shape or k.dtype != kv_dtype:
+                raise ValueError(
+                    f"kv_new_layers[{idx}] shape/dtype {(k.shape, k.dtype)} != {(ref_kv_shape, kv_dtype)}"
+                )
+        n_wr_layers, t_tokens = len(kv_seq), ref_kv_shape[0]
+        kv_tail_shape = ref_kv_shape[1:]
+        kv_payload: jax.Array | tuple[jax.Array, ...] = kv_seq
+    else:
+        if kv_new_layers.ndim != 5:
+            raise ValueError(
+                f"Expected 5D kv_new_layers (L, T, 1, 4, 128), got {kv_new_layers.shape}"
+            )
+        n_wr_layers, t_tokens = kv_new_layers.shape[0], kv_new_layers.shape[1]
+        kv_tail_shape = kv_new_layers.shape[2:]
+        kv_dtype = kv_new_layers.dtype
+        kv_payload = kv_new_layers
 
-    n_wr_layers, t_tokens = kv_new_layers.shape[0], kv_new_layers.shape[1]
     is_bundle = layer_ids is not None
     if is_bundle:
         if not isinstance(kv_caches, jax.Array) or kv_caches.ndim != 6:
@@ -3367,15 +3387,15 @@ def write_decode_kv_multi_layer_jax(
         layer_ids_1d = layer_ids.reshape(-1).astype(jnp.int32)
         if layer_ids_1d.shape[0] != n_wr_layers:
             raise ValueError(
-                f"layer_ids length {layer_ids_1d.shape[0]} != kv_new_layers.shape[0] {n_wr_layers}"
+                f"layer_ids length {layer_ids_1d.shape[0]} != n_wr_layers {n_wr_layers}"
             )
-        if kv_new_layers.shape[2:] != kv_caches.shape[3:]:
+        if kv_tail_shape != kv_caches.shape[3:]:
             raise ValueError(
-                f"kv_new trailing shape {kv_new_layers.shape[2:]} != kv_cache trailing shape {kv_caches.shape[3:]}"
+                f"kv_new trailing shape {kv_tail_shape} != kv_cache trailing shape {kv_caches.shape[3:]}"
             )
-        if kv_new_layers.dtype != kv_caches.dtype:
+        if kv_dtype != kv_caches.dtype:
             raise ValueError(
-                f"kv_new dtype {kv_new_layers.dtype} != kv_cache dtype {kv_caches.dtype}"
+                f"kv_new dtype {kv_dtype} != kv_cache dtype {kv_caches.dtype}"
             )
         phys_page_size = kv_caches.shape[2]
         n_pool_layers = kv_caches.shape[1]
@@ -3397,13 +3417,13 @@ def write_decode_kv_multi_layer_jax(
                 raise ValueError(
                     f"kv_caches[{idx}] shape/dtype {(c.shape, c.dtype)} != {(ref_shape, cache_dtype)}"
                 )
-        if kv_new_layers.shape[2:] != ref_shape[2:]:
+        if kv_tail_shape != ref_shape[2:]:
             raise ValueError(
-                f"kv_new trailing shape {kv_new_layers.shape[2:]} != kv_cache trailing shape {ref_shape[2:]}"
+                f"kv_new trailing shape {kv_tail_shape} != kv_cache trailing shape {ref_shape[2:]}"
             )
-        if kv_new_layers.dtype != cache_dtype:
+        if kv_dtype != cache_dtype:
             raise ValueError(
-                f"kv_new dtype {kv_new_layers.dtype} != kv_cache dtype {cache_dtype}"
+                f"kv_new dtype {kv_dtype} != kv_cache dtype {cache_dtype}"
             )
         phys_page_size = ref_shape[1]
         n_pool_layers = 1
@@ -3413,6 +3433,7 @@ def write_decode_kv_multi_layer_jax(
 
     def _fallback_per_layer(kv_in, caches_in):
         if is_bundle:
+            kv_arr = jnp.stack(kv_in, axis=0) if isinstance(kv_in, tuple) else kv_in
             n_blk = caches_in.shape[0]
             flat_2d = caches_in.reshape(
                 (n_blk * n_pool_layers, phys_page_size, *caches_in.shape[3:])
@@ -3421,7 +3442,7 @@ def write_decode_kv_multi_layer_jax(
             def _loop_body(i, cur_flat):
                 pg_i = page_indices * jnp.int32(n_pool_layers) + layer_ids_1d[i]
                 return write_decode_kv_merged_jax(
-                    kv_in[i],
+                    kv_arr[i],
                     cur_flat,
                     kv_lens,
                     pg_i,
@@ -3460,7 +3481,7 @@ def write_decode_kv_multi_layer_jax(
         for lo in range(0, n_wr_layers, 8):
             hi = min(lo + 8, n_wr_layers)
             res = write_decode_kv_multi_layer_jax(
-                kv_new_layers[lo:hi],
+                kv_payload[lo:hi],
                 caches_seq[lo:hi],
                 kv_lens,
                 page_indices,
@@ -3478,13 +3499,13 @@ def write_decode_kv_multi_layer_jax(
     if n_wr_layers <= 1 or _packed_kv_write_fallback_eligible(
         t_tokens,
         max_num_seqs,
-        kv_new_layers.shape[2:],
-        kv_new_layers.dtype,
+        kv_tail_shape,
+        kv_dtype,
         kv_pack_dense2=kv_pack_dense2,
         kv_pack_bd4=kv_pack_bd4,
     ):
         return _fallback_per_layer(
-            kv_new_layers, kv_caches if is_bundle else caches_seq
+            kv_payload, kv_caches if is_bundle else caches_seq
         )
 
     pack_factor = 4 if kv_pack_bd4 else (2 if kv_pack_dense2 else 1)
@@ -3517,7 +3538,17 @@ def write_decode_kv_multi_layer_jax(
     tpu_version = 0 if interpret_mode else get_tpu_version()
 
     def _run_multi_fast(kv_in, caches_in):
-        kv_in_hbm = kv_in.reshape((n_wr_layers * t_tokens, *kv_in.shape[2:]))
+        direct_seq_hbm = (
+            isinstance(kv_in, tuple)
+            and ((t_tokens % 8) == 0)
+            and ((not is_bundle) or (n_wr_layers <= layer_chunk))
+        )
+        if direct_seq_hbm:
+            kv_args = kv_in
+        else:
+            kv_arr = jnp.stack(kv_in, axis=0) if isinstance(kv_in, tuple) else kv_in
+            kv_args = (kv_arr.reshape((n_wr_layers * t_tokens, *kv_tail_shape)),)
+        n_kv_in = len(kv_args)
         if is_bundle:
             flat_caches = (
                 caches_in.reshape(
@@ -3535,10 +3566,10 @@ def write_decode_kv_multi_layer_jax(
 
         def _multi_kernel(*refs):
             meta_ref = refs[0]
-            kv_all_ref = refs[1]
-            cache_in_refs = refs[2 : 2 + n_bufs]
-            cache_out_refs = refs[2 + n_bufs : 2 + 2 * n_bufs]
-            scratch_refs = refs[2 + 2 * n_bufs :]
+            kv_in_refs = refs[1 : 1 + n_kv_in]
+            cache_in_refs = refs[1 + n_kv_in : 1 + n_kv_in + n_bufs]
+            cache_out_refs = refs[1 + n_kv_in + n_bufs : 1 + n_kv_in + 2 * n_bufs]
+            scratch_refs = refs[1 + n_kv_in + 2 * n_bufs :]
             if is_packed:
                 (
                     kv_chunk_vmem,
@@ -3586,11 +3617,21 @@ def write_decode_kv_multi_layer_jax(
                     if is_bundle
                     else n_wr_layers
                 )
-                pltpu.make_async_copy(
-                    src_ref=kv_all_ref.at[pl.ds(l_lo * t_tokens, l_cnt * t_tokens)],
-                    dst_ref=kv_chunk_vmem.at[pl.ds(0, l_cnt * t_tokens)],
-                    sem=kv_in_sem.at[0],
-                ).start()
+                if direct_seq_hbm:
+                    for li in range(n_wr_layers):
+                        pltpu.make_async_copy(
+                            src_ref=kv_in_refs[li],
+                            dst_ref=kv_chunk_vmem.at[pl.ds(li * t_tokens, t_tokens)],
+                            sem=kv_in_sem.at[0],
+                        ).start()
+                else:
+                    pltpu.make_async_copy(
+                        src_ref=kv_in_refs[0].at[
+                            pl.ds(l_lo * t_tokens, l_cnt * t_tokens)
+                        ],
+                        dst_ref=kv_chunk_vmem.at[pl.ds(0, l_cnt * t_tokens)],
+                        sem=kv_in_sem.at[0],
+                    ).start()
 
                 if is_packed:
 
@@ -3808,7 +3849,7 @@ def write_decode_kv_multi_layer_jax(
                         src = kv_chunk_vmem.at[pl.ds(0, w_tot)]
                     pltpu.make_async_copy(src, src, out_sem.at[0]).wait()
 
-            if is_bundle:
+            if is_bundle and not direct_seq_hbm:
                 @pl.loop(0, cdiv(n_wr_layers, layer_chunk))
                 def _chunk_loop(ch_idx):
                     _emit_chunk(ch_idx)
@@ -3816,7 +3857,7 @@ def write_decode_kv_multi_layer_jax(
                 _emit_chunk(jnp.int32(0))
 
         scratches = [
-            pltpu.VMEM((layer_chunk * t_pad, *kv_new_layers.shape[2:]), cache_dtype),
+            pltpu.VMEM((layer_chunk * t_pad, *kv_tail_shape), cache_dtype),
             *(
                 [
                     pltpu.VMEM((rmw_rows, 8, 1, 4, 128), cache_dtype),
@@ -3839,13 +3880,13 @@ def write_decode_kv_multi_layer_jax(
         pallas_kwargs = {
             "grid_spec": pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=1,
-                in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * (1 + n_bufs),
+                in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * (n_kv_in + n_bufs),
                 out_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * n_bufs,
                 grid=(1,),
                 scratch_shapes=scratches,
             ),
             "out_shape": out_shape,
-            "input_output_aliases": {2 + i: i for i in range(n_bufs)},
+            "input_output_aliases": {(1 + n_kv_in) + i: i for i in range(n_bufs)},
             "name": (
                 f"StepC_write_kv_multi_{'bd4' if kv_pack_bd4 else ('d2' if kv_pack_dense2 else 'u')}"
                 f"-p_{page_size}-m_{n_bufs}"
@@ -3863,10 +3904,9 @@ def write_decode_kv_multi_layer_jax(
                 disable_bounds_checks=True,
             )
         kernel = pl.pallas_call(_multi_kernel, **pallas_kwargs)
-        kv_arg = (
-            kv_in_hbm
-            if interpret_mode
-            else pltpu.with_memory_space_constraint(kv_in_hbm, pltpu.HBM)
+        kv_hbm_args = tuple(
+            k if interpret_mode else pltpu.with_memory_space_constraint(k, pltpu.HBM)
+            for k in kv_args
         )
         cache_args = tuple(
             fc
@@ -3874,7 +3914,7 @@ def write_decode_kv_multi_layer_jax(
             else pltpu.with_memory_space_constraint(fc, pltpu.HBM)
             for fc in flat_caches
         )
-        updated = kernel(meta_packed, kv_arg, *cache_args)
+        updated = kernel(meta_packed, *kv_hbm_args, *cache_args)
         if is_bundle:
             return updated[0].reshape(caches_in.shape)
         return tuple(u.reshape(c.shape) for u, c in zip(updated, caches_in))
@@ -3888,5 +3928,5 @@ def write_decode_kv_multi_layer_jax(
         has_multi_q,
         lambda args: _fallback_per_layer(*args),
         lambda args: _run_multi_fast(*args),
-        (kv_new_layers, kv_caches if is_bundle else caches_seq),
+        (kv_payload, kv_caches if is_bundle else caches_seq),
     )

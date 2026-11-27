@@ -828,15 +828,15 @@ def test_wave10_flush_pending_step_c_kv_writes_grouping():
     with (
         mock.patch.object(b1_moe_ops, "get_step_c_kv_write_op", side_effect=lambda **kw: lambda *a: calls.append(("single", kw, len(a)))),
         mock.patch.object(b1_moe_ops, "get_step_c_kv_write_multi_6d_op", side_effect=lambda **kw: lambda *a: calls.append(("m6d", kw, tuple(a[0].shape), tuple(a[-1].tolist())))),
-        mock.patch.object(b1_moe_ops, "get_step_c_kv_write_multi_5d_op", side_effect=lambda k, **kw: lambda *a: calls.append(("m5d", k, kw, tuple(a[0].shape)))),
+        mock.patch.object(b1_moe_ops, "get_step_c_kv_write_multi_5d_op", side_effect=lambda k, **kw: lambda *a: calls.append(("m5d", k, kw, tuple(x is pending[i + 3][7] if k == 8 else x is pending[i + 11][7] for i, x in enumerate(a[:k])), tuple(a[0].shape), len(a)))),
     ):
         b1_moe_ops.flush_pending_step_c_kv_writes(pending)
 
     assert calls == [
         ("m6d", {"kv_pack_dense2": False, "kv_pack_bd4": True}, (2, 32, 1, 4, 128), (0, 1)),
         ("single", {"kv_pack_dense2": False, "kv_pack_bd4": True}, 8),
-        ("m5d", 8, {"kv_pack_dense2": True, "kv_pack_bd4": False}, (8, 32, 1, 4, 128)),
-        ("m5d", 3, {"kv_pack_dense2": True, "kv_pack_bd4": False}, (3, 32, 1, 4, 128)),
+        ("m5d", 8, {"kv_pack_dense2": True, "kv_pack_bd4": False}, (True,) * 8, (32, 1, 4, 128), 21),
+        ("m5d", 3, {"kv_pack_dense2": True, "kv_pack_bd4": False}, (True,) * 3, (32, 1, 4, 128), 11),
     ]
 
     # Verify torch.compile(..., fullgraph=True) traces flush_pending_step_c_kv_writes with 0 id() failures.
@@ -881,6 +881,198 @@ def test_wave10_flush_pending_step_c_kv_writes_grouping():
         )
     assert out_c.shape == (32, 1, 4, 128)
     assert compiled_calls == ["m6d", "m5d_2"]
+
+
+def test_wave16_step_c_kv_write_multi_5d_op_schema_and_compile():
+    """Verify get_step_c_kv_write_multi_5d_op custom_op schema, mutates_args, and FakeTensor dispatch."""
+    from unittest import mock
+
+    import torch
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    from sglang_tpu.muse_megakernel.decode import b1_moe_ops
+
+    with pytest.raises(ValueError, match="2 <= num_layers <= 8"):
+        b1_moe_ops.get_step_c_kv_write_multi_5d_op(1)
+    with pytest.raises(ValueError, match="2 <= num_layers <= 8"):
+        b1_moe_ops.get_step_c_kv_write_multi_5d_op(9)
+
+    fake_calls: list[tuple[int, int]] = []
+    with (
+        mock.patch.dict(b1_moe_ops._STEP_C_KV_WRITE_MULTI_5D_OPS, {}, clear=True),
+        mock.patch(
+            "torch_tpu._internal.pallas.custom_jax_kernel",
+            side_effect=lambda fn, **kw: (
+                fake_calls.append((len(kw["donate_argnums"]), len(kw["input_output_aliases"]))) or fn
+            ),
+        ),
+    ):
+        op2 = b1_moe_ops.get_step_c_kv_write_multi_5d_op(2, kv_pack_dense2=True)
+        op8 = b1_moe_ops.get_step_c_kv_write_multi_5d_op(8, kv_pack_bd4=True)
+        assert fake_calls == [(2, 2), (8, 8)]
+
+        schema2 = op2._opoverload._schema
+        assert len(schema2.arguments) == 9  # 2 kv + 2 cache + 5 meta
+        assert [a.alias_info.is_write if a.alias_info else False for a in schema2.arguments] == [
+            False, False, True, True, False, False, False, False, False
+        ]
+        schema8 = op8._opoverload._schema
+        assert len(schema8.arguments) == 21  # 8 kv + 8 cache + 5 meta
+        assert [a.alias_info.is_write if a.alias_info else False for a in schema8.arguments] == (
+            [False] * 8 + [True] * 8 + [False] * 5
+        )
+
+        with FakeTensorMode():
+            kvs = [torch.empty((16, 1, 4, 128), dtype=torch.float8_e4m3fn) for _ in range(2)]
+            cs = [torch.empty((20, 256, 1, 4, 128), dtype=torch.float8_e4m3fn) for _ in range(2)]
+            meta = (
+                torch.empty((16,), dtype=torch.int32),
+                torch.empty((32,), dtype=torch.int32),
+                torch.empty((17,), dtype=torch.int32),
+                torch.empty((17,), dtype=torch.int32),
+                torch.empty((3,), dtype=torch.int32),
+            )
+            assert op2(*kvs, *cs, *meta) is None
+
+
+@pytest.mark.parametrize("fmt", ["512B", "dense2", "bd4"])
+def test_wave16_step_c_write_kv_multi_5d_zero_stack_on_wait_and_aot(fmt: str):
+    """Verify zero-stack 4D-tuple 5D multi-layer KV write under on_wait+detect_races and TPU7x HLO."""
+    from unittest import mock
+
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import topologies
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    from sglang_tpu.muse_megakernel.decode.b1_moe_b2_kernel import (
+        write_decode_kv_merged_jax,
+        write_decode_kv_multi_layer_jax,
+    )
+
+    bd4 = fmt == "bd4"
+    dense2 = fmt == "dense2"
+    pack_factor = 4 if bd4 else (2 if dense2 else 1)
+    phys_rows = 512 // pack_factor
+    B, n_layers, pps = 16, 5, 4
+    nb = B * pps + 4
+    n_live = 11
+    rng = np.random.default_rng(20262700 + len(fmt))
+
+    kvc_u8 = np.full((n_layers, nb, phys_rows, 1, 4, 128), 0x7F, dtype=np.uint8)
+    kvl_np = np.array(
+        [10, 11, 12, 13, 512, 513, 514, 515, 256, 257, 300, 0, 0, 0, 0, 0],
+        dtype=np.int32,
+    )
+    pg_mat = rng.permutation(nb)[: B * pps].reshape(B, pps).astype(np.int32)
+    for b_i in range(n_live):
+        tok = int(kvl_np[b_i]) - 1
+        pg = int(pg_mat[b_i, tok // 512])
+        pr = (tok % 512) // pack_factor
+        for s_prev in range(tok & (pack_factor - 1)):
+            c_pair = (0 if s_prev < 2 else 2) if bd4 else (0 if s_prev == 0 else 2)
+            l0, l1 = ((0, 64) if (s_prev & 1) == 0 else (64, 128)) if bd4 else (0, 128)
+            kvc_u8[:, pg, pr, 0, c_pair : c_pair + 2, l0:l1] = rng.integers(
+                0x30, 0x3D, size=(n_layers, 2, l1 - l0), dtype=np.uint8
+            )
+    caches_5d = tuple(
+        jax.lax.bitcast_convert_type(jnp.asarray(kvc_u8[li], jnp.uint8), jnp.float8_e4m3fn)
+        for li in range(n_layers)
+    )
+    kv_new_list = []
+    cols_valid = 64 if bd4 else 128
+    for _ in range(n_layers):
+        kv_u8 = np.full((B, 1, 4, 128), 0x7F, dtype=np.uint8)
+        kv_u8[:n_live, 0, :2, :cols_valid] = rng.integers(
+            0x30, 0x3D, size=(n_live, 2, cols_valid), dtype=np.uint8
+        )
+        kv_new_list.append(
+            jax.lax.bitcast_convert_type(jnp.asarray(kv_u8, jnp.uint8), jnp.float8_e4m3fn)
+        )
+    kv_tuple = tuple(kv_new_list)
+
+    kvl_j = jnp.asarray(kvl_np, jnp.int32)
+    pg_j = jnp.asarray(pg_mat.reshape(-1), jnp.int32)
+    cq = jnp.asarray(
+        np.concatenate([np.arange(n_live + 1), np.full((B - n_live,), n_live)], dtype=np.int32)
+    )
+    ckv = jnp.arange(B + 1, dtype=jnp.int32) * (pps * 512)
+    dist = jnp.asarray([n_live, n_live, n_live], jnp.int32)
+
+    ip_on_wait = pltpu.InterpretParams(
+        dma_execution_mode="on_wait",
+        detect_races=True,
+        uninitialized_memory="nan",
+    )
+    got = write_decode_kv_multi_layer_jax(
+        kv_tuple, caches_5d, kvl_j, pg_j, cq, ckv, dist,
+        kv_pack_dense2=dense2, kv_pack_bd4=bd4, interpret=ip_on_wait,
+    )
+    assert isinstance(got, tuple) and len(got) == n_layers
+    for li in range(n_layers):
+        ref_li = write_decode_kv_merged_jax(
+            kv_tuple[li], caches_5d[li], kvl_j, pg_j, cq, ckv, dist,
+            kv_pack_dense2=dense2, kv_pack_bd4=bd4, interpret=ip_on_wait,
+        )
+        assert np.array_equal(
+            np.asarray(ref_li).view(np.uint8), np.asarray(got[li]).view(np.uint8)
+        ), f"Zero-stack 5D on_wait mismatch at layer {li} (fmt={fmt})"
+
+    # Also verify q_len > 1 dynamic fallback with tuple input.
+    cq_mq = cq.at[1:].set(cq[1:] + 1)
+    kvl_mq = kvl_j.at[0].set(102)
+    got_mq = write_decode_kv_multi_layer_jax(
+        kv_tuple, caches_5d, kvl_mq, pg_j, cq_mq, ckv, dist,
+        kv_pack_dense2=dense2, kv_pack_bd4=bd4, interpret=ip_on_wait,
+    )
+    ref_mq0 = write_decode_kv_merged_jax(
+        kv_tuple[0], caches_5d[0], kvl_mq, pg_j, cq_mq, ckv, dist,
+        kv_pack_dense2=dense2, kv_pack_bd4=bd4, interpret=ip_on_wait,
+    )
+    assert np.array_equal(np.asarray(ref_mq0).view(np.uint8), np.asarray(got_mq[0]).view(np.uint8))
+
+    # TPU7x AOT HLO check for M=8 separate 4D inputs (matches get_step_c_kv_write_multi_5d_op):
+    # every cache output must may-alias and zero stack/DUS/concatenate/copy may exist on kv_new.
+    tpu_devs = topologies.get_topology_desc("tpu7x:2x2x2" if bd4 else "tpu7x:2x2x1", platform="tpu").devices
+    mesh = Mesh(np.array(tpu_devs[:1]), ("x",))
+    M8, T_aot = 8, 64
+    s = lambda sh, dt: jax.ShapeDtypeStruct(sh, dt)
+    abs_args = (
+        tuple(s((T_aot, 1, 4, 128), jnp.float8_e4m3fn) for _ in range(M8)),
+        tuple(s((nb, phys_rows, 1, 4, 128), jnp.float8_e4m3fn) for _ in range(M8)),
+        s((T_aot,), jnp.int32),
+        s((T_aot * pps,), jnp.int32),
+        s((T_aot + 1,), jnp.int32),
+        s((T_aot + 1,), jnp.int32),
+        s((3,), jnp.int32),
+    )
+    with mock.patch("sglang_tpu.attention.pallas.util.get_tpu_version", return_value=7):
+        compiled = jax.jit(
+            jax.shard_map(
+                lambda kvs, cs, kl, p, q, ck, d: write_decode_kv_multi_layer_jax(
+                    kvs, cs, kl, p, q, ck, d, kv_pack_dense2=dense2, kv_pack_bd4=bd4
+                ),
+                mesh=mesh,
+                in_specs=(
+                    tuple(P() for _ in range(M8)),
+                    tuple(P() for _ in range(M8)),
+                    P(), P(), P(), P(), P(),
+                ),
+                out_specs=tuple(P() for _ in range(M8)),
+                check_vma=False,
+            ),
+            donate_argnums=(1,),
+        ).lower(*abs_args).compile()
+    hlo = compiled.as_text()
+    for out_i in range(M8):
+        assert f"{{{out_i}}}: ({M8 + out_i}, {{}}, may-alias)" in hlo
+    bad_ops = [
+        ln
+        for ln in hlo.splitlines()
+        if any(op in ln.split("backend_config=")[0] for op in ("= dynamic-update-slice(", "= concatenate(", "= copy("))
+        and (f"f8e4m3fn[{M8},{T_aot},1,4,128]" in ln or f"f8e4m3fn[{T_aot},1,4,128]" in ln)
+    ]
+    assert not bad_ops, f"Unexpected stack/DUS/copy HLO ops: {bad_ops}"
 
 
 @pytest.mark.parametrize("tp", [8, 16])
