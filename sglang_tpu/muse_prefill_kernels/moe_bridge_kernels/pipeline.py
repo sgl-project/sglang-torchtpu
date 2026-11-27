@@ -1653,12 +1653,18 @@ def _d_with_next_in_gather(
     return new_stream, next_in_rest, gathered
 
 
-def _resolve_b2_pipe_chunks(spec: str, t_local: int) -> tuple[int, ...] | None:
+def _resolve_b2_pipe_chunks(
+    spec: str, t_local: int, ep_size: int = 8
+) -> tuple[int, ...] | None:
     """Resolve opt-in B2 multi-chunk pipelining schedule for ``t_local``, or None for fallback."""
     clean = spec.strip()
     if not clean:
         return None
     if clean.lower() == "auto":
+        if t_local == 256:
+            return (128, 128)
+        if t_local == 512:
+            return (256, 256) if ep_size >= 16 else None
         if t_local == 1024:
             return (512, 512)
         if t_local == 1536:
@@ -2293,7 +2299,9 @@ def fused_moe_full_bridge_and_ffn(
 
         _pipe_chunks_env = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_B2_PIPE_CHUNKS", None)
         _pipe_chunks = (
-            _resolve_b2_pipe_chunks(str(_pipe_chunks_env.get() or ""), t_local)
+            _resolve_b2_pipe_chunks(
+                str(_pipe_chunks_env.get() or ""), t_local, ep_size=ep_size
+            )
             if (
                 (_use_pq_lhs_fp8 and _pq_lhs_mode >= 5)
                 and fused_b1_b2_mode in (3, 4)

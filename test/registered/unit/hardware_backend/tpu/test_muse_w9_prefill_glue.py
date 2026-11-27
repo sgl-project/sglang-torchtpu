@@ -2081,6 +2081,9 @@ def test_b2_pipe_chunks_resolver_0ulp_parity_and_aot():
     assert pipeline._resolve_b2_pipe_chunks("auto", 2560) == (512, 1024, 512, 512)
     assert pipeline._resolve_b2_pipe_chunks("auto", 4096) == (512, 1024, 1024, 1024, 512)
     assert pipeline._resolve_b2_pipe_chunks("auto", 512) is None
+    assert pipeline._resolve_b2_pipe_chunks("auto", 512, ep_size=16) == (256, 256)
+    assert pipeline._resolve_b2_pipe_chunks("auto", 256) == (128, 128)
+    assert pipeline._resolve_b2_pipe_chunks("auto", 256, ep_size=16) == (128, 128)
     assert pipeline._resolve_b2_pipe_chunks("512,1024,1024,512", 3072) == (512, 1024, 1024, 512)
     assert pipeline._resolve_b2_pipe_chunks("512,1024,1024,512", 1024) is None
     for bad in ("512", "100,284", "0,384", "abc,128"):
@@ -2240,8 +2243,11 @@ def test_b2_pipe_chunks_resolver_0ulp_parity_and_aot():
         for topo_name, tp_d, t_loc_aot, expected_tags in (
             ("tpu7x=2x2x1", 8, 3072, ("_r0_512_", "_r512_1536_", "_r1536_2560_", "_r2560_3072_")),
             ("tpu7x=2x2x1", 8, 2048, ("_r0_512_", "_r512_1024_", "_r1024_1536_", "_r1536_2048_")),
+            ("tpu7x=2x2x1", 8, 256, ("_r0_128_", "_r128_256_")),
             ("tpu7x=2x2x2", 16, 1536, ("_r0_512_", "_r512_1024_", "_r1024_1536_")),
             ("tpu7x=2x2x2", 16, 1024, ("_r0_512_", "_r512_1024_")),
+            ("tpu7x=2x2x2", 16, 512, ("_r0_256_", "_r256_512_")),
+            ("tpu7x=2x2x2", 16, 256, ("_r0_128_", "_r128_256_")),
         ):
             topo = topologies.get_topology_desc(platform="tpu", topology_name=topo_name)
             aot_mesh = Mesh(np.array(topo.devices).reshape(tp_d), ("model",))
