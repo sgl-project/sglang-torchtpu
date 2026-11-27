@@ -96,6 +96,7 @@ _ENV_FIELDS_NOT_KEYED = frozenset(
         "SGLANG_TPU_PROFILE_NUM_CHIPS",
         "SGLANG_TPU_PROFILE_NUM_SPARSE_CORES",
         "SGLANG_TPU_PROFILE_PYTHON_TRACER",
+        "SGLANG_TPU_PROFILE_TRACE_MODE",
         # KV transfer timeout.
         "SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S",
         # Multi-host discovery port, derived from --dist-init-addr per launch.

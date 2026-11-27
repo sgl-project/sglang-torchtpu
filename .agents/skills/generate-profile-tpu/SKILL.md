@@ -114,9 +114,12 @@ How many steps:
 - A capture has a size limit (a 2 GB proto). When a capture goes over it, the
   profiler drops the rest of the trace and leaves a `Trace Buffers Dropped`
   event. The device timeline then shows the dropped part as idle time.
-- SparseCore events fill most of that space. With libtpu 0.0.50 the files
-  held every SparseCore and every tile, although
-  `SGLANG_TPU_PROFILE_NUM_SPARSE_CORES` defaults to 1.
+- SparseCore events fill most of that space. Captures used to hold every
+  SparseCore and every tile, because the scope never reached libtpu
+  (`_impl.start_trace` forwards only the tracer levels). The capture now goes
+  through `torch.profiler` with a `TpuProfilerConfig`, so one SparseCore and
+  one tile are traced by default. The step counts below were measured before
+  that change.
 - GLM-5.3-Flash on tpu7x-8, 64 requests of 8k tokens: one capture held one
   8k-token prefill step (0.34 s) or 8 decode steps (20 ms each). Asking for
   2 prefill steps or 10 decode steps lost the end of the capture. The
@@ -205,6 +208,7 @@ program, so changing them does not recompile anything.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `SGLANG_TPU_PROFILE_NUM_CHIPS` | 1 | Chips each rank traces. 0 or less traces all of them. |
-| `SGLANG_TPU_PROFILE_NUM_SPARSE_CORES` | 1 | SparseCores each rank traces. 0 or less traces all of them. With libtpu 0.0.50 the files still held all four SparseCores of the chip. |
+| `SGLANG_TPU_PROFILE_NUM_CHIPS` | 0 | Chips each rank traces. 0 or less traces all of them. |
+| `SGLANG_TPU_PROFILE_NUM_SPARSE_CORES` | 1 | SparseCores each rank traces. 0 or less traces all of them. At 1, one tile of it is traced. |
+| `SGLANG_TPU_PROFILE_TRACE_MODE` | `TRACE_COMPUTE` | libtpu `tpu_trace_mode`. Empty leaves the libtpu default. |
 | `SGLANG_TPU_PROFILE_PYTHON_TRACER` | 0 | 1 adds Python frames to the host trace. It uses a lot of host time. |
