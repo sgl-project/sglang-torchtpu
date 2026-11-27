@@ -653,13 +653,20 @@ def _b1_moe_b2_chip_sharded_impl(
             b2_out_kv = out_kv_merged_ref if rpa_skip_kv_write else rpad_kv_vmem
             b2_out_gate_arg = rpad_gate_vmem
             b2_gate_dst = rpad_gate_vmem
-            b2_after_qkv_fn = _after_qkv_epi
+            use_bkv_in_ici = (not rpa_kv_pack_dense2 or rpa_use_grp_vec) and (
+                world_size != 16 or rpa_cfg.num_slots <= 4
+            )
+            b2_during_in_ici_fn = _after_qkv_epi if use_bkv_in_ici else None
+            b2_during_in_ici_early = use_bkv_in_ici and world_size == 16 and r_pair >= 16
+            b2_after_qkv_fn = None if use_bkv_in_ici else _after_qkv_epi
             defer_store_wait = True
         else:
             b2_out_q = out_qkv_or_q_ref
             b2_out_kv = out_kv_or_gate_ref
             b2_out_gate_arg = out_gate_epi_ref
             b2_gate_dst = None
+            b2_during_in_ici_fn = None
+            b2_during_in_ici_early = False
             b2_after_qkv_fn = None
             defer_store_wait = False
 
@@ -738,6 +745,8 @@ def _b1_moe_b2_chip_sharded_impl(
             gate_dst_ref=b2_gate_dst,
             after_qkv_epi_fn=b2_after_qkv_fn,
             defer_stream_store_wait=defer_store_wait,
+            during_in_ici_fn=b2_during_in_ici_fn,
+            during_in_ici_early=b2_during_in_ici_early,
         )
 
         if rpad_refs is not None:
