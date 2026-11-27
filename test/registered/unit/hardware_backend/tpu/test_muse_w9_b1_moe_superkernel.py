@@ -2226,11 +2226,30 @@ def test_step_c_rpa_plan_group_sizing_and_fallback():
     assert (slot_pg_1b, use_grp_1b, is_ok_1b) == (5, False, True)
     assert cfg_1b.swabatch_group_size == 1
 
-    # 4. Base > 80*512 rows or active shared16 must return is_ok=False.
-    _, _, _, _, ok_too_big = resolve_step_c_rpa_plan(
+    # 4. Full-Attn 512B 16K (pps=32) auto-clamps to ring4k (s3, c4096 -> 12K <= 80*512);
+    # oversized stream0b and active shared16 without explicit shared_group_size return is_ok=False.
+    cfg_clamp, one_clamp, slot_clamp, grp_clamp, ok_clamp = resolve_step_c_rpa_plan(
         "w8,s4,batchfull,g4k,foldcol",
         sliding_window=None,
         pages_per_seq=32,
+        phys_page_rows=512,
+        kv_pack_dense2=False,
+        b_tokens=64,
+        max_num_seqs=64,
+    )
+    assert (cfg_clamp.loop_kind, one_clamp, slot_clamp, grp_clamp, ok_clamp) == (
+        "ring4k",
+        False,
+        8,
+        False,
+        True,
+    )
+    assert cfg_clamp.num_slots == 3 and cfg_clamp.chunk_sz == 4096
+
+    _, _, _, _, ok_too_big = resolve_step_c_rpa_plan(
+        "w2,stream0b",
+        sliding_window=None,
+        pages_per_seq=128,
         phys_page_rows=512,
         kv_pack_dense2=False,
         b_tokens=64,

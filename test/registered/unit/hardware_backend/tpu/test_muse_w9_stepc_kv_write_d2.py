@@ -360,7 +360,7 @@ def test_wave10_step_c_rpa_plan_full_attn_unlock():
     )
     assert ok_ring4k is True and one_ring4k is False
 
-    _, _, _, _, ok_512 = resolve_step_c_rpa_plan(
+    cfg_512, one_512, slot_512, grp_512, ok_512 = resolve_step_c_rpa_plan(
         mode,
         sliding_window=None,
         pages_per_seq=32,
@@ -369,7 +369,24 @@ def test_wave10_step_c_rpa_plan_full_attn_unlock():
         max_num_seqs=64,
         has_shared_prefix=False,
     )
-    assert ok_512 is False
+    assert ok_512 is True and one_512 is False and grp_512 is False
+    assert (cfg_512.loop_kind, cfg_512.num_slots, cfg_512.chunk_sz, slot_512) == (
+        "ring4k",
+        3,
+        4096,
+        8,
+    )
+
+    _, _, _, _, ok_too_big = resolve_step_c_rpa_plan(
+        "w2,stream0b",
+        sliding_window=None,
+        pages_per_seq=128,
+        phys_page_rows=512,
+        b_tokens=64,
+        max_num_seqs=64,
+        has_shared_prefix=False,
+    )
+    assert ok_too_big is False
 
     _, _, _, _, ok_lc_full = resolve_step_c_rpa_plan(
         mode,
@@ -1330,7 +1347,9 @@ def test_wave11_step_c_rpa_plan_shared_and_large_b():
     )
     assert ok_swa_256 is True
 
-    _, _, _, _, ok_full_256 = resolve_step_c_rpa_plan(
+    # B=128/256 BD4/DENSE2 Full 8K/1K (pps=32) auto-clamps to ring4k (s3, c4096 -> <= 16*512 rows & < 960 KiB SMEM);
+    # 512B B=128/256 (s3, c4096 = 24*512 > 16*512) and pps=512 B=256 (>960 KiB SMEM) stay gated to Step (b).
+    cfg_full_256, one_full_256, slot_full_256, grp_full_256, ok_full_256 = resolve_step_c_rpa_plan(
         "w8,s4,batchfull,g4k,foldcol",
         sliding_window=None,
         pages_per_seq=32,
@@ -1339,7 +1358,34 @@ def test_wave11_step_c_rpa_plan_shared_and_large_b():
         b_tokens=256,
         max_num_seqs=256,
     )
-    assert ok_full_256 is False
+    assert ok_full_256 is True and one_full_256 is False and grp_full_256 is False
+    assert (cfg_full_256.loop_kind, cfg_full_256.num_slots, cfg_full_256.chunk_sz, slot_full_256) == (
+        "ring4k",
+        3,
+        4096,
+        8,
+    )
+
+    _, _, _, _, ok_512_256 = resolve_step_c_rpa_plan(
+        "w8,s4,batchfull,g4k,foldcol",
+        sliding_window=None,
+        pages_per_seq=32,
+        phys_page_rows=512,
+        b_tokens=256,
+        max_num_seqs=256,
+    )
+    assert ok_512_256 is False
+
+    _, _, _, _, ok_smem_over = resolve_step_c_rpa_plan(
+        "w8,s4,batchfull,g4k,foldcol",
+        sliding_window=None,
+        pages_per_seq=1024,
+        phys_page_rows=128,
+        kv_pack_bd4=True,
+        b_tokens=256,
+        max_num_seqs=256,
+    )
+    assert ok_smem_over is False
 
     # LC shared64 accepted ONLY when explicit shared_group_size>0 and divisible.
     cfg_sh, _, _, _, ok_sh64 = resolve_step_c_rpa_plan(
@@ -1599,3 +1645,211 @@ def test_wave11_muse_spark_step_c_b128_b256_and_lc_full_dispatch():
     lc_mode = "w8,s4,c4096,shared64,coal,noz,pbf16,q1024,shfp8,batchfull,foldcol"
     assert _run_case(tp=16, batch=64, sw=None, pps=512, dist_len=4, rpa_mode=lc_mode, lc_full_env="0") == (["step_b"], 0)
     assert _run_case(tp=16, batch=64, sw=None, pps=512, dist_len=4, rpa_mode=lc_mode, lc_full_env="1") == (["step_c"], 1)
+
+    # Wave 12: 512B B=64 pps=32 & BD4 B=256 pps=32 Full-Attn auto-clamp to ring4k and enter Step (c).
+    assert _run_case(tp=16, batch=64, sw=None, pps=32, dist_len=3, rpa_mode="w8,s4,batchfull,g4k,foldcol", lc_full_env="0") == (["step_c"], 1)
+    assert _run_case(tp=16, batch=256, sw=None, pps=32, dist_len=3, rpa_mode="w8,s4,batchfull,g4k,foldcol", lc_full_env="0") == (["step_c"], 1)
+
+
+@pytest.mark.parametrize(
+    "tp,B,dense2,bd4,pps",
+    [
+        (8, 64, False, False, 32),
+        (16, 64, False, False, 32),
+        (16, 256, False, True, 32),
+        (8, 128, True, False, 32),
+    ],
+)
+def test_wave12_step_c_ring4k_autoclamp_and_adaptive_1k_aot(
+    tp: int, B: int, dense2: bool, bd4: bool, pps: int
+):
+    """Verify ring4k auto-clamp + adaptive 1K (_c1024_nope) compiles <63 MiB VMEM on TPU7x across 512B & B=128/256."""
+    hlo = _compile_step_c_aot(
+        tp=tp,
+        B=B,
+        pps=pps,
+        sw=-1,
+        mode="w8,s4,batchfull,g4k,foldcol,shared16",
+        dense2=dense2,
+        bd4=bd4,
+        dist_len=3,
+        has_rope=False,
+    )
+    assert f"muse_w9_b1_moe_b2_rpad_b{B}_tp{tp}_" in hlo
+    assert "_c1024_nope" in hlo
+
+
+@pytest.mark.parametrize("case", ["b64_512b_adaptive_1k", "b64_512b_ring4k_8k", "b128_d2_ring4k_8k"])
+def test_wave12_step_c_ring4k_and_adaptive_1k_interpret_parity(case: str):
+    """Verify eager race/NaN InterpretParams parity for ring4k auto-clamp and adaptive _c1024 Full-Attn Step (c)."""
+    import dataclasses
+    import gc
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    from sglang_tpu.attention.pallas.rpa_v3_decode_fast import run_decode_fast_rpa
+    from sglang_tpu.moe.pallas.fused_rs_muse.fused_decode_sparse import (
+        default_sparse_decode_config,
+    )
+    from sglang_tpu.muse_megakernel.decode.b1_moe_b2_kernel import (
+        b1_moe_b2_chip_sharded_jax,
+        b1_moe_b2_rpad_chip_sharded_jax,
+        write_decode_kv_merged_jax,
+    )
+
+    world_size = 8
+    devs = jax.devices("cpu")
+    if len(devs) < world_size:
+        pytest.skip(f"Requires XLA_FLAGS=--xla_force_host_platform_device_count={world_size}")
+    mesh = Mesh(np.array(devs[:world_size]), ("model",))
+
+    is_b128 = case == "b128_d2_ring4k_8k"
+    is_short = case == "b64_512b_adaptive_1k"
+    dense2 = is_b128
+    B = 128 if is_b128 else 64
+    pps = 32
+    phys_rows = 256 if dense2 else 512
+    hidden, h_pre, scale_block, qkv_cols, gate_cols = 8192, 4096, 512, 1280, 1024
+    r_pair = B // (world_size // 2)
+    rng = np.random.default_rng(20262300 + len(case))
+
+    cfg = dataclasses.replace(
+        default_sparse_decode_config(B, world_size, scale_block),
+        weight_mode="half_n" if B > 64 else "stream3",
+        pair_rs=True,
+        bridge_ag=True,
+        m_buckets=(32, 64) if B > 64 else (16, 32),
+        route_chunk_rows=32,
+        static_holder_mask=True,
+        route_fast=True,
+        fast_plan=2,
+        unroll_strips=True,
+        fast_gs=True,
+        spec_prime_parts=0,
+    )
+    _rf8 = lambda sh: jnp.asarray((rng.standard_normal(sh) * 0.15).astype(np.float32), jnp.float8_e4m3fn)
+    ranks = jnp.arange(world_size, dtype=jnp.int32)
+    stream_chip = jnp.asarray((rng.standard_normal((world_size * r_pair, hidden)) * 0.1).astype(np.float32))
+    gated = jnp.asarray((rng.standard_normal((B, world_size * gate_cols)) * 0.1).astype(np.float32), jnp.bfloat16)
+    wo, wos = _rf8((world_size * gate_cols, hidden)), jnp.ones((hidden,), jnp.float32) * 0.05
+    ones_h = jnp.ones((hidden,), jnp.float32)
+    w_pre, s_pre = _rf8((hidden, world_size * (h_pre // 2))), jnp.ones((world_size * (h_pre // 2),), jnp.float32) * 0.05
+    w_router = jnp.asarray((rng.standard_normal((hidden, 256)) * 0.02).astype(np.float32), jnp.bfloat16)
+    bias_np = np.zeros((1, 256), np.float32)
+    bias_np[0, 0:256:32] = 12.0
+    pre_exp, bias = jnp.ones((h_pre,), jnp.float32), jnp.asarray(bias_np)
+    w1_u = np.zeros((world_size * 32, 512, 8192), dtype=np.uint32)
+    w2_u = np.zeros((world_size * 32, 512, 4096), dtype=np.uint32)
+    w1_u[::32] = rng.integers(0, 0x11111111, size=(world_size, 512, 8192), dtype=np.uint32)
+    w2_u[::32] = rng.integers(0, 0x11111111, size=(world_size, 512, 4096), dtype=np.uint32)
+    w1, s1 = jnp.asarray(w1_u, jnp.uint32), jnp.ones((world_size * 32, 8, 8192), jnp.bfloat16) * 0.02
+    w2, s2 = jnp.asarray(w2_u, jnp.uint32), jnp.ones((world_size * 32, 8, 4096), jnp.bfloat16) * 0.02
+    del w1_u, w2_u, bias_np
+    gc.collect()
+
+    post_exp = jnp.ones((h_pre,), jnp.float32)
+    w_post, s_post = _rf8((world_size * h_pre, h_pre)), jnp.ones((h_pre,), jnp.float32) * 0.05
+    w_qkv, s_qkv = _rf8((world_size * hidden, qkv_cols)), jnp.ones((qkv_cols,), jnp.float32) * 0.05
+    w_gate, s_gate = _rf8((world_size * hidden, gate_cols)), jnp.ones((gate_cols,), jnp.float32) * 0.05
+    fp = jnp.asarray([0.84, 2.0, 0.20, 1.0], jnp.float32)
+
+    # Use 32 shared read blocks with per-seq permutations + B disjoint tail write blocks
+    # so pps=32 exercises full multi-chunk ring4k / _c1024 within the 32 GiB container limit.
+    nb = 32 + B
+    kvc_u8 = rng.integers(0x30, 0x3D, size=(nb, phys_rows, 1, 4, 128), dtype=np.uint8)
+    kvc_base = jax.lax.bitcast_convert_type(jnp.asarray(kvc_u8, jnp.uint8), jnp.float8_e4m3fn)
+    del kvc_u8
+    kvl_np = (
+        np.array([200 + (i * 11) % 800 for i in range(B)], dtype=np.int32)
+        if is_short
+        else np.array([6200 + (i * 73) % 4100 for i in range(B)], dtype=np.int32)
+    )
+    kvl_j = jnp.asarray(kvl_np, jnp.int32)
+    pg_mat = np.zeros((B, pps), dtype=np.int32)
+    for i in range(B):
+        pg_mat[i, :] = (np.arange(pps, dtype=np.int32) + i) % 32
+        pg_mat[i, int(kvl_np[i]) // 512] = 32 + i
+    pg_j = jnp.asarray(pg_mat.reshape(-1), jnp.int32)
+    cuq = jnp.arange(B + 1, dtype=jnp.int32)
+    cukv = jnp.arange(B + 1, dtype=jnp.int32) * (pps * 512)
+    dist = jnp.asarray([B, B, B], jnp.int32)
+    mode_sc = "w8,s4,batchfull,g4k,foldcol,shared16"
+    mode_sb = "w8,s3,ring4k,c4096,batchfull,g4k,foldcol"
+
+    base_args = (
+        ranks, stream_chip, gated, wo, wos, ones_h, ones_h, ones_h, w_pre, s_pre, w_router, pre_exp, bias,
+        w1, s1, w2, s2, post_exp, w_post, s_post, ones_h, ones_h, ones_h, ones_h, w_qkv, s_qkv, w_gate, s_gate,
+        kvc_base, kvl_j, pg_j, cuq, cukv, dist, fp,
+    )
+    in_specs = (
+        P("model"), P("model", None), P(None, "model"),
+        P("model", None), P(), P(), P(), P(),
+        P(None, "model"), P("model"), P(), P(), P(),
+        P("model", None, None), P("model", None, None), P("model", None, None), P("model", None, None),
+        P(), P("model", None), P(), P(), P(), P(), P(),
+        P("model", None), P(), P("model", None), P(),
+        P(), P(), P(), P(), P(), P(), P(),
+    )
+    ip_race = pltpu.InterpretParams(
+        dma_execution_mode="eager",
+        detect_races=True,
+        uninitialized_memory="nan",
+    )
+
+    def _ref_b(*args):
+        rk, st, gt, wo_, wos_, pa, pb, pfg, wp, sp, wr, pe, bs, w1_, s1_, w2_, s2_, nm, wpt, spt, pff, pfa, pfb, nig, wqk, sqk, wg_, sg_, kvc_, kvl_, pi_, cq_, ckv_, dt_, fp_ = args
+        st_o, q_5d, kvm, gt_o = b1_moe_b2_chip_sharded_jax(
+            rk, st, gt, wo_, wos_, pa, pb, pfg, wp, sp, wr, pe, bs, w1_, s1_, w2_, s2_, nm,
+            wpt, spt, pff, pfa, pfb, nig, wqk, sqk, wg_, sg_, cos_sin_step=None, free_params=fp_,
+            world_size=world_size, fuse_qkv_epi=True, replica_cost_mode="tiles", config=cfg, interpret=True,
+        )
+        out_g, kvc_o = run_decode_fast_rpa(
+            q_5d, kvm, None, kvc_, kvl_, pi_, cq_, ckv_, dt_,
+            sm_scale=64.0**-0.5, sliding_window=None,
+            k_scale=1.0, v_scale=1.0, mode_str=mode_sb, decode_query_size=1,
+            fused_out_pack=2, prepared_inputs=True, gate=gt_o, out_norm_eps=1e-5,
+            kv_pack_dense2=dense2, interpret=True,
+        )
+        return st_o, out_g, kvc_o
+
+    def _fast_c(*args):
+        rk, st, gt, wo_, wos_, pa, pb, pfg, wp, sp, wr, pe, bs, w1_, s1_, w2_, s2_, nm, wpt, spt, pff, pfa, pfb, nig, wqk, sqk, wg_, sg_, kvc_, kvl_, pi_, cq_, ckv_, dt_, fp_ = args
+        st_o, out_g, kvm = b1_moe_b2_rpad_chip_sharded_jax(
+            rk, st, gt, wo_, wos_, pa, pb, pfg, wp, sp, wr, pe, bs, w1_, s1_, w2_, s2_, nm,
+            wpt, spt, pff, pfa, pfb, nig, wqk, sqk, wg_, sg_, kvc_, kvl_, pi_, cq_, ckv_, dt_,
+            cos_sin_step=None, free_params=fp_, world_size=world_size,
+            rpa_sm_scale=64.0**-0.5, rpa_sliding_window=-1,
+            rpa_mode_str=mode_sc, kv_pack_dense2=dense2, replica_cost_mode="tiles",
+            config=cfg, skip_kv_write=True, interpret=ip_race,
+        )
+        kvc_o = write_decode_kv_merged_jax(
+            kvm, kvc_, kvl_, pi_, cq_, ckv_, dt_, kv_pack_dense2=dense2, interpret=ip_race,
+        )
+        return st_o, out_g, kvc_o
+
+    ref_res = jax.jit(
+        jax.shard_map(_ref_b, mesh=mesh, in_specs=in_specs, out_specs=(P("model", None), P(), P()), check_vma=False)
+    )(*base_args)
+    ref_st_np = np.asarray(ref_res[0], dtype=np.float64).ravel()
+    ref_g_np = np.asarray(ref_res[1], dtype=np.float64).ravel()
+    ref_kv_u8 = np.asarray(ref_res[2]).view(np.uint8).copy()
+    del ref_res
+    jax.clear_caches()
+    gc.collect()
+
+    fast_res = jax.jit(
+        jax.shard_map(_fast_c, mesh=mesh, in_specs=in_specs, out_specs=(P("model", None), P(), P()), check_vma=False)
+    )(*base_args)
+    fast_st_np = np.asarray(fast_res[0], dtype=np.float64).ravel()
+    fast_g_np = np.asarray(fast_res[1], dtype=np.float64).ravel()
+    fast_kv_u8 = np.asarray(fast_res[2]).view(np.uint8).copy()
+    del fast_res, base_args, w1, w2, s1, s2, kvc_base
+    jax.clear_caches()
+    gc.collect()
+
+    for x, y, nm in [(ref_st_np, fast_st_np, "stream"), (ref_g_np, fast_g_np, "gated")]:
+        cos = float(np.dot(x, y) / (np.linalg.norm(x) * np.linalg.norm(y) + 1e-12))
+        assert cos > 0.9999, f"{case} {nm} cos={cos}"
+    assert np.array_equal(ref_kv_u8, fast_kv_u8)
