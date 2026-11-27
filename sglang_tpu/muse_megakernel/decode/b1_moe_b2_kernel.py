@@ -2185,7 +2185,48 @@ def resolve_step_c_rpa_plan(
         or (sh_grp == 0 and cfg_rpa.loop_kind.startswith("shared"))
     )
     if (
+        (not shared_bad)
+        and sliding_window is None
+        and sh_grp == 0
+        and cfg_rpa.loop_kind in ("w7auto", "ring4k")
+        and cfg_rpa.num_slots * cfg_rpa.max_ring_pages * phys_page_rows > max_bkv_rows
+    ):
+        cand_rings = ((3, 4096),)
+        for c_slots, c_chunk in cand_rings:
+            if c_chunk < page_size or (c_chunk % page_size) != 0:
+                continue
+            c_ring_pgs = max(1, c_chunk // page_size)
+            c_blks_4k = (max(pages_per_seq, 1) + c_ring_pgs - 1) // c_ring_pgs
+            c_smem_bytes = (
+                eff_seqs * pages_per_seq + 2 + c_slots + 4 * eff_seqs * c_blks_4k
+            ) * 4
+            if (
+                c_slots * c_ring_pgs * phys_page_rows <= max_bkv_rows
+                and c_smem_bytes <= 960 * 1024
+            ):
+                cfg_rpa = dataclasses.replace(
+                    cfg_rpa,
+                    loop_kind="ring4k",
+                    num_slots=c_slots,
+                    chunk_sz=c_chunk,
+                    max_ring_pages=c_ring_pgs,
+                    lazy_slot_zero=True,
+                    coalesce_dma=True,
+                    swabatch_group_size=1,
+                )
+                one_block_per_seq = False
+                break
+    ring_smem_over = False
+    if cfg_rpa.loop_kind == "ring4k" and sh_grp == 0:
+        blks_4k = (max(pages_per_seq, 1) + max(cfg_rpa.max_ring_pages, 1) - 1) // max(
+            cfg_rpa.max_ring_pages, 1
+        )
+        ring_smem_over = (
+            eff_seqs * pages_per_seq + 2 + cfg_rpa.num_slots + 4 * eff_seqs * blks_4k
+        ) * 4 > 960 * 1024
+    if (
         shared_bad
+        or ring_smem_over
         or cfg_rpa.num_slots * cfg_rpa.max_ring_pages * phys_page_rows > max_bkv_rows
     ):
         return cfg_rpa, one_block_per_seq, cfg_rpa.max_ring_pages, False, False
@@ -2571,7 +2612,7 @@ def b1_moe_b2_rpad_chip_sharded_jax(
         eff_sw is None
         and shared_group_size == 0
         and skip_kv_write
-        and cfg_rpa.loop_kind == "w7auto"
+        and cfg_rpa.loop_kind in ("w7auto", "ring4k")
         and (1024 % page_size == 0)
         and pages_per_seq > (1024 // page_size)
     )

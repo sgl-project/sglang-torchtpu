@@ -1757,7 +1757,7 @@ def b1_moe_b2_rpad_replicated_b16_jax(
     use_adaptive_1k = (
         eff_sw is None
         and skip_kv_write
-        and cfg_rpa.loop_kind == "w7auto"
+        and cfg_rpa.loop_kind in ("w7auto", "ring4k")
         and (1024 % page_size == 0)
         and pages_per_seq > (1024 // page_size)
     )

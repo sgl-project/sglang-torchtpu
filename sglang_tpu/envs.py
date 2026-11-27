@@ -754,6 +754,10 @@ class TpuEnvs:
     # > 0 in (0, 32] e.g. 8.0 or 4.0 folds 1/S into w1_global_scale with zero row-scale AG/dequant;
     # GMM_PREQUANT_LHS_FP8=6 defaults this to 8.0 when unset).
     SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_LHS = EnvFloat(0.0)
+    # Explicit static FP8 scale S for GMM1 -> GMM2 intermediate activation (0.0 = off;
+    # > 0 in (0, 32] folds S into w1_global_scale up-proj and 1/S into w2_global_scale,
+    # writing float8_e4m3fn gmm1_out_ref directly and bypassing GMM2 rowmax/quant/dequant).
+    SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_GMM2_LHS = EnvFloat(0.0)
     # Muse Wave-8 NVFP4 wider compact block scales (0 = off; 512/1024/2048/4096 = requantize at load;
     # -512/-1024/-2048/-4096 = zero-reload in-kernel scale-stride perf probe).
     SGLANG_TPU_MUSE_KERNEL_COMPACT_FP4_QBLOCK = EnvInt(0)
@@ -1095,7 +1099,7 @@ class TpuEnvs:
     SGLANG_TPU_RPA_V3_DECODE_ADAPTIVE = EnvBool(False)
     # Unlock shared-prefix decode batches down to bs=8 (group_size=8 -> 128-row
     # MXU tile) for Long-Context c=8 workloads.
-    SGLANG_TPU_RPA_SHARED_BS8 = EnvBool(False)
+    SGLANG_TPU_RPA_SHARED_BS8 = EnvBool(True)
     # Optional RPAd_fast / RPAm diagnostic probe mode ("", "dense_kv", "nodma", "nocompute", "nokvwrite").
     SGLANG_TPU_RPA_V3_DECODE_PROBE = EnvStr("")
     # Wave-7 RPAm Stationary-Q prefill options (comma/underscore tokens: fp8_kv, fp8_qk,
@@ -1148,10 +1152,14 @@ class TpuEnvs:
     # 128-key half-slices per prefix bkv block while keeping sink (bkv=0) and
     # causal tail dense.
     SGLANG_TPU_RPA_V3_PREFILL_TOPK_SLICES = EnvInt(0)
-    # Query pooling stride for Stage-1 All-QK scoring (2 = pair-averaged Q, 1 = full Q).
+    # Query pooling stride for Stage-1 All-QK scoring (4 = quad, 2 = pair, 1 = full Q).
     SGLANG_TPU_RPA_V3_PREFILL_TOPK_QSTRIDE = EnvInt(2)
     # Use Stage-1 GQA-batched paired-K scorer + in-kernel exact top-k/bitpack (eliminates XLA sort).
     SGLANG_TPU_RPA_V3_PREFILL_TOPK_FAST = EnvBool(False)
+    # Optional Stage-1 TOPK_FAST K-slice pairing (0 = auto: 4 for qstride=4 else 2).
+    SGLANG_TPU_RPA_V3_PREFILL_TOPK_K_PAIR = EnvInt(0)
+    # Optional Stage-1 TOPK_FAST Q-block size override (0 = auto: 16384 for qstride=4 else kernel bq).
+    SGLANG_TPU_RPA_V3_PREFILL_TOPK_K1_BQ = EnvInt(0)
     # Muse prefill kernel path with SGLANG_TPU_KV_PACK_HEADS: A1 (two-half bf16 variants)
     # writes q and kv in RPA v3's packed layout, dropping the XLA expand/repack glue.
     SGLANG_TPU_MUSE_KERNEL_A1_RPA_LAYOUT = EnvBool(False)

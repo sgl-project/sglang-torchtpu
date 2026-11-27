@@ -31,7 +31,7 @@ def shared_decode_distribution(
     """Return [live, live, live, tiles-as-page-counts...] or None for stock."""
     rows, width = pages.shape
     if (
-        live < 8
+        live < 2
         or live > rows
         or group_size < 8
         or rows % group_size
@@ -55,10 +55,11 @@ def shared_decode_distribution(
     cached = np.maximum(np.asarray(lengths[:live], dtype=np.int64) - 1, 0)
     full = np.minimum.reduceat(cached, np.arange(0, live, group_size)) // page_size
     shared = np.minimum(full, mismatch) // block_pages * block_pages
-    # Keep small tails private and count savings using only the requests
-    # that would have fetched each page.
-    shared[group_sizes < 8] = 0
-    if np.dot(shared, group_sizes - 1) * 2 * page_size <= cached.sum():
+    # Keep single-sequence tails private and allow small live batches (2..7,
+    # e.g. c=8 decode while other requests prefill) once shared pages exceed ~25-50%.
+    shared[group_sizes < 2] = 0
+    min_savings_factor = 4 if live < 8 else 2
+    if np.dot(shared, group_sizes - 1) * min_savings_factor * page_size <= cached.sum():
         return None
     plan = np.zeros(3 + rows // group_size, dtype=np.int32)
     plan[:3] = live

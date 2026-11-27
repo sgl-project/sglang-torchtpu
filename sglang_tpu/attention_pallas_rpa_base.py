@@ -1323,7 +1323,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         from sglang_tpu.envs import envs as tpu_envs
 
         want_shared_decode = (
-            non_empty_bs >= 8
+            non_empty_bs >= 2
             and forward_batch.forward_mode.is_decode()
             and forward_batch.spec_info is None
             and seq_lens_cpu is not None

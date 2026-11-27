@@ -801,6 +801,12 @@ def _invoke_v3_kernel(
         topk_fast_env = getattr(
             envs, "SGLANG_TPU_RPA_V3_PREFILL_TOPK_FAST", None
         )
+        topk_k_pair_env = getattr(
+            envs, "SGLANG_TPU_RPA_V3_PREFILL_TOPK_K_PAIR", None
+        )
+        topk_k1_bq_env = getattr(
+            envs, "SGLANG_TPU_RPA_V3_PREFILL_TOPK_K1_BQ", None
+        )
         if (
             topk_slices > 0
             and is_lc_full
@@ -809,9 +815,27 @@ def _invoke_v3_kernel(
             extra["_prefill_topk_slices"] = topk_slices
             extra["_prefill_topk_qstride"] = topk_qstride
             if topk_fast_env is not None and topk_fast_env.get():
+                k_pair_val = (
+                    int(topk_k_pair_env.get())
+                    if topk_k_pair_env is not None
+                    else 0
+                )
+                k1_bq_val = (
+                    int(topk_k1_bq_env.get())
+                    if topk_k1_bq_env is not None
+                    else 0
+                )
                 extra["_prefill_topk_in_kernel"] = True
                 extra["_prefill_topk_gqa_batch"] = 4
-                extra["_prefill_topk_k_pair"] = 2
+                extra["_prefill_topk_k_pair"] = (
+                    k_pair_val
+                    if k_pair_val > 0
+                    else (4 if topk_qstride == 4 else 2)
+                )
+                if k1_bq_val > 0:
+                    extra["_prefill_topk_k1_bq"] = k1_bq_val
+                elif topk_qstride == 4:
+                    extra["_prefill_topk_k1_bq"] = 16384
     else:
         if mixed_blocks:
             extra["m_block_sizes"] = mixed_blocks

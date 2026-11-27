@@ -1361,6 +1361,8 @@ def test_w10_muse_spark_b8_step_b_and_tp16_embed_dispatch_and_prewarm():
         (8, 8, "512b", 2048, True),
         (16, 8, "bd4", 2048, False),
         (16, 16, "dense2", None, True),
+        (16, 8, "512b_ring4k", None, True),
+        (8, 16, "512b_ring4k_long", None, True),
     ],
 )
 def test_b1_moe_b2_rpad_replicated_b8_b16_interpret(
@@ -1402,7 +1404,7 @@ def test_b1_moe_b2_rpad_replicated_b8_b16_interpret(
     gate_cols = 512 if world_size == 16 else 1024
     kv_dense2 = pack_mode == "dense2"
     kv_bd4 = pack_mode == "bd4"
-    rpa_mode = "w8_noz"
+    rpa_mode = "w8_noz,ring4k" if pack_mode.startswith("512b_ring4k") else "w8_noz"
     row_mode = "sparse" if batch_size == 8 else "sparse"
     ip_race = pltpu.InterpretParams(
         dma_execution_mode="eager",
@@ -1460,8 +1462,8 @@ def test_b1_moe_b2_rpad_replicated_b8_b16_interpret(
     )
     free_params = jnp.asarray([0.84, 1.0, 0.20, 2.0], dtype=jnp.float32)
 
-    phys_rows = 128
-    pages_per_seq = 4
+    phys_rows = 512 if pack_mode.startswith("512b_ring4k") else 128
+    pages_per_seq = 8 if pack_mode.startswith("512b_ring4k") else 4
     num_layers_kv = 2 if pack_mode == "bd4" else 1
     total_pages = batch_size * pages_per_seq + 4
     kv_u8 = np.full(
@@ -1485,7 +1487,11 @@ def test_b1_moe_b2_rpad_replicated_b8_b16_interpret(
         layer_idx_arr = jnp.int32(0)
 
     kv_lens = jnp.asarray(
-        [120 + (i * 37) % 500 for i in range(batch_size)], dtype=jnp.int32
+        [
+            (1200 + (i * 117) % 1800) if pack_mode == "512b_ring4k_long" else (120 + (i * 37) % 500)
+            for i in range(batch_size)
+        ],
+        dtype=jnp.int32,
     )
     page_indices = jnp.arange(batch_size * pages_per_seq, dtype=jnp.int32)
     cu_q_lens = jnp.arange(batch_size + 1, dtype=jnp.int32)
@@ -1646,12 +1652,15 @@ def test_b1_moe_b2_rpad_replicated_b8_b16_tpu7x_aot():
     nq = h_pre // scale_block
 
     cases = [
-        (8, "tpu7x:2x2x1", 8, 2048, 8, False, False),
-        (8, "tpu7x:2x2x1", 16, None, 20, True, False),
-        (16, "tpu7x:2x2x2", 8, 2048, 4, False, True),
-        (16, "tpu7x:2x2x2", 16, None, 20, False, True),
+        (8, "tpu7x:2x2x1", 8, 2048, 8, 128, False, False, "w8_noz"),
+        (8, "tpu7x:2x2x1", 16, None, 20, 128, True, False, "w8_noz"),
+        (16, "tpu7x:2x2x2", 8, 2048, 4, 128, False, True, "w8_noz"),
+        (16, "tpu7x:2x2x2", 16, None, 20, 128, False, True, "w8_noz"),
+        (8, "tpu7x:2x2x1", 8, None, 32, 512, False, False, "w8_noz,ring4k"),
+        (16, "tpu7x:2x2x2", 8, None, 32, 512, False, False, "w8_noz,ring4k"),
+        (16, "tpu7x:2x2x2", 16, None, 32, 512, False, False, "w8_noz,ring4k"),
     ]
-    for ws_aot, topo_name, b_tok, sw, pgs, d2, bd4 in cases:
+    for ws_aot, topo_name, b_tok, sw, pgs, phys_r, d2, bd4, rpa_mode in cases:
         tpu_devs = topologies.get_topology_desc(topo_name, platform="tpu").devices
         mesh_aot = Mesh(
             np.array(
@@ -1694,7 +1703,7 @@ def test_b1_moe_b2_rpad_replicated_b8_b16_tpu7x_aot():
             jax.ShapeDtypeStruct((1, qc), jnp.float32),
             jax.ShapeDtypeStruct((hidden, gc_w), jnp.float8_e4m3fn),
             jax.ShapeDtypeStruct((1, gc_w), jnp.float32),
-            jax.ShapeDtypeStruct((b_tok * pgs + 1, 2, 128, 1, 4, 128), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((b_tok * pgs + 1, 2, phys_r, 1, 4, 128), jnp.float8_e4m3fn),
             jax.ShapeDtypeStruct((b_tok,), jnp.int32),
             jax.ShapeDtypeStruct((b_tok * pgs,), jnp.int32),
             jax.ShapeDtypeStruct((b_tok + 1,), jnp.int32),
@@ -1710,7 +1719,7 @@ def test_b1_moe_b2_rpad_replicated_b8_b16_tpu7x_aot():
             jax.ShapeDtypeStruct((), jnp.int32),
         )
 
-        def _aot_c(*args, _ws=ws_aot, _sw=sw, _d2=d2, _bd4=bd4):
+        def _aot_c(*args, _ws=ws_aot, _sw=sw, _d2=d2, _bd4=bd4, _mode=rpa_mode):
             return b1_moe_b2_rpad_replicated_b16_jax(
                 *args[:34],
                 cos_sin_step=args[34],
@@ -1723,7 +1732,7 @@ def test_b1_moe_b2_rpad_replicated_b8_b16_tpu7x_aot():
                 layer_idx=args[41],
                 world_size=_ws,
                 rpa_sliding_window=_sw,
-                rpa_mode_str="w8_noz",
+                rpa_mode_str=_mode,
                 kv_pack_dense2=_d2,
                 kv_pack_bd4=_bd4,
                 skip_kv_write=True,
