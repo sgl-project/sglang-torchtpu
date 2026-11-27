@@ -4809,6 +4809,91 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
                     comp.memory_analysis().generated_code_size_in_bytes, 0
                 )
 
+    def test_w12_pair_rs_b8_ep16_guard(self):
+        """Verify DECODE_PAIR_RS=2 disables pair_rs/bridge_ag cleanly when batch_size < ep (B=8 EP=16)."""
+        v1_mod = _load_pkg_module(
+            "fused_decode_sparse", _MUSE_DIR / "fused_decode_sparse.py"
+        )
+        clean_env = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith("SGLANG_TPU_MUSE_")
+        }
+        with mock.patch.dict(
+            os.environ,
+            {
+                **clean_env,
+                "SGLANG_TPU_MUSE_KERNEL_DECODE_PAIR_RS": "2",
+                "SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_B64": "4",
+                "SGLANG_TPU_MUSE_KERNEL_DECODE_B8": "1",
+            },
+            clear=True,
+        ):
+            cfg_b8_ep16 = v1_mod.default_sparse_decode_config(8, 16, 512)
+            self.assertFalse(cfg_b8_ep16.pair_rs)
+            self.assertFalse(cfg_b8_ep16.bridge_ag)
+            cfg_fp8_b8_ep16 = v1_mod.default_fp8_sparse_decode_config(8, 16)
+            self.assertFalse(cfg_fp8_b8_ep16.pair_rs)
+            self.assertFalse(cfg_fp8_b8_ep16.bridge_ag)
+
+            # B >= ep cases must still honor DECODE_PAIR_RS=2.
+            cfg_b16_ep16 = v1_mod.default_sparse_decode_config(16, 16, 512)
+            self.assertTrue(cfg_b16_ep16.pair_rs and cfg_b16_ep16.bridge_ag)
+            cfg_b8_ep8 = v1_mod.default_sparse_decode_config(8, 8, 512)
+            self.assertTrue(cfg_b8_ep8.pair_rs)
+
+        try:
+            import jax
+            import jax.numpy as jnp
+            from jax.experimental.topologies import get_topology_desc
+            from jax.sharding import Mesh, PartitionSpec as P
+            import numpy as np
+        except Exception as exc:
+            self.skipTest(f"JAX/TPU topologies unavailable: {exc}")
+
+        tpu_devs = get_topology_desc("tpu7x:2x2x2", platform="tpu").devices
+        if len(tpu_devs) >= 16:
+            ep, cur_b, h, n1, i_dim, sb = 16, 8, 4096, 8192, 4096, 512
+            e_local = 256 // ep
+            tpu_mesh = Mesh(
+                np.array(
+                    sorted(tpu_devs, key=lambda d: (d.coords[2], d.coords[1], d.coords[0], d.core_on_chip))
+                ),
+                ("model",),
+            )
+            shapes = (
+                jax.ShapeDtypeStruct((1,), jnp.int32),
+                jax.ShapeDtypeStruct((cur_b, 256), jnp.bfloat16),
+                jax.ShapeDtypeStruct((1, 256), jnp.float32),
+                jax.ShapeDtypeStruct((cur_b, h), jnp.bfloat16),
+                jax.ShapeDtypeStruct((e_local, h, n1), jnp.float4_e2m1fn),
+                jax.ShapeDtypeStruct((e_local, h // sb, n1), jnp.bfloat16),
+                jax.ShapeDtypeStruct((e_local, i_dim, h), jnp.float4_e2m1fn),
+                jax.ShapeDtypeStruct((e_local, i_dim // sb, h), jnp.bfloat16),
+                jax.ShapeDtypeStruct((1, h), jnp.bfloat16),
+            )
+
+            def _aot_b8_ep16(*args):
+                return v1_mod.fused_decode_sparse_from_logits(
+                    *args, ep=ep, return_sharded=False, config=cfg_b8_ep16
+                )
+
+            comp = (
+                jax.jit(
+                    jax.shard_map(
+                        _aot_b8_ep16,
+                        mesh=tpu_mesh,
+                        in_specs=(P(),) * len(shapes),
+                        out_specs=P(),
+                        check_vma=False,
+                    )
+                )
+                .trace(*shapes)
+                .lower(lowering_platforms=("tpu",))
+                .compile()
+            )
+            self.assertIn("tpu_custom_call", comp.as_text())
+
 
 if __name__ == "__main__":
     unittest.main()

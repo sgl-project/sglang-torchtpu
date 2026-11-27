@@ -370,6 +370,7 @@ def default_sparse_decode_config(
     use_pair_rs = (
         (pair_rs_ov > 0)
         and (ep in (8, 16))
+        and (batch_size >= ep)
         and (batch_size >= 32 or pair_rs_ov >= 2)
     )
     use_ep16_bridge_ag = use_pair_rs and (ep == 16)
@@ -5340,6 +5341,7 @@ def default_fp8_sparse_decode_config(
     fp8_pair_rs = (
         (pair_rs_ov > 0)
         and (ep in (8, 16))
+        and (batch_size >= ep)
         and (batch_size >= 32 or pair_rs_ov >= 2)
     )
     fp8_bridge_ag = (ep == 8) or (fp8_pair_rs and ep == 16)
