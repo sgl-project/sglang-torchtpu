@@ -18,6 +18,7 @@ from sglang.srt.layers.parameter import (
 )
 from sglang.srt.layers.quantization import fp8 as fp8_mod
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod, Fp8MoEMethod
+from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.plugins.hook_registry import HookRegistry
 from sglang_tpu.fp8_linear import (
@@ -292,6 +293,126 @@ class TestTpuFp8Reload(unittest.TestCase):
             dequant_w13 - fresh_w13.float()
         ).abs().max() / fresh_w13.float().abs().max()
         self.assertLess(rel_err.item(), 0.08)
+
+    def test_block_fp8_moe_reload_requantizes_fresh_checkpoint_into_the_same_parameters(
+        self,
+    ):
+        """A block-FP8 MoE checkpoint served channelwise must reload into the expert
+        Parameters direct_compile captured, with scales from the new checkpoint."""
+        self._install_reload_hooks()
+        cfg = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[128, 128],
+        )
+        # Non-square, so the restored [E, N, K] layout differs from the served [E, K, N].
+        num_experts, intermediate, hidden = 2, 128, 384
+        fake_runner_backend = SimpleNamespace(
+            is_auto=lambda: True,
+            is_cutlass=lambda: False,
+            is_pallas_tpu_fused_rs=lambda: False,
+            is_flashinfer_trtllm=lambda: False,
+            is_flashinfer_trtllm_routed=lambda: False,
+            is_hpc_ops=lambda: False,
+        )
+
+        def checkpoint(seed):
+            gen = torch.Generator().manual_seed(seed)
+            w13 = torch.randn(num_experts, 2 * intermediate, hidden, generator=gen)
+            w2 = torch.randn(num_experts, hidden, intermediate, generator=gen)
+            w13_s = torch.rand(num_experts, 2, 3, generator=gen) + 0.5
+            w2_s = torch.rand(num_experts, 3, 1, generator=gen) + 0.5
+            return w13.to(_FP8), w2.to(_FP8), w13_s, w2_s
+
+        def load(layer, tensors):
+            for name, tensor in zip(
+                (
+                    "w13_weight",
+                    "w2_weight",
+                    "w13_weight_scale_inv",
+                    "w2_weight_scale_inv",
+                ),
+                tensors,
+            ):
+                param = getattr(layer, name)
+                param.weight_loader(param, tensor)
+
+        with (
+            patch.object(fp8_mod, "_is_tpu", True),
+            patch.object(fp8_mod, "_is_cpu", False),
+            patch.object(fp8_mod, "_is_hip", False),
+            patch.object(fp8_mod, "_use_aiter", False),
+            patch.object(fp8_mod, "_is_fp8_fnuz", False),
+            # Leaves FP8 expert layouts alone on TPU (no DeepGEMM / aiter / AMX).
+            patch.object(Fp8MoEMethod, "process_weights_after_loading_block_quant"),
+            patch.object(
+                fp8_mod, "get_moe_runner_backend", return_value=fake_runner_backend
+            ),
+            patch(
+                "sglang_tpu.fp8_moe.get_parallel",
+                return_value=SimpleNamespace(pp_size=1, tp_rank=0),
+            ),
+            patch(
+                "sglang_tpu.fp8_moe._get_tpu_fp8_runtime", return_value="channelwise"
+            ),
+            patch(
+                "sglang_tpu.fp8_moe.current_platform",
+                SimpleNamespace(get_available_memory=lambda: (1024**3, 0)),
+            ),
+            patch("torch.accelerator.synchronize"),
+            patch(
+                "sglang_tpu.fp8_moe_fused_rs.prepare_fp8_fused_rs", return_value=False
+            ),
+        ):
+            method = Fp8MoEMethod(cfg)
+            layer = nn.Module()
+            layer.quant_method = method
+            layer.num_local_experts = num_experts
+            first = checkpoint(seed=0)
+            for name, tensor in zip(
+                (
+                    "w13_weight",
+                    "w2_weight",
+                    "w13_weight_scale_inv",
+                    "w2_weight_scale_inv",
+                ),
+                first,
+            ):
+                param = nn.Parameter(torch.empty_like(tensor), requires_grad=False)
+                param.weight_loader = _loader_fn
+                layer.register_parameter(name, param)
+            load(layer, first)
+            method.process_weights_after_loading(layer)
+
+            w13, w2 = layer.w13_weight, layer.w2_weight
+            w13_scale, w2_scale = layer.w13_weight_scale, layer.w2_weight_scale
+            self.assertEqual(tuple(w13.shape), (num_experts, hidden, 2 * intermediate))
+
+            DefaultModelLoader.restore_weights_before_loading(
+                layer, torch.device("cpu")
+            )
+            self.assertIs(layer.w13_weight, w13)
+            self.assertEqual(
+                tuple(layer.w13_weight.shape), (num_experts, 2 * intermediate, hidden)
+            )
+            self.assertIs(layer.w13_weight_scale_inv.weight_loader, _loader_fn)
+
+            fresh = checkpoint(seed=1)
+            load(layer, fresh)
+            method.process_weights_after_loading(layer)
+
+        self.assertIs(layer.w13_weight, w13)
+        self.assertIs(layer.w2_weight, w2)
+        self.assertIs(layer.w13_weight_scale, w13_scale)
+        self.assertIs(layer.w2_weight_scale, w2_scale)
+        for weight, scale, fresh_q, fresh_s in (
+            (layer.w13_weight, layer.w13_weight_scale, fresh[0], fresh[2]),
+            (layer.w2_weight, layer.w2_weight_scale, fresh[1], fresh[3]),
+        ):
+            expected = block_quant_dequant(fresh_q, fresh_s, [128, 128], torch.float32)
+            actual = weight.transpose(1, 2).float() * scale[:, 0, 0, :, None].float()
+            rel_err = (actual - expected).abs().max() / expected.abs().max()
+            self.assertLess(rel_err.item(), 0.08)
 
     def test_reload_fails_loud_where_core_post_processing_rebinds_parameters(self):
         """Per-tensor and non-channelwise FP8 reloads must raise instead of serving
