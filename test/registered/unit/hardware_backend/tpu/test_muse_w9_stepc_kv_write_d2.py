@@ -2504,3 +2504,404 @@ def test_wave17_step_c_ring_grp_and_priv_grp_aot_and_interpret():
             has_rope=False,
         )
         assert f"muse_w9_b1_moe_b2_rpad_b{b_a}_tp{tp_a}_" in hlo
+
+
+
+def test_wave18_embed_l0_rpad_interpret_parity_and_tpu7x_aot():
+    """Verify Fused L0 (chip-sharded & replicated B=8/16) under on_wait+races+nan and TPU7x AOT."""
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import pallas as pl
+    from jax.experimental import topologies
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    from sglang_tpu.attention.pallas import rpa_v3_decode_fast as rpad
+    from sglang_tpu.kernels import decode_collective_bridges_w8 as dcb8
+    from sglang_tpu.muse_megakernel.decode.embed_l0_rpad_kernel import (
+        embed_l0_rpad_chip_sharded_jax,
+        embed_l0_rpad_replicated_b16_jax,
+    )
+
+    cpu_devs = jax.devices("cpu")
+    if len(cpu_devs) >= 8:
+        mesh_cpu = Mesh(np.array(cpu_devs[:8]), ("model",))
+        ip = pltpu.InterpretParams(
+            dma_execution_mode="on_wait",
+            detect_races=True,
+            uninitialized_memory="nan",
+        )
+        ws, hidden = 8, 1024
+        in_sp = (
+            P(), P("model", None), P(), P("model", None), P(), P("model", None), P(),
+            P(), P(), P(), P(), P(), P(), P(),
+        )
+        rmode = "w8,s2,c2048,coal,noz,pbf16,batchfull,b2"
+
+        for B, is_rep, v_shard, d2 in (
+            (32, False, 18, True),
+            (64, False, 24, True),
+            (8, True, 18, True),
+            (16, True, 24, False),
+        ):
+            rng = np.random.default_rng(20261800 + B + v_shard)
+            ids_np = rng.integers(0, ws * v_shard, size=(B,), dtype=np.int32)
+            ids_np[0] = v_shard - 1
+            ids_np[1] = v_shard - 2
+            ids_np[2] = 3 * v_shard + (v_shard - 1)
+            ids_np[3] = 7 * v_shard + (v_shard - 2)
+            emb_bf16 = jnp.asarray(
+                rng.standard_normal((ws * v_shard, hidden)) * 0.1, dtype=jnp.bfloat16
+            )
+            l0_gain = jnp.asarray(rng.uniform(0.8, 1.2, (hidden,)), dtype=jnp.float32)
+            w_qkv = jnp.asarray(
+                rng.standard_normal((ws * hidden, 1280)) * 0.05, dtype=jnp.float8_e4m3fn
+            )
+            s_qkv = jnp.full((1280,), 0.02, dtype=jnp.float32)
+            w_gate = jnp.asarray(
+                rng.standard_normal((ws * hidden, 1024)) * 0.05, dtype=jnp.float8_e4m3fn
+            )
+            s_gate = jnp.full((1024,), 0.02, dtype=jnp.float32)
+            cs = jnp.asarray(rng.standard_normal((B, 2, 128)) * 0.5, dtype=jnp.float32)
+            phys = 256 if d2 else 512
+            kv_c = jnp.asarray(
+                rng.standard_normal((B * 2, phys, 1, 4, 128)) * 0.05,
+                dtype=jnp.float8_e4m3fn,
+            )
+            kvl = jnp.full((B,), 64, dtype=jnp.int32)
+            pidx = jnp.arange(B * 2, dtype=jnp.int32)
+            cuq = jnp.arange(B + 1, dtype=jnp.int32)
+            cukv = jnp.arange(B + 1, dtype=jnp.int32) * 64
+            dist = jnp.asarray([B, B, B], dtype=jnp.int32)
+            ids_j = jnp.asarray(ids_np, dtype=jnp.int32)
+
+            def _ref(ids, emb, gain, wq, sq, wg, sg, kvc, kl, pi, cq, ckv, dt, csin):
+                if is_rep:
+                    st_r = dcb8.decode_vocab_embed_norm_jax(
+                        ids, emb, world_size=ws, norm_eps=1e-5, interpret=ip
+                    )
+                    inv1 = jax.lax.rsqrt(jnp.mean(st_r * st_r, axis=-1, keepdims=True) + 1e-5)
+                    ain = ((st_r * inv1) * gain[None, :]).astype(jnp.bfloat16)
+                else:
+                    st_r, ain = dcb8.decode_vocab_embed_chip_sharded_jax(
+                        ids, emb, gain, world_size=ws, embed_eps=1e-5, l0_eps=1e-5,
+                        l0_scale_input=False, interpret=ip,
+                    )
+                qkv_r = (
+                    jnp.matmul(ain.astype(jnp.float32), wq.astype(jnp.float32)) * sq[None, :]
+                ).astype(jnp.bfloat16)
+                g_r = (
+                    jnp.matmul(ain.astype(jnp.float32), wg.astype(jnp.float32)) * sg[None, :]
+                ).astype(jnp.bfloat16)
+
+                def _ek(qr, csr, qor, kvor):
+                    dcb8._run_in_vmem_qkv_epilogue_dispatch(
+                        qr, csr, qor, kvor, norm_eps=1e-5, query_scale=1.0,
+                        k_scale=1.0, v_scale=1.0, has_rope=True, interpret_mode=True,
+                    )
+
+                q_e, kv_e = pl.pallas_call(
+                    _ek,
+                    out_shape=(
+                        jax.ShapeDtypeStruct((B, 16, 128), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((B, 1, 4, 128), jnp.float8_e4m3fn),
+                    ),
+                    interpret=ip,
+                )(qkv_r, csin)
+                out_r, _ = rpad.run_decode_fast_rpa(
+                    q_e.reshape(1, B, 8, 2, 128), kv_e, None, kvc, kl, pi, cq, ckv, dt,
+                    sm_scale=0.125, sliding_window=2048, k_scale=1.0, v_scale=1.0,
+                    mode_str=rmode, kv_pack_dense2=d2, gate=g_r, out_norm_eps=1e-5,
+                    fused_out_pack=2, prepared_inputs=True, interpret=True,
+                )
+                return st_r, out_r, kv_e
+
+            def _fus(ids, emb, gain, wq, sq, wg, sg, kvc, kl, pi, cq, ckv, dt, csin):
+                fn = embed_l0_rpad_replicated_b16_jax if is_rep else embed_l0_rpad_chip_sharded_jax
+                return fn(
+                    ids, emb, gain, wq, sq, wg, sg, kvc, kl, pi, cq, ckv, dt, csin,
+                    world_size=ws, embed_eps=1e-5, l0_eps=1e-5, l0_scale_input=False,
+                    qkv_norm_eps=1e-5, query_scale=1.0, k_scale=1.0, v_scale=1.0,
+                    rpa_sm_scale=0.125, rpa_sliding_window=2048, rpa_k_scale=1.0,
+                    rpa_v_scale=1.0, rpa_out_norm_eps=1e-5, rpa_mode_str=rmode,
+                    kv_pack_dense2=d2, kv_pack_bd4=False, skip_kv_write=True, interpret=ip,
+                )
+
+            out_sp = (P() if is_rep else P("model", None), P(), P())
+            args = (ids_j, emb_bf16, l0_gain, w_qkv, s_qkv, w_gate, s_gate, kv_c, kvl, pidx, cuq, cukv, dist, cs)
+            r_st, r_g, r_kv = jax.jit(
+                jax.shard_map(_ref, mesh=mesh_cpu, in_specs=in_sp, out_specs=out_sp, check_vma=False)
+            )(*args)
+            f_st, f_g, f_kv = jax.jit(
+                jax.shard_map(_fus, mesh=mesh_cpu, in_specs=in_sp, out_specs=out_sp, check_vma=False)
+            )(*args)
+            assert np.max(np.abs(np.asarray(r_st, np.float32) - np.asarray(f_st, np.float32))) == 0.0
+            rf, ff = np.asarray(r_g, np.float64).ravel(), np.asarray(f_g, np.float64).ravel()
+            g_cos = float(np.dot(rf, ff) / (np.linalg.norm(rf) * np.linalg.norm(ff) + 1e-30))
+            assert g_cos > 0.99999, f"Fused L0 gated_cos={g_cos} for B={B}, rep={is_rep}"
+            assert np.array_equal(np.asarray(r_kv).view(np.uint8), np.asarray(f_kv).view(np.uint8))
+
+    # TPU7x AOT sweep across TP=16 (BD4) and TP=8 (D2/512B), B=8..256, incl. tail v_shard % 8 == 2 and 6D layer_idx.
+    tpu_222 = topologies.get_topology_desc("tpu7x:2x2x2", platform="tpu").devices
+    tpu_221 = topologies.get_topology_desc("tpu7x:2x2x1", platform="tpu").devices
+    mesh16 = Mesh(np.array(sorted(tpu_222, key=lambda d: (d.coords[1], d.coords[0], d.core_on_chip))), ("model",))
+    mesh8 = Mesh(np.array(sorted(tpu_221, key=lambda d: (d.coords[1], d.coords[0], d.core_on_chip))), ("model",))
+    for ws, mesh, B, is_rep, d2, bd4, v_sh, rmode in (
+        (16, mesh16, 256, False, False, True, 16384, "w8,s4,c2048,coal,noz,pbf16,batchfull,b4"),
+        (16, mesh16, 64, False, False, True, 16386, "w8,s4,c2048,coal,noz,pbf16,batchfull,b4"),
+        (16, mesh16, 16, True, False, True, 16384, "w8,s4,c2048,coal,noz,pbf16,batchfull,b4"),
+        (8, mesh8, 256, False, True, False, 32768, "w8,s3,c2048,coal,noz,pbf16,batchfull,b2"),
+        (8, mesh8, 128, False, True, False, 32768, "w8,s4,c2048,coal,noz,pbf16,batchfull,b4"),
+        (8, mesh8, 32, False, True, False, 32770, "w8,s4,c2048,coal,noz,pbf16,batchfull,b4"),
+        (8, mesh8, 8, True, False, False, 32768, "w8,s4,c2048,coal,noz,pbf16,batchfull,b4"),
+    ):
+        qkv_c = 1280 if ws == 8 else 640
+        gate_c = 1024 if ws == 8 else 512
+        phys = 256 if d2 else 512
+        shapes = (
+            jax.ShapeDtypeStruct((B,), jnp.int32),
+            jax.ShapeDtypeStruct((v_sh, 8192), jnp.bfloat16),
+            jax.ShapeDtypeStruct((8192,), jnp.float32),
+            jax.ShapeDtypeStruct((8192, qkv_c), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((qkv_c,), jnp.float32),
+            jax.ShapeDtypeStruct((8192, gate_c), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((gate_c,), jnp.float32),
+            jax.ShapeDtypeStruct((32, 45, phys, 1, 4, 128), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((B,), jnp.int32),
+            jax.ShapeDtypeStruct((B * 8,), jnp.int32),
+            jax.ShapeDtypeStruct((B + 1,), jnp.int32),
+            jax.ShapeDtypeStruct((B + 1,), jnp.int32),
+            jax.ShapeDtypeStruct((3,), jnp.int32),
+            jax.ShapeDtypeStruct((B, 2, 128), jnp.float32),
+            jax.ShapeDtypeStruct((), jnp.int32),
+        )
+        fn = embed_l0_rpad_replicated_b16_jax if is_rep else embed_l0_rpad_chip_sharded_jax
+        sm = jax.jit(
+            jax.shard_map(
+                lambda *a, _fn=fn, _ws=ws, _rm=rmode, _d2=d2, _bd4=bd4: _fn(
+                    *a[:14], layer_idx=a[14], world_size=_ws, rpa_sliding_window=2048,
+                    rpa_mode_str=_rm, kv_pack_dense2=_d2, kv_pack_bd4=_bd4, skip_kv_write=True,
+                ),
+                mesh=mesh, in_specs=(P(),) * len(shapes), out_specs=(P(), P(), P()), check_vma=False,
+            )
+        )
+        assert sm.trace(*shapes).lower(lowering_platforms=("tpu",)).compile() is not None
+
+
+def test_wave18_tp8_b256_stepc_split34_l61_xy_ag_and_b8_shared8_aot():
+    """Verify TP=8 B=256 Step(c) (flat SWA D2 + nested Scope-3/4 Full D2 & SWA 512B), L61 XY AG, & B=8 shared8 AOT."""
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import topologies
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    from sglang_tpu.muse_megakernel.decode.b1_moe_b2_kernel import (
+        b1_moe_fnorm_chip_sharded_jax,
+        resolve_step_c_rpa_plan,
+    )
+
+    # Planner checks: TP=8 B=256 SWA D2, Full D2 ring4k, SWA 512B, and B=8 shared8 c8192 (512B/D2/BD4).
+    _, _, _, _, ok_256_swa_d2 = resolve_step_c_rpa_plan(
+        "w8,s3,c2048,coal,noz,pbf16,batchfull,b2",
+        sliding_window=2049, pages_per_seq=8, phys_page_rows=256,
+        kv_pack_dense2=True, b_tokens=256, max_num_seqs=256, allow_large_b=True,
+    )
+    assert ok_256_swa_d2 is True
+    cfg_256_full_d2, _, slot_256_full_d2, grp_256_full_d2, ok_256_full_d2 = resolve_step_c_rpa_plan(
+        "w8,s4,c4096,coal,noz,pbf16,ring4k,rb4",
+        sliding_window=None, pages_per_seq=20, phys_page_rows=256,
+        kv_pack_dense2=True, b_tokens=256, max_num_seqs=256, allow_large_b=True,
+    )
+    assert (
+        ok_256_full_d2 is True
+        and grp_256_full_d2 is True
+        and cfg_256_full_d2.ring_group_size == 2
+        and cfg_256_full_d2.num_slots * slot_256_full_d2 * 256 > 16 * 512
+    )
+    _, _, _, _, ok_256_swa_512 = resolve_step_c_rpa_plan(
+        "w8,s2,c2048,coal,noz,pbf16,batchfull,b2",
+        sliding_window=2049, pages_per_seq=8, phys_page_rows=512,
+        kv_pack_dense2=False, b_tokens=256, max_num_seqs=256, allow_large_b=True,
+    )
+    assert ok_256_swa_512 is True
+    for d2_sh, bd4_sh, phys_sh in ((False, False, 512), (True, False, 256), (False, True, 128)):
+        _, _, _, _, ok_sh8 = resolve_step_c_rpa_plan(
+            "w8,s4,c8192,shared8,coal,noz,pbf16,shfp8,batchfull",
+            sliding_window=None, pages_per_seq=516, phys_page_rows=phys_sh,
+            kv_pack_dense2=d2_sh, kv_pack_bd4=bd4_sh, b_tokens=8, max_num_seqs=8,
+            shared_group_size=8, has_shared_prefix=True,
+        )
+        assert ok_sh8 is True
+
+    # TPU7x AOT compile: TP=8 B=256 flat SWA D2, nested Scope-3/4 Full D2 ring4k rb4, nested Scope-3/4 SWA 512B.
+    for sw_a, d2_a, mode_a, pps_a in (
+        (2049, True, "w8,s3,c2048,coal,noz,pbf16,batchfull,b2", 8),
+        (-1, True, "w8,s4,c4096,coal,noz,pbf16,ring4k,rb4", 20),
+        (2049, False, "w8,s2,c2048,coal,noz,pbf16,batchfull,b2", 8),
+    ):
+        hlo = _compile_step_c_aot(
+            tp=8, B=256, pps=pps_a, sw=sw_a, mode=mode_a, dense2=d2_a, bd4=False,
+            dist_len=3, has_rope=(sw_a > 0), allow_large_b=True,
+        )
+        assert "muse_w9_b1_moe_b2_rpad_b256_tp8_" in hlo
+
+    # TPU7x AOT compile: TP=8 B=128 & B=256 Fused L61 (2D-XY AG 2-sem borrow + out_hidden_ref Scope-1 alias).
+    tpu_221 = topologies.get_topology_desc("tpu7x:2x2x1", platform="tpu").devices
+    mesh8 = Mesh(np.array(sorted(tpu_221, key=lambda d: (d.coords[1], d.coords[0], d.core_on_chip))), ("model",))
+    for B_l61 in (128, 256):
+        r_pair = B_l61 // 4
+        shapes = (
+            jax.ShapeDtypeStruct((1,), jnp.int32),
+            jax.ShapeDtypeStruct((r_pair, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((B_l61, 1024), jnp.bfloat16),
+            jax.ShapeDtypeStruct((1024, 8192), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((8192, 2048), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, 2048), jnp.float32),
+            jax.ShapeDtypeStruct((8192, 256), jnp.bfloat16),
+            jax.ShapeDtypeStruct((1, 4096), jnp.float32),
+            jax.ShapeDtypeStruct((1, 256), jnp.float32),
+            jax.ShapeDtypeStruct((32, 4096, 8192), jnp.float4_e2m1fn),
+            jax.ShapeDtypeStruct((32, 8, 8192), jnp.bfloat16),
+            jax.ShapeDtypeStruct((32, 4096, 4096), jnp.float4_e2m1fn),
+            jax.ShapeDtypeStruct((32, 8, 4096), jnp.bfloat16),
+            jax.ShapeDtypeStruct((1, 4096), jnp.bfloat16),
+            jax.ShapeDtypeStruct((4096, 4096), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, 4096), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((4,), jnp.float32),
+        )
+        sm = jax.jit(
+            jax.shard_map(
+                lambda *a: b1_moe_fnorm_chip_sharded_jax(
+                    *a[:24], free_params=a[24], world_size=8, replica_cost_mode="tiles"
+                ),
+                mesh=mesh8, in_specs=(P(),) * len(shapes), out_specs=P(), check_vma=False,
+            )
+        )
+        assert sm.trace(*shapes).lower(lowering_platforms=("tpu",)).compile() is not None
+
+
+def test_wave18_fuse_l0_and_fuse_l61_ops_and_killswitches():
+    """Verify FUSE_L0/FUSE_L61 env defaults, kill-switch gating, L0 op prewarm, and 45-layer [29, 16] flush."""
+    from unittest import mock
+
+    import torch
+    from sglang_tpu.envs import envs as tpu_envs
+    from sglang_tpu.models.muse_spark import MuseSparkDecoderLayer, MuseSparkTextModel
+    from sglang_tpu.muse_megakernel.decode import b1_moe_ops
+
+    assert bool(tpu_envs.SGLANG_TPU_MUSE_DECODE_FUSE_L61.get()) is True
+    assert bool(tpu_envs.SGLANG_TPU_MUSE_DECODE_FUSE_L0.get()) is True
+
+    # Verify _maybe_forward_embed_l0_rpad cleanly returns None when kill-switch or ready flag is off.
+    m = object.__new__(MuseSparkTextModel)
+    m.__dict__["_w18_fuse_l0_rpad_ready"] = True
+    m.__dict__["_w18_fuse_l0_rep_b16_ready"] = True
+    with mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_DECODE_FUSE_L0, "get", return_value=False):
+        assert m._maybe_forward_embed_l0_rpad(
+            input_ids=torch.zeros((64,), dtype=torch.int32),
+            positions=torch.zeros((64,), dtype=torch.int32),
+            forward_batch=None,
+            cos_sin_step=None,
+            n_tok=64,
+            tp=8,
+            replicated=False,
+            pending_step_c_kv_writes=[],
+        ) is None
+
+    # Verify _can_run_b1_moe_superkernel allows TP=8 B=256 when sparse MoE batches include 256.
+    from types import SimpleNamespace
+
+    lyr = object.__new__(MuseSparkDecoderLayer)
+    lyr.__dict__["_w9_b1_moe_b2_superkernel"] = True
+    fake_mlp = type("FakeMLP", (), {})()
+    fake_mlp.__dict__["_fused_decode_mode"] = "sparse"
+    fake_mlp.__dict__["_fused_decode_op"] = object()
+    fake_mlp.__dict__["_fused_decode_batches"] = (32, 64, 128, 256)
+    fake_mlp._buffers = {
+        "_w8_wpre_pair_w8k": torch.empty((1,)),
+        "_w7_wrouter_km": torch.empty((1,)),
+        "_decode_fp4_w1": SimpleNamespace(dtype=torch.float4_e2m1fn_x2, ndim=3, shape=(32, 4096, 4096)),
+        "_decode_fp4_s1": SimpleNamespace(dtype=torch.bfloat16, ndim=3, shape=(32, 8, 8192)),
+        "_decode_fp4_w2": SimpleNamespace(dtype=torch.float4_e2m1fn_x2, ndim=3, shape=(32, 4096, 2048)),
+        "_decode_fp4_s2": SimpleNamespace(dtype=torch.bfloat16, ndim=3, shape=(32, 8, 4096)),
+    }
+    fake_mlp._bias_2d = lambda: SimpleNamespace(dtype=torch.float32)
+    fake_mlp._norm_2d = lambda: SimpleNamespace(dtype=torch.bfloat16)
+    fake_mlp.experts = None
+    lyr.__dict__["_modules"] = {"mlp": fake_mlp}
+    assert lyr._can_run_b1_moe_superkernel(256, tp=8, is_dec_step=True, replicated=False) is True
+
+    # Verify FUSE_L61=False disables both replicated L61 and TP=8 B=256 chip-sharded L61 cleanly
+    # (never falling into TP=8 B<=128 Step (a) b1_moe_kernel).
+    fake_mlp._buffers["_w7_wpost_w8k"] = torch.empty((1,))
+    fake_mlp._buffers["_w9_wpost_pair_w8k"] = torch.empty((1,))
+    fake_mlp._free_params_for_batch = lambda _b: None
+    with mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_DECODE_FUSE_L61, "get", return_value=False):
+        assert lyr._try_b1_moe_replicated_b16_superkernel(
+            positions=None, stream=None, attn_input=None, forward_batch=None,
+            n_tok=8, tp=8, b2_kind=1, is_dec_step=True,
+            pa_alpha_arg=None, pa_beta_arg=None, pre_ff_gain=None, pre_exp_gain=None,
+            cos_sin_step=None, cs_kw={}, precomputed_qkv_gate=None,
+            precomputed_prepared_qkvg=None, precomputed_gated=None,
+            next_input_layernorm=None, next_layer_attn=None, final_layernorm=object(),
+        ) is None
+        assert lyr._try_b1_moe_superkernel(
+            positions=None, stream=None, attn_input=None, forward_batch=None,
+            n_tok=256, tp=8, b2_kind=1, is_dec_step=True,
+            pa_alpha_arg=None, pa_beta_arg=None, pre_ff_gain=None, pre_exp_gain=None,
+            cos_sin_step=None, cs_kw={}, precomputed_qkv_gate=None,
+            precomputed_prepared_qkvg=None, precomputed_gated=None,
+            next_input_layernorm=None, next_layer_attn=None, final_layernorm=object(),
+        ) is None
+
+    # Verify prewarm_b1_moe_superkernel_ops populates both L0 caches when include_fuse_l0=True.
+    exported: list[str] = []
+    with (
+        mock.patch.dict(b1_moe_ops._EMBED_L0_RPAD_OPS, {}, clear=True),
+        mock.patch.dict(b1_moe_ops._EMBED_L0_RPAD_B16_OPS, {}, clear=True),
+        mock.patch.object(
+            b1_moe_ops,
+            "_export_superkernel_op",
+            side_effect=lambda name, *a, **kw: exported.append(name) or (lambda *x: x),
+        ),
+        mock.patch.object(b1_moe_ops, "get_step_c_kv_write_op", return_value=lambda *x: None),
+        mock.patch.object(b1_moe_ops, "get_step_c_kv_write_multi_5d_op", return_value=lambda *x: None),
+        mock.patch.object(b1_moe_ops, "get_step_c_kv_write_multi_6d_op", return_value=lambda *x: None),
+    ):
+        b1_moe_ops.prewarm_b1_moe_superkernel_ops(
+            16,
+            [(0, False, "tiles", True)],
+            bridge_qkv_epi=True,
+            has_rope_variants=(True,),
+            include_rep_b16=True,
+            include_fuse_l0=True,
+            step_c_configs=((False, False, "w8,s4", True),),
+        )
+        assert len(b1_moe_ops._EMBED_L0_RPAD_OPS) == 1
+        assert len(b1_moe_ops._EMBED_L0_RPAD_B16_OPS) == 1
+        assert any("muse_w18_embed_l0_rpad_tp16_bd4" in n for n in exported)
+        assert any("muse_w18_embed_l0_rpad_rep_b16_tp16_bd4" in n for n in exported)
+
+    # Verify 45 SWA layers (L0 + 44 SWA) flush as exactly 2 batched chunks [29, 16].
+    chunk_sizes: list[int] = []
+    meta = tuple(torch.zeros((1,), dtype=torch.int32) for _ in range(5))
+    kv0 = torch.zeros((16, 1, 4, 128), dtype=torch.float8_e4m3fn)
+    entries = [
+        (torch.zeros((2, 128, 1, 4, 128), dtype=torch.float8_e4m3fn), *meta, None, kv0, False, True, (False, True, 0, False, True), li)
+        for li in range(45)
+    ]
+    with mock.patch.object(
+        b1_moe_ops,
+        "get_step_c_kv_write_multi_5d_op",
+        side_effect=lambda k, **kw: (chunk_sizes.append(k) or (lambda *a: None)),
+    ):
+        b1_moe_ops.flush_pending_step_c_kv_writes(entries)
+    assert chunk_sizes == [29, 16]

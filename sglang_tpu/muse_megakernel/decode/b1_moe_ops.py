@@ -27,6 +27,10 @@ from sglang_tpu.muse_megakernel.decode.b1_moe_b2_kernel import (
 from sglang_tpu.muse_megakernel.decode.b1_moe_kernel import (
     b1_moe_chip_sharded_jax,
 )
+from sglang_tpu.muse_megakernel.decode.embed_l0_rpad_kernel import (
+    embed_l0_rpad_chip_sharded_jax,
+    embed_l0_rpad_replicated_b16_jax,
+)
 
 _B1_MOE_LOCK = Lock()
 _B1_MOE_B2_OPS: dict[tuple, Callable] = {}
@@ -35,6 +39,8 @@ _B1_MOE_B2_B16_RPAD_OPS: dict[tuple, Callable] = {}
 _B1_MOE_B2_RPAD_OPS: dict[tuple, Callable] = {}
 _B1_MOE_FNORM_OPS: dict[tuple, Callable] = {}
 _B1_MOE_FNORM_B16_OPS: dict[tuple, Callable] = {}
+_EMBED_L0_RPAD_OPS: dict[tuple, Callable] = {}
+_EMBED_L0_RPAD_B16_OPS: dict[tuple, Callable] = {}
 _STEP_C_KV_WRITE_OPS: dict[tuple[bool, bool], Callable] = {}
 _STEP_C_KV_WRITE_MULTI_6D_OPS: dict[tuple[bool, bool], Callable] = {}
 _STEP_C_KV_WRITE_MULTI_5D_OPS: dict[tuple[int, bool, bool], Callable] = {}
@@ -1396,6 +1402,193 @@ def get_b1_moe_fnorm_replicated_b16_op(
     )
 
 
+_EMBED_L0_BASE_TENSOR_NAMES = (
+    "input_ids",
+    "embed_weight_shard",
+    "l0_in_gain",
+    "l0_w_qkv_w8k",
+    "l0_s_qkv",
+    "l0_w_gate_w8k",
+    "l0_s_gate",
+    "kv_cache_fused",
+    "kv_lens",
+    "page_indices",
+    "cu_q_lens",
+    "cu_kv_lens",
+    "distribution",
+)
+
+_EMBED_L0_STATIC_SPECS: tuple[tuple[str, type], ...] = (
+    ("embed_eps", float),
+    ("l0_eps", float),
+    ("l0_scale_input", bool),
+    ("qkv_norm_eps", float),
+    ("query_scale", float),
+    ("k_scale", float),
+    ("v_scale", float),
+    ("rpa_sm_scale", float),
+    ("rpa_sliding_window", int),
+    ("rpa_k_scale", float),
+    ("rpa_v_scale", float),
+    ("rpa_out_norm_eps", float),
+)
+
+
+def _get_embed_l0_rpad_op(
+    world_size: int,
+    *,
+    cache: dict[tuple, Callable],
+    jax_fn: Callable,
+    op_prefix: str,
+    has_rope: bool = True,
+    has_layer_idx: bool = False,
+    kv_pack_dense2: bool = False,
+    kv_pack_bd4: bool = False,
+    rpa_mode_str: str = "",
+) -> Callable:
+    """Return cached TorchTPU custom op for fused L0 ``[embed + norms + QKV/gate/epi + RPAd]``."""
+    if world_size not in SUPPORTED_WORLD_SIZES:
+        raise ValueError(
+            f"embed_l0_rpad requires world_size in {SUPPORTED_WORLD_SIZES}, got {world_size}"
+        )
+    if kv_pack_bd4:
+        kv_pack_dense2 = False
+    key = (
+        int(world_size),
+        bool(has_rope),
+        bool(has_layer_idx),
+        bool(kv_pack_dense2),
+        bool(kv_pack_bd4),
+        str(rpa_mode_str),
+    )
+    op = cache.get(key)
+    if op is not None:
+        return op
+
+    with _B1_MOE_LOCK:
+        op = cache.get(key)
+        if op is None:
+            tensor_names = (
+                _EMBED_L0_BASE_TENSOR_NAMES
+                + (("cos_sin_step",) if has_rope else ())
+                + (("layer_idx",) if has_layer_idx else ())
+            )
+            n_base = len(_EMBED_L0_BASE_TENSOR_NAMES)
+
+            def _local_embed_l0(*args):
+                n_t = len(tensor_names)
+                t_args = args[:n_t]
+                s_args = args[n_t:]
+                pos = n_base
+                cs_arg = None
+                if has_rope:
+                    cs_arg = t_args[pos]
+                    pos += 1
+                lidx_arg = t_args[pos] if has_layer_idx else None
+                (
+                    embed_eps,
+                    l0_eps,
+                    l0_scale_input,
+                    qkv_norm_eps,
+                    query_scale,
+                    k_scale,
+                    v_scale,
+                    rpa_sm_scale,
+                    rpa_sw,
+                    rpa_k_scale,
+                    rpa_v_scale,
+                    rpa_out_norm_eps,
+                ) = s_args[:12]
+                return jax_fn(
+                    *t_args[:n_base],
+                    cos_sin_step=cs_arg,
+                    layer_idx=lidx_arg,
+                    world_size=world_size,
+                    embed_eps=float(embed_eps),
+                    l0_eps=float(l0_eps),
+                    l0_scale_input=bool(l0_scale_input),
+                    qkv_norm_eps=float(qkv_norm_eps),
+                    query_scale=float(query_scale),
+                    k_scale=float(k_scale),
+                    v_scale=float(v_scale),
+                    rpa_sm_scale=float(rpa_sm_scale),
+                    rpa_sliding_window=(int(rpa_sw) if int(rpa_sw) > 0 else None),
+                    rpa_k_scale=float(rpa_k_scale),
+                    rpa_v_scale=float(rpa_v_scale),
+                    rpa_out_norm_eps=float(rpa_out_norm_eps),
+                    rpa_mode_str=(str(rpa_mode_str) if rpa_mode_str else None),
+                    kv_pack_dense2=bool(kv_pack_dense2),
+                    kv_pack_bd4=bool(kv_pack_bd4),
+                    skip_kv_write=True,
+                )
+
+            etag = f"_{'rope' if has_rope else 'nope'}"
+            ltag = "_li" if has_layer_idx else ""
+            d2tag = "_bd4" if kv_pack_bd4 else ("_d2" if kv_pack_dense2 else "")
+            mtag = (
+                f"_{re.sub(r'[^a-zA-Z0-9_]+', '_', rpa_mode_str).strip('_')}"
+                if rpa_mode_str
+                else ""
+            )
+            op_name = f"sglang_tpu_pallas::{op_prefix}_tp{world_size}{ltag}{d2tag}{mtag}{etag}"
+            op = _export_superkernel_op(
+                op_name,
+                world_size,
+                tensor_names,
+                _EMBED_L0_STATIC_SPECS,
+                3,
+                _local_embed_l0,
+            )
+            cache[key] = op
+    return op
+
+
+def get_embed_l0_rpad_chip_sharded_op(
+    world_size: int,
+    *,
+    has_rope: bool = True,
+    has_layer_idx: bool = False,
+    kv_pack_dense2: bool = False,
+    kv_pack_bd4: bool = False,
+    rpa_mode_str: str = "",
+) -> Callable:
+    """Return cached TorchTPU custom op for fused chip-sharded L0 megakernel."""
+    return _get_embed_l0_rpad_op(
+        world_size,
+        cache=_EMBED_L0_RPAD_OPS,
+        jax_fn=embed_l0_rpad_chip_sharded_jax,
+        op_prefix="muse_w18_embed_l0_rpad",
+        has_rope=has_rope,
+        has_layer_idx=has_layer_idx,
+        kv_pack_dense2=kv_pack_dense2,
+        kv_pack_bd4=kv_pack_bd4,
+        rpa_mode_str=rpa_mode_str,
+    )
+
+
+def get_embed_l0_rpad_replicated_b16_op(
+    world_size: int,
+    *,
+    has_rope: bool = True,
+    has_layer_idx: bool = False,
+    kv_pack_dense2: bool = False,
+    kv_pack_bd4: bool = False,
+    rpa_mode_str: str = "",
+) -> Callable:
+    """Return cached TorchTPU custom op for fused replicated ``B=8/16`` L0 megakernel."""
+    return _get_embed_l0_rpad_op(
+        world_size,
+        cache=_EMBED_L0_RPAD_B16_OPS,
+        jax_fn=embed_l0_rpad_replicated_b16_jax,
+        op_prefix="muse_w18_embed_l0_rpad_rep_b16",
+        has_rope=has_rope,
+        has_layer_idx=has_layer_idx,
+        kv_pack_dense2=kv_pack_dense2,
+        kv_pack_bd4=kv_pack_bd4,
+        rpa_mode_str=rpa_mode_str,
+    )
+
+
 def prewarm_b1_moe_superkernel_ops(
     world_size: int,
     layer_configs: Iterable[tuple[int, bool, str, bool]],
@@ -1405,6 +1598,7 @@ def prewarm_b1_moe_superkernel_ops(
     has_free_params: bool = False,
     include_rep_b16: bool = False,
     include_final_norm: bool = False,
+    include_fuse_l0: bool = False,
     step_c_configs: Iterable[tuple] = (),
 ) -> None:
     """Eagerly register Step (a), Step (b), L61, B=16, and Step (c) custom ops outside ``torch.compile``."""
@@ -1544,3 +1738,35 @@ def prewarm_b1_moe_superkernel_ops(
                             get_step_c_kv_write_multi_5d_op(
                                 _k5, kv_pack_dense2=eff_d2, kv_pack_bd4=eff_bd4
                             )
+    if include_fuse_l0 and step_c_list and bridge_qkv_epi:
+        seen_l0: set[tuple] = set()
+        for sc_item in step_c_list:
+            if len(sc_item) == 4:
+                has_lidx, dense2, rpa_m, bd4 = sc_item
+            else:
+                has_lidx, dense2, rpa_m = sc_item
+                bd4 = False
+            eff_d2 = bool(dense2) and not bool(bd4)
+            eff_bd4 = bool(bd4)
+            for r_flag in has_rope_variants:
+                l0_key = (bool(r_flag), bool(has_lidx), eff_d2, eff_bd4, str(rpa_m))
+                if l0_key in seen_l0:
+                    continue
+                seen_l0.add(l0_key)
+                get_embed_l0_rpad_chip_sharded_op(
+                    world_size,
+                    has_rope=r_flag,
+                    has_layer_idx=has_lidx,
+                    kv_pack_dense2=eff_d2,
+                    kv_pack_bd4=eff_bd4,
+                    rpa_mode_str=rpa_m,
+                )
+                if include_rep_b16:
+                    get_embed_l0_rpad_replicated_b16_op(
+                        world_size,
+                        has_rope=r_flag,
+                        has_layer_idx=has_lidx,
+                        kv_pack_dense2=eff_d2,
+                        kv_pack_bd4=eff_bd4,
+                        rpa_mode_str=rpa_m,
+                    )

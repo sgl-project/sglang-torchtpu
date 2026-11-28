@@ -1597,6 +1597,10 @@ class TpuEnvs:
     # on SWA / bounded-context layers (<= 20 ring slots*pages, B <= 64, EP=8/16): fuses next
     # layer RPAd directly behind Bridge 2b QKV/RoPE/KV epilogue and skips next self_attn.
     SGLANG_TPU_MUSE_DECODE_STEP_C_SUPERKERNEL = EnvBool(False)
+    # Wave-17/18 kill-switch for fused L61 Final Norm superkernel (b1_moe_fnorm_{chip_sharded,rep_b16}).
+    SGLANG_TPU_MUSE_DECODE_FUSE_L61 = EnvBool(True)
+    # Wave-18 kill-switch for fused L0 [embed + norms + QKV/RoPE/gate + L0 RPAd] megakernel.
+    SGLANG_TPU_MUSE_DECODE_FUSE_L0 = EnvBool(True)
     # Wave-8 fuse decode QKV RMSNorm + RoPE + KV FP8 quant epilogue directly into Bridge 2b & L0.
     SGLANG_TPU_MUSE_DECODE_BRIDGE_QKV_EPI = EnvBool(False)
     # Wave-9 unlock fused in-VMEM QKV/RoPE/FP8-KV epilogue on TP=16 (qkv_cols=640, 8Q/1KV) across
