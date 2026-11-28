@@ -2782,6 +2782,7 @@ def b1_moe_fnorm_chip_sharded_jax(
 
 _STEP_C_BASE_MAX_BKV_ROWS = 80 * 512
 _STEP_C_GROUP_MAX_BKV_ROWS = 80 * 512
+_STEP_C_SWABATCH_WIDE_GRP_MAX_BKV_ROWS = 60 * 512
 _STEP_C_LARGE_B_MAX_BKV_ROWS = 16 * 512
 _STEP_C_LARGE_B_RING_GRP_MAX_BKV_ROWS = 24 * 512
 _STEP_C_B128_MAX_BKV_ROWS = 40 * 512
@@ -2952,11 +2953,30 @@ def resolve_step_c_rpa_plan(
             allow_large_b=bool(allow_large_b),
             base_rows=_STEP_C_GROUP_MAX_BKV_ROWS,
         )
-        grp_cands = (
-            ((cfg_rpa.num_slots, 4), (3, 4), (cfg_rpa.num_slots, 2))
-            if (kv_pack_bd4 and cfg_rpa.num_slots == 4)
-            else ((cfg_rpa.num_slots, 4), (cfg_rpa.num_slots, 2))
+        wide_grp_limit = (
+            _STEP_C_SWABATCH_WIDE_GRP_MAX_BKV_ROWS
+            if kv_pack_bd4
+            else min(grp_limit, _STEP_C_SWABATCH_WIDE_GRP_MAX_BKV_ROWS)
         )
+        grp_cands = []
+        for g in (16, 8, 4, 2):
+            if g > cfg_rpa.swabatch_group_size:
+                continue
+            if g == 16:
+                slot_opts = (3,) if kv_pack_bd4 else (cfg_rpa.num_slots, 3)
+            elif g == 8:
+                slot_opts = (
+                    (3, 4)
+                    if (kv_pack_bd4 and cfg_rpa.num_slots == 4)
+                    else (cfg_rpa.num_slots, 3, 2)
+                )
+            elif g == 4 and kv_pack_bd4 and cfg_rpa.num_slots == 4:
+                slot_opts = (4, 3)
+            else:
+                slot_opts = (cfg_rpa.num_slots,)
+            for s in slot_opts:
+                if s <= cfg_rpa.num_slots and (s, g) not in grp_cands:
+                    grp_cands.append((s, g))
         for cand_slots, cand_grp in grp_cands:
             if (
                 cand_slots > cfg_rpa.num_slots
@@ -2964,6 +2984,7 @@ def resolve_step_c_rpa_plan(
                 or (eff_b % cand_grp) != 0
             ):
                 continue
+            cand_limit = wide_grp_limit if cand_grp > 4 else grp_limit
             cand_cfg = dataclasses.replace(
                 cfg_rpa, num_slots=cand_slots, swabatch_group_size=cand_grp
             )
@@ -2978,7 +2999,7 @@ def resolve_step_c_rpa_plan(
                     max_num_seqs=eff_seqs,
                 )
                 and cand_cfg.num_slots * cand_grp * cand_cfg.max_ring_pages * phys_page_rows
-                <= grp_limit
+                <= cand_limit
             ):
                 cfg_rpa = cand_cfg
                 eff_grp = cand_grp
@@ -3393,7 +3414,10 @@ def b1_moe_b2_rpad_chip_sharded_jax(
                 st["use_3scope"]
                 and (not kv_pack_bd4)
                 and (
-                    run_cfg.num_slots * run_slot_pg * phys_page_rows * 512
+                    run_cfg.num_slots
+                    * run_slot_pg
+                    * phys_page_rows
+                    * (4 * 128 * jnp.dtype(kv_cache_flat.dtype).itemsize)
                     + (
                         (2 * b_pad32 * q_heads * 128 * 4)
                         if (run_cfg.hoist_new_kv or run_grp_vec)

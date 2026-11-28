@@ -838,8 +838,8 @@ def test_wave10_flush_pending_step_c_kv_writes_grouping():
         ("m5d", 11, {"kv_pack_dense2": True, "kv_pack_bd4": False}, (True,) * 11, (32, 1, 4, 128), 27),
     ]
 
-    # Verify 45 layers chunk as [29, 16] and 27 layers chunk as [16, 11] (all in {2..16, 29}, <=64 args).
-    for n_chk, exp_k in ((45, [29, 16]), (27, [16, 11])):
+    # Verify 45 layers chunk as [29, 16], 46 layers (L0 + 45 SWA) chunk as [29, 17], and 27 as [16, 11].
+    for n_chk, exp_k in ((45, [29, 16]), (46, [29, 17]), (27, [16, 11])):
         p_big = [
             (
                 torch.zeros((8, 128, 1, 4, 128), dtype=torch.float8_e4m3fn),
@@ -2957,7 +2957,11 @@ def test_wave18_fuse_l0_and_fuse_l61_ops_and_killswitches():
             side_effect=lambda name, *a, **kw: exported.append(name) or (lambda *x: x),
         ),
         mock.patch.object(b1_moe_ops, "get_step_c_kv_write_op", return_value=lambda *x: None),
-        mock.patch.object(b1_moe_ops, "get_step_c_kv_write_multi_5d_op", return_value=lambda *x: None),
+        mock.patch.object(
+            b1_moe_ops,
+            "get_step_c_kv_write_multi_5d_op",
+            side_effect=lambda k, **kw: (exported.append(f"kv5d_{k}") or (lambda *x: None)),
+        ),
         mock.patch.object(b1_moe_ops, "get_step_c_kv_write_multi_6d_op", return_value=lambda *x: None),
     ):
         b1_moe_ops.prewarm_b1_moe_superkernel_ops(
@@ -2973,22 +2977,24 @@ def test_wave18_fuse_l0_and_fuse_l61_ops_and_killswitches():
         assert len(b1_moe_ops._EMBED_L0_RPAD_B16_OPS) == 1
         assert any("muse_w18_embed_l0_rpad_tp16_bd4" in n for n in exported)
         assert any("muse_w18_embed_l0_rpad_rep_b16_tp16_bd4" in n for n in exported)
+        assert "kv5d_17" in exported and "kv5d_29" in exported
 
-    # Verify 45 SWA layers (L0 + 44 SWA) flush as exactly 2 batched chunks [29, 16].
-    chunk_sizes: list[int] = []
+    # Verify 45 SWA layers flush as [29, 16] and 46 SWA layers (Fused L0 + 45 Step c SWA) flush as [29, 17].
     meta = tuple(torch.zeros((1,), dtype=torch.int32) for _ in range(5))
     kv0 = torch.zeros((16, 1, 4, 128), dtype=torch.float8_e4m3fn)
-    entries = [
-        (torch.zeros((2, 128, 1, 4, 128), dtype=torch.float8_e4m3fn), *meta, None, kv0, False, True, (False, True, 0, False, True), li)
-        for li in range(45)
-    ]
-    with mock.patch.object(
-        b1_moe_ops,
-        "get_step_c_kv_write_multi_5d_op",
-        side_effect=lambda k, **kw: (chunk_sizes.append(k) or (lambda *a: None)),
-    ):
-        b1_moe_ops.flush_pending_step_c_kv_writes(entries)
-    assert chunk_sizes == [29, 16]
+    for n_swa, want_chunks in ((45, [29, 16]), (46, [29, 17])):
+        chunk_sizes: list[int] = []
+        entries = [
+            (torch.zeros((2, 128, 1, 4, 128), dtype=torch.float8_e4m3fn), *meta, None, kv0, False, True, (False, True, 0, False, True), li)
+            for li in range(n_swa)
+        ]
+        with mock.patch.object(
+            b1_moe_ops,
+            "get_step_c_kv_write_multi_5d_op",
+            side_effect=lambda k, **kw: (chunk_sizes.append(k) or (lambda *a: None)),
+        ):
+            b1_moe_ops.flush_pending_step_c_kv_writes(entries)
+        assert chunk_sizes == want_chunks
 
 
 
@@ -3246,3 +3252,165 @@ def test_wave19_w32_b3_s12_wpre_hoist_unsplit_and_bkv_in_ici_aot():
             sh_a = tuple(jax.ShapeDtypeStruct(s.shape, s.dtype, sharding=NamedSharding(mesh8, P())) for s in sb_shapes)
             hlo_sb = fn_sb.lower(*sh_a).compile().as_text()
         assert "muse_w9_b1_moe_b2_b256_tp8_" in hlo_sb
+
+
+def test_wave19_w33_swabatch_g16_g8_step_c_plan_and_aot():
+    """Verify resolve_step_c_rpa_plan wide swabatch g16/g8 routing & TPU7x AOT <60/63 MiB."""
+    import dataclasses
+    from unittest import mock
+
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.experimental import topologies
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    import sglang_tpu.attention.pallas.rpa_v3_decode_fast as rpad
+    import sglang_tpu.muse_megakernel.decode.b1_moe_b2_kernel as mkb
+
+    orig_parse = rpad.parse_decode_fast_config
+    prod_mode = "w8,noadapt,hoistkv,g4k,foldcol,batch2,batch4"
+
+    # 1. Planner routing when parse_decode_fast_config emits wide swabatch_group_size (16/8) as in dec-rpa-w30.
+    plan_cases = [
+        # (label, B, sw, pps, phys, d2, bd4, req_g, want_s, want_g)
+        ("tp16_b64_bd4_1k", 64, None, 3, 128, False, True, 16, 3, 16),
+        ("tp16_b64_bd4_swa", 64, 2049, 8, 128, False, True, 16, 3, 16),
+        ("tp16_b256_bd4_swa", 256, 2049, 8, 128, False, True, 16, 3, 16),
+        ("tp8_b64_d2_1k_cap_g16_to_g8", 64, None, 3, 256, True, False, 16, 4, 8),
+        ("tp8_b64_d2_swa_g8", 64, 2049, 8, 256, True, False, 8, 3, 8),
+        ("tp8_b128_d2_swa_g8", 128, 2049, 8, 256, True, False, 8, 2, 8),
+        ("tp8_b256_d2_swa_g8", 256, 2049, 8, 256, True, False, 8, 2, 8),
+    ]
+    for label, B, sw, pps, phys, d2, bd4, req_g, want_s, want_g in plan_cases:
+        max_rp = 5 if sw is not None else pps
+        with mock.patch.object(
+            rpad,
+            "parse_decode_fast_config",
+            side_effect=lambda *a, _rg=req_g, _mrp=max_rp, **kw: dataclasses.replace(
+                orig_parse(*a, **kw),
+                loop_kind="swabatch",
+                num_slots=4,
+                swabatch_group_size=_rg,
+                max_ring_pages=_mrp,
+                hoist_new_kv=False,
+            ),
+        ):
+            cfg, ob, spg, gv, ok = mkb.resolve_step_c_rpa_plan(
+                prod_mode,
+                sliding_window=sw,
+                pages_per_seq=pps,
+                phys_page_rows=phys,
+                kv_pack_dense2=d2,
+                kv_pack_bd4=bd4,
+                b_tokens=B,
+                max_num_seqs=B,
+                allow_large_b=(B > 64),
+            )
+        assert ok is True and gv is True and ob is True, label
+        assert (cfg.num_slots, cfg.swabatch_group_size, spg) == (want_s, want_g, want_g * max_rp), (
+            label, cfg.num_slots, cfg.swabatch_group_size, spg,
+        )
+
+    # 2. Backward compatibility: cand_w9_29 swabatch_group_size == 4 unchanged.
+    cfg4, _, _, gv4, ok4 = mkb.resolve_step_c_rpa_plan(
+        prod_mode, sliding_window=2049, pages_per_seq=8, phys_page_rows=128,
+        kv_pack_bd4=True, b_tokens=256, max_num_seqs=256, allow_large_b=True,
+    )
+    assert ok4 is True and gv4 is True and (cfg4.num_slots, cfg4.swabatch_group_size) == (3, 4)
+
+    # 3. TPU7x AOT <60/63 MiB for unlocked wide swabatch Step (c) paths (incl. TP=16 B=256 BD4 g16 s3 with _dfp).
+    aot_cases = [
+        (16, 64, 3, -1, False, True, False, 16),
+        (16, 64, 8, 2049, False, True, True, 16),
+        (8, 64, 3, -1, True, False, False, 16),
+        (8, 128, 8, 2049, True, False, True, 8),
+    ]
+    for tp, B, pps, sw, d2, bd4, rope, req_g in aot_cases:
+        max_rp = 5 if sw > 0 else pps
+        with mock.patch.object(
+            rpad,
+            "parse_decode_fast_config",
+            side_effect=lambda *a, _rg=req_g, _mrp=max_rp, **kw: dataclasses.replace(
+                orig_parse(*a, **kw),
+                loop_kind="swabatch",
+                num_slots=4,
+                swabatch_group_size=_rg,
+                max_ring_pages=_mrp,
+                hoist_new_kv=False,
+            ),
+        ):
+            hlo = _compile_step_c_aot(
+                tp=tp, B=B, pps=pps, sw=sw, mode=prod_mode,
+                dense2=d2, bd4=bd4, dist_len=3, has_rope=rope, allow_large_b=(B > 64),
+            )
+            assert f"muse_w9_b1_moe_b2_rpad_b{B}_tp{tp}_" in hlo
+
+    # Explicit TP=16 B=256 BD4 SWA 2K g16 s3 AOT with free_params (_dfp) to verify <63 MiB headroom.
+    tpu16 = topologies.get_topology_desc("tpu7x:2x2x2", platform="tpu").devices
+    mesh16 = Mesh(np.array(sorted(tpu16, key=lambda d: (d.coords[2], d.coords[1], d.coords[0], d.core_on_chip))), ("model",))
+    B, H, pps = 256, 8192, 8
+    n_pg = B * pps
+    s16 = (
+        jax.ShapeDtypeStruct((1,), jnp.int32),
+        jax.ShapeDtypeStruct((32, H), jnp.float32),
+        jax.ShapeDtypeStruct((B, 512), jnp.bfloat16),
+        jax.ShapeDtypeStruct((512, H), jnp.float8_e4m3fn),
+        jax.ShapeDtypeStruct((H,), jnp.float32),
+        jax.ShapeDtypeStruct((H,), jnp.float32),
+        jax.ShapeDtypeStruct((H,), jnp.float32),
+        jax.ShapeDtypeStruct((H,), jnp.float32),
+        jax.ShapeDtypeStruct((H, 2048), jnp.float8_e4m3fn),
+        jax.ShapeDtypeStruct((2048,), jnp.float32),
+        jax.ShapeDtypeStruct((H, 256), jnp.bfloat16),
+        jax.ShapeDtypeStruct((4096,), jnp.float32),
+        jax.ShapeDtypeStruct((1, 256), jnp.float32),
+        jax.ShapeDtypeStruct((16, 4096, 8192), jnp.float4_e2m1fn),
+        jax.ShapeDtypeStruct((16, 8, 8192), jnp.bfloat16),
+        jax.ShapeDtypeStruct((16, 4096, 4096), jnp.float4_e2m1fn),
+        jax.ShapeDtypeStruct((16, 8, 4096), jnp.bfloat16),
+        jax.ShapeDtypeStruct((1, 4096), jnp.float32),
+        jax.ShapeDtypeStruct((4096, 4096), jnp.float8_e4m3fn),
+        jax.ShapeDtypeStruct((4096,), jnp.float32),
+        jax.ShapeDtypeStruct((H,), jnp.float32),
+        jax.ShapeDtypeStruct((H,), jnp.float32),
+        jax.ShapeDtypeStruct((H,), jnp.float32),
+        jax.ShapeDtypeStruct((H,), jnp.float32),
+        jax.ShapeDtypeStruct((H, 640), jnp.float8_e4m3fn),
+        jax.ShapeDtypeStruct((640,), jnp.float32),
+        jax.ShapeDtypeStruct((H, 512), jnp.float8_e4m3fn),
+        jax.ShapeDtypeStruct((512,), jnp.float32),
+        jax.ShapeDtypeStruct((B, 2, 128), jnp.float32),
+        jax.ShapeDtypeStruct((4,), jnp.float32),
+        jax.ShapeDtypeStruct((n_pg, 128, 1, 4, 128), jnp.float8_e4m3fn),
+        jax.ShapeDtypeStruct((B,), jnp.int32),
+        jax.ShapeDtypeStruct((n_pg,), jnp.int32),
+        jax.ShapeDtypeStruct((B + 1,), jnp.int32),
+        jax.ShapeDtypeStruct((B + 1,), jnp.int32),
+        jax.ShapeDtypeStruct((3,), jnp.int32),
+    )
+    with mock.patch.object(
+        rpad,
+        "parse_decode_fast_config",
+        side_effect=lambda *a, **kw: dataclasses.replace(
+            orig_parse(*a, **kw),
+            loop_kind="swabatch",
+            num_slots=4,
+            swabatch_group_size=16,
+            max_ring_pages=5,
+            hoist_new_kv=False,
+        ),
+    ):
+        fn16 = jax.jit(jax.shard_map(
+            lambda *a: mkb.b1_moe_b2_rpad_chip_sharded_jax(
+                *a[:28], a[30], a[31], a[32], a[33], a[34], a[35],
+                cos_sin_step=a[28], free_params=a[29],
+                world_size=16, rpa_sliding_window=2049, rpa_mode_str=prod_mode,
+                kv_pack_bd4=True, skip_kv_write=True, allow_large_b=True,
+                replica_cost_mode="tiles",
+            ),
+            mesh=mesh16, in_specs=(P(),) * len(s16), out_specs=(P(), P(), P()), check_vma=False,
+        ))
+        with jax.set_mesh(mesh16):
+            sh16 = tuple(jax.ShapeDtypeStruct(s.shape, s.dtype, sharding=NamedSharding(mesh16, P())) for s in s16)
+            hlo16 = fn16.lower(*sh16).compile().as_text()
+        assert "muse_w9_b1_moe_b2_rpad_b256_tp16_" in hlo16

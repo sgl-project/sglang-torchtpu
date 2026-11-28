@@ -1116,8 +1116,9 @@ def flush_pending_step_c_kv_writes(pending_writes: list) -> None:
 
         chunks: list[list] = []
         for run in runs:
-            # Emit prewarmed chunk sizes from {1} U {2..16} U {29}: split 17..28 as (16, rem - 16).
-            if 17 <= len(run) <= 28:
+            # Emit prewarmed chunk sizes from {1} U {2..17} U {29}: split 18..28 as (16, rem - 16)
+            # so 46 SWA layers (Fused L0 + 45 Step c SWA) flush in 2 launches [29, 17] (no 1-layer tail).
+            if 18 <= len(run) <= 28:
                 chunks.append(run[:16])
                 chunks.append(run[16:])
             else:
@@ -1734,7 +1735,7 @@ def prewarm_b1_moe_superkernel_ops(
                             kv_pack_dense2=eff_d2, kv_pack_bd4=eff_bd4
                         )
                     else:
-                        for _k5 in (*range(2, 17), 29):
+                        for _k5 in (*range(2, 18), 29):
                             get_step_c_kv_write_multi_5d_op(
                                 _k5, kv_pack_dense2=eff_d2, kv_pack_bd4=eff_bd4
                             )
