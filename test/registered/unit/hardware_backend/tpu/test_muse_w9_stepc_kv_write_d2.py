@@ -2460,8 +2460,8 @@ def test_wave18_step_c_d2_swa_g4_and_shared64_shsub_aot():
         shared_group_size=64,
         has_shared_prefix=True,
     )
-    assert (ok_sh_d2, cfg_sh_d2.chunk_sz, cfg_sh_d2.shared_q_tile, cfg_sh_d2.sh_sub_chunk, cfg_sh_d2.fold_col, cfg_sh_d2.priv_group_size) == (
-        True, 4096, 512, 2048, True, 1
+    assert (ok_sh_d2, cfg_sh_d2.chunk_sz, cfg_sh_d2.shared_q_tile, cfg_sh_d2.sh_sub_chunk, cfg_sh_d2.fold_col, cfg_sh_d2.priv_group_size, cfg_sh_d2.hoist_new_kv) == (
+        True, 8192, 512, 2048, True, 1, True
     )
 
     cfg_sh_bd4, _, slot_sh_bd4, _, ok_sh_bd4 = resolve_step_c_rpa_plan(
@@ -2475,8 +2475,8 @@ def test_wave18_step_c_d2_swa_g4_and_shared64_shsub_aot():
         shared_group_size=64,
         has_shared_prefix=True,
     )
-    assert (ok_sh_bd4, cfg_sh_bd4.chunk_sz, cfg_sh_bd4.shared_q_tile, cfg_sh_bd4.sh_sub_chunk, cfg_sh_bd4.fold_col, cfg_sh_bd4.priv_group_size, slot_sh_bd4) == (
-        True, 4096, 512, 2048, True, 4, 32
+    assert (ok_sh_bd4, cfg_sh_bd4.chunk_sz, cfg_sh_bd4.shared_q_tile, cfg_sh_bd4.sh_sub_chunk, cfg_sh_bd4.fold_col, cfg_sh_bd4.priv_group_size, cfg_sh_bd4.hoist_new_kv, slot_sh_bd4) == (
+        True, 8192, 512, 2048, True, 4, True, 32
     )
 
     for tp_a, b_a, pps_a, sw_a, d2_a, bd4_a, dist_a, rope_a, mode_a in (
@@ -2569,7 +2569,7 @@ def test_wave17_step_c_ring_grp_and_priv_grp_aot_and_interpret():
         shared_group_size=64,
         has_shared_prefix=True,
     )
-    assert ok_sh_d2 is True and (cfg_sh_d2.priv_group_size, cfg_sh_d2.priv_blk_pages, slot_sh_d2) == (1, 0, 8)
+    assert ok_sh_d2 is True and (cfg_sh_d2.priv_group_size, cfg_sh_d2.priv_blk_pages, slot_sh_d2) == (1, 0, 16)
 
     for tp_a, b_a, pps_a, d2_a, bd4_a, dist_a, mode_a in (
         (8, 64, 20, True, False, 3, "w8,c1024,batchfull,dyn4k"),

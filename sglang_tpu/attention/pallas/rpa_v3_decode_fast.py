@@ -487,26 +487,50 @@ def parse_decode_fast_config(
     fold_col = ("foldcol" in toks_cfg or gear_4k) and not no_fold
     fold_128 = ("fold128" in toks_cfg or fold_col) and not no_fold
     no_mask0 = "nomask0" in toks_cfg or gear_4k
+    auto_swa_grp = (
+        b_tokens is not None
+        and b_tokens >= 32
+        and not u4_flat
+        and (kv_pack_bd4 or kv_pack_dense2)
+        and (batch_full or use_w7)
+        and decode_query_size == 1
+        and "batch2" not in toks_cfg
+        and "b2" not in toks_cfg
+        and "batch4" not in toks_cfg
+        and "b4" not in toks_cfg
+    )
+    auto_swa_b2b4 = (
+        b_tokens is not None
+        and b_tokens >= 64
+        and not u4_flat
+        and (kv_pack_bd4 or kv_pack_dense2)
+        and decode_query_size == 1
+        and ("batch4" in toks_cfg or "b4" in toks_cfg)
+        and ("batch2" in toks_cfg or "b2" in toks_cfg)
+    )
     swabatch_group_size = (
         1
         if ("nobatch4" in toks_cfg or "b1" in toks_cfg)
         else (
-            4
+            16
             if (
-                "batch4" in toks_cfg
-                or "b4" in toks_cfg
-                or (
-                    "batch2" not in toks_cfg
-                    and "b2" not in toks_cfg
-                    and not u4_flat
-                    and (kv_pack_bd4 or kv_pack_dense2)
-                    and b_tokens is not None
-                    and b_tokens >= 32
-                    and (batch_full or use_w7)
-                    and decode_query_size == 1
+                "batch16" in toks_cfg
+                or "b16" in toks_cfg
+                or ((auto_swa_grp or auto_swa_b2b4) and b_tokens >= 64 and kv_pack_bd4)
+            )
+            else (
+                8
+                if (
+                    "batch8" in toks_cfg
+                    or "b8" in toks_cfg
+                    or ((auto_swa_grp or auto_swa_b2b4) and b_tokens >= 64 and kv_pack_dense2)
+                )
+                else (
+                    4
+                    if ("batch4" in toks_cfg or "b4" in toks_cfg or auto_swa_grp)
+                    else (2 if ("batch2" in toks_cfg or "b2" in toks_cfg) else 1)
                 )
             )
-            else (2 if ("batch2" in toks_cfg or "b2" in toks_cfg) else 1)
         )
     )
     fine_gears = (
@@ -527,7 +551,7 @@ def parse_decode_fast_config(
     kv_cap_tokens = pages_per_seq * page_size
     if sliding_window is not None:
         win_pages = cdiv(sliding_window + page_size - 1, page_size)
-        num_slots = 4
+        num_slots = 3 if (kv_pack_bd4 and swabatch_group_size >= 16) else 4
         chunk_sz = max(default_v2_chunk if use_v2 else 256, page_size)
         if win_pages * page_size <= 4096:
             if decode_query_size > 1:
@@ -548,14 +572,21 @@ def parse_decode_fast_config(
         chunk_sz = max(default_v2_chunk if use_v2 else 256, page_size)
         if batch_full and shared_group == 0 and decode_query_size == 1 and kv_cap_tokens <= 4096:
             loop_kind = "swabatch"
+            if kv_pack_bd4 and swabatch_group_size >= 16:
+                num_slots = 3
         elif shared_group > 0 and decode_query_size == 1:
             loop_kind = f"shared{shared_group}"
             use_sh_8k = (
-                (shared_group == 8 or (shared_group in (16, 32) and page_size >= 512))
+                (
+                    shared_group == 8
+                    or (shared_group in (16, 32) and page_size >= 512)
+                    or (shared_group >= 64 and page_size >= 512 and batch_full)
+                )
                 and kv_cap_tokens > 16384
                 and "c2048" not in toks_cfg
+                and "shc4096" not in toks_cfg
             )
-            chunk_sz = 8192 if use_sh_8k else 2048
+            chunk_sz = 8192 if use_sh_8k else (4096 if "shc4096" in toks_cfg else 2048)
             num_slots = (4 if shared_group == 16 else 3) if use_sh_8k else 4
             coalesce_dma = True
         elif (
@@ -644,6 +675,10 @@ def parse_decode_fast_config(
                 "dyn2ku",
                 "u4flat",
                 "ring8k",
+                "batch16",
+                "b16",
+                "batch8",
+                "b8",
                 "batch4",
                 "b4",
                 "batch2",
@@ -654,6 +689,7 @@ def parse_decode_fast_config(
                 "nod2grp",
                 "noshsub",
                 "forceq256",
+                "shc4096",
                 "b1",
                 "shsub1k",
                 "shsub2k",
@@ -678,13 +714,18 @@ def parse_decode_fast_config(
                         (parsed_c == 1024 and ("w8" in toks_cfg or "w7" in toks_cfg or loop_kind == "shared16"))
                         or (
                             parsed_c == 4096
-                            and (
-                                loop_kind == "shared8"
-                                or (loop_kind in ("shared16", "shared32") and page_size >= 512)
-                            )
                             and kv_cap_tokens > 16384
-                            and loop_kind not in toks_cfg
                             and "shc4096" not in toks_cfg
+                            and (
+                                (
+                                    (
+                                        loop_kind == "shared8"
+                                        or (loop_kind in ("shared16", "shared32") and page_size >= 512)
+                                    )
+                                    and loop_kind not in toks_cfg
+                                )
+                                or (loop_kind == "shared64" and batch_full and page_size >= 512)
+                            )
                         )
                     )
                 ):
@@ -774,8 +815,10 @@ def parse_decode_fast_config(
         or (b_tokens is not None and b_tokens >= 32 and "nod2grp" not in toks_cfg)
     )
     sh_hkv_env = getattr(envs, "SGLANG_TPU_RPA_V3_SHARED_HOISTKV", None)
-    shared_hoistkv = bool(sh_hkv_env is not None and sh_hkv_env.get())
     eff_shared_group = shared_group if (sliding_window is None and loop_kind.startswith("shared")) else 0
+    shared_hoistkv = bool(sh_hkv_env is not None and sh_hkv_env.get()) or (
+        eff_shared_group >= 64 and batch_full and decode_query_size == 1
+    )
     if eff_shared_group > 0 and decode_query_size == 1 and shared_hoistkv and "nohoistkv" not in toks_cfg:
         hoist_new_kv = True
     eff_swabatch_grp = (
@@ -4509,7 +4552,7 @@ def _run_rpad_vmem_core(
                     )
                     if (
                         not use_split_bd4
-                        and not mask_valid
+                        and (not mask_valid or n_seq_t >= 32)
                         and cfg.sh_sub_chunk > 0
                         and (eff_width % cfg.sh_sub_chunk) == 0
                         and eff_width > cfg.sh_sub_chunk
@@ -4527,8 +4570,13 @@ def _run_rpad_vmem_core(
                             else eff_sc
                         )
                         for sub_off in range(0, eff_width, sub_w):
-                            k_pair = _bkv_fp8_chunk(slot, sub_off, sub_w, kind="k")
+                            k_pair = _bkv_fp8_chunk(slot, sub_off, sub_w, kind="k", valid_tokens=valid_arg)
                             s_e, s_o = _bd4_logits_split(q_s, k_pair, n_seq_t, width_s)
+                            if mask_valid:
+                                c_e = _bd4_c_even_iota(sub_off, width_s, out_w)
+                                c_o = c_e + 1
+                                s_e = jnp.where(c_e < valid, s_e, _MASK_LOGIT)
+                                s_o = jnp.where(c_o < valid, s_o, _MASK_LOGIT)
                             s_mx = jnp.maximum(s_e, s_o)
                             blk_max = jnp.max(
                                 _fold128_op(s_mx, jnp.maximum) if use_f128_sh else s_mx,
@@ -4576,7 +4624,7 @@ def _run_rpad_vmem_core(
                                 p_dot = p_bd.astype(jnp.bfloat16)
                             else:
                                 p_dot = p_bd
-                            v_pair = _bkv_fp8_chunk(slot, sub_off, sub_w, kind="v")
+                            v_pair = _bkv_fp8_chunk(slot, sub_off, sub_w, kind="v", valid_tokens=valid_arg)
                             o_bd = jnp.matmul(
                                 p_dot, v_pair, preferred_element_type=jnp.float32
                             ).reshape(n_seq_t, 2, 8, 128)
@@ -4754,7 +4802,7 @@ def _run_rpad_vmem_core(
 
                 if (
                     not use_split
-                    and not mask_valid
+                    and (not mask_valid or q_w > 256)
                     and cfg.sh_sub_chunk > 0
                     and (eff_width % cfg.sh_sub_chunk) == 0
                     and eff_width > cfg.sh_sub_chunk
@@ -4764,8 +4812,11 @@ def _run_rpad_vmem_core(
                     cur_l = state_vmem_ref[1, lanes, :]
                     cur_a = state_vmem_ref[2, lanes, :]
                     for sub_off in range(0, eff_width, sub_w):
-                        k_sub = _bkv_fp8_chunk(slot, sub_off, sub_w, kind="k")
+                        k_sub = _bkv_fp8_chunk(slot, sub_off, sub_w, kind="k", valid_tokens=valid_arg)
                         s_sub = jnp.matmul(q_s, k_sub.T, preferred_element_type=jnp.float32)
+                        if mask_valid:
+                            valid_col = _col_iota(sub_off, sub_w, q_w) < valid
+                            s_sub = jnp.where(valid_col, s_sub, _MASK_LOGIT)
                         blk_mx_s = jnp.max(
                             _fold128_op(s_sub, jnp.maximum) if cfg.fold_128 else s_sub,
                             axis=1,
@@ -4803,7 +4854,7 @@ def _run_rpad_vmem_core(
                             p_d_s = p_s.astype(jnp.bfloat16)
                         else:
                             p_d_s = p_s
-                        v_sub = _bkv_fp8_chunk(slot, sub_off, sub_w, kind="v")
+                        v_sub = _bkv_fp8_chunk(slot, sub_off, sub_w, kind="v", valid_tokens=valid_arg)
                         pv_s = jnp.matmul(p_d_s, v_sub, preferred_element_type=jnp.float32)
                         cur_m = m_s
                         cur_l = cur_l * alpha_s + l_s * l_sc_s
