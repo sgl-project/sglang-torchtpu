@@ -253,7 +253,10 @@ costs never shrinks the chunks behind long prefixes. The value is set per
 deployment from its startup profile, above the modeled top-bucket step that the
 `TPU pipeline chunks` log line implies (the 8192 entry plus attention × 8192² / 2 with
 `--chunked-prefill-size 8192`).
-Startup fails on every rank if the ranks disagree on it.
+With a fixed target the quarter-step chunk floor also counts the tokens
+already in the step, so a first chunk behind another request's last chunk takes
+only what the target leaves. Startup fails on every rank if the ranks disagree
+on the value.
 
 ## Notes
 

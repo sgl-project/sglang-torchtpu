@@ -105,6 +105,8 @@ class StepCostModel:
     granularity: int
     # (pairs, bq, bkv) the attention kernel schedules per step, or None.
     schedule: tuple[int, int, int] | None = None
+    # Whether the quarter-step floor counts the tokens already in the step.
+    floor_counts_step: bool = False
 
     @classmethod
     def fit(
@@ -123,7 +125,9 @@ class StepCostModel:
         prefix-free top-bucket step (slowest ladder entry plus largest slope)
         when that is slower, so a full chunk always fits. While ``target_ms``
         covers that step, profiled costs never move the target, and a kernel
-        speedup that lowers the fitted ladder or slope never shrinks a chunk."""
+        speedup that lowers the fitted ladder or slope never shrinks a chunk.
+        A fixed target also makes the quarter-step floor count the step's
+        tokens (see ``chunk``)."""
         if target_ms is None and slack < 0:
             raise ValueError(f"the chunk slack must not be negative: {slack}")
         if not stage_samples:
@@ -172,7 +176,15 @@ class StepCostModel:
             )
         else:
             target = max(float(target_ms), full_step)
-        return cls(buckets, linear, attn, target, int(granularity), schedule)
+        return cls(
+            buckets,
+            linear,
+            attn,
+            target,
+            int(granularity),
+            schedule=schedule,
+            floor_counts_step=target_ms is not None,
+        )
 
     def pairs(self, chunk: int, prefix: int) -> int:
         """(query block, KV block) pairs the attention kernel schedules for
@@ -204,6 +216,9 @@ class StepCostModel:
         that does not finish the request leaves the step total on a granule
         multiple and is at least a quarter of a step when the step has the
         room, since a run of tiny steps costs more than the balance it buys;
+        with ``floor_counts_step`` the floor applies to the step total
+        instead, so in a step that already holds a quarter step the chunk
+        takes only what the target leaves;
         ``step_limit`` keeps the step within a smaller bucket, and with a
         schedule capacity the chunk's attention pairs must fit beside the
         ``step_schedule`` pairs already in the step. 0 when nothing
@@ -214,7 +229,9 @@ class StepCostModel:
         def attn_ms(tokens: int) -> float:
             return attn * (tokens * prefix + tokens * tokens / 2)
 
-        floor = min(remaining, self.buckets[-1] // 4)
+        floor = self.buckets[-1] // 4
+        if self.floor_counts_step:
+            floor -= step_tokens
         for bucket in self.buckets:
             if step_limit is not None and bucket > step_limit:
                 continue
@@ -235,7 +252,7 @@ class StepCostModel:
                 if attn_ms(fit + 1) <= budget:
                     fit += 1
             if fit < remaining:
-                fit = min(max(fit, floor), room)
+                fit = min(max(fit, floor), remaining, room)
             if fit < remaining:
                 total = step_tokens + fit
                 fit = total - total % self.granularity - step_tokens
@@ -259,6 +276,8 @@ class StepCostModel:
         if self.schedule is not None:
             pairs, bq, bkv = self.schedule
             text += f", at most {pairs} attention pairs ({bq}x{bkv}) per step"
+        if self.floor_counts_step:
+            text += ", quarter-step floor counts the step's tokens"
         return text
 
 

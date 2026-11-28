@@ -425,7 +425,9 @@ class TpuEnvs:
     SGLANG_TPU_PP_DYNAMIC_CHUNKS = EnvBool(True)
     SGLANG_TPU_PP_CHUNK_SLACK = EnvFloat(0.1)
     # A fixed step target in ms, raised to the prefix-free top-bucket step when
-    # that is slower; unset sizes it from the top bucket plus the slack.
+    # that is slower; unset sizes it from the top bucket plus the slack. A fixed
+    # target also makes the quarter-step chunk floor count the tokens already in
+    # the step.
     SGLANG_TPU_PP_CHUNK_TARGET_MS = EnvFloat(None)
 
     # PD disaggregation tracing

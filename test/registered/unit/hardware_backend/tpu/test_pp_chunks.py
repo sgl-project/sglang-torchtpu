@@ -2,6 +2,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+from dataclasses import replace
+
 import pytest
 
 from sglang.srt.runtime_context import get_context
@@ -214,6 +216,56 @@ def test_a_clipped_chunk_is_at_least_a_quarter_step():
     # The floor never exceeds the room left in the step.
     assert model.chunk(200 * 1024, 16384, 14336, 0.0, 0.0) == 2048
     assert model.chunk(200 * 1024, 16384, 16384, 0.0, 0.0) == 0
+    # Under the top-bucket target the floor ignores the step's tokens.
+    assert not model.floor_counts_step
+    deep = 600 * 1024
+    assert model.chunk(deep, 16384, 2048, 0.0, 2048.0**2) == 4096
+
+
+def test_only_a_fixed_target_makes_the_floor_count_the_step():
+    def counts(target_ms):
+        return StepCostModel.fit([_stage()], 0.1, 4096, target_ms=target_ms)
+
+    assert not counts(None).floor_counts_step
+    assert counts(250.0).floor_counts_step
+    note = "quarter-step floor counts the step's tokens"
+    assert note in counts(250.0).describe()
+    assert note not in counts(None).describe()
+
+
+def test_a_clipped_chunk_brings_the_step_to_a_quarter_step():
+    model = replace(_model(granularity=2048), floor_counts_step=True)
+    deep = 600 * 1024  # the time budget alone allows under a granule here
+    assert model.chunk(deep, 16384, 0, 0.0, 0.0) == 4096
+    # The floor counts the tokens already in the step.
+    assert model.chunk(deep, 16384, 2048, 0.0, 2048.0**2) == 2048
+    assert model.chunk(deep, 3000, 2048, 0.0, 2048.0**2) == 2048
+    # A step holding a few decode tokens keeps the floor, and still finishes
+    # a short request.
+    assert model.chunk(deep, 16384, 37, 0.0, 37.0) == 4096 - 37
+    assert model.chunk(deep, 3000, 37, 0.0, 37.0) == 3000
+    # A step that already holds a quarter step gets only what the target
+    # leaves; a full step has no room.
+    assert model.chunk(deep, 16384, 14336, 0.0, 0.0) == 0
+    assert model.chunk(deep, 16384, 16384, 0.0, 0.0) == 0
+
+
+def test_a_chunk_behind_another_requests_last_chunk_keeps_the_step_on_target():
+    # One pipeline stage's fit; prompts of 131,072 tokens with 117,760 cached
+    # end each 13,312-token tail on a 3,072-token last chunk, and the next
+    # request's first chunk joins that step.
+    buckets = [512] + list(range(1024, 8193, 1024))
+    ladder = [15.6, 19.4, 28.8, 38.5, 48.6, 59.4, 69.0, 82.0, 91.8]
+    model = StepCostModel(buckets, dict(zip(buckets, ladder)), 8.755e-8, 104.2, 1024)
+    step = (3072, 3072 * 128000.0, 3072.0**2)
+    # A floor that ignores the step's tokens raises the chunk to a quarter
+    # step and takes the step past the target.
+    assert model.chunk(117760, 13312, *step) == 2048
+    model = replace(model, floor_counts_step=True)
+    chunk = model.chunk(117760, 13312, *step)
+    assert chunk == 1024
+    pairs, squares = step[1] + chunk * 117760.0, step[2] + chunk**2
+    assert model.step_ms(4096, pairs, squares) <= model.target_ms
 
 
 def test_a_step_limit_holds_the_step_to_a_smaller_bucket():
