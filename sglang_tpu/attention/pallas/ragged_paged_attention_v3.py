@@ -843,6 +843,28 @@ def _stationary_q_v2_process(
     def _roll64(arr_u32):
         return jnp.roll(arr_u32, 64, axis=1) if interpret else pltpu.roll(arr_u32, shift=64, axis=1)
 
+    def _write_bd4_pair_sq1(dst_h0, pair_128):
+        if use_fp8_kv:
+            k_f = pltpu.bitcast(pair_128.astype(jnp.uint8), kv_dtype)
+            k_sub_ref[0, dst_h0] = k_f[:, :64]
+            k_sub_ref[0, dst_h0 + 1] = k_f[:, 64:]
+        else:
+            k_b = pltpu.bitcast(pair_128.astype(jnp.uint8), kv_dtype).astype(
+                jnp.bfloat16
+            )
+            k_sub_ref[0, dst_h0] = k_b[:, :64]
+            k_sub_ref[0, dst_h0 + 1] = k_b[:, 64:]
+        v_bf16 = pltpu.bitcast(
+            (pair_128 >> jnp.uint32(8)).astype(jnp.uint8), kv_dtype
+        ).astype(jnp.bfloat16)
+        vt_128 = jnp.swapaxes(v_bf16, 0, 1)
+        if use_vt_fp8:
+            vt_sub_ref[0, dst_h0] = vt_128[:64, :].astype(kv_dtype)
+            vt_sub_ref[0, dst_h0 + 1] = vt_128[64:, :].astype(kv_dtype)
+        else:
+            vt_sub_ref[0, dst_h0] = vt_128[:64, :]
+            vt_sub_ref[0, dst_h0 + 1] = vt_128[64:, :]
+
     def _unpack_full_bkv_block(bkv_sem_idx, slot_base_s=0):
         if kv_pack_bd4:
             kv_u32_all = (
@@ -852,12 +874,16 @@ def _stationary_q_v2_process(
                 .at[bkv_sem_idx]
                 .reshape((bkv_sz // 4) * bkv_stride, 128)
             )
+            use_bd4_sq1_fast = use_mk128 and use_k64 and sq_kv_heads == 1
 
             def _emit_bd4_slice(s_loc):
                 pair_u32 = _bkv_slice_u32(kv_u32_all, bkv_sem_idx, s_loc * 64, 64)
                 lo = pair_u32 & jnp.uint32(0xFFFF)
                 hi = pair_u32 >> jnp.uint32(16)
                 even_128 = jnp.concatenate([lo, hi], axis=0)
+                if use_bd4_sq1_fast:
+                    _write_bd4_pair_sq1(2 * (slot_base_s + s_loc), even_128)
+                    return
                 odd_128 = jnp.concatenate([_roll64(lo), _roll64(hi)], axis=0)
                 if use_mk128:
                     _write_unpacked_kv_slice(2 * (slot_base_s + s_loc), even_128)
@@ -867,7 +893,7 @@ def _stationary_q_v2_process(
                         slot_base_s + s_loc, jnp.concatenate([even_128, odd_128], axis=0)
                     )
 
-            if use_mk128 and not use_unroll_up:
+            if use_mk128 and (not use_unroll_up or (use_bd4_sq1_fast and num_s > 16)):
                 @pl.loop(0, num_s, unroll=False)
                 def _up_mk_bd4(s_loc):
                     _emit_bd4_slice(s_loc)
@@ -979,6 +1005,12 @@ def _stationary_q_v2_process(
             def _up_partial_bd4():
                 s_lim = cdiv(valid_keys, 256)
                 r_64 = lax.broadcasted_iota(jnp.int32, (64, 128), 0)
+                use_bd4_sq1_part = use_mk128 and use_k64 and sq_kv_heads == 1
+                is_lo_64 = (
+                    lax.broadcasted_iota(jnp.int32, (64, 128), 1) < 64
+                    if use_bd4_sq1_part
+                    else None
+                )
 
                 @pl.loop(0, s_lim, unroll=False)
                 def _up_one_bd4(s_loc):
@@ -986,6 +1018,16 @@ def _stationary_q_v2_process(
                     lo = pair_u32 & jnp.uint32(0xFFFF)
                     hi = pair_u32 >> jnp.uint32(16)
                     tok0 = s_loc * 256 + 4 * r_64
+                    if use_bd4_sq1_part:
+                        tok_lo = jnp.where(is_lo_64, tok0, tok0 + 1)
+                        tok_hi = jnp.where(is_lo_64, tok0 + 2, tok0 + 3)
+                        u_lo = jnp.where(tok_lo < valid_keys, lo, jnp.uint32(0))
+                        u_hi = jnp.where(tok_hi < valid_keys, hi, jnp.uint32(0))
+                        _write_bd4_pair_sq1(
+                            2 * (slot_base_s + s_loc),
+                            jnp.concatenate([u_lo, u_hi], axis=0),
+                        )
+                        return
                     u0 = jnp.where(tok0 < valid_keys, lo, jnp.uint32(0))
                     u1 = jnp.where((tok0 + 1) < valid_keys, _roll64(lo), jnp.uint32(0))
                     u2 = jnp.where((tok0 + 2) < valid_keys, hi, jnp.uint32(0))
