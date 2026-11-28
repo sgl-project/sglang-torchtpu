@@ -2383,8 +2383,13 @@ def fp8_lm_head_distributed_topk_jax(
                 logit_scale=logit_scale,
                 tn=1024 if tn is None else tn,
             )
-        eff_tn = (1024 if fast_topk else 512) if tn is None else tn
+        # Preserve exact lowest-ID col-0 tie-breaking unless fast_topk is explicitly enabled;
+        # Wave-17 silicon: 4-hop XOR butterfly cuts TP=16 Top-64 -10.5..-11.5 us with id_diff=0,
+        # and tn=1024 + XOR butterfly cuts TP=8 B>=64 Top-64 -4.0..-5.7 us with id_diff=0.
+        tp8_large_b = world_size == 8 and x.shape[0] > 32
+        eff_tn = (1024 if (fast_topk or tp8_large_b) else 512) if tn is None else tn
         eff_tie = False if (fast_topk and k > 1) else exact_tie_break
+        eff_xor_bfly = bool(fast_topk or world_size == 16 or tp8_large_b)
         return fp8_lm_head_fused_topk64_jax(
             x,
             w8k,
@@ -2398,7 +2403,7 @@ def fp8_lm_head_distributed_topk_jax(
             logit_scale=logit_scale,
             tn=eff_tn,
             exact_tie_break=eff_tie,
-            use_xor_butterfly=bool(fast_topk),
+            use_xor_butterfly=eff_xor_bfly,
         )
     local_logits = fp8_lm_head_zsp_jax(x, w8k, scale, out_bf16=False, logit_scale=logit_scale)
     from sglang_tpu.kernels.distributed_topk import distributed_top_k as orig_dist_topk
