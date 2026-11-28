@@ -208,10 +208,11 @@ def _agreed_target_ms(*, world_group: Any) -> float | None:
     field = envs.SGLANG_TPU_PP_CHUNK_TARGET_MS
     raw = os.getenv(field.name)
     target_ms, error = None, None
-    # Parsed here, not with get(), which warns and falls back to the default;
-    # "None" is how the env API records an explicit unset.
+    # Parsed here, not with get(), which warns and falls back to the default.
+    # An empty value and "None" (the env API's explicit unset) mean unset.
     try:
-        target_ms = None if raw in (None, str(None)) else field.parse(raw)
+        unset = raw is None or not raw.strip() or raw == str(None)
+        target_ms = None if unset else field.parse(raw)
     except ValueError as exc:
         error = str(exc)
     if target_ms is not None and not is_step_target_ms(target_ms):
@@ -238,7 +239,8 @@ def profile_and_install_cost_model(scheduler: Scheduler) -> None:
         return
     if not get_exec().graph.enable_torch_compile:
         raise ValueError("TPU pipeline dynamic chunks require --enable-torch-compile.")
-    # Agreed before any rank-local check can stop one rank short of it.
+    # Agreed before the rank-local slack check below, so a bad target fails
+    # every rank; the slack itself is still read per rank.
     target_ms = _agreed_target_ms(world_group=scheduler.world_group)
     if target_ms is None and envs.SGLANG_TPU_PP_CHUNK_SLACK.get() < 0:
         raise ValueError("SGLANG_TPU_PP_CHUNK_SLACK must be nonnegative.")

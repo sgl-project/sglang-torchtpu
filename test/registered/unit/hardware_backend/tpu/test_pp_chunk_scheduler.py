@@ -424,8 +424,11 @@ def test_a_malformed_step_target_fails_startup(monkeypatch):
         monkeypatch.setenv("SGLANG_TPU_PP_CHUNK_TARGET_MS", raw)
         with pytest.raises(ValueError, match=message):
             pp_chunk_scheduler._agreed_target_ms(world_group=group)
-    # The env API's explicit unset is not malformed.
+    # The env API's explicit unset and an empty value are not malformed.
     with envs.SGLANG_TPU_PP_CHUNK_TARGET_MS.override(None):
+        assert pp_chunk_scheduler._agreed_target_ms(world_group=group) is None
+    for raw in ("", "  "):
+        monkeypatch.setenv("SGLANG_TPU_PP_CHUNK_TARGET_MS", raw)
         assert pp_chunk_scheduler._agreed_target_ms(world_group=group) is None
 
 
