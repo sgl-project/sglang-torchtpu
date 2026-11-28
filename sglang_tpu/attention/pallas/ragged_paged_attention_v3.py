@@ -2127,7 +2127,7 @@ def _stationary_q_v2_process(
         mask_lo_u32 = jnp.where(is_lo_ep, jnp.uint32(0xFFFFFFFF), jnp.uint32(0))
         mask_hi_u32 = jnp.where(is_lo_ep, jnp.uint32(0), jnp.uint32(0xFFFFFFFF))
 
-        def _pair_col_f32(a0, a1, l0, l1):
+        def _pair_col_bf16(a0, a1, l0, l1):
             if use_sub8_l:
                 l0 = jnp.broadcast_to(jnp.sum(l0, axis=0, keepdims=True), (8, tq_sz))
                 l1 = jnp.broadcast_to(jnp.sum(l1, axis=0, keepdims=True), (8, tq_sz))
@@ -2152,7 +2152,7 @@ def _stationary_q_v2_process(
                 .astype(jnp.bfloat16)
             )
             pair_t = jnp.concatenate([o0_t, o1_t], axis=0)
-            return jnp.swapaxes(pair_t, 0, 1).astype(jnp.float32) + 0.0
+            return jnp.swapaxes(pair_t, 0, 1)
 
         def _pack_pair_out(a0, a1, l0, l1, s):
             if use_sub8_l:
@@ -2247,12 +2247,12 @@ def _stationary_q_v2_process(
                             c_sl = slice(s * 128, (s + 1) * 128)
                             col_s = jnp.concatenate(
                                 [
-                                    _pair_col_f32(
+                                    _pair_col_bf16(
                                         acc_ref[h0, :, t_sl],
                                         acc_ref[h1, :, t_sl],
                                         l_ref[h0, :, t_sl],
                                         l_ref[h1, :, t_sl],
-                                    ),
+                                    ).astype(jnp.float32),
                                     zero_tail_st,
                                 ],
                                 axis=0,
@@ -2343,12 +2343,12 @@ def _stationary_q_v2_process(
                         tq_start = tq_idx * tq_sz
                         t_sl = pl.ds(tq_start, tq_sz)
                         parts_s.append(
-                            _pair_col_f32(
+                            _pair_col_bf16(
                                 acc_ref[h0, :, t_sl],
                                 acc_ref[h1, :, t_sl],
                                 l_ref[h0, :, t_sl],
                                 l_ref[h1, :, t_sl],
-                            )
+                            ).astype(jnp.float32)
                         )
                     col_s = jnp.concatenate([*parts_s, zero_tail_16], axis=0)
                     col_s = jnp.where(row_iota_ep < valid_ep, col_s, 0.0)
@@ -2543,7 +2543,7 @@ def _stationary_q_v2_process(
                     bo_sem_idx,
                     :tq_sz,
                     c_sl_sw,
-                ] = _pair_col_f32(a0, a1, l0, l1).astype(jnp.bfloat16)
+                ] = _pair_col_bf16(a0, a1, l0, l1)
             else:
                 _write_bo_pair_u32(
                     out_u32_ref,
@@ -3428,6 +3428,19 @@ def _stationary_q_v2_process(
             )
             n_qgrps_per_bq = actual_bq_sz // prefix_q_grp_sz
             n_i32_topk = max(prefix_topk_slices // 4, 1)
+            use_tail_g8_sparse = (
+                use_prefix_fast
+                and use_prefix_topk_inner
+                and prefix_topk_tail_local > 0
+                and use_mk128
+                and use_k64
+                and use_fp8_kv
+                and "gqa8" in prefill_opts
+                and not use_fp8_qk_dyn
+                and not use_vt_fp8
+                and (prefix_q_grp_sz % 256 == 0)
+                and probe != "nocompute"
+            )
 
             def _make_od_unpacker(cur_sem_idx):
                 phys_r = (
@@ -3838,6 +3851,118 @@ def _stationary_q_v2_process(
                         else:
                             _exec_prefix_pass(static_first=False, with_topk=False)
 
+                if use_tail_g8_sparse:
+                    tail_g8_active = jnp.logical_and(
+                        tail_bkv_start > start_bkv_idx,
+                        tail_bkv_start < end_bkv_idx,
+                    )
+                    tail_sem_pre = sem_ids_ref[1]
+
+                    @pl.when(tail_g8_active)
+                    def _exec_tail_sparse_g8():
+                        (
+                            nxt_sq_t0,
+                            _,
+                            nxt_bkv_t0,
+                            nxt_sem_t0,
+                        ) = get_next_bkv_ids(
+                            seq_idx,
+                            bq_idx,
+                            tail_bkv_start,
+                            tail_sem_pre,
+                            num_bkv=end_bkv_idx,
+                        )
+
+                        @pl.when(nxt_sq_t0 < end_seq_idx)
+                        def _pf_after_tail0():
+                            sem_ids_ref[1] = nxt_sem_t0
+                            start_fetch_bkv(nxt_sq_t0, nxt_bkv_t0, nxt_sem_t0)
+
+                        off_t0, usz_t0 = wait_fetch_bkv(
+                            seq_idx, tail_bkv_start, tail_sem_pre
+                        )
+                        is_lv_t0 = bq_idx == num_bq - 1
+
+                        @pl.when(jnp.logical_and(usz_t0 > 0, is_lv_t0))
+                        def _upd_t0_cache():
+                            start_update_kv_cache(
+                                seq_idx, tail_sem_pre, off_t0, usz_t0
+                            )
+
+                        od_t_g8 = _make_od_unpacker(tail_sem_pre)
+                        tq_per_qg_t = prefix_q_grp_sz // 256
+                        n_qgs_t = cdiv(valid_bq_rows, prefix_q_grp_sz)
+                        static_h_t = tuple(range(prefix_topk_slices))
+                        tail_kv_base = tail_bkv_start * bkv_sz
+
+                        @pl.loop(0, n_qgs_t, unroll=False)
+                        def _t_qg_g8(qg_i):
+                            qg_row = qg_i * prefix_q_grp_sz
+                            qg_abs = processed_q_len + qg_row
+                            dlo_qg = jnp.clip(
+                                (
+                                    qg_abs
+                                    - prefix_topk_tail_local
+                                    - tail_kv_base
+                                )
+                                // 256,
+                                0,
+                                num_s,
+                            )
+
+                            @pl.when(dlo_qg >= (2 * prefix_topk_slices))
+                            def _run_t_qg_g8():
+                                for kv_h in range(sq_kv_heads):
+                                    h_ind = _load_topk_indices(
+                                        kv_h, tail_bkv_start, qg_row
+                                    )
+                                    for k_i in range(prefix_topk_slices):
+                                        od_t_g8(kv_h, k_i, h_ind[k_i])
+
+                                    @pl.loop(0, tq_per_qg_t, unroll=False)
+                                    def _t_od_i256(loc_256, kv_h=kv_h):
+                                        i256 = qg_i * tq_per_qg_t + loc_256
+                                        t_sl_p = pl.ds(
+                                            pl.multiple_of(i256 * 256, 256), 256
+                                        )
+                                        for half_i in range(2):
+                                            q128_start = (
+                                                i256 * 256 + half_i * 128
+                                            )
+
+                                            @pl.when(q128_start < valid_bq_rows)
+                                            def _run_t_half():
+                                                for sub_c in range(4):
+                                                    r_idx = (
+                                                        kv_h * 8
+                                                        + half_i * 4
+                                                        + sub_c
+                                                    )
+                                                    r_sl = slice(
+                                                        r_idx, r_idx + 1
+                                                    )
+                                                    acc_8h, l_8h = (
+                                                        _eval_mk128_head(
+                                                            kv_h,
+                                                            q_t_ref[
+                                                                r_sl, :, t_sl_p
+                                                            ],
+                                                            None,
+                                                            0,
+                                                            num_s,
+                                                            ("none",) * num_s,
+                                                            h_indices=static_h_t,
+                                                        )
+                                                    )
+                                                    l_ref[r_sl, :, t_sl_p] = (
+                                                        l_ref[r_sl, :, t_sl_p]
+                                                        + l_8h
+                                                    )
+                                                    acc_ref[r_sl, :, t_sl_p] = (
+                                                        acc_ref[r_sl, :, t_sl_p]
+                                                        + acc_8h
+                                                    )
+
                 if (
                     use_mk128
                     and "gqa8" in prefill_opts
@@ -3953,32 +4078,54 @@ def _stationary_q_v2_process(
 
             @pl.loop(tail_bkv_start, end_bkv_idx, unroll=False)
             def _stream_bkv(bkv_idx):
-                bkv_sem_idx = sem_ids_ref[1]
-                (
-                    next_seq_idx_kv,
-                    _,
-                    next_bkv_idx,
-                    next_bkv_sem_idx,
-                ) = get_next_bkv_ids(
-                    seq_idx, bq_idx, bkv_idx, bkv_sem_idx, num_bkv=end_bkv_idx
-                )
                 processed_kv_len = bkv_idx * bkv_sz
+                already_waited_t0 = (
+                    jnp.logical_and(tail_g8_active, bkv_idx == tail_bkv_start)
+                    if use_tail_g8_sparse
+                    else jnp.bool_(False)
+                )
+                bkv_sem_idx = (
+                    lax.select(already_waited_t0, tail_sem_pre, sem_ids_ref[1])
+                    if use_tail_g8_sparse
+                    else sem_ids_ref[1]
+                )
 
-                @pl.when(next_seq_idx_kv < end_seq_idx)
-                def _pf_stream_bkv():
-                    sem_ids_ref[1] = next_bkv_sem_idx
-                    start_fetch_bkv(next_seq_idx_kv, next_bkv_idx, next_bkv_sem_idx)
+                @pl.when(jnp.logical_not(already_waited_t0))
+                def _do_stream_pf_wait():
+                    (
+                        next_seq_idx_kv,
+                        _,
+                        next_bkv_idx,
+                        next_bkv_sem_idx,
+                    ) = get_next_bkv_ids(
+                        seq_idx,
+                        bq_idx,
+                        bkv_idx,
+                        bkv_sem_idx,
+                        num_bkv=end_bkv_idx,
+                    )
 
-                @pl.when(bkv_idx == start_bkv_idx)
-                def _wait_up_bq_stream():
-                    _wait_and_unpack_cur_bq(bq_sem_idx)
+                    @pl.when(next_seq_idx_kv < end_seq_idx)
+                    def _pf_stream_bkv():
+                        sem_ids_ref[1] = next_bkv_sem_idx
+                        start_fetch_bkv(
+                            next_seq_idx_kv, next_bkv_idx, next_bkv_sem_idx
+                        )
 
-                offset, update_sz = wait_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx)
-                is_last_visit = bq_idx == num_bq - 1
+                    @pl.when(bkv_idx == start_bkv_idx)
+                    def _wait_up_bq_stream():
+                        _wait_and_unpack_cur_bq(bq_sem_idx)
 
-                @pl.when(jnp.logical_and(update_sz > 0, is_last_visit))
-                def _upd_stream_cache():
-                    start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz)
+                    offset, update_sz = wait_fetch_bkv(
+                        seq_idx, bkv_idx, bkv_sem_idx
+                    )
+                    is_last_visit = bq_idx == num_bq - 1
+
+                    @pl.when(jnp.logical_and(update_sz > 0, is_last_visit))
+                    def _upd_stream_cache():
+                        start_update_kv_cache(
+                            seq_idx, bkv_sem_idx, offset, update_sz
+                        )
 
                 if probe != "nocompute":
                     effective_bkv_sz = jnp.clip(
@@ -4041,16 +4188,22 @@ def _stationary_q_v2_process(
 
                                     @pl.when(do_tail_tk)
                                     def _do_sparse_tail_blk():
-                                        _run_ring_chunk(
-                                            0,
-                                            num_s,
-                                            False,
-                                            ("none",) * num_s,
-                                            t_sl,
-                                            topk_loader=lambda kv_h: _load_topk_indices(
-                                                kv_h, bkv_idx, tq_start
-                                            ),
+
+                                        @pl.when(
+                                            jnp.logical_not(already_waited_t0)
                                         )
+                                        def _do_tail_tk_fallback():
+                                            _run_ring_chunk(
+                                                0,
+                                                num_s,
+                                                False,
+                                                ("none",) * num_s,
+                                                t_sl,
+                                                topk_loader=lambda kv_h: _load_topk_indices(
+                                                    kv_h, bkv_idx, tq_start
+                                                ),
+                                            )
+
                                         _run_slice_range(
                                             q_first,
                                             dense_unm_lo,
