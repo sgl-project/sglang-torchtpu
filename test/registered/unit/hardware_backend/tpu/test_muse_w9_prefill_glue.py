@@ -3630,3 +3630,359 @@ def test_w17_causal_chunk_spec_le1536_guard_non_v10_sp():
         sanitized = _sanitize_causal_chunk_spec("le1536:1;256,512", "v6")
         chunks = resolve_causal_chunks(ts, sanitized)
         assert len(chunks) >= 2 and sum(chunks) == ts
+
+
+def test_w18_b2_direct_fp8_symmetric_dus_no_pad_max_aot():
+    """Verify #5508/#5509: symmetric 2-half B2 direct-FP8 stitching uses 3D DUS even with
+    default ``B2_POW2_CHUNKS=False`` / ``B2_PIPE_CHUNKS=''``, eliminating ``pad_maximum_fusion``.
+    """
+    jax = pytest.importorskip("jax")
+    import jax.numpy as jnp
+    from jax.experimental import topologies
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels import pipeline
+
+    assert tpu_envs.SGLANG_TPU_MUSE_KERNEL_B2_POW2_CHUNKS.get() is False
+    assert tpu_envs.SGLANG_TPU_MUSE_KERNEL_B2_PIPE_CHUNKS.get() == ""
+
+    with (
+        mock.patch(
+            "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+        ),
+        tpu_info_for_cpu_export(),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_FUSED_B1_B2, "get", return_value=4),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_B1_B2_FAST, "get", return_value=True),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_B2_DBL_STREAM, "get", return_value=True),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8, "get", return_value=6),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_FP8_LHS_QBS, "get", return_value=4096),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_LHS, "get", return_value=0.03125),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_COMPACT_LOCAL_SORT, "get", return_value=1),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_SORTFREE_PREFILL, "get", return_value=True),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_OPT, "get", return_value=7),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_T128_FAST, "get", return_value=True),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_FP8_UNPOOL, "get", return_value=512),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_RS, "get", return_value=6.0),
+        mock.patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_SALU_OVERLAP, "get", return_value=True),
+    ):
+        topo = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x=2x2x2")
+        aot_mesh = Mesh(np.array(topo.devices).reshape(16), ("model",))
+        t_loc = 1024
+        sm_aot = jax.jit(
+            jax.shard_map(
+                lambda *a: pipeline.fused_moe_full_bridge_and_ffn(
+                    *a,
+                    mesh=aot_mesh,
+                    router_mode="bf16_hilo_pre",
+                    b2_layout="nstream",
+                    b2_two_half=True,
+                    hoist_routing=True,
+                    d_layout="4slab",
+                    d_tok_tile=128,
+                    d_fp8_unpool=True,
+                    d_emit_static_fp8_attn_in=True,
+                    in_shard_map=True,
+                ),
+                mesh=aot_mesh,
+                in_specs=(
+                    P("model", None), P("model", None),
+                    P(), P(), P(), P(), P(), P(), P(), P(),
+                    P("model"), P("model"), P("model"), P("model"),
+                    P(), P("model"), P(), P(), P(), P(), P(), P(),
+                ),
+                out_specs=(P("model", None),) * 4,
+                check_vma=False,
+            )
+        )
+        c_aot = sm_aot.trace(
+            jax.ShapeDtypeStruct((16 * t_loc, 8192), jnp.bfloat16),
+            jax.ShapeDtypeStruct((16 * t_loc, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((8192,), jnp.float32),
+            jax.ShapeDtypeStruct((8192,), jnp.float32),
+            jax.ShapeDtypeStruct((8192,), jnp.float32),
+            jax.ShapeDtypeStruct((8192, 256), jnp.float32),
+            jax.ShapeDtypeStruct((256,), jnp.float32),
+            jax.ShapeDtypeStruct((8192, 4096), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((4096,), jnp.float32),
+            jax.ShapeDtypeStruct((4096,), jnp.bfloat16),
+            jax.ShapeDtypeStruct((256, 4096, 8192), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((256, 4096, 4096), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((256, 1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((256, 1, 4096), jnp.float32),
+            jax.ShapeDtypeStruct((4096,), jnp.bfloat16),
+            jax.ShapeDtypeStruct((16,), jnp.int32),
+            jax.ShapeDtypeStruct((4096, 8192), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((8192,), jnp.float32),
+            jax.ShapeDtypeStruct((8192,), jnp.float32),
+            jax.ShapeDtypeStruct((8192,), jnp.float32),
+            jax.ShapeDtypeStruct((8192,), jnp.float32),
+            jax.ShapeDtypeStruct((8192,), jnp.float32),
+        ).lower(lowering_platforms=("tpu",)).compile()
+        hlo_txt = c_aot.as_text()
+        assert "pad_maximum_fusion" not in hlo_txt
+        assert "dynamic-update-slice" in hlo_txt
+
+
+def test_w18_pack_ulysses_qkv_u32_bit_exact_and_tm1024_aot():
+    """Verify bit-exact u32 KV packing in ``pallas_pack_ulysses_qkv_for_rpa`` under
+    race-detect Pallas interpret + ``tm=1024`` routing/AOT at ``c_tok=24576``.
+    """
+    jax = pytest.importorskip("jax")
+    import jax.numpy as jnp
+    from jax.experimental import topologies
+    from jax.sharding import Mesh
+
+    from sglang_tpu.muse_prefill_kernels import integration
+    from sglang_tpu.muse_prefill_kernels.attn_kernels import kernel_a1
+
+    rng = np.random.default_rng(18)
+
+    with _interpret_on_cpu():
+        for c_tok, tm_arg in ((512, 512), (1024, 1024)):
+            q_np = (rng.standard_normal((c_tok, 512)) * 2.0).astype(np.float32)
+            kv_vals = rng.uniform(-4.0, 4.0, (c_tok, 128)).astype(np.float32)
+            # Adversarial FP8 extremes + zero lanes in both halves.
+            kv_vals[:8, :64] = 448.0
+            kv_vals[:8, 64:] = -448.0
+            kv_vals[8:16, :] = 0.0
+            q_j = jnp.array(q_np, jnp.bfloat16)
+            kv_j = jnp.array(kv_vals, jnp.float8_e4m3fn)
+            q_out, kv_out = kernel_a1.pallas_pack_ulysses_qkv_for_rpa(
+                q_j, kv_j, h_q_local=8, h_kv_local=1, tm=tm_arg
+            )
+            assert q_out.shape == (1, c_tok, 4, 2, 128)
+            assert kv_out.shape == (c_tok, 1, 4, 128)
+
+            kv_host_u8 = np.asarray(jax.device_get(kv_j)).view(np.uint8)
+            got_kv_u8 = np.asarray(jax.device_get(kv_out)).view(np.uint8)
+            # kv_out[:, 0, 0..1, 0..63]: K bytes at sublanes (0, 2); V bytes at (1, 3).
+            np.testing.assert_array_equal(got_kv_u8[:, 0, 0, :64], kv_host_u8[:, :64])
+            np.testing.assert_array_equal(got_kv_u8[:, 0, 1, :64], kv_host_u8[:, 64:])
+            assert np.all(got_kv_u8[:, 0, 0, 64:] == 0)
+            assert np.all(got_kv_u8[:, 0, 1, 64:] == 0)
+            assert np.all(got_kv_u8[:, 0, 2:, :] == 0)
+
+    # Verify integration._ops routing (tm=1024 at c_tok>=16384 vs tm=512 at c_tok=8192) & AOT.
+    if len(jax.devices("cpu")) >= 16:
+        torch = pytest.importorskip("torch")
+        from sglang_tpu.pallas_jax_op import _jax_placeholders
+
+        topo16 = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x=2x2x2")
+        mesh16 = Mesh(np.array(topo16.devices).reshape(16), ("model",))
+        with (
+            mock.patch.dict(os.environ, {"SGLANG_TPU_MUSE_KERNEL_ULYSSES_ASYNC_A2A": "1"}),
+            mock.patch("sglang_tpu.moe.pallas.fused_moe_rs_op._get_mesh", return_value=mesh16),
+            mock.patch(
+                "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+            ),
+            tpu_info_for_cpu_export(),
+        ):
+            integration._ops.cache_clear()
+            ops = integration._ops(
+                8, 1, "v10_sp", "v16", True, 1e-5, a1_rpa_layout=True, causal_chunk_stream=True
+            )
+            fn_obj = ops.a1_ulysses_full._init_fn
+
+            def _mlir_for_ck(c_k_val: int) -> str:
+                f8 = getattr(torch, "float8_e4m3fn")
+                fake_args = (
+                    torch.empty((c_k_val, 8192), dtype=f8),
+                    torch.empty((16, 8192, 640), dtype=f8),
+                    torch.empty((16, 1, 640), dtype=torch.float32),
+                    torch.empty((8192, 8192), dtype=f8),
+                    torch.empty((1, 8192), dtype=torch.float32),
+                    torch.empty((16 * c_k_val, 128), dtype=torch.float32),
+                    torch.empty((16 * c_k_val, 128), dtype=torch.float32),
+                )
+                jargs = _jax_placeholders(
+                    fake_args, mesh=fn_obj.mesh, partition_specs=fn_obj.input_partition_specs
+                )
+                with jax._src.config.export_ignore_forward_compatibility(True):
+                    return fn_obj.exported(*jargs).mlir_module()
+
+            assert "pallas_pack_ulysses_rpa_c24576_q512_kv128_tm1024" in _mlir_for_ck(1536)
+            assert "pallas_pack_ulysses_rpa_c8192_q512_kv128_tm512" in _mlir_for_ck(512)
+
+    from jax.sharding import PartitionSpec as P
+
+    topo_pack = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x=2x2x2")
+    mesh_pack = Mesh(np.array(topo_pack.devices).reshape(16), ("model",))
+    jax.jit(
+        jax.shard_map(
+            lambda q2, kv2: tuple(
+                x[None]
+                for x in kernel_a1.pallas_pack_ulysses_qkv_for_rpa(
+                    q2[0], kv2[0], h_q_local=8, h_kv_local=1, tm=1024
+                )
+            ),
+            mesh=mesh_pack,
+            in_specs=(P("model"), P("model")),
+            out_specs=(P("model"), P("model")),
+            check_vma=False,
+        )
+    ).trace(
+        jax.ShapeDtypeStruct((16, 24576, 512), jnp.bfloat16),
+        jax.ShapeDtypeStruct((16, 24576, 128), jnp.float8_e4m3fn),
+    ).lower(lowering_platforms=("tpu",)).compile()
+
+
+def test_w19_d_with_next_in_gather_t1024_unsplit_xor1_auto_and_aot():
+    """Verify TP=8 t_local=1024 rows0 in (256, 384) auto-switches D_with_next_in_gather to unsplit+xor1."""
+    import functools
+
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from jax.experimental import topologies
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels import kernel_d
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.pipeline import (
+        _d_with_next_in_gather,
+        _should_unsplit_d_with_next_in_gather,
+    )
+
+    base_gate = dict(
+        ep_size=8,
+        d_layout="4slab",
+        d_tok_tile=128,
+        d_fp8_unpool=True,
+        d_coal=False,
+        d_ik_ag=False,
+        has_w4_wu=False,
+        t_local=1024,
+        next_in_gather_rows=384,
+    )
+    assert _should_unsplit_d_with_next_in_gather(**base_gate)
+    assert _should_unsplit_d_with_next_in_gather(**{**base_gate, "next_in_gather_rows": 256})
+    for overrides in (
+        {"t_local": 512, "next_in_gather_rows": 128},
+        {"t_local": 1536, "next_in_gather_rows": 512},
+        {"t_local": 2048, "next_in_gather_rows": 768},
+        {"ep_size": 16},
+        {"d_tok_tile": 64},
+        {"d_fp8_unpool": False},
+    ):
+        assert not _should_unsplit_d_with_next_in_gather(**{**base_gate, **overrides})
+
+    if len(jax.devices()) < 8:
+        pytest.skip("Requires >=8 JAX devices")
+
+    topo8 = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x=2x2x1")
+    mesh8 = Mesh(np.array(topo8.devices).reshape(8), ("model",))
+
+    calls: list[tuple[int | None, int]] = []
+
+    def _fake_d(x, *, num_rows=None, row_start=0, stream_out=None):
+        calls.append((num_rows, row_start))
+        end = x.shape[0] if num_rows is None else row_start + num_rows
+        sl = x[row_start:end]
+        stream = sl if stream_out is None else jnp.concatenate([stream_out, sl], axis=0)
+        return stream, sl
+
+    def _trace(prefer: bool, env_dict: dict[str, str], rows0: int = 384) -> str:
+        calls.clear()
+        with (
+            mock.patch(
+                "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+            ),
+            tpu_info_for_cpu_export(),
+            mock.patch.dict(os.environ, env_dict),
+        ):
+            fn = jax.jit(
+                jax.shard_map(
+                    lambda x: _d_with_next_in_gather(
+                        d_fn=_fake_d,
+                        d_args=(x[0],),
+                        rows0=rows0,
+                        split=True,
+                        axis_name="model",
+                        gather_static_fp8=False,
+                        prefer_unsplit_xor1=prefer,
+                    )[2][None],
+                    mesh=mesh8,
+                    in_specs=(P("model", None, None),),
+                    out_specs=P("model", None, None, None),
+                    check_vma=False,
+                )
+            )
+            return (
+                fn.trace(jax.ShapeDtypeStruct((8, 1024, 128), jnp.float8_e4m3fn))
+                .lower(lowering_platforms=("tpu",))
+                .as_text("stablehlo")
+            )
+
+    for rows0 in (256, 384):
+        hlo_auto = _trace(True, {}, rows0=rows0)
+        assert calls == [(None, 0)]
+        assert "xor1_xytorus_ag_tp8" in hlo_auto
+
+    for env_override in (
+        {"SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG": "4"},
+        {"SGLANG_TPU_MUSE_KERNEL_XOR1_AG_MOE": "3"},
+    ):
+        hlo_keep = _trace(True, env_override, rows0=384)
+        assert calls == [(384, 0), (None, 384)]
+        assert "all_gather" in hlo_keep and "xor1_" not in hlo_keep
+
+    # TPU7x AOT compile of pipeline callsite gating with real Kernel D (fp8_unpool + STATIC_FP8_RS=6.0)
+    with (
+        mock.patch(
+            "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+        ),
+        tpu_info_for_cpu_export(),
+        mock.patch.dict(
+            os.environ,
+            {
+                "SGLANG_TPU_MUSE_KERNEL_D_OPT": "7",
+                "SGLANG_TPU_MUSE_KERNEL_D_FP8_UNPOOL": "512",
+                "SGLANG_TPU_MUSE_KERNEL_D_T128_FAST": "1",
+                "SGLANG_TPU_MUSE_KERNEL_D_SALU_OVERLAP": "1",
+                "SGLANG_TPU_MUSE_KERNEL_D_T64_C16": "1",
+                "SGLANG_TPU_MUSE_KERNEL_D_MXU_COMBINE": "1",
+                "SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_RS": "6.0",
+            },
+        ),
+    ):
+        def _real_d_aot(ob, inv, wt, sm, wu, v1, v2, v3, v4, v5):
+            dfn = functools.partial(
+                kernel_d.pallas_combine_unpool_residual_nextnorm_4slab,
+                tok_tile=128,
+                fp8_unpool=True,
+                fp8_unpool_qbs=512,
+                emit_static_fp8_attn_in=True,
+                salu_overlap=True,
+                scrub_mxu_nan=False,
+            )
+            ns, nr, g = _d_with_next_in_gather(
+                d_fn=dfn,
+                d_args=(ob[0], inv[0], wt[0], sm[0], wu[0], v1[0], v2[0], v3[0], v4[0], v5[0]),
+                rows0=384,
+                split=True,
+                axis_name="model",
+                gather_static_fp8=True,
+                prefer_unsplit_xor1=True,
+            )
+            return ns[None], nr[None], g[None]
+
+        lowered = jax.jit(
+            jax.shard_map(
+                _real_d_aot,
+                mesh=mesh8,
+                in_specs=(P("model"),) * 10,
+                out_specs=(P("model"),) * 3,
+                check_vma=False,
+            )
+        ).trace(
+            jax.ShapeDtypeStruct((8, 1024 * 8, 32, 128), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((8, 1024, 8), jnp.int32),
+            jax.ShapeDtypeStruct((8, 1024, 8), jnp.float32),
+            jax.ShapeDtypeStruct((8, 1024, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((8, 4096, 8192), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((8, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((8, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((8, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((8, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((8, 8192), jnp.float32),
+        ).lower(lowering_platforms=("tpu",))
+        assert "xor1_xytorus_ag_tp8" in lowered.as_text("stablehlo")
+        lowered.compile()

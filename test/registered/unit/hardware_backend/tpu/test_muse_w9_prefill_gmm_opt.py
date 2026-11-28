@@ -3239,3 +3239,710 @@ def test_w16_b2_bm256_hbm_and_kd_smid4_interpret_and_aot() -> None:
                         assert 0 < imem_d <= 3_385_344, f"{topo_name} q={qbs_aot} d imem={imem_d}"
         finally:
             jax.clear_caches()
+
+
+def test_w18_m32k_fulln_wla2_interpret_and_aot() -> None:
+    """Verify Wave-18 M=32768..49152 full-N wla=2 tiles, Identity-safe SMEM windows, Interpret parity, and TPU7x AOT IMEM."""
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from jax import lax
+    from jax.experimental import pallas as pl
+    from jax.experimental import topologies
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    from sglang_tpu.moe.pallas.fused_rs_muse.gmm_fused_rs_nodedup import (
+        _precompute_block_scatter_meta_closed_form,
+        _precompute_fused_rs_metadata,
+        _select_fused_rs_block_sizes,
+        fused_rs_smem_rows,
+        gmm_v2_fused_rs,
+    )
+    from sglang_tpu.moe.pallas.fused_rs_muse.gmm_v2_gather_scatter import (
+        Dimensions,
+        GmmConfigs,
+        InputConfigs,
+        MetadataRef,
+        TileSizes,
+        WeightsRef,
+        dma_gather_gm_start,
+        dma_gather_gm_wait,
+        inner_kernel,
+    )
+
+    # 1. Identity-safe fused_rs_smem_rows preservation across pql6 (with u16_lhs=-1), default-off, and explicit opt-in override.
+    with patch.dict(
+        os.environ,
+        {
+            "SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8": "6",
+            "SGLANG_TPU_MUSE_KERNEL_GMM_PACK_U16_LHS": "-1",
+            "SGLANG_TPU_MUSE_KERNEL_GMM_SMEM_WINDOW_ROWS": "0",
+        },
+    ):
+        assert fused_rs_smem_rows(32_768, 8, False) == 32_768
+        assert fused_rs_smem_rows(65_536, 8, False) == 65_536
+        assert fused_rs_smem_rows(98_304, 8, False) == 98_304
+        assert fused_rs_smem_rows(131_072, 8, False) == 131_072
+        assert fused_rs_smem_rows(196_608, 8, False) == 98_304
+        assert fused_rs_smem_rows(262_144, 8, False) == 131_072
+        assert fused_rs_smem_rows(32_768, 16, False) == 32_768
+        assert fused_rs_smem_rows(65_536, 16, False) == 65_536
+        assert fused_rs_smem_rows(131_072, 16, False) == 65_536
+        assert fused_rs_smem_rows(196_608, 16, False) == 65_536
+        assert fused_rs_smem_rows(262_144, 16, False) == 131_072
+        assert fused_rs_smem_rows(65_536, 4, False) == 65_536
+        assert fused_rs_smem_rows(131_072, 4, False) == 131_072
+        assert fused_rs_smem_rows(196_608, 4, False) == 147_456
+
+        for ep_sz, m_tok, tile_m in (
+            (8, 32_768, 128),
+            (8, 65_536, 256),
+            (8, 131_072, 256),
+            (8, 196_608, 256),
+            (16, 32_768, 128),
+            (16, 65_536, 256),
+            (16, 131_072, 256),
+            (16, 196_608, 256),
+        ):
+            w_rows = fused_rs_smem_rows(m_tok, ep_sz, False)
+            num_slots = (288 // ep_sz) + (w_rows + tile_m - 1) // tile_m - 1
+            smem_bytes = (
+                296 * 4
+                + 8
+                + (5 + 2 * num_slots) * 4
+                + (w_rows // 2 + 1) * 4
+                + (num_slots + 1) * (3 * ep_sz + 2) * 4
+                + 36 * 4
+                + 3 * (288 // ep_sz + 1) * 4
+                + (2 * num_slots + 1) * 4
+                + 35 * 4
+            )
+            assert smem_bytes < 700 * 1024
+
+    with patch.dict(
+        os.environ,
+        {
+            "SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8": "0",
+            "SGLANG_TPU_MUSE_KERNEL_GMM_PACK_U16_LHS": "-1",
+            "SGLANG_TPU_MUSE_KERNEL_GMM_SMEM_WINDOW_ROWS": "0",
+        },
+    ):
+        assert fused_rs_smem_rows(65_536, 8, False) == 65_536
+        assert fused_rs_smem_rows(131_072, 8, False) == 131_072
+        assert fused_rs_smem_rows(196_608, 8, False) == 98_304
+        assert fused_rs_smem_rows(65_536, 16, False) == 65_536
+        assert fused_rs_smem_rows(131_072, 16, False) == 65_536
+
+    with patch.dict(
+        os.environ,
+        {
+            "SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8": "6",
+            "SGLANG_TPU_MUSE_KERNEL_GMM_PACK_U16_LHS": "-1",
+            "SGLANG_TPU_MUSE_KERNEL_GMM_SMEM_WINDOW_ROWS": "24000",
+        },
+    ):
+        assert fused_rs_smem_rows(131_072, 8, False) == 24_064
+
+    # 2. _select_fused_rs_block_sizes at M=32768..49152 uses (128, 4096, 4096, 4096, 4096, 2, 2).
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.pipeline import (
+        register_ep16_tuned_block_sizes,
+    )
+
+    register_ep16_tuned_block_sizes()
+    base_bs_kw = dict(
+        size_k1=4096,
+        size_n1=8192,
+        size_k2=4096,
+        size_n2=4096,
+        size_group=36,
+        size_lhs_group=288,
+        ep_size=8,
+        out_dtype=jnp.bfloat16,
+        w1_dtype=jnp.float4_e2m1fn,
+        w2_dtype=jnp.float4_e2m1fn,
+        is_quantized=True,
+        act_fn="silu",
+    )
+    slh_wla2_env = {
+        "SGLANG_TPU_MUSE_KERNEL_PREFILL_GMM_TILES": "",
+        "SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8": "6",
+        "SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_LHS": "8.0",
+        "SGLANG_TPU_MUSE_KERNEL_GMM_WEIGHT_LOOKAHEAD": "2",
+        "SGLANG_TPU_MUSE_KERNEL_GMM_EXPERT_OUTER_FP8": "0",
+        "SGLANG_TPU_MUSE_KERNEL_K256_PREFILL_TILES": "0",
+        "SGLANG_TPU_MUSE_KERNEL_FLATTEN_BS_META": "1",
+    }
+    with (
+        patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+        tpu_info_for_cpu_export(),
+        jax.default_device(jax.devices("cpu")[0]),
+    ):
+        with patch.dict(os.environ, slh_wla2_env):
+            for m_mid in (32_768, 49_152):
+                bs_32k = _select_fused_rs_block_sizes(
+                    size_m=m_mid, quant_block_size=512, **base_bs_kw
+                )
+                assert (
+                    bs_32k.tile_m,
+                    bs_32k.tile_k1,
+                    bs_32k.tile_n1,
+                    bs_32k.tile_k2,
+                    bs_32k.tile_n2,
+                    bs_32k.num_w1_bufs,
+                    bs_32k.num_w2_bufs,
+                ) == (128, 4096, 4096, 4096, 4096, 2, 2)
+            for m_hi in (65_536, 131_072, 196_608):
+                bs_hi = _select_fused_rs_block_sizes(
+                    size_m=m_hi, quant_block_size=512, **base_bs_kw
+                )
+                assert (
+                    bs_hi.tile_m,
+                    bs_hi.tile_k1,
+                    bs_hi.tile_n1,
+                    bs_hi.tile_k2,
+                    bs_hi.tile_n2,
+                    bs_hi.num_w1_bufs,
+                    bs_hi.num_w2_bufs,
+                ) == (256, 4096, 4096, 4096, 4096, 2, 1)
+            assert (
+                _select_fused_rs_block_sizes(
+                    size_m=16_384, quant_block_size=512, **base_bs_kw
+                ).tile_n1
+                != 4096
+            )
+            assert (
+                _select_fused_rs_block_sizes(
+                    size_m=32_768, quant_block_size=16, **base_bs_kw
+                ).tile_n1
+                != 4096
+            )
+            assert (
+                _select_fused_rs_block_sizes(
+                    size_m=32_768, quant_block_size=512, hot_interleave=True, **base_bs_kw
+                ).tile_n1
+                != 4096
+            )
+        for bad_ov in (
+            {"SGLANG_TPU_MUSE_KERNEL_GMM_WEIGHT_LOOKAHEAD": "0"},
+            {
+                "SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8": "4",
+                "SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_LHS": "0",
+            },
+            {"SGLANG_TPU_MUSE_KERNEL_GMM_EXPERT_OUTER_FP8": "3"},
+        ):
+            with patch.dict(os.environ, {**slh_wla2_env, **bad_ov}):
+                assert (
+                    _select_fused_rs_block_sizes(
+                        size_m=32_768, quant_block_size=512, **base_bs_kw
+                    ).tile_n1
+                    != 4096
+                )
+
+    # 3. on_wait InterpretParams (detect_races=True, uninitialized_memory="nan") parity:
+    #    (a) Full out-N single-tile inner_kernel vs 2-N-tile inner_kernel (0-ULP).
+    #    (b) Tight SMEM-windowed metadata + dma_gather_gm_start/wait vs unwindowed reference.
+    rng = np.random.default_rng(20261128)
+    on_wait_interp = pltpu.InterpretParams(
+        dma_execution_mode="on_wait",
+        detect_races=True,
+        uninitialized_memory="nan",
+    )
+    m_int, k1_int, n1_half_int, k2_int, n2_int, rhs_qbs_int = 128, 2048, 512, 512, 512, 256
+    lhs_3d_int = jnp.asarray(
+        (rng.standard_normal((m_int, k1_int // 128, 128)) * 0.25).astype(np.float32),
+        jnp.bfloat16,
+    )
+    w1_int = jnp.asarray(
+        rng.integers(0, 2**31 - 1, size=(k1_int // 8, n1_half_int * 2), dtype=np.uint32)
+    )
+    s1_int = jnp.asarray(
+        rng.uniform(0.1, 0.8, size=(k1_int // rhs_qbs_int, n1_half_int * 2)).astype(np.float32),
+        jnp.bfloat16,
+    )
+    w2_int = jnp.asarray(
+        rng.integers(0, 2**31 - 1, size=(k2_int // 8, n2_int), dtype=np.uint32)
+    )
+    s2_int = jnp.asarray(
+        rng.uniform(0.1, 0.8, size=(k2_int // rhs_qbs_int, n2_int)).astype(np.float32),
+        jnp.bfloat16,
+    )
+    gs_g_int = jnp.asarray(rng.uniform(0.5, 1.5, size=(1,)).astype(np.float32), jnp.float32)
+    gs_u_int = jnp.asarray(rng.uniform(0.5, 1.5, size=(1,)).astype(np.float32), jnp.float32)
+    gs_w2_int = jnp.asarray(rng.uniform(0.5, 1.5, size=(1,)).astype(np.float32), jnp.float32)
+
+    def _run_n_tile_inner(n_tiles: int) -> np.ndarray:
+        tn1 = n1_half_int // n_tiles
+        tn1_g = tn1 * 2
+        tn2 = n2_int // n_tiles
+        c1 = GmmConfigs(
+            dims=Dimensions(
+                size_m=8192,
+                size_k=k1_int,
+                size_n=n1_half_int * 2,
+                size_group=1,
+                size_lhs_group=1,
+                size_lhs_sublane=8,
+            ),
+            tiles=TileSizes(tile_m=m_int, tile_k=k1_int, tile_n=tn1_g),
+            lhs_cfgs=InputConfigs(
+                quant_dtype=jnp.float8_e4m3fn.dtype,
+                quant_block_size=k1_int,
+                dtype=jnp.bfloat16,
+            ),
+            rhs_cfgs=InputConfigs(
+                quant_dtype=jnp.float4_e2m1fn.dtype,
+                quant_block_size=rhs_qbs_int,
+                dtype=jnp.float4_e2m1fn,
+                has_scale=True,
+                packing=8,
+                num_quant_blocks=k1_int // rhs_qbs_int,
+            ),
+            out_dtype=jnp.bfloat16,
+            acc_dtype=jnp.float32,
+            zero_init=False,
+            fuse_act="silu",
+        )
+        c2 = GmmConfigs(
+            dims=Dimensions(
+                size_m=8192,
+                size_k=k2_int,
+                size_n=n2_int,
+                size_group=1,
+                size_lhs_group=1,
+                size_lhs_sublane=8,
+            ),
+            tiles=TileSizes(tile_m=m_int, tile_k=k2_int, tile_n=tn2),
+            lhs_cfgs=InputConfigs(
+                quant_dtype=jnp.float8_e4m3fn.dtype,
+                quant_block_size=k2_int,
+                dtype=jnp.bfloat16,
+            ),
+            rhs_cfgs=InputConfigs(
+                quant_dtype=jnp.float4_e2m1fn.dtype,
+                quant_block_size=rhs_qbs_int,
+                dtype=jnp.float4_e2m1fn,
+                has_scale=True,
+                packing=8,
+                num_quant_blocks=k2_int // rhs_qbs_int,
+            ),
+            out_dtype=jnp.bfloat16,
+            acc_dtype=jnp.float32,
+            zero_init=False,
+            fuse_act=None,
+        )
+
+        if n_tiles == 1:
+            w1_chunks = [(w1_int, s1_int)]
+            w2_chunks = [(w2_int, s2_int)]
+        else:
+            w1_chunks = [
+                (
+                    jnp.concatenate(
+                        [w1_int[:, nid * tn1 : (nid + 1) * tn1], w1_int[:, n1_half_int + nid * tn1 : n1_half_int + (nid + 1) * tn1]],
+                        axis=1,
+                    ),
+                    jnp.concatenate(
+                        [s1_int[:, nid * tn1 : (nid + 1) * tn1], s1_int[:, n1_half_int + nid * tn1 : n1_half_int + (nid + 1) * tn1]],
+                        axis=1,
+                    ),
+                )
+                for nid in range(n_tiles)
+            ]
+            w2_chunks = [
+                (w2_int[:, nid * tn2 : (nid + 1) * tn2], s2_int[:, nid * tn2 : (nid + 1) * tn2])
+                for nid in range(n_tiles)
+            ]
+
+        def _ker(*all_refs):
+            it_r = iter(all_refs)
+            x3d_r = next(it_r)
+            w1_refs = [(next(it_r), next(it_r)) for _ in range(n_tiles)]
+            w2_refs = [(next(it_r), next(it_r)) for _ in range(n_tiles)]
+            gs_g_r, gs_u_r, gs_w2_r = next(it_r), next(it_r), next(it_r)
+            out_r, g1_r, pq_fp8_r, pq_sc_r, p1_r, acc_r, gid_r, moff_r = (
+                next(it_r),
+                next(it_r),
+                next(it_r),
+                next(it_r),
+                next(it_r),
+                next(it_r),
+                next(it_r),
+                next(it_r),
+            )
+            gid_r[0] = 0
+            moff_r[0] = 0
+            moff_r[1] = m_int
+            meta = MetadataRef(gm_id_to_group_id=gid_r, gm_id_to_m_offset=moff_r)
+            for nid, (w1_r, s1_r) in enumerate(w1_refs):
+                inner_kernel(
+                    None,
+                    WeightsRef(weight=w1_r, scale=s1_r, bias=None),
+                    g1_r.at[:, pl.ds(nid * tn1, tn1)],
+                    p1_r,
+                    acc_r,
+                    meta,
+                    cfgs=c1,
+                    gs_gate_ref=gs_g_r,
+                    gs_up_ref=gs_u_r,
+                    scatter_mode=True,
+                    _k_id=0,
+                    _num_k=1,
+                    _gm_id=0,
+                    _n_id=nid,
+                    _num_n=n_tiles,
+                    fused_g2_amax_slot=None,
+                    prequant_lhs_fp8_ref=pq_fp8_r,
+                    prequant_lhs_scale_ref=pq_sc_r,
+                    skip_row_mask=True,
+                    lhs_3d_vmem_ref=x3d_r,
+                )
+            for nid, (w2_r, s2_r) in enumerate(w2_refs):
+                inner_kernel(
+                    None,
+                    WeightsRef(weight=w2_r, scale=s2_r, bias=None),
+                    out_r.at[:, pl.ds(nid * tn2, tn2)],
+                    p1_r,
+                    acc_r,
+                    meta,
+                    cfgs=c2,
+                    gs_gate_ref=gs_w2_r,
+                    gs_up_ref=gs_w2_r,
+                    scatter_mode=True,
+                    _k_id=0,
+                    _num_k=1,
+                    _gm_id=0,
+                    _n_id=nid,
+                    _num_n=n_tiles,
+                    fused_g2_amax_slot=None,
+                    prequant_lhs_fp8_ref=g1_r,
+                    prequant_lhs_scale_ref=pq_sc_r,
+                    skip_row_mask=True,
+                    prequant_lhs_ready=True,
+                    skip_lhs_scale_mul=True,
+                )
+
+        n_vmem_in = 1 + 2 * n_tiles + 2 * n_tiles
+        flat_args = [
+            lhs_3d_int,
+            *[arr for pair in w1_chunks for arr in pair],
+            *[arr for pair in w2_chunks for arr in pair],
+            gs_g_int,
+            gs_u_int,
+            gs_w2_int,
+        ]
+        with (
+            patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+            tpu_info_for_cpu_export(),
+            patch.dict(
+                os.environ,
+                {
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_FAST_LHS_QUANT": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_SCOPED_W4A8": "8",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_DIRECT_SILU": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_FP4_LHS_QBS": "4096",
+                    "SGLANG_TPU_MUSE_KERNEL_FP4_ACC_MODE": "3",
+                    "SGLANG_TPU_MUSE_KERNEL_PREFILL_STRIP_N": "256",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_FLQ_ZERO_RMW": "3",
+                },
+            ),
+            jax.default_device(jax.devices("cpu")[0]),
+        ):
+            call = pl.pallas_call(
+                _ker,
+                out_shape=jax.ShapeDtypeStruct((m_int, n2_int), jnp.bfloat16),
+                in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] * n_vmem_in
+                + [pl.BlockSpec(memory_space=pltpu.SMEM)] * 3,
+                out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
+                scratch_shapes=[
+                    pltpu.VMEM((m_int, n1_half_int), jnp.float8_e4m3fn),
+                    pltpu.VMEM((m_int, k1_int), jnp.float8_e4m3fn),
+                    pltpu.VMEM((1, m_int, 128), jnp.float32),
+                    pltpu.VMEM((8, tn1_g), jnp.float32),
+                    pltpu.VMEM((m_int, tn1_g), jnp.float32),
+                    pltpu.SMEM((1,), jnp.int32),
+                    pltpu.SMEM((2,), jnp.int32),
+                ],
+                interpret=on_wait_interp,
+            )
+            return np.asarray(call(*flat_args), np.float32)
+
+    np.testing.assert_array_equal(_run_n_tile_inner(1), _run_n_tile_inner(2))
+
+    # (b) SMEM windowing: exact base_w shift + dynamic_slice window + closed-form meta + dma_gather_gm_start/wait.
+    with jax.default_device(jax.devices("cpu")[0]):
+        ep_w, sz_g, tm_w, my_id_w, loc_start_w, loc_cnt_w = 8, 4, 128, 2, 128, 160
+        cnt_gc = np.full((sz_g, ep_w), 5, dtype=np.int32)
+        rot_w = [(my_id_w + 1 + c) % ep_w for c in range(ep_w)]
+        idx_w = [np.zeros((loc_start_w,), dtype=np.int32)]
+        for _g in range(sz_g):
+            for c_tgt in rot_w:
+                n_r = int(cnt_gc[_g, c_tgt])
+                idx_w.append(c_tgt * 64 + (np.arange(n_r, dtype=np.int32) % 64))
+        idx_w.append(np.zeros((512 - loc_start_w - loc_cnt_w,), dtype=np.int32))
+        lhs_idx_full = np.concatenate(idx_w, axis=0)
+        win_len = 256
+        gs_all = np.zeros((ep_w * sz_g,), dtype=np.int32)
+        gs_all[my_id_w * sz_g : (my_id_w + 1) * sz_g] = cnt_gc.sum(axis=1)
+        gstart_raw = np.concatenate(
+            [
+                np.array([loc_start_w, loc_cnt_w], dtype=np.int32),
+                np.zeros((ep_w,), dtype=np.int32),
+                cnt_gc.reshape(-1),
+            ]
+        )
+        n_slots_w = sz_g + pl.cdiv(win_len, tm_w) - 1
+        fused_full = np.asarray(
+            _precompute_fused_rs_metadata(
+                jnp.asarray(gs_all),
+                jnp.asarray([my_id_w * sz_g], jnp.int32),
+                jnp.asarray(gstart_raw),
+                jnp.asarray(lhs_idx_full),
+                size_group=sz_g,
+                tile_m=tm_w,
+                sublane=8,
+                chunk_size=64,
+                num_slots=n_slots_w,
+            )
+        )
+        raw_base_w = (int(fused_full[0]) // 128) * 128
+        base_w = min(raw_base_w, len(lhs_idx_full) - win_len)
+        assert base_w == loc_start_w
+        shift_w = np.zeros_like(fused_full)
+        shift_w[0:2] = base_w
+        shift_w[4 + n_slots_w :] = base_w
+        fused_win = fused_full - shift_w
+        lhs_idx_win = np.asarray(
+            lax.dynamic_slice_in_dim(jnp.asarray(lhs_idx_full), base_w, win_len)
+        )
+        bs_win = np.asarray(
+            _precompute_block_scatter_meta_closed_form(
+                jnp.asarray(gs_all),
+                jnp.asarray([my_id_w * sz_g], jnp.int32),
+                jnp.asarray(gstart_raw),
+                size_group=sz_g,
+                tile_m=tm_w,
+                num_slots=n_slots_w,
+                ep_size=ep_w,
+                rotate_rs=True,
+                inter32_min_kf=2,
+                smem_base_offset=base_w,
+            )
+        )
+        bs_full = np.asarray(
+            _precompute_block_scatter_meta_closed_form(
+                jnp.asarray(gs_all),
+                jnp.asarray([my_id_w * sz_g], jnp.int32),
+                jnp.asarray(gstart_raw),
+                size_group=sz_g,
+                tile_m=tm_w,
+                num_slots=n_slots_w,
+                ep_size=ep_w,
+                rotate_rs=True,
+                inter32_min_kf=2,
+            )
+        )
+        aux_w = bs_win[(n_slots_w + 1) * (3 * ep_w + 2) :].reshape(n_slots_w, 1 + ep_w)
+        aux_f = bs_full[(n_slots_w + 1) * (3 * ep_w + 2) :].reshape(n_slots_w, 1 + ep_w)
+        np.testing.assert_array_equal(aux_w[:, 0], aux_f[:, 0])
+        np.testing.assert_array_equal(aux_w[:, 1:] + base_w, aux_f[:, 1:])
+
+        hs_win_src = jnp.asarray(
+            rng.integers(-64, 64, size=(ep_w * 64, 1, 128), dtype=np.int32),
+            jnp.float8_e4m3fn,
+        )
+        n_gm_w = int(fused_full[3])
+
+        def _gather_win(lhs_i_arr: np.ndarray, fused_arr: np.ndarray) -> np.ndarray:
+            gid_v = fused_arr[4 : 4 + n_slots_w]
+            moff_v = fused_arr[4 + n_slots_w :]
+
+            def _gker(lhs_r, gid_r, moff_r, hs_r, out_r, buf_r, gsem_r):
+                out_r[...] = jnp.zeros_like(out_r)
+                mref = MetadataRef(gm_id_to_group_id=gid_r, gm_id_to_m_offset=moff_r)
+
+                def _step(gm_i, _u):
+                    dma_gather_gm_start(
+                        hs_r,
+                        buf_r,
+                        lhs_r,
+                        gsem_r.at[0],
+                        gm_i,
+                        mref,
+                        divisor=1,
+                        packed_u16=False,
+                    )
+                    dma_gather_gm_wait(buf_r, gsem_r.at[0], gm_i, mref)
+                    out_r[gm_i, :, :] = buf_r[:, 0, :]
+                    return _u
+
+                lax.fori_loop(0, n_gm_w, _step, jnp.int32(0))
+
+            with (
+                patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+                tpu_info_for_cpu_export(),
+            ):
+                c_g = pl.pallas_call(
+                    _gker,
+                    out_shape=jax.ShapeDtypeStruct((n_gm_w, tm_w, 128), jnp.float8_e4m3fn),
+                    grid_spec=pltpu.PrefetchScalarGridSpec(
+                        num_scalar_prefetch=3,
+                        grid=(1,),
+                        in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)],
+                        out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
+                        scratch_shapes=[
+                            pltpu.VMEM((tm_w, 1, 128), jnp.float8_e4m3fn),
+                            pltpu.SemaphoreType.DMA((1,)),
+                        ],
+                    ),
+                    interpret=on_wait_interp,
+                )
+                return np.asarray(
+                    c_g(
+                        jnp.asarray(lhs_i_arr),
+                        jnp.asarray(gid_v),
+                        jnp.asarray(moff_v),
+                        hs_win_src,
+                    ).astype(jnp.float32)
+                )
+
+        g_win_np = _gather_win(lhs_idx_win, fused_win)
+        g_full_np = _gather_win(lhs_idx_full, fused_full)
+        for gm_i in range(n_gm_w):
+            nv_g = int(
+                fused_full[4 + n_slots_w + gm_i + 1] - fused_full[4 + n_slots_w + gm_i]
+            )
+            np.testing.assert_array_equal(g_win_np[gm_i, :nv_g], g_full_np[gm_i, :nv_g])
+
+    # 4. TPU7x 2x2x1 (TP=8, E=36) and 2x2x2 (TP=16, E=22) AOT IMEM <= 3_385_344 at M=32768.
+    def _compile_w18(topo_name: str, ep_size: int, e_local: int, m_tok: int) -> tuple[int, str]:
+        topo = topologies.get_topology_desc(platform="tpu", topology_name=topo_name)
+        mesh = Mesh(np.array(topo.devices), ("model",))
+        e_global = ep_size * e_local
+        num_tok = m_tok // 8
+        caller_tm = 128 if m_tok < 65_536 else 256
+        n_slots = e_local + (m_tok + caller_tm - 1) // caller_tm
+        env_map = {
+            "SGLANG_TPU_MUSE_KERNEL_FLATTEN_BS_META": "1",
+            "SGLANG_TPU_MUSE_KERNEL_FP4_LHS_QBS": "4096",
+            "SGLANG_TPU_MUSE_KERNEL_FP4_ACC_MODE": "3",
+            "SGLANG_TPU_MUSE_KERNEL_PREFILL_STRIP_N": "256",
+            "SGLANG_TPU_MUSE_KERNEL_GMM_FAST_LHS_QUANT": "1",
+            "SGLANG_TPU_MUSE_KERNEL_GMM_FLQ_ZERO_RMW": "3",
+            "SGLANG_TPU_MUSE_KERNEL_GMM_SCOPED_W4A8": "8",
+            "SGLANG_TPU_MUSE_KERNEL_GMM_DIRECT_SILU": "1",
+            "SGLANG_TPU_MUSE_KERNEL_GMM_GATHER_2AHEAD": "6",
+            "SGLANG_TPU_MUSE_KERNEL_GMM_ROTATE_RS": "2",
+            "SGLANG_TPU_MUSE_KERNEL_GMM_INTERLEAVE_RS": "12",
+            "SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8": "6",
+            "SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_LHS": "8.0",
+            "SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_GMM2_LHS": "4.0",
+            "SGLANG_TPU_MUSE_KERNEL_GMM_WEIGHT_LOOKAHEAD": "2",
+            "SGLANG_TPU_MUSE_KERNEL_PREFILL_GMM_TILES": "",
+            "SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_RS": "6.0",
+            "SGLANG_TPU_MUSE_KERNEL_PREFILL_ROW_BUCKETS": "4",
+            "SGLANG_TPU_MUSE_KERNEL_GMM_PACK_U16_LHS": "-1",
+            "SGLANG_TPU_MUSE_KERNEL_BLOCK256_SCALES": "0",
+            "SGLANG_TPU_MUSE_KERNEL_COMPACT_K256_SCALES": "0",
+            "SGLANG_TPU_MUSE_KERNEL_K256_PREFILL_TILES": "0",
+            "SGLANG_TPU_MUSE_KERNEL_COMPACT_FP4_QBLOCK": "512",
+            "SGLANG_TPU_MUSE_KERNEL_GMM_W4A8_K_CHAIN": "0",
+            "SGLANG_TPU_MUSE_KERNEL_GMM_W2_FP8_CACHE": "1",
+        }
+        with patch.dict(os.environ, env_map):
+            jax.clear_caches()
+
+            def _fn(h, w1, w1s, w2, w2s, w1gs, w2gs, gs, li, g_st, go, mn, pnw):
+                return gmm_v2_fused_rs(
+                    h,
+                    w1,
+                    w2,
+                    gs,
+                    li,
+                    li,
+                    w1_scale=w1s,
+                    w2_scale=w2s,
+                    w1_global_scale=w1gs,
+                    w2_global_scale=w2gs,
+                    act_fn="silu",
+                    group_offset=go,
+                    group_start=g_st,
+                    output_size=num_tok,
+                    topk_indices=jnp.zeros((1,), jnp.int32),
+                    ep_size=ep_size,
+                    ep_axis_name="model",
+                    max_num_gm=mn[0],
+                    caller_tile_m=caller_tm,
+                    top_k=8,
+                    post_expert_norm_weight=pnw,
+                    block_scatter=True,
+                )
+
+            in_sp = (
+                P(),
+                P("model"),
+                P("model"),
+                P("model"),
+                P("model"),
+                P("model"),
+                P("model"),
+                P(),
+                P(),
+                P(),
+                P("model"),
+                P(),
+                P(),
+            )
+            sd = jax.ShapeDtypeStruct
+            sh_r, sh_m = NamedSharding(mesh, P()), NamedSharding(mesh, P("model"))
+            specs = [
+                sd((num_tok, 32, 128), jnp.float8_e4m3fn, sharding=sh_r),
+                sd((e_global, 4096, 8192), jnp.float4_e2m1fn, sharding=sh_m),
+                sd((e_global, 8, 8192), jnp.bfloat16, sharding=sh_m),
+                sd((e_global, 4096, 4096), jnp.float4_e2m1fn, sharding=sh_m),
+                sd((e_global, 8, 4096), jnp.bfloat16, sharding=sh_m),
+                sd((e_global, 2), jnp.float32, sharding=sh_m),
+                sd((e_global,), jnp.float32, sharding=sh_m),
+                sd((e_global,), jnp.int32, sharding=sh_r),
+                sd((m_tok,), jnp.int32, sharding=sh_r),
+                sd((4 + 2 * n_slots,), jnp.int32, sharding=sh_r),
+                sd((ep_size,), jnp.int32, sharding=sh_m),
+                sd((1,), jnp.int32, sharding=sh_r),
+                sd((4096,), jnp.bfloat16, sharding=sh_r),
+            ]
+            lowered = (
+                jax.jit(
+                    jax.shard_map(
+                        _fn,
+                        mesh=mesh,
+                        in_specs=in_sp,
+                        out_specs=P("model", None, None),
+                        check_vma=False,
+                    )
+                )
+                .trace(*specs)
+                .lower()
+            )
+            hlo = lowered.as_text("stablehlo")
+            compiled = lowered.compile()
+            return (
+                int(getattr(compiled.memory_analysis(), "generated_code_size_in_bytes", -1)),
+                hlo,
+            )
+
+    with (
+        patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+        tpu_info_for_cpu_export(),
+        jax.default_device(jax.devices("cpu")[0]),
+    ):
+        try:
+            for topo_name, ep_sz, e_loc in (("tpu7x=2x2x1", 8, 36), ("tpu7x=2x2x2", 16, 22)):
+                for m_tok in (32_768,):
+                    imem_b, hlo_txt = _compile_w18(topo_name, ep_sz, e_loc, m_tok)
+                    assert "-pql6-slh8" in hlo_txt
+                    assert "-wla2" in hlo_txt and "-w2c1" not in hlo_txt
+                    if ep_sz == 8:
+                        assert "-i32_12" in hlo_txt
+                    assert 0 < imem_b <= 3_385_344, (
+                        f"Wave-18 IMEM over budget: {topo_name} M={m_tok} imem={imem_b} > 3,385,344"
+                    )
+        finally:
+            jax.clear_caches()

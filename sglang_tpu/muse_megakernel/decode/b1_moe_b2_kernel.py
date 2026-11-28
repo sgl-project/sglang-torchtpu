@@ -200,6 +200,7 @@ def _b1_moe_b2_chip_sharded_impl(
     step_b3_scope2_shapes: tuple = (),
     step_b3_scope3_shapes: tuple = (),
     use_3scope: bool = False,
+    split_b2_rpad: bool = False,
     final_norm_only: bool = False,
 ) -> None:
     """Shared Pallas kernel body for Step (b), Step (c) (``+ RPAd``), and fused L61 Final Norm."""
@@ -676,11 +677,43 @@ def _b1_moe_b2_chip_sharded_impl(
                 skip_barrier_wait=not sync_entry_barrier,
                 skip_stream_load=True,
             )
+            eff_l61_s, eff_l61_r = sems["ag_log_send"], sems["ag_log_recv"]
+            if (
+                world_size == 8
+                and r_pair >= 32
+                and sems["ag_exp_send"] is not sems["ag_log_send"]
+                and sems["ag_exp_recv"] is not sems["ag_log_recv"]
+                and min(int(sems["ag_log_send"].shape[0]), int(sems["ag_log_recv"].shape[0])) < 5
+                and int(sems["ag_exp_send"].shape[0]) >= 2
+                and int(sems["ag_exp_recv"].shape[0]) >= 2
+            ):
+                from sglang_tpu.kernels.decode_collective_bridges_w8 import (
+                    _CombinedSemSeq,
+                )
+
+                eff_l61_s = _CombinedSemSeq(
+                    [
+                        sems["ag_log_send"].at[0],
+                        sems["ag_log_send"].at[1],
+                        sems["ag_log_send"].at[2],
+                        sems["ag_exp_send"].at[0],
+                        sems["ag_exp_send"].at[1],
+                    ]
+                )
+                eff_l61_r = _CombinedSemSeq(
+                    [
+                        sems["ag_log_recv"].at[0],
+                        sems["ag_log_recv"].at[1],
+                        sems["ag_log_recv"].at[2],
+                        sems["ag_exp_recv"].at[0],
+                        sems["ag_exp_recv"].at[1],
+                    ]
+                )
             _ag_chip_sharded_half_col_xor1(
                 ffn_pair_buf if r_pair == 8 else None,
                 out_hidden_ref,
-                sems["ag_log_send"],
-                sems["ag_log_recv"],
+                eff_l61_s,
+                eff_l61_r,
                 sems["c1c_send"],
                 sems["c1c_recv"],
                 me=me,
@@ -1087,9 +1120,14 @@ def _b1_moe_b2_chip_sharded_impl(
             s1_it = iter(s1_refs)
             w_pre_core_buf = next(s1_it)
             w_router_buf = next(s1_it)
-            own_half = next(s1_it)
-            send_half = next(s1_it)
-            mate_recv = next(s1_it)
+            if final_norm_only and not interpret_mode:
+                own_half = out_hidden_ref.at[:, pl.ds(0, 4096)]
+                send_half = out_hidden_ref.at[:, pl.ds(4096, 4096)]
+                mate_recv = next(s1_it)
+            else:
+                own_half = next(s1_it)
+                send_half = next(s1_it)
+                mate_recv = next(s1_it)
             rs1_a_s1 = next(s1_it)
             rs1_b_s1 = next(s1_it)
             rs2_a_s1 = next(s1_it)
@@ -1373,6 +1411,203 @@ def _b1_moe_b2_chip_sharded_impl(
                 prestarted_qkv_gate_dma=False,
             )
 
+        if has_rpad and split_b2_rpad and not final_norm_only:
+            from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
+                _run_rpad_vmem_core,
+                prepare_and_start_rpad_dmas,
+            )
+
+            n_shared = 2 if rpa_skip_kv_write else 3
+
+            def _run_b3_split34(*shared_refs) -> None:
+                sh_it = iter(shared_refs)
+                rpad_q_vmem = next(sh_it)
+                rpad_kv_vmem = None if rpa_skip_kv_write else next(sh_it)
+                rpad_gate_vmem = next(sh_it)
+                b2_out_kv = out_kv_merged_ref if rpa_skip_kv_write else rpad_kv_vmem
+
+                def _run_b3_b2_only(*b2_refs) -> None:
+                    next_in_vmem, mate_recv_b2, mate_tok_b2, w_qkv_buf, w_gate_buf = b2_refs[:5]
+                    qkv_vmem_slice = mate_recv_b2.at[:, pl.ds(0, qkv_cols)]
+                    mate_tok_slice = mate_tok_b2.at[pl.ds(0, rows_per_rank), :]
+                    moe_full_slice = mate_recv_b2.at[pl.ds(0, r_pair), :]
+                    _run_chip_b2_vmem_core(
+                        stream_chip_hbm,
+                        moe_sh_vmem,
+                        w_post_hbm,
+                        s_post_ref,
+                        post_ff_gain_ref,
+                        pf_alpha_ref,
+                        pf_beta_ref,
+                        next_in_gain_ref,
+                        next_w_qkv_hbm,
+                        next_s_qkv_ref,
+                        next_w_gate_hbm,
+                        next_s_gate_ref,
+                        cos_sin_ref,
+                        out_stream_chip_hbm,
+                        rpad_q_vmem,
+                        b2_out_kv,
+                        rpad_gate_vmem,
+                        w_post_buf,
+                        w_qkv_buf,
+                        w_gate_buf,
+                        s_buf,
+                        ffn_pair_buf,
+                        next_in_vmem,
+                        qkv_vmem_slice,
+                        mate_tok_slice,
+                        moe_full_slice,
+                        b2_scalar_dummy_post,
+                        my_pair_bf16,
+                        recv_pair_bf16,
+                        ffn_pair_buf,
+                        b2_scalar_dummy_cols,
+                        exp_3d_buf,
+                        sems["w_post_sem"],
+                        sems["w_qkv_sem"],
+                        sems["w_gate_sem"],
+                        sems["s_in_sem"],
+                        sems["s_out_sem"],
+                        sems["c1a_send"],
+                        sems["c1a_recv"],
+                        sems["ag_log_send"],
+                        sems["ag_log_recv"],
+                        sems["ag_exp_d2d_send"],
+                        sems["ag_exp_d2d_recv"],
+                        sems["pre_send"],
+                        sems["pre_recv"],
+                        sems["ag_exp_send"],
+                        sems["ag_exp_recv"],
+                        sems["ag_log_send"],
+                        sems["ag_log_recv"],
+                        sems["c1c_send"],
+                        sems["c1c_recv"],
+                        world_size=world_size,
+                        sharded_moe_in=sharded_moe_in,
+                        post_ff_eps=post_ff_eps,
+                        post_ff_scale_input=post_ff_scale_input,
+                        next_in_eps=next_in_eps,
+                        next_in_scale_input=next_in_scale_input,
+                        fuse_qkv_epi=fuse_qkv_epi,
+                        qkv_norm_eps=qkv_norm_eps,
+                        query_scale=query_scale,
+                        k_scale=k_scale,
+                        v_scale=v_scale,
+                        has_rope=has_rope,
+                        interpret_mode=interpret_mode,
+                        skip_barrier_signal=False,
+                        skip_barrier_wait=False,
+                        skip_stream_load=True,
+                        skip_stream_store=False,
+                        prestarted_w_post_dma=True,
+                        prestarted_w_qkv_dma=False,
+                        prestarted_w_gate_dma=False,
+                        gate_dst_ref=rpad_gate_vmem,
+                        after_qkv_epi_fn=None,
+                        defer_stream_store_wait=True,
+                        during_in_ici_fn=None,
+                        during_in_ici_early=False,
+                    )
+
+                pl.run_scoped(_run_b3_b2_only, *step_b3_scope3_shapes)
+
+                def _run_b3_rpad_only(*r_refs) -> None:
+                    r_it = iter(r_refs)
+                    bkv_vmem_ref = next(r_it)
+                    state_vmem_ref = next(r_it)
+                    o_vmem_ref = next(r_it)
+                    kv_write_vmem_ref = (
+                        next(r_it)
+                        if ((rpa_kv_pack_dense2 or rpa_kv_pack_bd4) and not rpa_skip_kv_write)
+                        else None
+                    )
+                    init_sv_vmem_ref = (
+                        next(r_it)
+                        if (rpa_cfg.hoist_new_kv or rpa_use_grp_vec)
+                        else None
+                    )
+                    pre_state = prepare_and_start_rpad_dmas(
+                        kv_lens_ref=kv_lens_ref,
+                        page_indices_ref=page_indices_ref,
+                        cu_q_lens_ref=cu_q_lens_ref,
+                        cu_kv_lens_ref=cu_kv_lens_ref,
+                        distribution_ref=distribution_ref,
+                        kv_cache_hbm_ref=kv_cache_hbm_ref,
+                        bkv_vmem_ref=bkv_vmem_ref,
+                        bkv_sems=rpad_bkv_sems,
+                        sliding_window=rpa_sliding_window,
+                        cfg=rpa_cfg,
+                        one_block_per_seq=rpa_one_block_per_seq,
+                        decode_query_size=1,
+                        kv_pack_dense2=rpa_kv_pack_dense2,
+                        interpret_mode=interpret_mode,
+                        b_tokens=rows,
+                        init_sv_vmem_ref=init_sv_vmem_ref,
+                        use_grp_vec=rpa_use_grp_vec,
+                        kv_pack_bd4=rpa_kv_pack_bd4,
+                    )
+                    if rpa_kv_pack_bd4:
+                        q_rows_tot = rpad_q_vmem.shape[0]
+                        step_q = math.gcd(q_rows_tot, 8)
+                        for q0 in range(0, q_rows_tot, step_q):
+                            q_sl = pl.ds(q0, step_q)
+                            q_lo_2d = rpad_q_vmem[q_sl, pl.ds(0, 8), :].reshape(step_q * 8, 128)
+                            q_hi_2d = (
+                                jnp.roll(q_lo_2d, 64, axis=1)
+                                if interpret_mode
+                                else pltpu.roll(q_lo_2d, 64, axis=1)
+                            )
+                            rpad_q_vmem[q_sl, pl.ds(8, 8), :] = q_hi_2d.reshape(step_q, 8, 128)
+                        q_for_rpa = rpad_q_vmem
+                    elif world_size == 16:
+                        q_for_rpa = rpad_q_vmem.at[:, pl.ds(0, 8), :]
+                    else:
+                        q_for_rpa = rpad_q_vmem
+                    _run_rpad_vmem_core(
+                        kv_lens_ref=kv_lens_ref,
+                        page_indices_ref=page_indices_ref,
+                        cu_q_lens_ref=cu_q_lens_ref,
+                        cu_kv_lens_ref=cu_kv_lens_ref,
+                        distribution_ref=distribution_ref,
+                        q_vmem_ref=q_for_rpa,
+                        kv_merged_vmem_ref=b2_out_kv,
+                        gate_vmem_ref=rpad_gate_vmem,
+                        kv_cache_hbm_ref=kv_cache_hbm_ref,
+                        o_out_vmem_ref=out_gated_ref,
+                        updated_kv_cache_hbm_ref=out_kv_cache_hbm_ref,
+                        bkv_vmem_ref=bkv_vmem_ref,
+                        state_vmem_ref=state_vmem_ref,
+                        o_vmem_ref=o_vmem_ref,
+                        kv_write_vmem_ref=kv_write_vmem_ref,
+                        init_sv_vmem_ref=init_sv_vmem_ref,
+                        written_cnt_smem_ref=written_cnt_smem_ref,
+                        bkv_sems=rpad_bkv_sems,
+                        cache_write_sem=rpad_cache_write_sem,
+                        sm_scale=rpa_sm_scale,
+                        sliding_window=rpa_sliding_window,
+                        k_scale=rpa_k_scale,
+                        v_scale=rpa_v_scale,
+                        cfg=rpa_cfg,
+                        one_block_per_seq=rpa_one_block_per_seq,
+                        decode_query_size=1,
+                        in_kernel_pack2=True,
+                        has_gate=True,
+                        out_norm_eps=rpa_out_norm_eps,
+                        kv_pack_dense2=rpa_kv_pack_dense2,
+                        interpret_mode=interpret_mode,
+                        prestarted_bkv_state=pre_state,
+                        use_grp_vec=rpa_use_grp_vec,
+                        skip_kv_write=rpa_skip_kv_write,
+                        kv_pack_bd4=rpa_kv_pack_bd4,
+                    )
+                    _dma_wait(out_stream_chip_hbm, sems["s_out_sem"].at[0])
+
+                pl.run_scoped(_run_b3_rpad_only, *step_c_scope2_shapes[n_shared:])
+
+            pl.run_scoped(_run_b3_split34, *step_c_scope2_shapes[:n_shared])
+            return
+
         scope3_shapes = step_b3_scope3_shapes + (
             tuple(step_c_scope2_shapes) if has_rpad else ()
         )
@@ -1633,7 +1868,7 @@ def _prepare_chip_b1_moe_b2_setup(
         _, qkv_cols = next_w_qkv_w8k.shape
         _, gate_cols = next_w_gate_w8k.shape
 
-    valid_rows = (32, 64, 128) if world_size == 8 else (64, 128, 256)
+    valid_rows = (32, 64, 128, 256) if world_size == 8 else (64, 128, 256)
     if (
         rows not in valid_rows
         or rows != n_chips * r_pair
@@ -1669,7 +1904,11 @@ def _prepare_chip_b1_moe_b2_setup(
         import dataclasses
 
         base_cfg = default_sparse_decode_config(rows, world_size, scale_block)
-        safe_wm = "stream3" if rows <= 64 else "half_n"
+        safe_wm = (
+            base_cfg.weight_mode
+            if base_cfg.weight_mode in ("stream3", "half_n")
+            else ("stream3" if rows <= 64 else "half_n")
+        )
         config = dataclasses.replace(
             base_cfg,
             weight_mode=safe_wm,
@@ -1908,9 +2147,15 @@ def _prepare_chip_b1_moe_b2_setup(
         [
             vmem((hidden, pre_pair_cols), w_pre_pair_w8k.dtype),
             v_w_router_buf,
-            vmem((rows, half), jnp.bfloat16),
-            vmem((rows, half), jnp.bfloat16),
-            vmem((rows, half), jnp.bfloat16),
+            *(
+                [vmem((rows, half), jnp.bfloat16)]
+                if (final_norm_only and not interpret_mode)
+                else [
+                    vmem((rows, half), jnp.bfloat16),
+                    vmem((rows, half), jnp.bfloat16),
+                    vmem((rows, half), jnp.bfloat16),
+                ]
+            ),
             *v_rs_slice_shapes,
             v_rs2_b,
             v_sq_pair_pa,
@@ -2401,7 +2646,7 @@ def _step_c_max_bkv_rows(
     allow_large_b: bool,
     base_rows: int,
 ) -> int:
-    if eff_b == 128 and not kv_pack_bd4 and (not kv_pack_dense2 or allow_large_b):
+    if eff_b in (128, 256) and not kv_pack_bd4 and (not kv_pack_dense2 or allow_large_b):
         return _STEP_C_B128_MAX_BKV_ROWS
     return _STEP_C_LARGE_B_MAX_BKV_ROWS if eff_b > 64 else base_rows
 
@@ -2995,6 +3240,16 @@ def b1_moe_b2_rpad_chip_sharded_jax(
             rpa_use_grp_vec=bool(run_grp_vec),
             rpa_skip_kv_write=bool(skip_kv_write),
             use_3scope=st["use_3scope"],
+            split_b2_rpad=bool(
+                st["use_3scope"]
+                and (not kv_pack_bd4)
+                and (
+                    world_size == 8
+                    or run_cfg.num_slots * run_slot_pg * phys_page_rows > _STEP_C_LARGE_B_MAX_BKV_ROWS
+                    or run_cfg.hoist_new_kv
+                    or run_grp_vec
+                )
+            ),
             step_b3_moe_is_scope2=st["step_b3_moe_is_scope2"],
             step_b3_n_moe_outer=st["step_b3_n_moe_outer"],
             step_b3_scope1_shapes=st["step_b3_scope1_shapes"],

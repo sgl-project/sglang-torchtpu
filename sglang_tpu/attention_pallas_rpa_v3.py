@@ -837,6 +837,15 @@ def _invoke_v3_kernel(
             and is_lc_full
             and "prefix_fast" in prefill_opts
         ):
+            if (
+                is_tp16_sq_target
+                and use_w9_preset
+                and "nogqa8" not in eff_lc_toks
+                and "nogqa8" not in raw_all_toks
+                and "nogqa8" not in all_prefill_toks
+                and "full_nogqa8" not in raw_all_toks
+            ):
+                prefill_opts.add("gqa8")
             extra["_prefill_topk_slices"] = topk_slices
             extra["_prefill_topk_qstride"] = topk_qstride
             topk_sink_val = (
@@ -851,6 +860,17 @@ def _invoke_v3_kernel(
             )
             if topk_tail_local_val > 0:
                 extra["_prefill_topk_tail_local"] = topk_tail_local_val
+            topk_kpool = (
+                8
+                if "kpool8" in eff_lc_toks
+                else (
+                    4
+                    if "kpool4" in eff_lc_toks
+                    else (2 if "kpool2" in eff_lc_toks else 1)
+                )
+            )
+            if topk_kpool > 1:
+                extra["_prefill_topk_kpool"] = topk_kpool
             if topk_fast_env is not None and topk_fast_env.get():
                 k_pair_val = (
                     int(topk_k_pair_env.get())
@@ -864,14 +884,21 @@ def _invoke_v3_kernel(
                 )
                 extra["_prefill_topk_in_kernel"] = True
                 extra["_prefill_topk_gqa_batch"] = 8 if topk_qstride == 16 else 4
+                base_k_pair = (
+                    8
+                    if topk_qstride in (8, 16)
+                    else (4 if topk_qstride == 4 else 2)
+                )
                 extra["_prefill_topk_k_pair"] = (
                     k_pair_val
                     if k_pair_val > 0
-                    else (4 if topk_qstride in (4, 8, 16) else 2)
+                    else min(64, base_k_pair * topk_kpool)
                 )
                 if k1_bq_val > 0:
                     extra["_prefill_topk_k1_bq"] = k1_bq_val
-                elif topk_qstride in (4, 8, 16):
+                elif topk_qstride == 16:
+                    extra["_prefill_topk_k1_bq"] = 24576
+                elif topk_qstride in (4, 8):
                     extra["_prefill_topk_k1_bq"] = 16384
     else:
         if mixed_blocks:

@@ -1038,12 +1038,23 @@ def _run_oproj_ar_and_post_attn_norm(
 
             v_own = ns_own * pre_ff_gain_ref[0:1, c_own] if pre_ff_scale_input else ns_own
             v_oth = ns_oth * pre_ff_gain_ref[0:1, c_oth] if pre_ff_scale_input else ns_oth
-            sq = v_own * v_own + v_oth * v_oth
-            return acc + (sq[:, 0:128] + sq[:, 128:256])
+            sq_o = v_own * v_own
+            sq_t = v_oth * v_oth
+            own_acc, oth_acc = acc
+            return (
+                own_acc + (sq_o[:, 0:128] + sq_o[:, 128:256]),
+                oth_acc + (sq_t[:, 0:128] + sq_t[:, 128:256]),
+            )
 
-        pff_sq = _reduce_col_blocks(
-            half, _res_both_halves, jnp.zeros((bm, 128), dtype=jnp.float32)
+        own_pff_sq, oth_pff_sq = _reduce_col_blocks(
+            half,
+            _res_both_halves,
+            (
+                jnp.zeros((bm, 128), dtype=jnp.float32),
+                jnp.zeros((bm, 128), dtype=jnp.float32),
+            ),
         )
+        pff_sq = own_pff_sq + oth_pff_sq
         inv_pff = lax.rsqrt(
             jnp.sum(pff_sq, axis=-1, keepdims=True) * jnp.float32(1.0 / hidden)
             + jnp.float32(pre_ff_eps)
@@ -1556,23 +1567,146 @@ def _run_rep_b1_vmem_core(
         s3.wait()
     else:
         eff_pre_b = send_half.at[pl.ds(0, pre_buf_rows), :] if h_pre == half else pre_half_b
-        _gather_shard_xor1(
-            pre_shard,
-            eff_pre_a,
-            eff_pre_b,
-            ag_s1_send,
-            ag_s1_recv,
-            ag_s2_send,
-            ag_s2_recv,
-            ag_s3_send,
-            ag_s3_recv,
-            me=me,
-            world_size=world_size,
-            use_halfrow=False,
-            during_ici_fn=_under_ag_exp_ici,
-            my_half_epilogue_fn=_norm_pre_slice,
-            mate_half_epilogue_fn=_norm_pre_slice,
-        )
+        half_pre = h_pre // 2
+        if (
+            not tile_r32
+            and pre_cols % 128 == 0
+            and half_pre % 128 == 0
+            and (
+                out_expert_3d_ref is None
+                or (h_pre % 2048 == 0 and 2048 % pre_cols == 0)
+            )
+        ):
+            # Wave-18 Zero-s1 -50% ICI half-col AG + D2D-overlapped own_pre_sq (B in {8, 16}):
+            # removes the serial s1 D2D round-trip before ICI, halves ICI bytes across peers,
+            # and hides the single contiguous [B, H_PRE/2] D2D swap underneath own_pre_sq.
+            n_chips = world_size // 2
+            mate = me ^ jnp.int32(1)
+            side = me & jnp.int32(1)
+            other_side = jnp.int32(1) - side
+            chip = me >> jnp.int32(1)
+            own_h0 = pl.multiple_of(side * half_pre, 128)
+            oth_h0 = pl.multiple_of(other_side * half_pre, 128)
+            my_slot_c0 = pl.multiple_of(own_h0 + chip * pre_cols, 128)
+            c_step = 512 if (pre_cols % 512 == 0) else (256 if (pre_cols % 256 == 0) else 128)
+
+            def _fold128(x):
+                w_x = x.shape[1]
+                acc_f = x[:, 0:128]
+                for off_f in range(128, w_x, 128):
+                    acc_f = acc_f + x[:, off_f : off_f + 128]
+                return acc_f
+
+            s2_ops = []
+            for d in range(1, n_chips):
+                peer = me ^ jnp.int32(d << 1)
+                op = pltpu.make_async_remote_copy(
+                    pre_shard,
+                    eff_pre_a.at[:, pl.ds(my_slot_c0, pre_cols)],
+                    ag_s2_send.at[d - 1],
+                    ag_s2_recv.at[d - 1],
+                    device_id=(peer,),
+                    device_id_type=pl.DeviceIdType.MESH,
+                )
+                op.start()
+                s2_ops.append(op)
+
+            for off in range(0, pre_cols, c_step):
+                eff_pre_a[:, pl.ds(pl.multiple_of(my_slot_c0 + off, 128), c_step)] = pre_shard[
+                    :, pl.ds(off, c_step)
+                ]
+            _under_ag_exp_ici()
+            for op in s2_ops:
+                op.wait()
+
+            op_d2d = pltpu.make_async_remote_copy(
+                eff_pre_a.at[:, pl.ds(own_h0, half_pre)],
+                eff_pre_a.at[:, pl.ds(own_h0, half_pre)],
+                ag_s3_send.at[0],
+                ag_s3_recv.at[0],
+                device_id=(mate,),
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+            op_d2d.start()
+
+            own_sq = jnp.zeros((rows, 128), dtype=jnp.float32)
+            for c in range(n_chips):
+                for off in range(0, pre_cols, c_step):
+                    c_src = pl.ds(pl.multiple_of(own_h0 + c * pre_cols + off, 128), c_step)
+                    c_can = pl.ds(
+                        pl.multiple_of((2 * c) * pre_cols + side * pre_cols + off, 128), c_step
+                    )
+                    xf = eff_pre_a[:, c_src].astype(jnp.float32)
+                    if pre_exp_scale_input:
+                        xf = xf * pre_exp_gain_ref[0:1, c_can]
+                    own_sq = own_sq + _fold128(xf * xf)
+            op_d2d.wait()
+
+            oth_sq = jnp.zeros((rows, 128), dtype=jnp.float32)
+            for c in range(n_chips):
+                for off in range(0, pre_cols, c_step):
+                    c_src = pl.ds(pl.multiple_of(oth_h0 + c * pre_cols + off, 128), c_step)
+                    c_can = pl.ds(
+                        pl.multiple_of((2 * c) * pre_cols + other_side * pre_cols + off, 128),
+                        c_step,
+                    )
+                    xf = eff_pre_a[:, c_src].astype(jnp.float32)
+                    if pre_exp_scale_input:
+                        xf = xf * pre_exp_gain_ref[0:1, c_can]
+                    oth_sq = oth_sq + _fold128(xf * xf)
+
+            # Commutative f32 sum across side=0/1 -> bit-exact inv across all TP ranks.
+            inv = lax.rsqrt(
+                jnp.sum(own_sq + oth_sq, axis=-1, keepdims=True) * jnp.float32(1.0 / h_pre)
+                + jnp.float32(pre_exp_eps)
+            )
+            # After op_d2d.wait(), even ranks sit in [0:half_pre] and odd ranks in [half_pre:h_pre].
+            if out_expert_in_ref is not None:
+                for r_idx in range(world_size):
+                    src_base = (r_idx & 1) * half_pre + (r_idx >> 1) * pre_cols
+                    dst_base = r_idx * pre_cols
+                    for off in range(0, pre_cols, c_step):
+                        xf = eff_pre_a[:, pl.ds(src_base + off, c_step)].astype(jnp.float32)
+                        g = pre_exp_gain_ref[0:1, pl.ds(dst_base + off, c_step)]
+                        yn = (xf * g) * inv if pre_exp_scale_input else (xf * inv) * g
+                        out_expert_in_ref[:, pl.ds(dst_base + off, c_step)] = yn.astype(
+                            out_expert_in_ref.dtype
+                        )
+            if out_expert_3d_ref is not None:
+                n_2k = h_pre // 2048
+                ranks_per_2k = 2048 // pre_cols
+                for h_i in range(n_2k):
+                    chunks = []
+                    for k in range(ranks_per_2k):
+                        r_idx = h_i * ranks_per_2k + k
+                        src_base = (r_idx & 1) * half_pre + (r_idx >> 1) * pre_cols
+                        dst_base = r_idx * pre_cols
+                        for off in range(0, pre_cols, c_step):
+                            xf = eff_pre_a[:, pl.ds(src_base + off, c_step)].astype(jnp.float32)
+                            g = pre_exp_gain_ref[0:1, pl.ds(dst_base + off, c_step)]
+                            yn = (xf * g) * inv if pre_exp_scale_input else (xf * inv) * g
+                            chunks.append(yn.astype(out_expert_3d_ref.dtype))
+                    out_expert_3d_ref[:, pl.ds(h_i * 16, 16), :] = jnp.concatenate(
+                        chunks, axis=1
+                    ).reshape(rows, 16, 128)
+        else:
+            _gather_shard_xor1(
+                pre_shard,
+                eff_pre_a,
+                eff_pre_b,
+                ag_s1_send,
+                ag_s1_recv,
+                ag_s2_send,
+                ag_s2_recv,
+                ag_s3_send,
+                ag_s3_recv,
+                me=me,
+                world_size=world_size,
+                use_halfrow=False,
+                during_ici_fn=_under_ag_exp_ici,
+                my_half_epilogue_fn=_norm_pre_slice,
+                mate_half_epilogue_fn=_norm_pre_slice,
+            )
         if not skip_stream_store:
             _dma_wait(out_stream_hbm, s_out_sem.at[0])
 

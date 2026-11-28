@@ -69,6 +69,7 @@ class DecodeFastConfig:
     ring_group_size: int = 1
     priv_group_size: int = 1
     priv_blk_pages: int = 0
+    sh_sub_chunk: int = 0
 
 
 def _uses_swabatch_group(
@@ -488,8 +489,25 @@ def parse_decode_fast_config(
     no_mask0 = "nomask0" in toks_cfg or gear_4k
     swabatch_group_size = (
         1
-        if "nobatch4" in toks_cfg
-        else (4 if ("batch4" in toks_cfg or "b4" in toks_cfg) else (2 if ("batch2" in toks_cfg or "b2" in toks_cfg) else 1))
+        if ("nobatch4" in toks_cfg or "b1" in toks_cfg)
+        else (
+            4
+            if (
+                "batch4" in toks_cfg
+                or "b4" in toks_cfg
+                or (
+                    "batch2" not in toks_cfg
+                    and "b2" not in toks_cfg
+                    and not u4_flat
+                    and (kv_pack_bd4 or kv_pack_dense2)
+                    and b_tokens is not None
+                    and b_tokens >= 32
+                    and (batch_full or use_w7)
+                    and decode_query_size == 1
+                )
+            )
+            else (2 if ("batch2" in toks_cfg or "b2" in toks_cfg) else 1)
+        )
     )
     fine_gears = (
         decode_query_size == 1
@@ -555,7 +573,14 @@ def parse_decode_fast_config(
                 and "noringgrp" not in toks_cfg
                 and "dyn2k" not in toks_cfg
                 and not explicit_streamdyn
-                and (explicit_dyn_chunk >= 4096 or use_w7 or batch_full)
+                and (
+                    use_w7
+                    or batch_full
+                    or "b4" in toks_cfg
+                    or "batch4" in toks_cfg
+                    or "b2" in toks_cfg
+                    or "batch2" in toks_cfg
+                )
             )
         ):
             loop_kind = "ring4k"
@@ -626,7 +651,13 @@ def parse_decode_fast_config(
                 "nobatch4",
                 "noringgrp",
                 "noprivgrp",
+                "nod2grp",
+                "noshsub",
+                "forceq256",
                 "b1",
+                "shsub1k",
+                "shsub2k",
+                "shsub4k",
             ):
                 continue
             if tok.startswith("s") and tok[1:].isdigit():
@@ -737,7 +768,11 @@ def parse_decode_fast_config(
 
     num_slots = max(2, num_slots)
     d2_grp_env = getattr(envs, "SGLANG_TPU_RPA_V3_DENSE2_GROUP", None)
-    dense2_group = ("d2grp" in toks_cfg) or bool(d2_grp_env is not None and d2_grp_env.get())
+    dense2_group = (
+        ("d2grp" in toks_cfg)
+        or bool(d2_grp_env is not None and d2_grp_env.get())
+        or (b_tokens is not None and b_tokens >= 32 and "nod2grp" not in toks_cfg)
+    )
     sh_hkv_env = getattr(envs, "SGLANG_TPU_RPA_V3_SHARED_HOISTKV", None)
     shared_hoistkv = bool(sh_hkv_env is not None and sh_hkv_env.get())
     eff_shared_group = shared_group if (sliding_window is None and loop_kind.startswith("shared")) else 0
@@ -756,17 +791,47 @@ def parse_decode_fast_config(
         and not disable_rg_grp
     ):
         eff_ring_grp = (
-            2
-            if ("batch2" in toks_cfg or "b2" in toks_cfg)
-            else (4 if ("batch4" in toks_cfg or "b4" in toks_cfg or batch_full or use_w7) else 1)
+            4
+            if ("batch4" in toks_cfg or "b4" in toks_cfg)
+            else (
+                2
+                if ("batch2" in toks_cfg or "b2" in toks_cfg)
+                else (4 if (batch_full or use_w7) else 1)
+            )
         )
     else:
         eff_ring_grp = 1
-    if loop_kind == "ring4k" and eff_ring_grp > 1 and not no_fold:
+    if not no_fold and (
+        (loop_kind == "ring4k" and eff_ring_grp > 1)
+        or (loop_kind == "swabatch" and eff_swabatch_grp > 1)
+        or (eff_shared_group > 0 and page_size >= 512 and chunk_sz >= 4096)
+    ):
         fold_col = True
         fold_128 = True
+    if (
+        eff_shared_group > 0
+        and page_size >= 512
+        and chunk_sz >= 4096
+        and shared_q_tile < 512
+        and "q128" not in toks_cfg
+        and "forceq256" not in toks_cfg
+    ):
+        shared_q_tile = 512
     if loop_kind == "shared32" and chunk_sz == 8192 and kv_pack_dense2 and shared_q_tile > 512:
         shared_q_tile = 512
+
+    if "noshsub" in toks_cfg:
+        sh_sub_chunk = 0
+    elif "shsub1k" in toks_cfg:
+        sh_sub_chunk = 1024
+    elif "shsub2k" in toks_cfg:
+        sh_sub_chunk = 2048
+    elif "shsub4k" in toks_cfg:
+        sh_sub_chunk = 4096
+    elif eff_shared_group >= 16 and page_size >= 512 and chunk_sz >= 4096:
+        sh_sub_chunk = 2048 if (not kv_pack_bd4 or not (shared_fp8_qkpv or shared_fp8_pv_only)) else (4096 if chunk_sz >= 8192 else 0)
+    else:
+        sh_sub_chunk = 0
 
     if sliding_window is not None:
         if loop_kind in ("stream0b", "swabatch", "swafast", "swafast2", "stream2h", "stream1p", "stream2ld", "clean1p"):
@@ -853,6 +918,7 @@ def parse_decode_fast_config(
             )
             else 0
         ),
+        sh_sub_chunk=sh_sub_chunk,
     )
 
 
@@ -4118,7 +4184,7 @@ def _run_rpad_vmem_core(
                     off_m = meta_base_off + 2 * cur_idx
                     fl = jnp.where(b_i == 0, jnp.int32(1 << 0), jnp.int32(0))
                     if short_pg > 0:
-                        fl = fl | jnp.where((b_i == 0) & (mx_pg <= short_pg), jnp.int32(1 << 2), jnp.int32(0))
+                        fl = fl | jnp.where((mx_pg - b_i * blk_pg) <= short_pg, jnp.int32(1 << 2), jnp.int32(0))
                     written_cnt_smem_ref[off_m + 0] = (g_i << 16) | b_i
                     written_cnt_smem_ref[off_m + 1] = fl
 
@@ -4441,6 +4507,92 @@ def _run_rpad_vmem_core(
                         if q_exp2_sc is not None
                         else jnp.float32(exp2_scale)
                     )
+                    if (
+                        not use_split_bd4
+                        and not mask_valid
+                        and cfg.sh_sub_chunk > 0
+                        and (eff_width % cfg.sh_sub_chunk) == 0
+                        and eff_width > cfg.sh_sub_chunk
+                    ):
+                        sub_w = cfg.sh_sub_chunk
+                        width_s = sub_w // 2
+                        cur_m = state_vmem_ref[0, lanes, :]
+                        cur_l = state_vmem_ref[1, lanes, :]
+                        cur_a = state_vmem_ref[2, lanes, :]
+                        use_f128_sh = cfg.fold_128 and (width_s >= 128) and (width_s % 128 == 0)
+                        use_fcol_sh = cfg.fold_col and use_f128_sh
+                        eff_sc_w = (
+                            _broadcast_minor_128_any(eff_sc, width_s)
+                            if (q_exp2_sc is not None and not use_fcol_sh)
+                            else eff_sc
+                        )
+                        for sub_off in range(0, eff_width, sub_w):
+                            k_pair = _bkv_fp8_chunk(slot, sub_off, sub_w, kind="k")
+                            s_e, s_o = _bd4_logits_split(q_s, k_pair, n_seq_t, width_s)
+                            s_mx = jnp.maximum(s_e, s_o)
+                            blk_max = jnp.max(
+                                _fold128_op(s_mx, jnp.maximum) if use_f128_sh else s_mx,
+                                axis=1,
+                                keepdims=True,
+                            )
+                            blk_m_128 = _broadcast_minor_128(blk_max)
+                            m_s = jnp.maximum(cur_m, blk_m_128)
+                            alpha_s = jnp.exp2((cur_m - m_s) * eff_sc)
+                            if use_fp8_pv:
+                                ref_m_128 = blk_m_128
+                                beta_s = jnp.exp2((blk_m_128 - m_s) * eff_sc)
+                                l_scale = beta_s
+                                pv_scale = beta_s * jnp.float32(v_scale_val / 448.0)
+                            else:
+                                ref_m_128 = m_s
+                                l_scale = jnp.float32(1.0)
+                                pv_scale = jnp.float32(v_scale_val)
+                            if use_fcol_sh:
+                                p_xe, l_xe = _exp2_fold_col(s_e, ref_m_128, eff_sc)
+                                p_xo, l_xo = _exp2_fold_col(s_o, ref_m_128, eff_sc)
+                                l_tot = l_xe + l_xo
+                            elif use_f128_sh:
+                                m_1 = ref_m_128[:, :1]
+                                p_xe = jnp.exp2((s_e - m_1) * eff_sc)
+                                p_xo = jnp.exp2((s_o - m_1) * eff_sc)
+                                l_tot = _fold128_op(p_xe + p_xo, jnp.add)
+                            else:
+                                ref_m_w = _broadcast_minor_128_any(ref_m_128, width_s)
+                                p_xe = jnp.exp2((s_e - ref_m_w) * eff_sc_w)
+                                p_xo = jnp.exp2((s_o - ref_m_w) * eff_sc_w)
+                                l_tot = jnp.sum(
+                                    (p_xe + p_xo).reshape(out_w, width_s // 128, 128), axis=1
+                                )
+                            p_bd = jnp.concatenate(
+                                [
+                                    p_xe.reshape(n_seq_t, 8, width_s),
+                                    p_xo.reshape(n_seq_t, 8, width_s),
+                                ],
+                                axis=1,
+                            ).reshape(n_seq_t * 16, width_s)
+                            if use_fp8_pv:
+                                p_dot = (p_bd * jnp.float32(448.0)).astype(jnp.float8_e4m3fn)
+                            elif cfg.pv_bf16:
+                                p_dot = p_bd.astype(jnp.bfloat16)
+                            else:
+                                p_dot = p_bd
+                            v_pair = _bkv_fp8_chunk(slot, sub_off, sub_w, kind="v")
+                            o_bd = jnp.matmul(
+                                p_dot, v_pair, preferred_element_type=jnp.float32
+                            ).reshape(n_seq_t, 2, 8, 128)
+                            o_odd = _roll_lanes_fast(
+                                o_bd[:, 1].reshape(out_w, 128),
+                                64,
+                                interpret_mode=interpret_mode,
+                            ).reshape(n_seq_t, 8, 128)
+                            pv_s = (o_bd[:, 0] + o_odd).reshape(out_w, 128)
+                            cur_m = m_s
+                            cur_l = cur_l * alpha_s + l_tot * l_scale
+                            cur_a = cur_a * alpha_s + pv_s * pv_scale
+                        state_vmem_ref[0, lanes, :] = cur_m
+                        state_vmem_ref[1, lanes, :] = cur_l
+                        state_vmem_ref[2, lanes, :] = cur_a
+                        return
                     if use_split_bd4:
                         width_s = max_ring_rows // 4
                         k01, k23 = _load_bkv_bd4_pair_parts(
@@ -4599,6 +4751,67 @@ def _run_rpad_vmem_core(
                     if q_exp2_sc is not None
                     else jnp.float32(exp2_scale)
                 )
+
+                if (
+                    not use_split
+                    and not mask_valid
+                    and cfg.sh_sub_chunk > 0
+                    and (eff_width % cfg.sh_sub_chunk) == 0
+                    and eff_width > cfg.sh_sub_chunk
+                ):
+                    sub_w = cfg.sh_sub_chunk
+                    cur_m = state_vmem_ref[0, lanes, :]
+                    cur_l = state_vmem_ref[1, lanes, :]
+                    cur_a = state_vmem_ref[2, lanes, :]
+                    for sub_off in range(0, eff_width, sub_w):
+                        k_sub = _bkv_fp8_chunk(slot, sub_off, sub_w, kind="k")
+                        s_sub = jnp.matmul(q_s, k_sub.T, preferred_element_type=jnp.float32)
+                        blk_mx_s = jnp.max(
+                            _fold128_op(s_sub, jnp.maximum) if cfg.fold_128 else s_sub,
+                            axis=1,
+                            keepdims=True,
+                        )
+                        blk_m_s = _broadcast_minor_128(blk_mx_s)
+                        m_s = jnp.maximum(cur_m, blk_m_s)
+                        alpha_s = jnp.exp2((cur_m - m_s) * eff_sc)
+                        if use_fp8_pv:
+                            ref_s = blk_m_s
+                            beta_s = jnp.exp2((blk_m_s - m_s) * eff_sc)
+                            l_sc_s = beta_s
+                            pv_sc_s = beta_s * jnp.float32(v_scale_val / 448.0)
+                        else:
+                            ref_s = m_s
+                            l_sc_s = jnp.float32(1.0)
+                            pv_sc_s = jnp.float32(v_scale_val)
+                        if cfg.fold_col:
+                            p_s, l_s = _exp2_fold_col(s_sub, ref_s, eff_sc)
+                        elif cfg.fold_128:
+                            p_s = jnp.exp2((s_sub - ref_s[:, :1]) * eff_sc)
+                            l_s = _fold128_op(p_s, jnp.add)
+                        else:
+                            ref_sw = _broadcast_minor_128_any(ref_s, sub_w)
+                            sc_sw = (
+                                _broadcast_minor_128_any(eff_sc, sub_w)
+                                if q_exp2_sc is not None
+                                else eff_sc
+                            )
+                            p_s = jnp.exp2((s_sub - ref_sw) * sc_sw)
+                            l_s = jnp.sum(p_s.reshape(q_w, sub_w // 128, 128), axis=1)
+                        if use_fp8_pv:
+                            p_d_s = (p_s * jnp.float32(448.0)).astype(jnp.float8_e4m3fn)
+                        elif cfg.pv_bf16:
+                            p_d_s = p_s.astype(jnp.bfloat16)
+                        else:
+                            p_d_s = p_s
+                        v_sub = _bkv_fp8_chunk(slot, sub_off, sub_w, kind="v")
+                        pv_s = jnp.matmul(p_d_s, v_sub, preferred_element_type=jnp.float32)
+                        cur_m = m_s
+                        cur_l = cur_l * alpha_s + l_s * l_sc_s
+                        cur_a = cur_a * alpha_s + pv_s * pv_sc_s
+                    state_vmem_ref[0, lanes, :] = cur_m
+                    state_vmem_ref[1, lanes, :] = cur_l
+                    state_vmem_ref[2, lanes, :] = cur_a
+                    return
 
                 if use_split:
                     width_s = max_ring_rows // 2
@@ -5679,26 +5892,27 @@ def _run_rpad_vmem_core(
                                         cache_write_sem.at[0],
                                     ).start()
 
-                        if w_pg <= 2:
-                            for p_i in range(w_pg):
-                                _san_grp_pg(
-                                    sl,
-                                    pg_base_sl + p_i,
-                                    jnp.maximum(rf_seq - p_i * page_size, 0),
-                                    jnp.clip(re - p_i * page_size, 0, page_size),
-                                )
-                        else:
-                            _san_grp_pg(sl, pg_base_sl, rf_seq, re)
-                            last_p = jnp.clip(npg - 1, 0, w_pg - 1)
-                            @pl.when(last_p > 0)
-                            def _slp(lp=last_p, re_v=re, pbs=pg_base_sl):
-                                _san_grp_pg(
-                                    sl, pbs + lp, 0, jnp.clip(re_v - lp * page_size, 0, page_size)
-                                )
-                            for p_i in range(1, w_pg):
-                                @pl.when(p_i >= npg)
-                                def _zpi(pi_=p_i, pbs=pg_base_sl):
-                                    _zero_grp_pg(sl, pbs + pi_)
+                        @pl.when((rf_seq > 0) | (re < page_size))
+                        def _sp0(rfs=rf_seq, re_v=re, pbs=pg_base_sl):
+                            _san_grp_pg(sl, pbs, rfs, re_v)
+
+                        if w_pg == 2:
+                            @pl.when(re < w_tok)
+                            def _sp1(re_v=re, pbs=pg_base_sl):
+                                _san_grp_pg(sl, pbs + 1, 0, jnp.clip(re_v - page_size, 0, page_size))
+                        elif w_pg > 2:
+                            @pl.when(re < w_tok)
+                            def _stail(np=npg, re_v=re, pbs=pg_base_sl):
+                                last_p = jnp.clip(np - 1, 0, w_pg - 1)
+                                @pl.when((last_p > 0) & (re_v < (last_p + 1) * page_size))
+                                def _slp():
+                                    _san_grp_pg(
+                                        sl, pbs + last_p, 0, jnp.clip(re_v - last_p * page_size, 0, page_size)
+                                    )
+                                for p_i in range(1, w_pg):
+                                    @pl.when(p_i >= np)
+                                    def _zpi(pi_=p_i):
+                                        _zero_grp_pg(sl, pbs + pi_)
 
                     q_g = q_vmem_ref[pl.ds(grp_sz * g_i, grp_sz)]
                     s_new_g = jnp.concatenate(
@@ -5791,18 +6005,25 @@ def _run_rpad_vmem_core(
                         )
                         v0_g = v0_g.reshape(grp_sz, n_u32, 128)
                         v1_g = v1_g.reshape(grp_sz, n_u32, 128)
-                        pv_g = jnp.concatenate(
-                            [
-                                _bd4_pv_reduce(
-                                    pe_flat[sub * 8 : (sub + 1) * 8],
-                                    po_flat[sub * 8 : (sub + 1) * 8],
-                                    jnp.concatenate([v0_g[sub], v1_g[sub]], axis=0),
-                                    n_seq=1,
-                                    p_bf16=cfg.pv_bf16,
-                                )
-                                for sub in range(grp_sz)
-                            ],
-                            axis=0,
+                        o_e_list, o_o_list = [], []
+                        for sub in range(grp_sz):
+                            p_bd_s = jnp.concatenate(
+                                [pe_flat[sub * 8 : (sub + 1) * 8], po_flat[sub * 8 : (sub + 1) * 8]],
+                                axis=0,
+                            )
+                            if cfg.pv_bf16:
+                                p_bd_s = p_bd_s.astype(jnp.bfloat16)
+                            o_bd_s = jnp.matmul(
+                                p_bd_s,
+                                jnp.concatenate([v0_g[sub], v1_g[sub]], axis=0),
+                                preferred_element_type=jnp.float32,
+                            )
+                            o_e_list.append(o_bd_s[:8])
+                            o_o_list.append(o_bd_s[8:])
+                        pv_g = jnp.concatenate(o_e_list, axis=0) + _roll_lanes_fast(
+                            jnp.concatenate(o_o_list, axis=0),
+                            64,
+                            interpret_mode=interpret_mode,
                         )
                         _finish_grp_out(pv_g, l_flat, m_flat)
                         return wr_cnt

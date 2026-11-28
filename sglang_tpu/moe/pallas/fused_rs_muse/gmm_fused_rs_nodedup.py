@@ -591,8 +591,9 @@ def _select_fused_rs_block_sizes(
         and (size_k1, aligned_n1, padded_k2, aligned_n2) == (4096, 8192, 4096, 4096)
         and quant_block_size is not None
         and quant_block_size >= 256
-        # Preserve M<=32768 tile_m=128 (inter32=12 IMEM budget); upgrade >=8K prefill (M>=65536).
-        and size_m >= 65536
+        # Wave-18: keep tile_m=128 at 32K<=M<65K (inter32=12 IMEM cap) with full out-N
+        # (4096, 4096, 2, 2) + wla=2; use tile_m=256 (2, 1) at M>=65K.
+        and size_m >= 32768
         and not envs.SGLANG_TPU_MUSE_KERNEL_K256_PREFILL_TILES.get()
         and int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_EXPERT_OUTER_FP8.get() or 0) < 3
         and int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_WEIGHT_LOOKAHEAD.get() or 0) == 2
@@ -606,17 +607,10 @@ def _select_fused_rs_block_sizes(
             )
             > 0.0
         ):
-            # FP8 LHS (-2 MiB VMEM) + wla=2: full out-N (2,1) unlocks wla=2 caching
-            # and beats pipeline's n2048 (2,2) across 4K..24K (-4.5%..-8.9% ABAB).
-            tile_m, tile_k1, tile_n1, tile_k2, tile_n2, num_w1_bufs, num_w2_bufs = (
-                256,
-                4096,
-                4096,
-                4096,
-                4096,
-                2,
-                1,
-            )
+            # FP8 LHS (-2 MiB VMEM) + wla=2: full out-N unlocks wla=2 caching
+            # across M>=65K (256, (2,1)) and M=32K..65K (128, (2,2)).
+            tile_m, num_w2_bufs = (256, 1) if size_m >= 65536 else (128, 2)
+            tile_k1, tile_n1, tile_k2, tile_n2, num_w1_bufs = 4096, 4096, 4096, 4096, 2
     if (
         prefill_tiles
         and is_quantized

@@ -1611,20 +1611,66 @@ def fused_bridge_b1_b2_ag_routing(
     )
 
 
+def _should_unsplit_d_with_next_in_gather(
+    *,
+    ep_size: int,
+    d_layout: str,
+    d_tok_tile: int,
+    d_fp8_unpool: bool,
+    d_coal: bool,
+    d_ik_ag: bool,
+    has_w4_wu: bool,
+    t_local: int,
+    next_in_gather_rows: int,
+) -> bool:
+    """Return True when unsplit D + xor1_xytorus_ag_tp8 beats split D + SparseCore AG."""
+    return (
+        ep_size == 8
+        and d_layout == "4slab"
+        and d_tok_tile == 128
+        and d_fp8_unpool
+        and not d_coal
+        and not d_ik_ag
+        and not has_w4_wu
+        and t_local == 1024
+        and next_in_gather_rows in (256, 384)
+    )
+
+
 def _d_with_next_in_gather(
-    *, d_fn, d_args, rows0: int, split: bool, axis_name, gather_static_fp8: bool = False
+    *,
+    d_fn,
+    d_args,
+    rows0: int,
+    split: bool,
+    axis_name,
+    gather_static_fp8: bool = False,
+    prefer_unsplit_xor1: bool = False,
 ):
     """Kernel D with the first ``rows0`` rows of next_attn_in all-gathered: (new_stream, rest, gathered)."""
     from sglang_tpu.kernels.xor1_bridge_all_gather import xor1_bridge_all_gather
 
     # Split _d_with_next_in_gather overlaps AG with Kernel D Part 2 only when AG runs on
     # SparseCore (jax.lax.all_gather); XOR1_BRIDGE_AG=4 is MoE-only and keeps D on SparseCore.
+    # For TP=8 t_local==1024 with rows0 in (256, 384), Part 2 (<=768 rows) fails to amortize
+    # reloading 32 MiB wunpool_fp8, so unsplit D + xor1_xytorus_ag_tp8 wins (-21..-38 us/L).
     bridge_ag_mode = envs.SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG.get()
     under_d_mode = envs.SGLANG_TPU_MUSE_KERNEL_XOR1_AG_UNDER_D.get()
-    use_xor1 = bool(under_d_mode) if split else (bridge_ag_mode in (1, 2, 3))
-    xor1_xy_torus = (bridge_ag_mode >= 3) or (
-        bool(under_d_mode) and bridge_ag_mode == 0
-    )
+    moe_ag_mode = envs.SGLANG_TPU_MUSE_KERNEL_XOR1_AG_MOE.get()
+    if (
+        prefer_unsplit_xor1
+        and bridge_ag_mode in (0, 3)
+        and moe_ag_mode <= 0
+        and not under_d_mode
+    ):
+        split = False
+        use_xor1 = True
+        xor1_xy_torus = True
+    else:
+        use_xor1 = bool(under_d_mode) if split else (bridge_ag_mode in (1, 2, 3))
+        xor1_xy_torus = (bridge_ag_mode >= 3) or (
+            bool(under_d_mode) and bridge_ag_mode == 0
+        )
 
     def _prep_part0(x_part):
         if gather_static_fp8 and x_part.dtype != jnp.float8_e4m3fn:
@@ -2753,31 +2799,24 @@ def fused_moe_full_bridge_and_ffn(
                     local_topk_ids_u8_b, global_topk_u8_b, local_topk_weights, hs_4d
                 )
                 if _b2_direct_fp8_2half:
-                    if _use_b2_pow2:
-                        k_grp = he_dim // 128
-                        hs_buf = jnp.empty(
-                            (ep_size, t_local * k_grp, 128),
-                            dtype=ag_i8_0.dtype,
-                        )
-                        hs_buf = jax.lax.dynamic_update_slice(
-                            hs_buf,
-                            ag_i8_0.reshape(ep_size, c0_tok * k_grp, 128),
-                            (0, 0, 0),
-                        )
-                        hs_buf = jax.lax.dynamic_update_slice(
-                            hs_buf,
-                            ag_i8_1.reshape(ep_size, c1_tok * k_grp, 128),
-                            (0, c0_tok * k_grp, 0),
-                        )
-                        hidden_states = hs_buf.reshape(ep_size * t_local, k_grp, 128)
-                    else:
-                        hidden_states = jnp.concatenate(
-                            [
-                                ag_i8_0.reshape(ep_size, c0_tok, he_dim // 128, 128),
-                                ag_i8_1.reshape(ep_size, c1_tok, he_dim // 128, 128),
-                            ],
-                            axis=1,
-                        ).reshape(ep_size * t_local, he_dim // 128, 128)
+                    # Use 3D DUS even when c0_tok == c1_tok: XLA lowers FP8 jnp.concatenate
+                    # on axis=1 to pad_maximum_fusion (pad(-448)->f32->max->fp8).
+                    k_grp = he_dim // 128
+                    hs_buf = jnp.empty(
+                        (ep_size, t_local * k_grp, 128),
+                        dtype=ag_i8_0.dtype,
+                    )
+                    hs_buf = jax.lax.dynamic_update_slice(
+                        hs_buf,
+                        ag_i8_0.reshape(ep_size, c0_tok * k_grp, 128),
+                        (0, 0, 0),
+                    )
+                    hs_buf = jax.lax.dynamic_update_slice(
+                        hs_buf,
+                        ag_i8_1.reshape(ep_size, c1_tok * k_grp, 128),
+                        (0, c0_tok * k_grp, 0),
+                    )
+                    hidden_states = hs_buf.reshape(ep_size * t_local, k_grp, 128)
                 elif _use_pq_lhs_fp8:
                     hidden_states, hidden_states_scale = (
                         _convert_both_halves_fp8_gmm_layout(
@@ -3417,6 +3456,17 @@ def fused_moe_full_bridge_and_ffn(
                     ag_part0_static_fp8=next_in_gather_static_fp8,
                 )
             elif next_in_gather_rows:
+                prefer_unsplit_xor1 = _should_unsplit_d_with_next_in_gather(
+                    ep_size=ep_size,
+                    d_layout=d_layout,
+                    d_tok_tile=d_tok_tile,
+                    d_fp8_unpool=d_fp8_unpool,
+                    d_coal=d_coal,
+                    d_ik_ag=d_ik_ag,
+                    has_w4_wu=has_w4_wu,
+                    t_local=t_local,
+                    next_in_gather_rows=next_in_gather_rows,
+                )
                 new_stream, next_attn_in, next_in_gathered = _d_with_next_in_gather(
                     d_fn=d_fn,
                     d_args=(
@@ -3435,6 +3485,7 @@ def fused_moe_full_bridge_and_ffn(
                     split=d_layout == "4slab" and next_in_gather_rows % d_tok_tile == 0,
                     axis_name=expert_axis,
                     gather_static_fp8=next_in_gather_static_fp8,
+                    prefer_unsplit_xor1=prefer_unsplit_xor1,
                 )
             elif d_two_half:
                 half_tok = t_local // 2

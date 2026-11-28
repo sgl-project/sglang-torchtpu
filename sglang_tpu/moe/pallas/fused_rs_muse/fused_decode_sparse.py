@@ -575,7 +575,9 @@ def default_sparse_decode_config(
     )
     return SparseDecodeConfig(
         row_mode="sparse",
-        weight_mode="half_n",
+        # Use stream3 (1 contiguous 8 MiB W2 DMA, 3 DMAs/expert vs 4) at B >= 128 too:
+        # same 24 MiB weight VMEM as half_n, bit-exact (-4..-17.8 us/L at B=128/256).
+        weight_mode="stream3",
         tile_m=tile_m_large,
         m_buckets=m_bkts_large,
         loop32_in_tile=False,
