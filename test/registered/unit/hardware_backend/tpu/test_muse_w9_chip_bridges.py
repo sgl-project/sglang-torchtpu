@@ -5288,7 +5288,7 @@ def test_w18_sum1shot_crafted_partials_prs_sf_zpp_and_rep_zero_s1_on_wait_and_ao
         >= 0.9999
     )
 
-    # 3. W18-2: Zero-post_pair_full + op_pd2d overlap (TP=8 r_pair in {8, 16, 32} + TP=16 r_pair=8, L61 round_bf16).
+    # 3. W18-2: Zero-post_pair_full + op_pd2d overlap (TP=8 r_pair in {8, 32}, TP=16 r_pair=8; TP=8 r_pair=16 spill-free balanced).
     for tp_z, m_z, b_z, sh_z in ((8, mesh8, 32, False), (8, mesh8, 64, True), (8, mesh8, 128, True), (16, mesh16, 64, False)):
         rp_z = b_z // (tp_z // 2)
         H_z, HP_z = 2048, 512
@@ -5436,3 +5436,203 @@ def test_w18_sum1shot_crafted_partials_prs_sf_zpp_and_rep_zero_s1_on_wait_and_ao
             )
         ).lower(*rep_args_a).compile()
         assert "tpu_custom_call" in c_ra.as_text()
+
+
+def test_w19_embed_norm_hc_and_topk64_pack_fold_on_wait_and_aot():
+    """Verify Wave-19 half-col embed_norm + Top-64 batch-lane folding & tail-512 under on_wait + TPU7x AOT."""
+    import jax
+
+    if len(jax.devices("cpu")) < 16:
+        pytest.skip("Requires XLA_FLAGS=--xla_force_host_platform_device_count=16")
+
+    import jax.numpy as jnp
+    from jax.experimental import pallas as pl
+    from jax.experimental import topologies
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    from sglang_tpu.kernels import decode_collective_bridges_w8 as w8
+    from sglang_tpu.kernels import fp8_lm_head_fused as lmf
+
+    ip_on_wait = pltpu.InterpretParams(
+        dma_execution_mode="on_wait",
+        detect_races=True,
+        uninitialized_memory="nan",
+    )
+    ip_eager = pltpu.InterpretParams(
+        dma_execution_mode="eager",
+        detect_races=False,
+        uninitialized_memory="nan",
+    )
+    devs = jax.devices("cpu")
+    mesh8 = Mesh(np.array(devs[:8]), ("model",))
+    mesh16 = Mesh(np.array(devs[:16]), ("model",))
+    rng = np.random.default_rng(20261205)
+
+    # 1. Negative guard for hidden % 512 != 0 & multi-strip + cross-rank parity for embed_norm_hc.
+    with pytest.raises(ValueError, match="Unsupported decode_vocab_embed"):
+        w8.decode_vocab_embed_norm_jax(
+            jnp.zeros((16,), jnp.int32),
+            jnp.zeros((20, 256), jnp.bfloat16),
+            world_size=8,
+            interpret=ip_on_wait,
+        )
+
+    H_emb = 1024
+    for tp_e, m_e, b_e in ((8, mesh8, 16), (16, mesh16, 64)):
+        v_sh = 18
+        emb_bf16 = jnp.asarray(rng.standard_normal((tp_e * v_sh, H_emb)) * 0.25, jnp.bfloat16)
+        ids_e = rng.integers(0, tp_e * v_sh, size=(b_e,), dtype=np.int32)
+        ids_e[0], ids_e[1], ids_e[-1] = v_sh - 1, 2 * v_sh - 1, tp_e * v_sh - 1
+        out_e = jax.shard_map(
+            lambda i, e, _tp=tp_e: w8.decode_vocab_embed_norm_jax(
+                i, e, world_size=_tp, norm_eps=1e-5, interpret=ip_on_wait
+            ),
+            mesh=m_e,
+            in_specs=(P(), P("model", None)),
+            out_specs=P("model", None),
+            check_vma=False,
+        )(jnp.asarray(ids_e), emb_bf16)
+        out_np = np.asarray(out_e, np.float32).reshape(tp_e, b_e, H_emb)
+        assert np.isfinite(out_np).all()
+        for r_idx in range(1, tp_e):
+            np.testing.assert_array_equal(out_np[0], out_np[r_idx])
+        ref_e = np.asarray(
+            jnp.asarray(
+                _rms_norm_np(
+                    np.asarray(emb_bf16[ids_e], np.float32),
+                    np.ones((H_emb,), np.float32),
+                    1e-5,
+                    False,
+                ),
+                dtype=jnp.bfloat16,
+            ),
+            dtype=np.float32,
+        )
+        np.testing.assert_allclose(out_np[0], ref_e, rtol=1e-2, atol=1e-2)
+
+    # 2. LMHead Top-64 batch-lane folding (B <= 64) + tail-512 (vp = 1536 = 1024 + 512):
+    #    exact (id=0, vd=0.0) parity vs float32 NumPy reference + tied col-0 lowest-ID parity!
+    orig_pc = pl.pallas_call
+    for tp_l, m_l, b_l, v_loc, vp_l, xbf_l in (
+        (8, mesh8, 1, 640, 1536, False),
+        (8, mesh8, 32, 640, 1024, False),
+        (16, mesh16, 16, 640, 1536, True),
+        (16, mesh16, 64, 640, 1024, True),
+    ):
+        x_u = jax.device_put(
+            jnp.asarray(rng.standard_normal((b_l, 128)) * 0.25, jnp.bfloat16),
+            NamedSharding(m_l, P()),
+        )
+        w_np = (rng.standard_normal((128, tp_l * vp_l)) * 0.2).astype(np.float32)
+        w_u = jax.device_put(
+            jnp.asarray(w_np, jnp.float8_e4m3fn),
+            NamedSharding(m_l, P(None, "model")),
+        )
+        s_u = jax.device_put(
+            jnp.asarray(np.abs(rng.standard_normal((1, tp_l * vp_l))) * 0.03 + 1e-3, jnp.float32),
+            NamedSharding(m_l, P(None, "model")),
+        )
+        with mock.patch.object(
+            pl, "pallas_call", lambda *a, **kw: orig_pc(*a, **{**kw, "interpret": ip_on_wait})
+        ):
+            v_pf, i_pf = jax.jit(
+                jax.shard_map(
+                    lambda x0, w0, s0: lmf.fp8_lm_head_fused_topk64_jax(
+                        x0, w0, s0, world_size=tp_l, local_width=v_loc,
+                        org_vocab_size=tp_l * v_loc, global_vocab_size=tp_l * v_loc,
+                        org_vocab_padded_count=v_loc, k=64, tn=1024,
+                        exact_tie_break=True, use_xor_butterfly=xbf_l, use_pack_fold=True,
+                    ),
+                    mesh=m_l, in_specs=(P(), P(None, "model"), P(None, "model")), out_specs=(P(), P()),
+                    check_vma=False,
+                )
+            )(x_u, w_u, s_u)
+        w_f32 = (
+            np.asarray(w_u, np.float32)
+            .reshape(128, tp_l, vp_l)[:, :, :v_loc]
+            .reshape(128, tp_l * v_loc)
+        )
+        s_f32 = (
+            np.asarray(s_u, np.float32)
+            .reshape(1, tp_l, vp_l)[:, :, :v_loc]
+            .reshape(1, tp_l * v_loc)
+        )
+        logits_ref = (np.asarray(x_u, np.float32) @ w_f32) * s_f32
+        i_ref = np.stack(
+            [np.lexsort((np.arange(tp_l * v_loc), -logits_ref[r]))[:64] for r in range(b_l)],
+            axis=0,
+        ).astype(np.int32)
+        v_ref = np.take_along_axis(logits_ref, i_ref, axis=1).astype(np.float32)
+        np.testing.assert_allclose(np.asarray(v_pf), v_ref, rtol=1e-5, atol=1e-5)
+        np.testing.assert_array_equal(np.asarray(i_pf), i_ref)
+
+    # Explicit tied-weight col-0 lowest-global-ID parity check for batch-lane folding (B=1, 64).
+    for b_t in (1, 64):
+        x_t = jax.device_put(
+            jnp.asarray(rng.standard_normal((b_t, 128)) * 0.25, jnp.bfloat16),
+            NamedSharding(mesh8, P()),
+        )
+        w_t = jax.device_put(
+            jnp.full((128, 8 * 1024), 0.5, jnp.float8_e4m3fn),
+            NamedSharding(mesh8, P(None, "model")),
+        )
+        s_t = jax.device_put(
+            jnp.ones((1, 8 * 1024), jnp.float32),
+            NamedSharding(mesh8, P(None, "model")),
+        )
+        with mock.patch.object(
+            pl, "pallas_call", lambda *a, **kw: orig_pc(*a, **{**kw, "interpret": ip_on_wait})
+        ):
+            vt, it = jax.jit(
+                jax.shard_map(
+                    lambda x0, w0, s0: lmf.fp8_lm_head_fused_topk64_jax(
+                        x0, w0, s0, world_size=8, local_width=640,
+                        org_vocab_size=8 * 640, global_vocab_size=8 * 640,
+                        org_vocab_padded_count=640, k=64, tn=1024,
+                        exact_tie_break=True, use_xor_butterfly=False, use_pack_fold=True,
+                    ),
+                    mesh=mesh8, in_specs=(P(), P(None, "model"), P(None, "model")), out_specs=(P(), P()),
+                    check_vma=False,
+                )
+            )(x_t, w_t, s_t)
+        np.testing.assert_array_equal(np.asarray(it)[:, 0], np.zeros((b_t,), dtype=np.int32))
+        assert np.isfinite(np.asarray(vt)).all()
+
+    # 3. Offline TPU7x AOT checks: embed_norm_hc & LMHead `_pf` routing across TP=8/16.
+    tpu8 = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x=2x2x1").devices
+    aot_m8 = Mesh(np.array(sorted(tpu8, key=lambda d: (d.coords[1], d.coords[0], d.core_on_chip))), ("model",))
+    tpu16 = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x=2x2x2").devices
+    aot_m16 = Mesh(np.array(sorted(tpu16, key=lambda d: (d.coords[1], d.coords[0], d.core_on_chip))), ("model",))
+    SD = jax.ShapeDtypeStruct
+    for mesh_a, tp_a, b_a in ((aot_m8, 8, 8), (aot_m16, 16, 32)):
+        c_emb = jax.jit(
+            jax.shard_map(
+                lambda i, e, _tp=tp_a: w8.decode_vocab_embed_norm_jax(i, e, world_size=_tp),
+                mesh=mesh_a, in_specs=(P(), P("model", None)), out_specs=P(), check_vma=False,
+            )
+        ).lower(SD((b_a,), jnp.int32), SD((202048, 8192), jnp.bfloat16)).compile()
+        assert "tpu_custom_call" in c_emb.as_text()
+
+    for mesh_a, tp_a, b_a, vp_a, exp_pf, exp_xbf in (
+        (aot_m8, 8, 16, 25600, True, False),
+        (aot_m8, 8, 64, 25600, True, True),
+        (aot_m16, 16, 16, 12800, True, True),
+        (aot_m16, 16, 128, 12800, False, True),
+    ):
+        lw_a = 202048 // tp_a
+        cm = jax.jit(
+            jax.shard_map(
+                lambda x0, w0, s0: lmf.fp8_lm_head_distributed_topk_jax(
+                    x0, w0, s0, world_size=tp_a, local_width=lw_a, org_vocab_size=202048,
+                    global_vocab_size=202048, org_vocab_padded_count=lw_a, k=64, fast_topk=False,
+                ),
+                mesh=mesh_a, in_specs=(P(), P(), P()), out_specs=(P(), P()), check_vma=False,
+            )
+        ).trace(
+            SD((b_a, 8192), jnp.bfloat16),
+            SD((8192, vp_a), jnp.float8_e4m3fn),
+            SD((1, vp_a), jnp.float32),
+        ).lower(lowering_platforms=("tpu",)).compile()
+        hlo = cm.as_text()
+        assert ("_pf" in hlo) == exp_pf
+        assert ("_xbf" in hlo) == exp_xbf

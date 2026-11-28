@@ -1549,8 +1549,9 @@ def _decode_embed_ar_norm_kernel(
     out_stream_hbm,
     partial_emb_buf,
     slot_2d_buf,
-    mate_buf,
-    ici_buf,
+    own_half_buf,
+    ici_half_buf,
+    oth_half_buf,
     s_out_buf,
     row_sems,
     d2d_send,
@@ -1562,7 +1563,7 @@ def _decode_embed_ar_norm_kernel(
     world_size: int,
     norm_eps: float,
 ) -> None:
-    """In-kernel owner lookup + XOR=1 D2D + 1-shot ICI sum + RMSNorm -> ``stream [B, H] f32``."""
+    """In-kernel owner lookup + half-col XOR=1 D2D + 1-shot half-col ICI + D2D-overlapped RMSNorm."""
     import jax.numpy as jnp
     from jax import lax
     from jax.experimental import pallas as pl
@@ -1570,12 +1571,19 @@ def _decode_embed_ar_norm_kernel(
 
     actual_rows = out_stream_hbm.shape[0]
     pad_rows, hidden = partial_emb_buf.shape
+    half_h = hidden // 2
     n_chips = world_size // 2
     bm = _pick_strip(pad_rows, 32)
     n_strips = hidden // _COL_STRIP
+    n_half_strips = half_h // _COL_STRIP
 
     me = lax.axis_index("model").astype(jnp.int32)
     mate = me ^ jnp.int32(1)
+    side = me & jnp.int32(1)
+    other_side = jnp.int32(1) - side
+    own_h0 = pl.multiple_of(side * half_h, 128)
+    oth_h0 = pl.multiple_of(other_side * half_h, 128)
+
     _signal_barrier(me, world_size)
     _lookup_local_vocab_rows_in_kernel(
         input_ids_smem,
@@ -1588,9 +1596,14 @@ def _decode_embed_ar_norm_kernel(
     )
     _wait_barrier(world_size)
 
+    # Half-col XOR=1 D2D: exchange complementary half_h slice (-50% D2D bytes vs full [B, H]).
     c1 = pltpu.make_async_remote_copy(
-        partial_emb_buf, mate_buf, d2d_send.at[0], d2d_recv.at[0],
-        device_id=(mate,), device_id_type=pl.DeviceIdType.MESH,
+        partial_emb_buf.at[:, pl.ds(oth_h0, half_h)],
+        own_half_buf,
+        d2d_send.at[0],
+        d2d_recv.at[0],
+        device_id=(mate,),
+        device_id_type=pl.DeviceIdType.MESH,
     )
     c1.start()
     c1.wait()
@@ -1599,42 +1612,90 @@ def _decode_embed_ar_norm_kernel(
         rs = pl.ds(r0, bm)
 
         def _col(s, _):
-            c_sl = pl.ds(pl.multiple_of(s * _COL_STRIP, _COL_STRIP), _COL_STRIP)
-            v = partial_emb_buf[rs, c_sl].astype(jnp.float32) + mate_buf[rs, c_sl].astype(jnp.float32)
-            mate_buf[rs, c_sl] = v.astype(mate_buf.dtype)
+            c_l = pl.ds(pl.multiple_of(s * _COL_STRIP, _COL_STRIP), _COL_STRIP)
+            c_g = pl.ds(pl.multiple_of(own_h0 + s * _COL_STRIP, 128), _COL_STRIP)
+            v = (
+                partial_emb_buf[rs, c_g].astype(jnp.float32)
+                + own_half_buf[rs, c_l].astype(jnp.float32)
+            )
+            own_half_buf[rs, c_l] = v.astype(own_half_buf.dtype)
             return jnp.int32(0)
 
-        lax.fori_loop(0, n_strips, _col, jnp.int32(0))
+        lax.fori_loop(0, n_half_strips, _col, jnp.int32(0))
 
     _fori_strips(pad_rows, bm, _sum_mate)
 
+    # 1-shot half-col ICI across all same-side peers (-50% ICI bytes vs full [B, H]).
     c2 = []
     for d in range(1, n_chips):
         peer = me ^ jnp.int32(d << 1)
         op = pltpu.make_async_remote_copy(
-            mate_buf, ici_buf.at[d - 1], ici_send.at[d - 1], ici_recv.at[d - 1],
-            device_id=(peer,), device_id_type=pl.DeviceIdType.MESH,
+            own_half_buf,
+            ici_half_buf.at[d - 1],
+            ici_send.at[d - 1],
+            ici_recv.at[d - 1],
+            device_id=(peer,),
+            device_id_type=pl.DeviceIdType.MESH,
         )
         op.start()
         c2.append(op)
     for op in c2:
         op.wait()
 
-    def _sum_and_norm(r0):
+    def _sum_own_half(r0):
         rs = pl.ds(r0, bm)
 
-        def _sq_pass(s, acc):
-            c_sl = pl.ds(pl.multiple_of(s * _COL_STRIP, _COL_STRIP), _COL_STRIP)
-            tot = mate_buf[rs, c_sl].astype(jnp.float32)
+        def _col(s, _):
+            c_l = pl.ds(pl.multiple_of(s * _COL_STRIP, _COL_STRIP), _COL_STRIP)
+            tot = own_half_buf[rs, c_l].astype(jnp.float32)
             for slot in range(n_chips - 1):
-                tot = tot + ici_buf[slot, rs, c_sl].astype(jnp.float32)
-            s_out_buf[rs, c_sl] = tot
-            sq = tot * tot
+                tot = tot + ici_half_buf[slot, rs, c_l].astype(jnp.float32)
+            s_out_buf[rs, pl.ds(pl.multiple_of(own_h0 + s * _COL_STRIP, 128), _COL_STRIP)] = tot
+            return jnp.int32(0)
+
+        lax.fori_loop(0, n_half_strips, _col, jnp.int32(0))
+
+    _fori_strips(pad_rows, bm, _sum_own_half)
+
+    # Exchange reduced f32 own_h0 -> mate's oth_half_buf overlapped underneath strip-0 own_sq.
+    c3 = pltpu.make_async_remote_copy(
+        s_out_buf.at[:, pl.ds(own_h0, half_h)],
+        oth_half_buf,
+        d2d_send.at[1],
+        d2d_recv.at[1],
+        device_id=(mate,),
+        device_id_type=pl.DeviceIdType.MESH,
+    )
+    c3.start()
+
+    def _finish_norm(r0, *, wait_c3: bool):
+        rs = pl.ds(r0, bm)
+
+        def _sq_own(s, acc):
+            c_g = pl.ds(pl.multiple_of(own_h0 + s * _COL_STRIP, 128), _COL_STRIP)
+            v = s_out_buf[rs, c_g]
+            sq = v * v
             return acc + (sq[:, 0:128] + sq[:, 128:256])
 
-        sq_acc = lax.fori_loop(0, n_strips, _sq_pass, jnp.zeros((bm, 128), dtype=jnp.float32))
+        own_sq = lax.fori_loop(
+            0, n_half_strips, _sq_own, jnp.zeros((bm, 128), dtype=jnp.float32)
+        )
+        if wait_c3:
+            c3.wait()
+
+        def _sq_oth(s, acc):
+            c_l = pl.ds(pl.multiple_of(s * _COL_STRIP, _COL_STRIP), _COL_STRIP)
+            c_g = pl.ds(pl.multiple_of(oth_h0 + s * _COL_STRIP, 128), _COL_STRIP)
+            v = oth_half_buf[rs, c_l]
+            s_out_buf[rs, c_g] = v
+            sq = v * v
+            return acc + (sq[:, 0:128] + sq[:, 128:256])
+
+        oth_sq = lax.fori_loop(
+            0, n_half_strips, _sq_oth, jnp.zeros((bm, 128), dtype=jnp.float32)
+        )
         inv = lax.rsqrt(
-            jnp.sum(sq_acc, axis=-1, keepdims=True) * jnp.float32(1.0 / hidden)
+            jnp.sum(own_sq + oth_sq, axis=-1, keepdims=True) * jnp.float32(1.0 / hidden)
             + jnp.float32(norm_eps)
         )
 
@@ -1646,7 +1707,16 @@ def _decode_embed_ar_norm_kernel(
 
         lax.fori_loop(0, n_strips, _norm_out, jnp.int32(0))
 
-    _fori_strips(pad_rows, bm, _sum_and_norm)
+    _finish_norm(0, wait_c3=True)
+    if pad_rows > bm:
+        n_row_strips = pad_rows // bm
+        lax.fori_loop(
+            1,
+            n_row_strips,
+            lambda i, _: (_finish_norm(pl.multiple_of(i * bm, bm), wait_c3=False) or jnp.int32(0)),
+            jnp.int32(0),
+        )
+
     s_src = s_out_buf if pad_rows == actual_rows else s_out_buf.at[pl.ds(0, actual_rows), :]
     pltpu.make_async_copy(s_src, out_stream_hbm, s_out_sem.at[0]).start()
     _dma_wait(out_stream_hbm, s_out_sem.at[0])
@@ -1673,10 +1743,11 @@ def decode_vocab_embed_norm_jax(
         not (rows == 8 or (16 <= rows <= 384 and rows % 16 == 0))
         or v_shard < 16
         or v_shard % 2 != 0
-        or hidden % _COL_STRIP != 0
+        or hidden % (2 * _COL_STRIP) != 0
     ):
         raise ValueError("Unsupported decode_vocab_embed_norm shapes")
     pad_rows = max(rows, 16)
+    half_h = hidden // 2
     n_chips = world_size // 2
     smem, vmem, hbm, sem = pltpu.SMEM, pltpu.VMEM, pltpu.HBM, pltpu.SemaphoreType.DMA
 
@@ -1693,18 +1764,19 @@ def decode_vocab_embed_norm_jax(
         scratch_shapes=[
             vmem((pad_rows, hidden), jnp.bfloat16),
             vmem((256, hidden), jnp.bfloat16),
-            vmem((pad_rows, hidden), jnp.bfloat16),
-            vmem((n_chips - 1, pad_rows, hidden), jnp.bfloat16),
+            vmem((pad_rows, half_h), jnp.bfloat16),
+            vmem((n_chips - 1, pad_rows, half_h), jnp.bfloat16),
+            vmem((pad_rows, half_h), jnp.float32),
             vmem((pad_rows, hidden), jnp.float32),
             sem((16,)),
-            sem((1,)),
-            sem((1,)),
+            sem((2,)),
+            sem((2,)),
             sem((n_chips - 1,)),
             sem((n_chips - 1,)),
             sem((1,)),
         ],
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=52 * 1024**2,
+            vmem_limit_bytes=56 * 1024**2,
             collective_id=collective_id,
             disable_bounds_checks=True,
         ),
@@ -7404,15 +7476,16 @@ def _run_chip_sharded_post_fast_core(
         )
         op_pd2d.start()
 
-        if r_pair == 8 or (world_size == 8 and r_pair <= 32):
-            # Wave-18 Zero-post_pair_full + op_pd2d overlap (TP=8 B=32/64/128, TP=16 B=64):
+        if r_pair == 8 or (world_size == 8 and r_pair == 32):
+            # Wave-18/19 Zero-post_pair_full + op_pd2d overlap (TP=8 B=32/128, TP=16 B=64):
             # hides op_pd2d D2D underneath own_b_sq, skips post_pair_full write + 2x reads,
-            # keeps VREG-cached chunks for r_pair<=16 and spill-free own/oth passes for r_pair=32,
-            # and preserves 0.0 chipmate bit-exactness via commutative own_sq + oth_sq sums.
+            # keeps VREG-cached chunks for r_pair==8 and spill-free own/oth passes for r_pair==32,
+            # keeps TP=8 B=64 (r_pair==16) on the spill-free balanced path, and preserves 0.0
+            # chipmate bit-exactness via commutative own_sq + oth_sq sums.
             own_c0 = pl.multiple_of(side * half_h, 128)
             other_c0 = pl.multiple_of(other_side * half_h, 128)
-            half_spans = _tile_spans(half_h, 1024 if r_pair <= 16 else 512)
-            if r_pair <= 16:
+            half_spans = _tile_spans(half_h, 1024 if r_pair == 8 else 512)
+            if r_pair == 8:
                 own_b_sq = jnp.zeros((r_pair, 128), dtype=jnp.float32)
                 own_bc, own_bg = [], []
                 for off, cw in half_spans:
