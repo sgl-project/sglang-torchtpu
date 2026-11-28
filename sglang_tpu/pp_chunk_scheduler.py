@@ -146,16 +146,19 @@ class TpuPipelinePrefillAdder(PrefillAdder):
             and not self.can_run_list
             and original > 0
         ):
-            cap = min(remaining, self.cost.granularity)
+            granule = min(remaining, self.cost.granularity)
             if (
-                self.cost.schedule is not None
-                and self.step_schedule + self.cost.pairs(cap, prefix)
-                > self.cost.schedule[0]
+                self.cost.schedule is None
+                or self.step_schedule + self.cost.pairs(granule, prefix)
+                <= self.cost.schedule[0]
             ):
+                cap = granule
+            elif self.step_schedule == 0:
                 raise ValueError(
                     "The minimum pipeline chunk exceeds the attention schedule capacity; "
                     "reduce --chunked-prefill-size or --context-length."
                 )
+            # Otherwise mixed decode rows hold the capacity; the request waits a step.
         # Admission reserves whole KV pages; the cost model counts query tokens.
         budget = (
             self.ceil_paged_tokens(cap)

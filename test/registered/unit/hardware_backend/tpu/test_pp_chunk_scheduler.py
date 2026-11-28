@@ -245,9 +245,9 @@ def test_minimum_progress_never_bypasses_schedule_capacity():
         obj.add_chunked_req(req(32768, 16384))
 
 
-def test_continuation_beside_decode_rows_admits_a_page(monkeypatch):
+def test_continuation_beside_decode_rows_still_progresses(monkeypatch):
     """Mixed decode rows can leave a fixed-target step a cap under one KV page;
-    a continuation alone in the step must still be admitted at least a page."""
+    a continuation alone in the step must still be admitted at least a granule."""
     admitted = []
 
     def admit(self, request):
@@ -263,6 +263,20 @@ def test_continuation_beside_decode_rows_admits_a_page(monkeypatch):
     assert 0 < model.chunk(16384, 16384, obj.step_tokens, 0.0, 0.0) < obj.page_size
     assert obj.add_chunked_req(request) is None
     assert admitted == [model.granularity]
+
+
+def test_decode_rows_holding_schedule_capacity_defer_a_continuation(monkeypatch):
+    """Mixed decode rows that hold the attention schedule's capacity defer a
+    continuation to a later step instead of failing the minimum-chunk check."""
+    monkeypatch.setattr(PrefillAdder, "add_chunked_req", lambda self, request: None)
+    model = cost()
+    model.schedule = (1024, 256, 256)
+    obj = adder(model)
+    obj.step_tokens = 100
+    obj.step_schedule = model.schedule[0]
+    request = req(32768, prefix=16384)
+    assert obj.add_chunked_req(request) is request
+    assert obj.rem_chunk_tokens == 16384
 
 
 def test_host_prefix_is_included_before_chunk_is_sized():
