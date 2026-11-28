@@ -653,19 +653,37 @@ def _pick_bd_nc(bd_rows: int, max_n: int, narrow: bool = True) -> int:
     return min(128, max_n)
 
 
-def _prequant_lhs_k256(x_src_ref, lhs_fp8_ref, lhs_sc_ref, m_rows: int) -> None:
-    """Online-quantize ``x_src_ref[0:m_rows, 4096]`` per K256 block into FP8 + scale."""
+def _prequant_lhs_k256(
+    x_src_ref,
+    lhs_fp8_ref,
+    lhs_sc_ref,
+    m_rows: int,
+    *,
+    x_is_3d: bool = False,
+) -> None:
+    """Online-quantize ``[0:m_rows, 4096]`` (2D or ``[*, 32, 128]`` 3D) per K256 block."""
     read_m = 16 if m_rows == 8 else m_rows
     fp8_m = max(32, read_m)
     for b_id in range(_H // _KC):
         c0 = b_id * _KC
-        xf = x_src_ref[pl.ds(0, read_m), pl.ds(c0, _KC)].astype(jnp.float32)
+        if x_is_3d:
+            xf = (
+                x_src_ref[pl.ds(0, read_m), pl.ds(b_id * 2, 2), :]
+                .reshape(read_m, _KC)
+                .astype(jnp.float32)
+            )
+        else:
+            xf = x_src_ref[pl.ds(0, read_m), pl.ds(c0, _KC)].astype(
+                jnp.float32
+            )
         amax = jnp.max(jnp.abs(xf), axis=1, keepdims=True)
         sc = jnp.maximum(amax, 1e-12) * (1.0 / 448.0)
         xq = jnp.clip(xf / sc, -448.0, 448.0).astype(jnp.float8_e4m3fn)
-        lhs_fp8_ref[pl.ds(0, fp8_m), pl.ds(c0, _KC)] = _pad_rows_to(xq, fp8_m)
-        lhs_sc_ref[pl.ds(0, read_m), pl.ds(b_id * 128, 128)] = jnp.broadcast_to(
-            sc, (read_m, 128)
+        lhs_fp8_ref[pl.ds(0, fp8_m), pl.ds(c0, _KC)] = _pad_rows_to(
+            xq, fp8_m
+        )
+        lhs_sc_ref[pl.ds(0, read_m), pl.ds(b_id * 128, 128)] = (
+            jnp.broadcast_to(sc, (read_m, 128))
         )
 
 
@@ -3578,9 +3596,13 @@ def run_muse_sparse_experts_and_rs_from_vmem(
                 return
 
             tile_fp8 = use_lhs_fp8 and (m_rows >= cfg.lhs_fp8_min_m)
-            _copy_io_3d_to_lhs_2d_at(0, m_rows)
             if tile_fp8:
-                _prequant_lhs_k256(lhs_2d_buf, lhs_fp8_buf, lhs_sc_buf, m_rows)
+                # Quantize directly from 3D io_3d_buf without copying [m_rows, 4096] via lhs_2d_buf.
+                _prequant_lhs_k256(
+                    io_3d_buf, lhs_fp8_buf, lhs_sc_buf, m_rows, x_is_3d=True
+                )
+            else:
+                _copy_io_3d_to_lhs_2d_at(0, m_rows)
             sq_sum = jnp.zeros((m_rows, 1), dtype=jnp.float32)
 
             if w_mode in ("stream3", "stream3_k2"):
