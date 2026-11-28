@@ -815,7 +815,7 @@ def test_wave10_flush_pending_step_c_kv_writes_grouping():
         torch.zeros((32, 1, 4, 128), dtype=torch.float8_e4m3fn),
         False, True, (True, True, 0, False, True), 14,
     ))
-    # 11 Full unified 5D layers -> must split cleanly into chunks [8, 3] via pure layer_num.
+    # 11 Full unified 5D layers -> stays in a single m5d(11) call (<=32 limit, <=16 prewarmed).
     for i in range(11):
         pending.append((
             torch.zeros((8, 256, 1, 4, 128), dtype=torch.float8_e4m3fn),
@@ -828,16 +828,34 @@ def test_wave10_flush_pending_step_c_kv_writes_grouping():
     with (
         mock.patch.object(b1_moe_ops, "get_step_c_kv_write_op", side_effect=lambda **kw: lambda *a: calls.append(("single", kw, len(a)))),
         mock.patch.object(b1_moe_ops, "get_step_c_kv_write_multi_6d_op", side_effect=lambda **kw: lambda *a: calls.append(("m6d", kw, tuple(a[0].shape), tuple(a[-1].tolist())))),
-        mock.patch.object(b1_moe_ops, "get_step_c_kv_write_multi_5d_op", side_effect=lambda k, **kw: lambda *a: calls.append(("m5d", k, kw, tuple(x is pending[i + 3][7] if k == 8 else x is pending[i + 11][7] for i, x in enumerate(a[:k])), tuple(a[0].shape), len(a)))),
+        mock.patch.object(b1_moe_ops, "get_step_c_kv_write_multi_5d_op", side_effect=lambda k, **kw: lambda *a: calls.append(("m5d", k, kw, tuple(x is pending[i + 3][7] for i, x in enumerate(a[:k])), tuple(a[0].shape), len(a)))),
     ):
         b1_moe_ops.flush_pending_step_c_kv_writes(pending)
 
     assert calls == [
         ("m6d", {"kv_pack_dense2": False, "kv_pack_bd4": True}, (2, 32, 1, 4, 128), (0, 1)),
         ("single", {"kv_pack_dense2": False, "kv_pack_bd4": True}, 8),
-        ("m5d", 8, {"kv_pack_dense2": True, "kv_pack_bd4": False}, (True,) * 8, (32, 1, 4, 128), 21),
-        ("m5d", 3, {"kv_pack_dense2": True, "kv_pack_bd4": False}, (True,) * 3, (32, 1, 4, 128), 11),
+        ("m5d", 11, {"kv_pack_dense2": True, "kv_pack_bd4": False}, (True,) * 11, (32, 1, 4, 128), 27),
     ]
+
+    # Verify 45 layers chunk as [29, 16] and 27 layers chunk as [16, 11] (all in {2..16, 29}, <=64 args).
+    for n_chk, exp_k in ((45, [29, 16]), (27, [16, 11])):
+        p_big = [
+            (
+                torch.zeros((8, 128, 1, 4, 128), dtype=torch.float8_e4m3fn),
+                kvl, pg_full, cq, ckv, dist_full, None,
+                torch.zeros((32, 1, 4, 128), dtype=torch.float8_e4m3fn),
+                False, True, (False, False, -1, False, True), 100 + i,
+            )
+            for i in range(n_chk)
+        ]
+        chk_calls: list[int] = []
+        with mock.patch.object(
+            b1_moe_ops, "get_step_c_kv_write_multi_5d_op",
+            side_effect=lambda k, **_kw: lambda *_a, _k=k: chk_calls.append(_k),
+        ):
+            b1_moe_ops.flush_pending_step_c_kv_writes(p_big)
+        assert chk_calls == exp_k
 
     # Verify torch.compile(..., fullgraph=True) traces flush_pending_step_c_kv_writes with 0 id() failures.
     b1_moe_ops.get_step_c_kv_write_multi_6d_op(kv_pack_dense2=False, kv_pack_bd4=True)
@@ -891,10 +909,10 @@ def test_wave16_step_c_kv_write_multi_5d_op_schema_and_compile():
     from torch._subclasses.fake_tensor import FakeTensorMode
     from sglang_tpu.muse_megakernel.decode import b1_moe_ops
 
-    with pytest.raises(ValueError, match="2 <= num_layers <= 8"):
+    with pytest.raises(ValueError, match="2 <= num_layers <= 29"):
         b1_moe_ops.get_step_c_kv_write_multi_5d_op(1)
-    with pytest.raises(ValueError, match="2 <= num_layers <= 8"):
-        b1_moe_ops.get_step_c_kv_write_multi_5d_op(9)
+    with pytest.raises(ValueError, match="2 <= num_layers <= 29"):
+        b1_moe_ops.get_step_c_kv_write_multi_5d_op(30)
 
     fake_calls: list[tuple[int, int]] = []
     with (

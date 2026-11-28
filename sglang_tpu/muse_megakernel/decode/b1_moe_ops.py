@@ -17,10 +17,12 @@ from sglang_tpu.kernels.decode_collective_bridges import (
 from sglang_tpu.muse_megakernel.decode.b1_moe_b2_b16_kernel import (
     b1_moe_b2_replicated_b16_jax,
     b1_moe_b2_rpad_replicated_b16_jax,
+    b1_moe_fnorm_replicated_b16_jax,
 )
 from sglang_tpu.muse_megakernel.decode.b1_moe_b2_kernel import (
     b1_moe_b2_chip_sharded_jax,
     b1_moe_b2_rpad_chip_sharded_jax,
+    b1_moe_fnorm_chip_sharded_jax,
 )
 from sglang_tpu.muse_megakernel.decode.b1_moe_kernel import (
     b1_moe_chip_sharded_jax,
@@ -31,6 +33,8 @@ _B1_MOE_B2_OPS: dict[tuple, Callable] = {}
 _B1_MOE_B2_B16_OPS: dict[tuple, Callable] = {}
 _B1_MOE_B2_B16_RPAD_OPS: dict[tuple, Callable] = {}
 _B1_MOE_B2_RPAD_OPS: dict[tuple, Callable] = {}
+_B1_MOE_FNORM_OPS: dict[tuple, Callable] = {}
+_B1_MOE_FNORM_B16_OPS: dict[tuple, Callable] = {}
 _STEP_C_KV_WRITE_OPS: dict[tuple[bool, bool], Callable] = {}
 _STEP_C_KV_WRITE_MULTI_6D_OPS: dict[tuple[bool, bool], Callable] = {}
 _STEP_C_KV_WRITE_MULTI_5D_OPS: dict[tuple[int, bool, bool], Callable] = {}
@@ -94,6 +98,22 @@ _B2_STATIC_SPECS: tuple[tuple[str, type], ...] = (
     ("next_in_scale_input", bool),
 )
 
+_B2_FNORM_TENSOR_NAMES = (
+    "w_post_w8k",
+    "s_post",
+    "post_ff_gain",
+    "pf_alpha",
+    "pf_beta",
+    "final_gain",
+)
+
+_FNORM_STATIC_SPECS: tuple[tuple[str, type], ...] = (
+    ("post_ff_eps", float),
+    ("post_ff_scale_input", bool),
+    ("final_eps", float),
+    ("final_scale_input", bool),
+)
+
 _EPI_STATIC_SPECS: tuple[tuple[str, type], ...] = (
     ("qkv_norm_eps", float),
     ("query_scale", float),
@@ -119,7 +139,8 @@ def _export_superkernel_op(
     mesh = _get_tp_mesh(world_size)
     n_t = len(tensor_names)
     t_specs = (P(),) * n_t
-    out_specs = (P(),) * num_outputs
+    out_specs = P() if num_outputs == 1 else (P(),) * num_outputs
+    out_spec_tuple = (P(),) if num_outputs == 1 else out_specs
     in_specs = t_specs + (None,) * len(static_specs)
     params = [
         inspect.Parameter(name, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=jax.Array)
@@ -128,7 +149,11 @@ def _export_superkernel_op(
         inspect.Parameter(name, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=typ)
         for name, typ in static_specs
     ]
-    ret_ann = tuple[(jax.Array,) * num_outputs]  # type: ignore[valid-type]
+    ret_ann = (
+        jax.Array
+        if num_outputs == 1
+        else tuple[(jax.Array,) * num_outputs]  # type: ignore[valid-type]
+    )
 
     def _wrapped(*args):
         tensors = args[:n_t]
@@ -153,7 +178,7 @@ def _export_superkernel_op(
         _wrapped,
         mesh=mesh,
         input_partition_specs=in_specs,
-        output_partition_specs=out_specs,
+        output_partition_specs=out_spec_tuple,
     )
 
 
@@ -846,6 +871,7 @@ def get_step_c_kv_write_multi_6d_op(
                     layer_ids=layer_ids.reshape(-1),
                     kv_pack_dense2=d2_key,
                     kv_pack_bd4=bd4_key,
+                    assume_decode_q1=True,
                 )
 
             jax_kernel = _torch_pallas.custom_jax_kernel(
@@ -904,9 +930,9 @@ def get_step_c_kv_write_multi_5d_op(
     kv_pack_dense2: bool = False,
     kv_pack_bd4: bool = False,
 ) -> Callable:
-    """Return cached batched Step (c) KV writer op for ``2 <= num_layers <= 8`` 5D buffers."""
-    if not (2 <= num_layers <= 8):
-        raise ValueError(f"Expected 2 <= num_layers <= 8 for 5D multi-write, got {num_layers}")
+    """Return cached batched Step (c) KV writer op for ``2 <= num_layers <= 29`` 5D buffers (``<= 64`` PyTorch args)."""
+    if not (2 <= num_layers <= 29):
+        raise ValueError(f"Expected 2 <= num_layers <= 29 for 5D multi-write, got {num_layers}")
     d2_key, bd4_key, suffix = _step_c_kv_write_tags(kv_pack_dense2, kv_pack_bd4)
     key = (int(num_layers), d2_key, bd4_key)
     op = _STEP_C_KV_WRITE_MULTI_5D_OPS.get(key)
@@ -945,6 +971,7 @@ def get_step_c_kv_write_multi_5d_op(
                     layer_ids=None,
                     kv_pack_dense2=d2_key,
                     kv_pack_bd4=bd4_key,
+                    assume_decode_q1=True,
                 )
 
             _wrapped_5d.__name__ = f"jax_multi_5d_l{num_layers}"
@@ -1067,19 +1094,28 @@ def flush_pending_step_c_kv_writes(pending_writes: list) -> None:
             )
             continue
 
-        chunks: list[list] = []
-        cur_chunk: list = []
+        runs: list[list] = []
+        cur_run: list = []
         seen_ids: set[int] = set()
         for entry in grp:
             cid = int(entry[11]) if len(entry) >= 12 else id(entry[0])
-            if len(cur_chunk) >= 8 or cid in seen_ids:
-                chunks.append(cur_chunk)
-                cur_chunk = []
+            if len(cur_run) >= 29 or cid in seen_ids:
+                runs.append(cur_run)
+                cur_run = []
                 seen_ids = set()
-            cur_chunk.append(entry)
+            cur_run.append(entry)
             seen_ids.add(cid)
-        if cur_chunk:
-            chunks.append(cur_chunk)
+        if cur_run:
+            runs.append(cur_run)
+
+        chunks: list[list] = []
+        for run in runs:
+            # Emit prewarmed chunk sizes from {1} U {2..16} U {29}: split 17..28 as (16, rem - 16).
+            if 17 <= len(run) <= 28:
+                chunks.append(run[:16])
+                chunks.append(run[16:])
+            else:
+                chunks.append(run)
 
         for ch in chunks:
             if len(ch) == 1:
@@ -1203,6 +1239,163 @@ def get_b1_moe_chip_sharded_op(
     return op
 
 
+def _get_b1_moe_fnorm_op(
+    world_size: int,
+    *,
+    cache: dict[tuple, Callable],
+    jax_fn: Callable,
+    op_prefix: str,
+    bf16_router: bool,
+    num_replicas: int,
+    has_spec_slot: bool,
+    replica_cost_mode: str,
+    has_free_params: bool,
+) -> Callable:
+    """Shared factory for fused L61 Final Norm superkernel custom ops."""
+    if world_size not in SUPPORTED_WORLD_SIZES:
+        raise ValueError(
+            f"{op_prefix} requires world_size in {SUPPORTED_WORLD_SIZES}, got {world_size}"
+        )
+    key = (
+        int(world_size),
+        bool(bf16_router),
+        int(num_replicas),
+        bool(has_spec_slot),
+        str(replica_cost_mode),
+        bool(has_free_params),
+    )
+    op = cache.get(key)
+    if op is not None:
+        return op
+
+    with _B1_MOE_LOCK:
+        op = cache.get(key)
+        if op is None:
+            has_rep = num_replicas > 0
+            tensor_names = (
+                _B1_BASE_TENSOR_NAMES
+                + _B2_FNORM_TENSOR_NAMES
+                + (_REPLICA_TENSOR_NAMES if has_rep else ())
+                + (("spec_home_slot",) if has_spec_slot else ())
+                + (("free_params",) if has_free_params else ())
+            )
+            static_specs = _B1_STATIC_SPECS + _FNORM_STATIC_SPECS
+            n_base = len(_B1_BASE_TENSOR_NAMES) + len(_B2_FNORM_TENSOR_NAMES)
+
+            def _local_fnorm(*args):
+                n_t = len(tensor_names)
+                t_args = args[:n_t]
+                s_args = args[n_t:]
+                pos = n_base
+                rep_args = (None, None, None, None, None)
+                if has_rep:
+                    rep_args = t_args[pos : pos + 5]
+                    pos += 5
+                spec_arg = None
+                if has_spec_slot:
+                    spec_arg = t_args[pos]
+                    pos += 1
+                fp_arg = t_args[pos] if has_free_params else None
+                (
+                    pa_eps,
+                    pre_ff_eps,
+                    pre_ff_sc,
+                    rmul,
+                    pre_exp_eps,
+                    pre_exp_sc,
+                    post_ff_eps,
+                    post_ff_sc,
+                    final_eps,
+                    final_sc,
+                ) = s_args
+                return jax_fn(
+                    *t_args[:n_base],
+                    rep_w1=rep_args[0],
+                    rep_s1=rep_args[1],
+                    rep_w2=rep_args[2],
+                    rep_s2=rep_args[3],
+                    replica_meta=rep_args[4],
+                    spec_home_slot=spec_arg,
+                    free_params=fp_arg,
+                    world_size=world_size,
+                    pa_eps=float(pa_eps),
+                    pre_ff_eps=float(pre_ff_eps),
+                    pre_ff_scale_input=bool(pre_ff_sc),
+                    router_multiplier=float(rmul),
+                    pre_exp_eps=float(pre_exp_eps),
+                    pre_exp_scale_input=bool(pre_exp_sc),
+                    post_ff_eps=float(post_ff_eps),
+                    post_ff_scale_input=bool(post_ff_sc),
+                    final_eps=float(final_eps),
+                    final_scale_input=bool(final_sc),
+                    replica_cost_mode=str(replica_cost_mode),
+                )
+
+            rtag = "r16" if bf16_router else "r32"
+            stag = "_sp" if has_spec_slot else ""
+            ftag = "_dfp" if has_free_params else ""
+            op_name = (
+                f"sglang_tpu_pallas::{op_prefix}_tp{world_size}"
+                f"_{rtag}_rep{num_replicas}_{replica_cost_mode}{stag}{ftag}"
+            )
+            op = _export_superkernel_op(
+                op_name,
+                world_size,
+                tensor_names,
+                static_specs,
+                1,
+                _local_fnorm,
+            )
+            cache[key] = op
+    return op
+
+
+def get_b1_moe_fnorm_chip_sharded_op(
+    world_size: int,
+    *,
+    bf16_router: bool = True,
+    num_replicas: int = 0,
+    has_spec_slot: bool = False,
+    replica_cost_mode: str = "tiles",
+    has_free_params: bool = False,
+) -> Callable:
+    """Return cached TorchTPU custom op for fused chip-sharded L61 Final Norm superkernel."""
+    return _get_b1_moe_fnorm_op(
+        world_size,
+        cache=_B1_MOE_FNORM_OPS,
+        jax_fn=b1_moe_fnorm_chip_sharded_jax,
+        op_prefix="muse_w9_b1_moe_fnorm",
+        bf16_router=bf16_router,
+        num_replicas=num_replicas,
+        has_spec_slot=has_spec_slot,
+        replica_cost_mode=replica_cost_mode,
+        has_free_params=has_free_params,
+    )
+
+
+def get_b1_moe_fnorm_replicated_b16_op(
+    world_size: int,
+    *,
+    bf16_router: bool = True,
+    num_replicas: int = 0,
+    has_spec_slot: bool = False,
+    replica_cost_mode: str = "tiles",
+    has_free_params: bool = False,
+) -> Callable:
+    """Return cached TorchTPU custom op for fused replicated ``B=8/16`` L61 Final Norm superkernel."""
+    return _get_b1_moe_fnorm_op(
+        world_size,
+        cache=_B1_MOE_FNORM_B16_OPS,
+        jax_fn=b1_moe_fnorm_replicated_b16_jax,
+        op_prefix="muse_w9_b1_moe_fnorm_rep_b16",
+        bf16_router=bf16_router,
+        num_replicas=num_replicas,
+        has_spec_slot=has_spec_slot,
+        replica_cost_mode=replica_cost_mode,
+        has_free_params=has_free_params,
+    )
+
+
 def prewarm_b1_moe_superkernel_ops(
     world_size: int,
     layer_configs: Iterable[tuple[int, bool, str, bool]],
@@ -1211,9 +1404,10 @@ def prewarm_b1_moe_superkernel_ops(
     has_rope_variants: tuple[bool, ...] = (True,),
     has_free_params: bool = False,
     include_rep_b16: bool = False,
+    include_final_norm: bool = False,
     step_c_configs: Iterable[tuple] = (),
 ) -> None:
-    """Eagerly register Step (a), Step (b), B=16, and Step (c) custom ops outside ``torch.compile``."""
+    """Eagerly register Step (a), Step (b), L61, B=16, and Step (c) custom ops outside ``torch.compile``."""
     if world_size not in SUPPORTED_WORLD_SIZES:
         return
     cfgs = list(layer_configs)
@@ -1243,6 +1437,24 @@ def prewarm_b1_moe_superkernel_ops(
                     return_sharded=ret_sh,
                     has_free_params=has_free_params,
                 )
+            if include_final_norm:
+                get_b1_moe_fnorm_chip_sharded_op(
+                    world_size,
+                    bf16_router=bf16_router,
+                    num_replicas=num_replicas,
+                    has_spec_slot=has_spec_slot,
+                    replica_cost_mode=cost_mode,
+                    has_free_params=has_free_params,
+                )
+                if include_rep_b16:
+                    get_b1_moe_fnorm_replicated_b16_op(
+                        world_size,
+                        bf16_router=bf16_router,
+                        num_replicas=num_replicas,
+                        has_spec_slot=has_spec_slot,
+                        replica_cost_mode=cost_mode,
+                        has_free_params=has_free_params,
+                    )
         epi_modes = (False, True) if bridge_qkv_epi else (False,)
         for use_epi in epi_modes:
             rope_opts = has_rope_variants if use_epi else (False,)
@@ -1328,7 +1540,7 @@ def prewarm_b1_moe_superkernel_ops(
                             kv_pack_dense2=eff_d2, kv_pack_bd4=eff_bd4
                         )
                     else:
-                        for _k5 in range(2, 9):
+                        for _k5 in (*range(2, 17), 29):
                             get_step_c_kv_write_multi_5d_op(
                                 _k5, kv_pack_dense2=eff_d2, kv_pack_bd4=eff_bd4
                             )
