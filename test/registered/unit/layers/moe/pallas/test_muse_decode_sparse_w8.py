@@ -5511,6 +5511,210 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
             self.assertIn("_stream3_", comp_txt)
             self.assertGreater(comp.memory_analysis().generated_code_size_in_bytes, 0)
 
+    def test_w19_w4a8_direct_3d_lhs_prequant(self):
+        """Wave-19: W4A8 direct 3D-to-FP8 prequant matches 2D copy path bit-for-bit."""
+        v1_mod = _load_pkg_module(
+            "fused_decode_sparse", _MUSE_DIR / "fused_decode_sparse.py"
+        )
+        try:
+            import jax
+            import jax.numpy as jnp
+            from jax.experimental import pallas as pl
+            from jax.experimental.pallas import tpu as pltpu
+            from jax.experimental.topologies import get_topology_desc
+            from jax.sharding import Mesh, PartitionSpec as P
+        except Exception as exc:
+            self.skipTest(f"JAX/Pallas TPU unavailable: {exc}")
+
+        rng = np.random.default_rng(1903)
+        interpret = pltpu.InterpretParams(
+            dma_execution_mode="on_wait",
+            detect_races=True,
+            **(
+                {"uninitialized_memory": "nan"}
+                if "uninitialized_memory" in pltpu.InterpretParams.__annotations__
+                else {}
+            ),
+        )
+        for m_rows in (8, 16, 32, 64, 128):
+            read_m = 16 if m_rows == 8 else m_rows
+            fp8_m = max(32, read_m)
+            x_3d = jnp.asarray(
+                rng.normal(0.0, 0.5, (read_m, 32, 128)), jnp.bfloat16
+            )
+
+            def _kern_2d(x3_r, out_q_r, out_s_r, scratch_2d):
+                for h_idx in range(2):
+                    scratch_2d[:, pl.ds(h_idx * 2048, 2048)] = x3_r[
+                        :, pl.ds(h_idx * 16, 16), :
+                    ].reshape(read_m, 2048)
+                v1_mod._prequant_lhs_k256(
+                    scratch_2d, out_q_r, out_s_r, m_rows, x_is_3d=False
+                )
+
+            def _kern_3d(x3_r, out_q_r, out_s_r):
+                v1_mod._prequant_lhs_k256(
+                    x3_r, out_q_r, out_s_r, m_rows, x_is_3d=True
+                )
+
+            out_shapes = (
+                jax.ShapeDtypeStruct((fp8_m, 4096), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((read_m, 16 * 128), jnp.float32),
+            )
+            q2, s2 = pl.pallas_call(
+                _kern_2d,
+                out_shape=out_shapes,
+                grid_spec=pltpu.PrefetchScalarGridSpec(
+                    num_scalar_prefetch=0,
+                    grid=(1,),
+                    in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)],
+                    out_specs=[
+                        pl.BlockSpec(memory_space=pltpu.VMEM),
+                        pl.BlockSpec(memory_space=pltpu.VMEM),
+                    ],
+                    scratch_shapes=(
+                        pltpu.VMEM((read_m, 4096), jnp.bfloat16),
+                    ),
+                ),
+                interpret=interpret,
+            )(x_3d)
+            q3, s3 = pl.pallas_call(
+                _kern_3d,
+                out_shape=out_shapes,
+                in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)],
+                out_specs=[
+                    pl.BlockSpec(memory_space=pltpu.VMEM),
+                    pl.BlockSpec(memory_space=pltpu.VMEM),
+                ],
+                interpret=interpret,
+            )(x_3d)
+            np.testing.assert_array_equal(
+                np.asarray(q2).view(np.uint8),
+                np.asarray(q3).view(np.uint8),
+            )
+            np.testing.assert_array_equal(np.asarray(s2), np.asarray(s3))
+
+        # Single-device m=128 on_wait Interpret parity: 3D-prequant W4A8 vs BF16 reference.
+        m_rows, k_dim, n_col, sb = 128, 4096, 1024, 512
+        x_3d_128 = jnp.asarray(
+            rng.normal(0.0, 0.3, size=(m_rows, 32, 128)), jnp.bfloat16
+        )
+        w1_u32 = jnp.asarray(
+            rng.integers(0, 0xFFFFFFFF, size=(k_dim // 8, 2 * n_col), dtype=np.uint32)
+        )
+        s1_bf = jnp.asarray(
+            rng.uniform(0.01, 0.05, size=(k_dim // sb, 2 * n_col)), jnp.bfloat16
+        )
+
+        def _run_m128(w4a8_flag: bool):
+            def _kern(x3_r, w_r, s_r, o_r, x2_r, fp8_r, sc_r):
+                if w4a8_flag:
+                    v1_mod._prequant_lhs_k256(
+                        x3_r, fp8_r, sc_r, m_rows, x_is_3d=True
+                    )
+                    lhs_r, sc_arg = fp8_r, sc_r
+                else:
+                    for h_idx in range(2):
+                        x2_r[:, pl.ds(h_idx * 2048, 2048)] = x3_r[
+                            :, pl.ds(h_idx * 16, 16), :
+                        ].reshape(m_rows, 2048)
+                    lhs_r, sc_arg = x2_r, None
+                g = v1_mod._fp4_gmm_chunked(
+                    lhs_r, w_r, s_r, m_rows, k_dim, 0, n_col, True, sb,
+                    lhs_sc_ref=sc_arg, hoist_scales=True, nc_split512=True,
+                )
+                u = v1_mod._fp4_gmm_chunked(
+                    lhs_r, w_r, s_r, m_rows, k_dim, n_col, n_col, True, sb,
+                    lhs_sc_ref=sc_arg, hoist_scales=True, nc_split512=True,
+                )
+                o_r[...] = (
+                    jax.nn.silu(g).astype(jnp.bfloat16).astype(jnp.float32) * u
+                ).astype(jnp.bfloat16)
+
+            vm = pltpu.VMEM
+            return pl.pallas_call(
+                _kern,
+                out_shape=jax.ShapeDtypeStruct((m_rows, n_col), jnp.bfloat16),
+                grid_spec=pltpu.PrefetchScalarGridSpec(
+                    num_scalar_prefetch=0,
+                    grid=(1,),
+                    in_specs=(pl.BlockSpec(memory_space=vm),) * 3,
+                    out_specs=pl.BlockSpec(memory_space=vm),
+                    scratch_shapes=(
+                        pltpu.VMEM((m_rows, k_dim), jnp.bfloat16),
+                        pltpu.VMEM((m_rows, k_dim), jnp.float8_e4m3fn),
+                        pltpu.VMEM((m_rows, (k_dim // 256) * 128), jnp.float32),
+                    ),
+                ),
+                interpret=interpret,
+            )(x_3d_128, w1_u32, s1_bf)
+
+        y_bf = np.asarray(_run_m128(False), dtype=np.float32)
+        y_fp8 = np.asarray(_run_m128(True), dtype=np.float32)
+        self.assertTrue(np.all(np.isfinite(y_fp8)))
+        cos = float(
+            np.dot(y_bf.ravel(), y_fp8.ravel())
+            / max(float(np.linalg.norm(y_bf) * np.linalg.norm(y_fp8)), 1e-12)
+        )
+        self.assertGreater(cos, 0.99)
+
+        clean_env = {
+            k: v for k, v in os.environ.items() if not k.startswith("SGLANG_TPU_")
+        }
+        for topo_name, ep in (("tpu7x:2x2x1", 8), ("tpu7x:2x2x2", 16)):
+            tpu_devs = get_topology_desc(topo_name, platform="tpu").devices
+            if len(tpu_devs) < ep:
+                continue
+            key_fn = (
+                (lambda d: (d.coords[2], d.coords[1], d.coords[0], d.core_on_chip))
+                if ep == 16
+                else (lambda d: (d.coords[1], d.coords[0], d.core_on_chip))
+            )
+            tpu_mesh = Mesh(np.array(sorted(tpu_devs, key=key_fn)), ("model",))
+            with mock.patch.dict(
+                os.environ,
+                {
+                    **clean_env,
+                    "SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_B64": "4",
+                    "SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_DECODE_TILE_M128": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8_MIN_BATCH": "128",
+                },
+                clear=True,
+            ):
+                cur_cfg = v1_mod.default_sparse_decode_config(256, ep, 512)
+            self.assertTrue(cur_cfg.lhs_fp8)
+            self.assertEqual(cur_cfg.tile_m, 128)
+            e_local = 256 // ep
+            shapes = (
+                jax.ShapeDtypeStruct((1,), jnp.int32),
+                jax.ShapeDtypeStruct((256, 256), jnp.bfloat16),
+                jax.ShapeDtypeStruct((1, 256), jnp.float32),
+                jax.ShapeDtypeStruct((256, 4096), jnp.bfloat16),
+                jax.ShapeDtypeStruct((e_local, 4096, 8192), jnp.float4_e2m1fn),
+                jax.ShapeDtypeStruct((e_local, 4096 // 512, 8192), jnp.bfloat16),
+                jax.ShapeDtypeStruct((e_local, 4096, 4096), jnp.float4_e2m1fn),
+                jax.ShapeDtypeStruct((e_local, 4096 // 512, 4096), jnp.bfloat16),
+                jax.ShapeDtypeStruct((1, 4096), jnp.bfloat16),
+            )
+            comp = (
+                jax.jit(
+                    jax.shard_map(
+                        lambda *args, _cfg=cur_cfg, _ep=ep: v1_mod.fused_decode_sparse_from_logits(
+                            *args, ep=_ep, return_sharded=True, config=_cfg
+                        ),
+                        mesh=tpu_mesh,
+                        in_specs=(P(),) * len(shapes),
+                        out_specs=P(),
+                        check_vma=False,
+                    )
+                )
+                .trace(*shapes)
+                .lower(lowering_platforms=("tpu",))
+                .compile()
+            )
+            self.assertIn("tpu_custom_call", comp.as_text())
+
 
 if __name__ == "__main__":
     unittest.main()

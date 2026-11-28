@@ -195,10 +195,13 @@ def _b1_moe_b2_chip_sharded_impl(
     step_c_scope1_shapes: tuple = (),
     step_c_scope2_shapes: tuple = (),
     step_b3_n_moe_outer: int = 0,
-    step_b3_moe_is_scope2: tuple[bool, ...] = (),
+    step_b3_moe_scope_tier: tuple[int, ...] = (),
+    step_b3_s12_shapes: tuple = (),
     step_b3_scope1_shapes: tuple = (),
     step_b3_scope2_shapes: tuple = (),
     step_b3_scope3_shapes: tuple = (),
+    step_b3_hoist_w_pre: bool = False,
+    step_b3_hoist_w_gate: bool = False,
     use_3scope: bool = False,
     split_b2_rpad: bool = False,
     final_norm_only: bool = False,
@@ -624,7 +627,10 @@ def _b1_moe_b2_chip_sharded_impl(
         rpad_bkv_sems=None,
         rpad_cache_write_sem=None,
         sync_entry_barrier: bool = False,
-        prestarted_qkv_gate_dma: bool = True,
+        prestarted_w_qkv_dma: bool = True,
+        prestarted_w_gate_dma: bool = True,
+        qkv_vmem_override=None,
+        moe_full_override=None,
     ) -> None:
         if final_norm_only:
             mate_tok_slice = (
@@ -632,7 +638,11 @@ def _b1_moe_b2_chip_sharded_impl(
                 if sharded_moe_in
                 else b2_scalar_dummy_post
             )
-            moe_full_slice = mate_recv.at[pl.ds(0, r_pair), :]
+            moe_full_slice = (
+                moe_full_override
+                if moe_full_override is not None
+                else mate_recv.at[pl.ds(0, r_pair), :]
+            )
             if sync_entry_barrier:
                 _signal_barrier(me, world_size)
             _run_chip_sharded_post_fast_core(
@@ -724,9 +734,17 @@ def _b1_moe_b2_chip_sharded_impl(
             )
             return
 
-        qkv_vmem_slice = mate_recv.at[:, pl.ds(0, qkv_cols)]
+        qkv_vmem_slice = (
+            qkv_vmem_override
+            if qkv_vmem_override is not None
+            else mate_recv.at[:, pl.ds(0, qkv_cols)]
+        )
         mate_tok_slice = send_half.at[pl.ds(0, rows_per_rank), :]
-        moe_full_slice = mate_recv.at[pl.ds(0, r_pair), :]
+        moe_full_slice = (
+            moe_full_override
+            if moe_full_override is not None
+            else mate_recv.at[pl.ds(0, r_pair), :]
+        )
 
         if rpad_refs is not None:
             from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
@@ -773,9 +791,9 @@ def _b1_moe_b2_chip_sharded_impl(
             b2_out_kv = out_kv_merged_ref if rpa_skip_kv_write else rpad_kv_vmem
             b2_out_gate_arg = rpad_gate_vmem
             b2_gate_dst = rpad_gate_vmem
-            use_bkv_in_ici = (not rpa_kv_pack_dense2 or rpa_use_grp_vec) and (
-                world_size != 16 or rpa_cfg.num_slots <= 4
-            )
+            use_bkv_in_ici = (
+                not rpa_kv_pack_dense2 or rpa_use_grp_vec or use_3scope
+            ) and (world_size != 16 or rpa_cfg.num_slots <= 4)
             b2_during_in_ici_fn = _after_qkv_epi if use_bkv_in_ici else None
             b2_during_in_ici_early = use_bkv_in_ici and world_size == 16 and r_pair >= 16
             b2_after_qkv_fn = None if use_bkv_in_ici else _after_qkv_epi
@@ -860,8 +878,8 @@ def _b1_moe_b2_chip_sharded_impl(
             skip_stream_load=True,
             skip_stream_store=False,
             prestarted_w_post_dma=True,
-            prestarted_w_qkv_dma=prestarted_qkv_gate_dma,
-            prestarted_w_gate_dma=prestarted_qkv_gate_dma,
+            prestarted_w_qkv_dma=prestarted_w_qkv_dma,
+            prestarted_w_gate_dma=prestarted_w_gate_dma,
             gate_dst_ref=b2_gate_dst,
             after_qkv_epi_fn=b2_after_qkv_fn,
             defer_stream_store_wait=defer_store_wait,
@@ -1062,22 +1080,19 @@ def _b1_moe_b2_chip_sharded_impl(
 
     if use_3scope:
         # 3-Scope Step (b) and Step (c) for rows > 128:
-        # w_pre_pair stays in Scope 1 (-16 MiB outer/Scope 2) and w_qkv+w_gate live in
-        # Scope 3 (alongside RPAd when has_rpad=True), keeping peak VMEM < 63.94 MiB.
+        # Wrap Scope 1 + Scope 2 in s12 so MoE w2_buf/x_3d_buf/s1/s2/gain_f32 (~10.5 MiB)
+        # are freed before Scope 3; hoist w_pre_pair_buf to outer when non-L61 so
+        # _on_experts_done_b3 prestarts w_qkv (+ w_gate on TP=16) under PAIR_RS.
         moe_outer_refs = [next(it) for _ in range(step_b3_n_moe_outer)]
+        w_pre_outer = next(it) if step_b3_hoist_w_pre else None
         s_buf = next(it)
-        my_pair_bf16 = next(it)
-        recv_pair_bf16 = next(it)
-        ffn_pair_buf = next(it)
-        exp_3d_buf = next(it)
-        logits_vmem = next(it)
         moe_sh_vmem = next(it) if sharded_moe_in else None
         b2_scalar_dummy_post = next(it)
         b2_scalar_dummy_cols = next(it)
 
         o_it_b3 = iter(moe_outer_refs)
         stitched_outer_b3 = [
-            None if flg else next(o_it_b3) for flg in step_b3_moe_is_scope2
+            next(o_it_b3) if tier == 0 else None for tier in step_b3_moe_scope_tier
         ]
         msc_outer_b3 = _unpack_muse_sparse_scratch(
             iter(stitched_outer_b3),
@@ -1099,6 +1114,19 @@ def _b1_moe_b2_chip_sharded_impl(
             w_post_buf = _alias_w_post_buf(
                 msc_outer_b3["w1_buf"], w_mode=msc_outer_b3["w_mode"]
             )
+        if step_b3_hoist_w_pre:
+            w_qkv_outer = (
+                w_pre_outer
+                if qkv_cols == w_pre_outer.shape[1]
+                else w_pre_outer.at[:, pl.ds(0, qkv_cols)]
+            )
+            w_gate_outer = (
+                w_pre_outer.at[:, pl.ds(qkv_cols, gate_cols)]
+                if step_b3_hoist_w_gate
+                else None
+            )
+        else:
+            w_qkv_outer = w_gate_outer = None
         if has_rpad:
             written_cnt_smem_ref, rpad_bkv_sems, rpad_cache_write_sem = (
                 _unpack_rpad_outer_meta(
@@ -1114,279 +1142,352 @@ def _b1_moe_b2_chip_sharded_impl(
             rpad_bkv_sems = None
             rpad_cache_write_sem = None
 
-        plan_holder_b3 = []
-
-        def _run_b3_scope1(*s1_refs) -> None:
-            s1_it = iter(s1_refs)
-            w_pre_core_buf = next(s1_it)
-            w_router_buf = next(s1_it)
-            if final_norm_only and not interpret_mode:
-                own_half = out_hidden_ref.at[:, pl.ds(0, 4096)]
-                send_half = out_hidden_ref.at[:, pl.ds(4096, 4096)]
-                mate_recv = next(s1_it)
-            else:
-                own_half = next(s1_it)
-                send_half = next(s1_it)
-                mate_recv = next(s1_it)
-            rs1_a_s1 = next(s1_it)
-            rs1_b_s1 = next(s1_it)
-            rs2_a_s1 = next(s1_it)
-            rs2_b_recv = next(s1_it)
-            sq_pair_pa_buf = next(s1_it)
-            router_pair_buf = next(s1_it)
-            pre_my_half = next(s1_it)
-            pre_mate_half = next(s1_it)
-            sq_pair_pre_buf = next(s1_it)
-            wo_buf = (
-                next(s1_it)
-                if interpret_mode
-                else _alias_wo_buf(
-                    msc_outer_b3["w1_buf"],
-                    msc_outer_b3["w2_buf"],
-                    w_mode=msc_outer_b3["w_mode"],
-                    o_in=o_in,
-                    half=half,
-                )
-            )
-
-            def _during_ag_exp_ici_b3() -> None:
-                plan_res = plan_and_prime_muse_sparse_from_vmem(
-                    me,
-                    logits_vmem,
-                    bias_ref,
-                    post_exp_norm_ref,
-                    w1_u32,
-                    s1_ref,
-                    w2_u32,
-                    s2_ref,
-                    d_scratch=msc_outer_b3["d_scratch"],
-                    r_scratch=msc_outer_b3["r_scratch"],
-                    w1_buf=msc_outer_b3["w1_buf"],
-                    s1_buf=msc_outer_b3["s1_buf"],
-                    w2_buf=msc_outer_b3["w2_buf"],
-                    s2_buf=msc_outer_b3["s2_buf"],
-                    w1_sem=msc_outer_b3["w1_sem"],
-                    w2_sem=msc_outer_b3["w2_sem"],
-                    misc_sem=msc_outer_b3["misc_sem"],
-                    gain_f32_buf=msc_outer_b3["gain_f32_buf"],
-                    accum_3d=None,
-                    io_3d_buf=None,
-                    accum_2d=None,
-                    rep_w1_u32=rep_w1_u32,
-                    rep_s1_ref=rep_s1_ref,
-                    rep_w2_u32=rep_w2_u32,
-                    rep_s2_ref=rep_s2_ref,
-                    replica_meta_ref=replica_meta_ref,
-                    owner_load_smem=msc_outer_b3["owner_load_smem"],
-                    moved_flag_smem=msc_outer_b3["moved_flag_smem"],
-                    local_suppress_smem=msc_outer_b3["local_suppress_smem"],
-                    holder_slot_expert_smem=msc_outer_b3["holder_slot_expert_smem"],
-                    holder_cand_smem=msc_outer_b3["holder_cand_smem"],
-                    spec_slot_ref=spec_slot_ref,
-                    free_params_ref=free_params_ref,
-                    ep=world_size,
-                    batch_size=rows,
-                    scale_block=scale_block,
-                    num_replicas=num_replicas,
-                    replica_cost_mode=replica_cost_mode,
-                    cfg=cfg,
-                    zero_and_pack=False,
-                )
-                plan_holder_b3.append(plan_res)
-
-            _run_chip_b1_vmem_core(
-                stream_chip_hbm,
-                gated_ref,
-                wo_hbm,
-                wo_scale_ref,
-                pa_alpha_ref,
-                pa_beta_ref,
-                pre_ff_gain_ref,
-                w_pre_pair_hbm,
-                w_pre_pair_scale_ref,
-                w_router_hbm,
-                pre_exp_gain_ref,
-                out_stream_chip_hbm,
-                logits_vmem,
-                None,
-                wo_buf,
-                w_pre_core_buf,
-                w_router_buf,
-                s_buf,
-                send_half,
-                mate_recv,
-                own_half,
-                rs1_a_s1,
-                rs1_b_s1,
-                rs2_a_s1,
-                rs2_b_recv,
-                my_pair_bf16,
-                recv_pair_bf16,
-                sq_pair_pa_buf,
-                ffn_pair_buf,
-                router_pair_buf,
-                pre_my_half,
-                pre_mate_half,
-                sq_pair_pre_buf,
-                exp_3d_buf,
-                msc_outer_b3["w1_sem"],
-                sems["w_pre_sem"],
-                sems["w_router_sem"],
-                sems["s_in_sem"],
-                sems["s_out_sem"],
-                sems["c1a_send"],
-                sems["c1a_recv"],
-                sems["rs1_send"],
-                sems["rs1_recv"],
-                sems["rs2_send"],
-                sems["rs2_recv"],
-                sems["rs3_send"],
-                sems["rs3_recv"],
-                sems["c1c_send"],
-                sems["c1c_recv"],
-                sems["pre_send"],
-                sems["pre_recv"],
-                sems["ag_exp_send"],
-                sems["ag_exp_recv"],
-                sems["ag_exp_d2d_send"],
-                sems["ag_exp_d2d_recv"],
-                sems["ag_log_send"],
-                sems["ag_log_recv"],
-                world_size=world_size,
-                pa_eps=pa_eps,
-                pre_ff_eps=pre_ff_eps,
-                pre_ff_scale_input=pre_ff_scale_input,
-                router_multiplier=router_multiplier,
-                pre_exp_eps=pre_exp_eps,
-                pre_exp_scale_input=pre_exp_scale_input,
-                skip_barrier_signal=False,
-                skip_barrier_wait=False,
-                skip_stream_load=False,
-                skip_stream_store=True,
-                early_router_and_log_ag=True,
-                during_ag_exp_ici_fn=_during_ag_exp_ici_b3,
-                during_ag_exp_d2d2_fn=None,
-                out_expert_3d_ref=msc_outer_b3["x_3d_buf"],
-            )
-            p_b3 = plan_holder_b3[0]
-            return (
-                p_b3.num_exec,
-                jnp.int32(0) if p_b3.spec_slot is None else p_b3.spec_slot,
-                p_b3.spec_enabled,
-            )
-
-        b3_num_exec, b3_spec_slot, b3_spec_en = pl.run_scoped(
-            _run_b3_scope1, *step_b3_scope1_shapes
-        )
-
-        def _on_experts_done_b3() -> None:
-            pltpu.make_async_copy(w_post_hbm, w_post_buf, sems["w_post_sem"].at[0]).start()
-
-        def _run_b3_scope2(*s2_refs) -> None:
-            o_it_s2 = iter(moe_outer_refs)
-            s2_it = iter(s2_refs)
-            stitched_s2 = [next(s2_it) if flg else next(o_it_s2) for flg in step_b3_moe_is_scope2]
-            msc_s2 = _unpack_muse_sparse_scratch(
-                iter(stitched_s2),
+        def _run_b3_s12(*s12_refs) -> None:
+            o_it_s12 = iter(moe_outer_refs)
+            s12_it = iter(s12_refs)
+            stitched_s12 = [
+                next(o_it_s12)
+                if tier == 0
+                else (next(s12_it) if tier == 1 else None)
+                for tier in step_b3_moe_scope_tier
+            ]
+            msc_s12 = _unpack_muse_sparse_scratch(
+                iter(stitched_s12),
                 ep=world_size,
                 scale_block=scale_block,
                 num_replicas=num_replicas,
                 return_sharded=sharded_moe_in,
                 cfg=cfg,
             )
-            p_tmpl = plan_holder_b3[0]
-            plan_s2 = dataclasses.replace(
-                p_tmpl,
-                num_exec=b3_num_exec,
-                spec_slot=None if p_tmpl.spec_slot is None else b3_spec_slot,
-                spec_enabled=b3_spec_en,
-            )
-            _signal_barrier(me, world_size)
-            zero_and_pack_muse_sparse_from_vmem(
-                plan_s2,
-                r_scratch=msc_s2["r_scratch"],
-                accum_3d=msc_s2["accum_3d"],
-                io_3d_buf=msc_s2["io_3d_buf"],
-                accum_2d=msc_s2["accum_2d"],
-                batch_size=rows,
-                cfg=cfg,
-            )
-            _wait_barrier(world_size)
-            run_muse_sparse_experts_and_rs_from_vmem(
-                me,
-                None,
-                plan_s2,
-                d_scratch=msc_s2["d_scratch"],
-                r_scratch=msc_s2["r_scratch"],
-                w1_buf=msc_s2["w1_buf"],
-                s1_buf=msc_s2["s1_buf"],
-                w2_buf=msc_s2["w2_buf"],
-                s2_buf=msc_s2["s2_buf"],
-                w1_acc_buf=msc_s2["w1_acc_buf"],
-                x_3d_buf=msc_s2["x_3d_buf"],
-                io_3d_buf=msc_s2["io_3d_buf"],
-                lhs_2d_buf=msc_s2["lhs_2d_buf"],
-                act_2d_buf=msc_s2["act_2d_buf"],
-                y_stage_buf=msc_s2["y_stage_buf"],
-                lhs_fp8_buf=msc_s2["lhs_fp8_buf"],
-                lhs_sc_buf=msc_s2["lhs_sc_buf"],
-                masked_x_buf=msc_s2["masked_x_buf"],
-                bd_sc_buf=msc_s2["bd_sc_buf"],
-                gain_f32_buf=msc_s2["gain_f32_buf"],
-                accum_3d=msc_s2["accum_3d"],
-                accum_2d=msc_s2["accum_2d"],
-                fan_3d_buf=msc_s2["fan_3d_buf"],
-                rs_send_bf16=msc_s2["rs_send_bf16"],
-                rs_pair_recv=msc_s2["rs_pair_recv"],
-                rs_chip_send=msc_s2["rs_chip_send"],
-                rs_chip_recv=msc_s2["rs_chip_recv"],
-                rs_pair_ssem=msc_s2["rs_pair_ssem"],
-                rs_pair_rsem=msc_s2["rs_pair_rsem"],
-                rs_chip_ssem=msc_s2["rs_chip_ssem"],
-                rs_chip_rsem=msc_s2["rs_chip_rsem"],
-                rs_recv_3d=msc_s2["rs_recv_3d"],
-                rs_send_sem=msc_s2["rs_send_sem"],
-                rs_recv_sem=msc_s2["rs_recv_sem"],
-                owner_3d=msc_s2["owner_3d"],
-                fan_send_sem=msc_s2["fan_send_sem"],
-                fan_recv_sem=msc_s2["fan_recv_sem"],
-                fan_s2_send_sem=msc_s2["fan_s2_send_sem"],
-                fan_s2_recv_sem=msc_s2["fan_s2_recv_sem"],
-                barrier_sem=None,
-                output_ref=moe_sh_vmem,
-                ep=world_size,
-                batch_size=rows,
-                scale_block=scale_block,
-                return_sharded=sharded_moe_in,
-                ep_axis_name=ep_axis_name,
-                cfg=cfg,
-                x_is_3d=True,
-                wait_entry_barrier=False,
-                write_output_ref=True,
-                on_experts_done_fn=_on_experts_done_b3,
+            plan_holder_b3 = []
+
+            def _run_b3_scope1(*s1_refs) -> tuple:
+                s1_it = iter(s1_refs)
+                w_pre_core_buf = (
+                    (
+                        w_pre_outer
+                        if w_pre_outer.shape[1] == pre_pair_cols
+                        else w_pre_outer.at[:, pl.ds(0, pre_pair_cols)]
+                    )
+                    if step_b3_hoist_w_pre
+                    else next(s1_it)
+                )
+                w_router_buf = next(s1_it)
+                if final_norm_only and not interpret_mode:
+                    own_half = out_hidden_ref.at[:, pl.ds(0, 4096)]
+                    send_half = out_hidden_ref.at[:, pl.ds(4096, 4096)]
+                    mate_recv = next(s1_it)
+                else:
+                    own_half = next(s1_it)
+                    send_half = next(s1_it)
+                    mate_recv = next(s1_it)
+                rs1_a_s1 = next(s1_it)
+                rs1_b_s1 = next(s1_it)
+                rs2_a_s1 = next(s1_it)
+                rs2_b_recv = next(s1_it)
+                my_pair_bf16 = next(s1_it)
+                recv_pair_bf16 = next(s1_it)
+                ffn_pair_buf = next(s1_it)
+                exp_3d_buf = next(s1_it)
+                logits_vmem = next(s1_it)
+                sq_pair_pa_buf = next(s1_it)
+                router_pair_buf = next(s1_it)
+                pre_my_half = next(s1_it)
+                pre_mate_half = next(s1_it)
+                sq_pair_pre_buf = next(s1_it)
+                wo_buf = (
+                    next(s1_it)
+                    if interpret_mode
+                    else _alias_wo_buf(
+                        msc_s12["w1_buf"],
+                        msc_s12["w2_buf"],
+                        w_mode=msc_s12["w_mode"],
+                        o_in=o_in,
+                        half=half,
+                    )
+                )
+
+                def _during_ag_exp_ici_b3() -> None:
+                    plan_res = plan_and_prime_muse_sparse_from_vmem(
+                        me,
+                        logits_vmem,
+                        bias_ref,
+                        post_exp_norm_ref,
+                        w1_u32,
+                        s1_ref,
+                        w2_u32,
+                        s2_ref,
+                        d_scratch=msc_s12["d_scratch"],
+                        r_scratch=msc_s12["r_scratch"],
+                        w1_buf=msc_s12["w1_buf"],
+                        s1_buf=msc_s12["s1_buf"],
+                        w2_buf=msc_s12["w2_buf"],
+                        s2_buf=msc_s12["s2_buf"],
+                        w1_sem=msc_s12["w1_sem"],
+                        w2_sem=msc_s12["w2_sem"],
+                        misc_sem=msc_s12["misc_sem"],
+                        gain_f32_buf=msc_s12["gain_f32_buf"],
+                        accum_3d=None,
+                        io_3d_buf=None,
+                        accum_2d=None,
+                        rep_w1_u32=rep_w1_u32,
+                        rep_s1_ref=rep_s1_ref,
+                        rep_w2_u32=rep_w2_u32,
+                        rep_s2_ref=rep_s2_ref,
+                        replica_meta_ref=replica_meta_ref,
+                        owner_load_smem=msc_s12["owner_load_smem"],
+                        moved_flag_smem=msc_s12["moved_flag_smem"],
+                        local_suppress_smem=msc_s12["local_suppress_smem"],
+                        holder_slot_expert_smem=msc_s12["holder_slot_expert_smem"],
+                        holder_cand_smem=msc_s12["holder_cand_smem"],
+                        spec_slot_ref=spec_slot_ref,
+                        free_params_ref=free_params_ref,
+                        ep=world_size,
+                        batch_size=rows,
+                        scale_block=scale_block,
+                        num_replicas=num_replicas,
+                        replica_cost_mode=replica_cost_mode,
+                        cfg=cfg,
+                        zero_and_pack=False,
+                    )
+                    plan_holder_b3.append(plan_res)
+
+                _run_chip_b1_vmem_core(
+                    stream_chip_hbm,
+                    gated_ref,
+                    wo_hbm,
+                    wo_scale_ref,
+                    pa_alpha_ref,
+                    pa_beta_ref,
+                    pre_ff_gain_ref,
+                    w_pre_pair_hbm,
+                    w_pre_pair_scale_ref,
+                    w_router_hbm,
+                    pre_exp_gain_ref,
+                    out_stream_chip_hbm,
+                    logits_vmem,
+                    None,
+                    wo_buf,
+                    w_pre_core_buf,
+                    w_router_buf,
+                    s_buf,
+                    send_half,
+                    mate_recv,
+                    own_half,
+                    rs1_a_s1,
+                    rs1_b_s1,
+                    rs2_a_s1,
+                    rs2_b_recv,
+                    my_pair_bf16,
+                    recv_pair_bf16,
+                    sq_pair_pa_buf,
+                    ffn_pair_buf,
+                    router_pair_buf,
+                    pre_my_half,
+                    pre_mate_half,
+                    sq_pair_pre_buf,
+                    exp_3d_buf,
+                    msc_s12["w1_sem"],
+                    sems["w_pre_sem"],
+                    sems["w_router_sem"],
+                    sems["s_in_sem"],
+                    sems["s_out_sem"],
+                    sems["c1a_send"],
+                    sems["c1a_recv"],
+                    sems["rs1_send"],
+                    sems["rs1_recv"],
+                    sems["rs2_send"],
+                    sems["rs2_recv"],
+                    sems["rs3_send"],
+                    sems["rs3_recv"],
+                    sems["c1c_send"],
+                    sems["c1c_recv"],
+                    sems["pre_send"],
+                    sems["pre_recv"],
+                    sems["ag_exp_send"],
+                    sems["ag_exp_recv"],
+                    sems["ag_exp_d2d_send"],
+                    sems["ag_exp_d2d_recv"],
+                    sems["ag_log_send"],
+                    sems["ag_log_recv"],
+                    world_size=world_size,
+                    pa_eps=pa_eps,
+                    pre_ff_eps=pre_ff_eps,
+                    pre_ff_scale_input=pre_ff_scale_input,
+                    router_multiplier=router_multiplier,
+                    pre_exp_eps=pre_exp_eps,
+                    pre_exp_scale_input=pre_exp_scale_input,
+                    skip_barrier_signal=False,
+                    skip_barrier_wait=False,
+                    skip_stream_load=False,
+                    skip_stream_store=True,
+                    early_router_and_log_ag=True,
+                    during_ag_exp_ici_fn=_during_ag_exp_ici_b3,
+                    during_ag_exp_d2d2_fn=None,
+                    out_expert_3d_ref=msc_s12["x_3d_buf"],
+                )
+                p_b3 = plan_holder_b3[0]
+                return (
+                    p_b3.num_exec,
+                    jnp.int32(0) if p_b3.spec_slot is None else p_b3.spec_slot,
+                    p_b3.spec_enabled,
+                )
+
+            b3_num_exec, b3_spec_slot, b3_spec_en = pl.run_scoped(
+                _run_b3_scope1, *step_b3_scope1_shapes
             )
 
-        pl.run_scoped(_run_b3_scope2, *step_b3_scope2_shapes)
+            def _on_experts_done_b3() -> None:
+                pltpu.make_async_copy(w_post_hbm, w_post_buf, sems["w_post_sem"].at[0]).start()
+                if step_b3_hoist_w_pre:
+                    pltpu.make_async_copy(
+                        next_w_qkv_hbm, w_qkv_outer, sems["w_qkv_sem"].at[0]
+                    ).start()
+                if step_b3_hoist_w_gate:
+                    pltpu.make_async_copy(
+                        next_w_gate_hbm, w_gate_outer, sems["w_gate_sem"].at[0]
+                    ).start()
+
+            def _run_b3_scope2(*s2_refs) -> None:
+                o_it_s2 = iter(moe_outer_refs)
+                s12_it_s2 = iter(s12_refs)
+                s2_it = iter(s2_refs)
+                stitched_s2 = [
+                    next(o_it_s2)
+                    if tier == 0
+                    else (next(s12_it_s2) if tier == 1 else next(s2_it))
+                    for tier in step_b3_moe_scope_tier
+                ]
+                msc_s2 = _unpack_muse_sparse_scratch(
+                    iter(stitched_s2),
+                    ep=world_size,
+                    scale_block=scale_block,
+                    num_replicas=num_replicas,
+                    return_sharded=sharded_moe_in,
+                    cfg=cfg,
+                )
+                p_tmpl = plan_holder_b3[0]
+                plan_s2 = dataclasses.replace(
+                    p_tmpl,
+                    num_exec=b3_num_exec,
+                    spec_slot=None if p_tmpl.spec_slot is None else b3_spec_slot,
+                    spec_enabled=b3_spec_en,
+                )
+                _signal_barrier(me, world_size)
+                zero_and_pack_muse_sparse_from_vmem(
+                    plan_s2,
+                    r_scratch=msc_s2["r_scratch"],
+                    accum_3d=msc_s2["accum_3d"],
+                    io_3d_buf=msc_s2["io_3d_buf"],
+                    accum_2d=msc_s2["accum_2d"],
+                    batch_size=rows,
+                    cfg=cfg,
+                )
+                _wait_barrier(world_size)
+                run_muse_sparse_experts_and_rs_from_vmem(
+                    me,
+                    None,
+                    plan_s2,
+                    d_scratch=msc_s2["d_scratch"],
+                    r_scratch=msc_s2["r_scratch"],
+                    w1_buf=msc_s2["w1_buf"],
+                    s1_buf=msc_s2["s1_buf"],
+                    w2_buf=msc_s2["w2_buf"],
+                    s2_buf=msc_s2["s2_buf"],
+                    w1_acc_buf=msc_s2["w1_acc_buf"],
+                    x_3d_buf=msc_s2["x_3d_buf"],
+                    io_3d_buf=msc_s2["io_3d_buf"],
+                    lhs_2d_buf=msc_s2["lhs_2d_buf"],
+                    act_2d_buf=msc_s2["act_2d_buf"],
+                    y_stage_buf=msc_s2["y_stage_buf"],
+                    lhs_fp8_buf=msc_s2["lhs_fp8_buf"],
+                    lhs_sc_buf=msc_s2["lhs_sc_buf"],
+                    masked_x_buf=msc_s2["masked_x_buf"],
+                    bd_sc_buf=msc_s2["bd_sc_buf"],
+                    gain_f32_buf=msc_s2["gain_f32_buf"],
+                    accum_3d=msc_s2["accum_3d"],
+                    accum_2d=msc_s2["accum_2d"],
+                    fan_3d_buf=msc_s2["fan_3d_buf"],
+                    rs_send_bf16=msc_s2["rs_send_bf16"],
+                    rs_pair_recv=msc_s2["rs_pair_recv"],
+                    rs_chip_send=msc_s2["rs_chip_send"],
+                    rs_chip_recv=msc_s2["rs_chip_recv"],
+                    rs_pair_ssem=msc_s2["rs_pair_ssem"],
+                    rs_pair_rsem=msc_s2["rs_pair_rsem"],
+                    rs_chip_ssem=msc_s2["rs_chip_ssem"],
+                    rs_chip_rsem=msc_s2["rs_chip_rsem"],
+                    rs_recv_3d=msc_s2["rs_recv_3d"],
+                    rs_send_sem=msc_s2["rs_send_sem"],
+                    rs_recv_sem=msc_s2["rs_recv_sem"],
+                    owner_3d=msc_s2["owner_3d"],
+                    fan_send_sem=msc_s2["fan_send_sem"],
+                    fan_recv_sem=msc_s2["fan_recv_sem"],
+                    fan_s2_send_sem=msc_s2["fan_s2_send_sem"],
+                    fan_s2_recv_sem=msc_s2["fan_s2_recv_sem"],
+                    barrier_sem=None,
+                    output_ref=moe_sh_vmem,
+                    ep=world_size,
+                    batch_size=rows,
+                    scale_block=scale_block,
+                    return_sharded=sharded_moe_in,
+                    ep_axis_name=ep_axis_name,
+                    cfg=cfg,
+                    x_is_3d=True,
+                    wait_entry_barrier=False,
+                    write_output_ref=True,
+                    on_experts_done_fn=_on_experts_done_b3,
+                )
+
+            pl.run_scoped(_run_b3_scope2, *step_b3_scope2_shapes)
+
+        pl.run_scoped(_run_b3_s12, *step_b3_s12_shapes)
+
+        def _unpack_b3_s3_base(s3_it):
+            if final_norm_only:
+                next_in_vmem = None
+                qkv_vmem_b2 = None
+                moe_full_b2 = next(s3_it)
+                mate_tok_b2 = next(s3_it)
+                my_pair_bf16 = next(s3_it)
+                recv_pair_bf16 = next(s3_it)
+                ffn_pair_buf = next(s3_it)
+                w_qkv_buf = w_gate_buf = None
+            else:
+                next_in_vmem = next(s3_it)
+                qkv_vmem_b2 = next(s3_it)
+                moe_full_b2 = next(s3_it)
+                mate_tok_b2 = next(s3_it)
+                my_pair_bf16 = next(s3_it)
+                recv_pair_bf16 = next(s3_it)
+                ffn_pair_buf = next(s3_it)
+                w_qkv_buf = w_qkv_outer if step_b3_hoist_w_pre else next(s3_it)
+                w_gate_buf = w_gate_outer if step_b3_hoist_w_gate else next(s3_it)
+            # use_3scope requires rows > 128 -> r_pair >= 32 != 8, so ag_3d_buf is unused (-2 MiB).
+            return (
+                next_in_vmem, qkv_vmem_b2, moe_full_b2, mate_tok_b2,
+                my_pair_bf16, recv_pair_bf16, ffn_pair_buf, None,
+                w_qkv_buf, w_gate_buf,
+            )
 
         def _run_b3_scope3(*s3_refs) -> None:
-            if final_norm_only:
-                mate_recv_b2, mate_tok_b2 = s3_refs[:2]
-                next_in_vmem = w_qkv_buf = w_gate_buf = None
-                rpad_refs_b3 = None
-            else:
-                next_in_vmem, mate_recv_b2, mate_tok_b2, w_qkv_buf, w_gate_buf = s3_refs[:5]
-                rpad_refs_b3 = (
-                    _unpack_rpad_scope_refs(
-                        iter(s3_refs[5:]),
-                        rpa_skip_kv_write=rpa_skip_kv_write,
-                        rpa_kv_pack_dense2=rpa_kv_pack_dense2,
-                        rpa_kv_pack_bd4=rpa_kv_pack_bd4,
-                        rpa_cfg=rpa_cfg,
-                        rpa_use_grp_vec=rpa_use_grp_vec,
-                    )
-                    if has_rpad
-                    else None
+            s3_it = iter(s3_refs)
+            (
+                next_in_vmem, qkv_vmem_b2, moe_full_b2, mate_tok_b2,
+                my_pair_bf16, recv_pair_bf16, ffn_pair_buf, exp_3d_buf,
+                w_qkv_buf, w_gate_buf,
+            ) = _unpack_b3_s3_base(s3_it)
+            rpad_refs_b3 = (
+                _unpack_rpad_scope_refs(
+                    s3_it,
+                    rpa_skip_kv_write=rpa_skip_kv_write,
+                    rpa_kv_pack_dense2=rpa_kv_pack_dense2,
+                    rpa_kv_pack_bd4=rpa_kv_pack_bd4,
+                    rpa_cfg=rpa_cfg,
+                    rpa_use_grp_vec=rpa_use_grp_vec,
                 )
+                if (has_rpad and not final_norm_only)
+                else None
+            )
             _run_stage5_6_b2_rpad(
                 moe_dst_vmem=moe_sh_vmem,
                 w_post_buf=w_post_buf,
@@ -1395,7 +1496,7 @@ def _b1_moe_b2_chip_sharded_impl(
                 s_buf=s_buf,
                 next_in_vmem=next_in_vmem,
                 send_half=mate_tok_b2,
-                mate_recv=mate_recv_b2,
+                mate_recv=None,
                 my_pair_bf16=my_pair_bf16,
                 recv_pair_bf16=recv_pair_bf16,
                 ffn_pair_buf=ffn_pair_buf,
@@ -1408,7 +1509,10 @@ def _b1_moe_b2_chip_sharded_impl(
                 rpad_bkv_sems=rpad_bkv_sems,
                 rpad_cache_write_sem=rpad_cache_write_sem,
                 sync_entry_barrier=True,
-                prestarted_qkv_gate_dma=False,
+                prestarted_w_qkv_dma=step_b3_hoist_w_pre,
+                prestarted_w_gate_dma=step_b3_hoist_w_gate,
+                qkv_vmem_override=qkv_vmem_b2,
+                moe_full_override=moe_full_b2,
             )
 
         if has_rpad and split_b2_rpad and not final_norm_only:
@@ -1427,10 +1531,14 @@ def _b1_moe_b2_chip_sharded_impl(
                 b2_out_kv = out_kv_merged_ref if rpa_skip_kv_write else rpad_kv_vmem
 
                 def _run_b3_b2_only(*b2_refs) -> None:
-                    next_in_vmem, mate_recv_b2, mate_tok_b2, w_qkv_buf, w_gate_buf = b2_refs[:5]
-                    qkv_vmem_slice = mate_recv_b2.at[:, pl.ds(0, qkv_cols)]
+                    (
+                        next_in_vmem, qkv_vmem_b2, moe_full_b2, mate_tok_b2,
+                        my_pair_bf16, recv_pair_bf16, ffn_pair_buf, exp_3d_buf,
+                        w_qkv_buf, w_gate_buf,
+                    ) = _unpack_b3_s3_base(iter(b2_refs))
+                    qkv_vmem_slice = qkv_vmem_b2
                     mate_tok_slice = mate_tok_b2.at[pl.ds(0, rows_per_rank), :]
-                    moe_full_slice = mate_recv_b2.at[pl.ds(0, r_pair), :]
+                    moe_full_slice = moe_full_b2
                     _run_chip_b2_vmem_core(
                         stream_chip_hbm,
                         moe_sh_vmem,
@@ -1501,8 +1609,8 @@ def _b1_moe_b2_chip_sharded_impl(
                         skip_stream_load=True,
                         skip_stream_store=False,
                         prestarted_w_post_dma=True,
-                        prestarted_w_qkv_dma=False,
-                        prestarted_w_gate_dma=False,
+                        prestarted_w_qkv_dma=step_b3_hoist_w_pre,
+                        prestarted_w_gate_dma=step_b3_hoist_w_gate,
                         gate_dst_ref=rpad_gate_vmem,
                         after_qkv_epi_fn=None,
                         defer_stream_store_wait=True,
@@ -2107,36 +2215,44 @@ def _prepare_chip_b1_moe_b2_setup(
         cfg=config,
     )
     b3_n_route_sc = 6 if config.row_mode == "dense" else 12
-    b3_keep_outer = {
+    b3_outer_vmem = {b3_idx_map["w1_buf"]}
+    b3_s12_vmem = {
         *range(b3_n_route_sc),
-        b3_idx_map["w1_buf"],
         b3_idx_map["s1_buf"],
         b3_idx_map["w2_buf"],
         b3_idx_map["s2_buf"],
         b3_idx_map["gain_f32_buf"],
         b3_idx_map["x_3d_buf"],
     }
-    step_b3_moe_is_scope2 = tuple(
-        (idx not in b3_keep_outer) and (getattr(sp, "memory_space", None) == vmem)
+    step_b3_moe_scope_tier = tuple(
+        0
+        if (getattr(sp, "memory_space", None) != vmem or idx in b3_outer_vmem)
+        else (1 if idx in b3_s12_vmem else 2)
         for idx, sp in enumerate(moe_scratch)
     )
     step_b3_moe_outer = [
-        sp for sp, flg in zip(moe_scratch, step_b3_moe_is_scope2) if not flg
+        sp for sp, tier in zip(moe_scratch, step_b3_moe_scope_tier) if tier == 0
     ]
-    step_b3_moe_scope2 = tuple(
-        sp for sp, flg in zip(moe_scratch, step_b3_moe_is_scope2) if flg
+    step_b3_s12_shapes = tuple(
+        sp for sp, tier in zip(moe_scratch, step_b3_moe_scope_tier) if tier == 1
     )
+    step_b3_moe_scope2 = tuple(
+        sp for sp, tier in zip(moe_scratch, step_b3_moe_scope_tier) if tier == 2
+    )
+    step_b3_hoist_w_pre = (not final_norm_only) and (qkv_cols + gate_cols <= pre_pair_cols)
+    step_b3_hoist_w_gate = step_b3_hoist_w_pre
+    step_b3_w_pre_cols = pre_pair_cols
     v_interp_b3_post = (
         [vmem((_H, post_cols), w_post_tp2_w8k.dtype)] if interpret_mode else []
     )
     step_b3_outer_scratch = [
         *step_b3_moe_outer,
+        *(
+            [vmem((hidden, step_b3_w_pre_cols), w_pre_pair_w8k.dtype)]
+            if step_b3_hoist_w_pre
+            else []
+        ),
         v_s_buf,
-        v_my_pair_bf16,
-        v_recv_pair_bf16,
-        v_ffn_pair,
-        v_exp_3d,
-        v_logits,
         *v_moe_sh,
         v_b2_dummy_post,
         v_b2_dummy_cols,
@@ -2145,7 +2261,11 @@ def _prepare_chip_b1_moe_b2_setup(
     ]
     step_b3_scope1_shapes = tuple(
         [
-            vmem((hidden, pre_pair_cols), w_pre_pair_w8k.dtype),
+            *(
+                []
+                if step_b3_hoist_w_pre
+                else [vmem((hidden, pre_pair_cols), w_pre_pair_w8k.dtype)]
+            ),
             v_w_router_buf,
             *(
                 [vmem((rows, half), jnp.bfloat16)]
@@ -2158,6 +2278,11 @@ def _prepare_chip_b1_moe_b2_setup(
             ),
             *v_rs_slice_shapes,
             v_rs2_b,
+            v_my_pair_bf16,
+            v_recv_pair_bf16,
+            v_ffn_pair,
+            v_exp_3d,
+            v_logits,
             v_sq_pair_pa,
             v_router_pair,
             v_pre_my,
@@ -2168,16 +2293,31 @@ def _prepare_chip_b1_moe_b2_setup(
     )
     step_b3_scope3_shapes = (
         (
-            vmem((rows, half), jnp.bfloat16),
+            vmem((r_pair, _H), jnp.bfloat16),
             vmem((rows_per_rank, _H), jnp.bfloat16),
+            v_my_pair_bf16,
+            v_recv_pair_bf16,
+            v_ffn_pair,
         )
         if final_norm_only
         else (
             vmem((rows, hidden), jnp.bfloat16),
-            vmem((rows, half), jnp.bfloat16),
+            vmem((rows, qkv_cols), jnp.bfloat16),
+            vmem((r_pair, _H), jnp.bfloat16),
             vmem((rows_per_rank, _H), jnp.bfloat16),
-            vmem((hidden, qkv_cols), next_w_qkv_w8k.dtype),
-            vmem((hidden, gate_cols), next_w_gate_w8k.dtype),
+            v_my_pair_bf16,
+            v_recv_pair_bf16,
+            v_ffn_pair,
+            *(
+                ()
+                if step_b3_hoist_w_pre
+                else (vmem((hidden, qkv_cols), next_w_qkv_w8k.dtype),)
+            ),
+            *(
+                ()
+                if step_b3_hoist_w_gate
+                else (vmem((hidden, gate_cols), next_w_gate_w8k.dtype),)
+            ),
         )
     )
 
@@ -2319,11 +2459,14 @@ def _prepare_chip_b1_moe_b2_setup(
         scratch_shapes=moe_scratch + shared_scratch,
         use_3scope=use_3scope,
         step_b3_outer_scratch=step_b3_outer_scratch,
-        step_b3_moe_is_scope2=step_b3_moe_is_scope2,
+        step_b3_moe_scope_tier=step_b3_moe_scope_tier,
         step_b3_n_moe_outer=len(step_b3_moe_outer),
+        step_b3_s12_shapes=step_b3_s12_shapes,
         step_b3_scope1_shapes=step_b3_scope1_shapes,
         step_b3_scope2_shapes=step_b3_moe_scope2,
         step_b3_scope3_shapes=step_b3_scope3_shapes,
+        step_b3_hoist_w_pre=step_b3_hoist_w_pre,
+        step_b3_hoist_w_gate=step_b3_hoist_w_gate,
         step_c_outer_scratch=moe_outer + outer_shared_vmem + outer_sems + v_interp_b2,
         step_c_moe_is_scope1=moe_is_scope1,
         step_c_n_moe_outer=len(moe_outer),
@@ -2463,10 +2606,13 @@ def b1_moe_b2_chip_sharded_jax(
         alias_mate_recv=st["alias_mate_recv"],
         use_3scope=st["use_3scope"],
         step_b3_n_moe_outer=st["step_b3_n_moe_outer"],
-        step_b3_moe_is_scope2=st["step_b3_moe_is_scope2"],
+        step_b3_moe_scope_tier=st["step_b3_moe_scope_tier"],
+        step_b3_s12_shapes=st["step_b3_s12_shapes"],
         step_b3_scope1_shapes=st["step_b3_scope1_shapes"],
         step_b3_scope2_shapes=st["step_b3_scope2_shapes"],
         step_b3_scope3_shapes=st["step_b3_scope3_shapes"],
+        step_b3_hoist_w_pre=st["step_b3_hoist_w_pre"],
+        step_b3_hoist_w_gate=st["step_b3_hoist_w_gate"],
     )
 
     res = pl.pallas_call(
@@ -2600,10 +2746,13 @@ def b1_moe_fnorm_chip_sharded_jax(
         alias_mate_recv=st["alias_mate_recv"],
         use_3scope=st["use_3scope"],
         step_b3_n_moe_outer=st["step_b3_n_moe_outer"],
-        step_b3_moe_is_scope2=st["step_b3_moe_is_scope2"],
+        step_b3_moe_scope_tier=st["step_b3_moe_scope_tier"],
+        step_b3_s12_shapes=st["step_b3_s12_shapes"],
         step_b3_scope1_shapes=st["step_b3_scope1_shapes"],
         step_b3_scope2_shapes=st["step_b3_scope2_shapes"],
         step_b3_scope3_shapes=st["step_b3_scope3_shapes"],
+        step_b3_hoist_w_pre=st["step_b3_hoist_w_pre"],
+        step_b3_hoist_w_gate=st["step_b3_hoist_w_gate"],
     )
     return pl.pallas_call(
         kernel_fn,
@@ -2633,6 +2782,7 @@ def b1_moe_fnorm_chip_sharded_jax(
 
 _STEP_C_BASE_MAX_BKV_ROWS = 80 * 512
 _STEP_C_GROUP_MAX_BKV_ROWS = 80 * 512
+_STEP_C_SWABATCH_WIDE_GRP_MAX_BKV_ROWS = 60 * 512
 _STEP_C_LARGE_B_MAX_BKV_ROWS = 16 * 512
 _STEP_C_LARGE_B_RING_GRP_MAX_BKV_ROWS = 24 * 512
 _STEP_C_B128_MAX_BKV_ROWS = 40 * 512
@@ -2646,7 +2796,10 @@ def _step_c_max_bkv_rows(
     allow_large_b: bool,
     base_rows: int,
 ) -> int:
-    if eff_b in (128, 256) and not kv_pack_bd4 and (not kv_pack_dense2 or allow_large_b):
+    if not kv_pack_bd4 and (
+        (eff_b == 128 and (not kv_pack_dense2 or allow_large_b))
+        or (eff_b == 256 and allow_large_b)
+    ):
         return _STEP_C_B128_MAX_BKV_ROWS
     return _STEP_C_LARGE_B_MAX_BKV_ROWS if eff_b > 64 else base_rows
 
@@ -2803,11 +2956,31 @@ def resolve_step_c_rpa_plan(
             allow_large_b=bool(allow_large_b),
             base_rows=_STEP_C_GROUP_MAX_BKV_ROWS,
         )
-        grp_cands = (
-            ((cfg_rpa.num_slots, 4), (3, 4), (cfg_rpa.num_slots, 2))
-            if (kv_pack_bd4 and cfg_rpa.num_slots == 4)
-            else ((cfg_rpa.num_slots, 4), (cfg_rpa.num_slots, 2))
+        wide_grp_limit = (
+            _STEP_C_SWABATCH_WIDE_GRP_MAX_BKV_ROWS
+            if kv_pack_bd4
+            else min(grp_limit, _STEP_C_SWABATCH_WIDE_GRP_MAX_BKV_ROWS)
         )
+        # Cap fused Step (c) swabatch grouping at g=8: on TP=16 BD4 silicon, g8 s3 (7.5 MiB bkv)
+        # beats both g4 and g16 s3 (15 MiB bkv) across B=64 (-1.74 / -6.41 us/L), B=128 (-3.25 /
+        # -1.17 us/L), and B=256 (-6.57 / -0.76 us/L); on TP=8 D2, g8 beats g4 across B=64..256.
+        grp_cands = []
+        for g in (8, 4, 2):
+            if g > cfg_rpa.swabatch_group_size:
+                continue
+            if g == 8:
+                slot_opts = (
+                    (3, 4)
+                    if (kv_pack_bd4 and cfg_rpa.num_slots == 4)
+                    else (cfg_rpa.num_slots, 3, 2)
+                )
+            elif g == 4 and kv_pack_bd4 and cfg_rpa.num_slots == 4:
+                slot_opts = (4, 3)
+            else:
+                slot_opts = (cfg_rpa.num_slots,)
+            for s in slot_opts:
+                if s <= cfg_rpa.num_slots and (s, g) not in grp_cands:
+                    grp_cands.append((s, g))
         for cand_slots, cand_grp in grp_cands:
             if (
                 cand_slots > cfg_rpa.num_slots
@@ -2815,6 +2988,7 @@ def resolve_step_c_rpa_plan(
                 or (eff_b % cand_grp) != 0
             ):
                 continue
+            cand_limit = wide_grp_limit if cand_grp > 4 else grp_limit
             cand_cfg = dataclasses.replace(
                 cfg_rpa, num_slots=cand_slots, swabatch_group_size=cand_grp
             )
@@ -2829,7 +3003,7 @@ def resolve_step_c_rpa_plan(
                     max_num_seqs=eff_seqs,
                 )
                 and cand_cfg.num_slots * cand_grp * cand_cfg.max_ring_pages * phys_page_rows
-                <= grp_limit
+                <= cand_limit
             ):
                 cfg_rpa = cand_cfg
                 eff_grp = cand_grp
@@ -3244,17 +3418,26 @@ def b1_moe_b2_rpad_chip_sharded_jax(
                 st["use_3scope"]
                 and (not kv_pack_bd4)
                 and (
-                    world_size == 8
-                    or run_cfg.num_slots * run_slot_pg * phys_page_rows > _STEP_C_LARGE_B_MAX_BKV_ROWS
-                    or run_cfg.hoist_new_kv
-                    or run_grp_vec
+                    run_cfg.num_slots
+                    * run_slot_pg
+                    * phys_page_rows
+                    * (4 * 128 * jnp.dtype(kv_cache_flat.dtype).itemsize)
+                    + (
+                        (2 * b_pad32 * q_heads * 128 * 4)
+                        if (run_cfg.hoist_new_kv or run_grp_vec)
+                        else 0
+                    )
+                    > 10 * 1024**2
                 )
             ),
-            step_b3_moe_is_scope2=st["step_b3_moe_is_scope2"],
+            step_b3_moe_scope_tier=st["step_b3_moe_scope_tier"],
             step_b3_n_moe_outer=st["step_b3_n_moe_outer"],
+            step_b3_s12_shapes=st["step_b3_s12_shapes"],
             step_b3_scope1_shapes=st["step_b3_scope1_shapes"],
             step_b3_scope2_shapes=st["step_b3_scope2_shapes"],
             step_b3_scope3_shapes=st["step_b3_scope3_shapes"],
+            step_b3_hoist_w_pre=st["step_b3_hoist_w_pre"],
+            step_b3_hoist_w_gate=st["step_b3_hoist_w_gate"],
             step_c_moe_is_scope1=st["step_c_moe_is_scope1"],
             step_c_n_moe_outer=st["step_c_n_moe_outer"],
             step_c_n_moe_scope1=st["step_c_n_moe_scope1"],

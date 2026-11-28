@@ -920,14 +920,17 @@ def _fp8_lm_head_fused_topk64_kernel(
     bm_mxu: int,
     exact_tie_break: bool,
     use_xor_butterfly: bool = False,
+    use_pack_fold: bool = True,
 ) -> None:
-    """Zero-spill 1-kernel fused FP8 LM head + quad-decomposed bitonic Top-64 + 1-hop VMEM AG.
+    """Zero-spill 1-kernel fused FP8 LM head + quad-decomposed bitonic Top-64 + VMEM AG.
 
     - ``[B, V_local]`` logits NEVER touch HBM.
     - Full ``bm_mxu = min(b_pad, 128)`` MXU utilization overlapped with double-buffered HBM DMA.
+    - For ``b_pad <= 64``, Wave-19 batch-lane folding packs ``128 // bm_mxu`` 128-col chunks into
+      each ``(128, 128)`` transpose and folds lanes across ``bm_mxu`` once at the end.
     - Quad-decomposed vertical bitonic Top-64 keeps ``<= 12`` live VREGs (``0 / 0`` spills).
-    - Compact ``(n_m * 64, 128)`` 1-hop cyclic VMEM all-gather + in-VMEM global rank merge
-      returns final descending global Top-64 directly (zero post-kernel XLA ``top_k``!).
+    - Compact ``(n_m * 64, 128)`` VMEM all-gather + in-VMEM global rank merge returns final
+      descending global Top-64 directly (zero post-kernel XLA ``top_k``!).
     """
     import jax.numpy as jnp
     from jax import lax
@@ -936,10 +939,11 @@ def _fp8_lm_head_fused_topk64_kernel(
 
     b_pad, _ = x_ref.shape
     vp = w8k_hbm.shape[1]
-    n_tiles = vp // tn
+    n_full_tiles = vp // tn
+    has_tail_512 = (vp % tn) == 512
     n_m = b_pad // bm_mxu
-    n_sub = tn // 512
     added_width = local_width - org_vocab_padded_count
+    n_grp = (128 // bm_mxu) if (use_pack_fold and bm_mxu < 128 and n_m == 1) else 1
 
     me = lax.axis_index("model").astype(jnp.int32)
     _entry_barrier_signal(me, world_size)
@@ -956,20 +960,39 @@ def _fp8_lm_head_fused_topk64_kernel(
         jnp.int32(added_width),
     )
 
-    def _start_w(slot: int, tile_idx):
+    def _start_w(slot: int, tile_idx, cols_w: int = tn):
         c0 = pl.multiple_of(tile_idx * tn, tn)
-        pltpu.make_async_copy(
-            w8k_hbm.at[:, pl.ds(c0, tn)],
-            w_buf.at[slot],
-            w_sem.at[slot],
-        ).start()
+        if cols_w == tn:
+            pltpu.make_async_copy(
+                w8k_hbm.at[:, pl.ds(c0, tn)],
+                w_buf.at[slot],
+                w_sem.at[slot],
+            ).start()
+        else:
+            pltpu.make_async_copy(
+                w8k_hbm.at[:, pl.ds(c0, cols_w)],
+                w_buf.at[slot, :, pl.ds(0, cols_w)],
+                w_sem.at[slot],
+            ).start()
 
-    def _wait_w(slot: int):
-        pltpu.make_async_copy(w_buf.at[slot], w_buf.at[slot], w_sem.at[slot]).wait()
+    def _wait_w(slot: int, cols_w: int = tn):
+        if cols_w == tn:
+            pltpu.make_async_copy(w_buf.at[slot], w_buf.at[slot], w_sem.at[slot]).wait()
+        else:
+            pltpu.make_async_copy(
+                w_buf.at[slot, :, pl.ds(0, cols_w)],
+                w_buf.at[slot, :, pl.ds(0, cols_w)],
+                w_sem.at[slot],
+            ).wait()
 
-    _start_w(0, jnp.int32(0))
-    if n_tiles >= 2:
-        _start_w(1, jnp.int32(1))
+    if n_full_tiles >= 1:
+        _start_w(0, jnp.int32(0), tn)
+    elif has_tail_512:
+        _start_w(0, jnp.int32(0), 512)
+    if n_full_tiles >= 2:
+        _start_w(1, jnp.int32(1), tn)
+    elif n_full_tiles == 1 and has_tail_512:
+        _start_w(1, jnp.int32(1), 512)
 
     neg_inf_8 = jnp.full((8, 128), -jnp.inf, dtype=jnp.float32)
     max_i32_8 = jnp.full((8, 128), 0x7FFFFFFF, dtype=jnp.int32)
@@ -983,9 +1006,69 @@ def _fp8_lm_head_fused_topk64_kernel(
         arg_v_buf[pl.ds(im * 8, 8), :] = neg_inf_8
         arg_i_buf[pl.ds(im * 8, 8), :] = max_i32_8
 
-    def _process_tile(tile_idx, slot: int, has_next_prefetch: bool) -> None:
-        _wait_w(slot)
+    if n_grp > 1:
+        bm_shift = bm_mxu.bit_length() - 1
+        grp_col_off = lax.shift_left(
+            lax.shift_right_logical(lax.broadcasted_iota(jnp.int32, (8, 128), 1), jnp.int32(bm_shift)),
+            jnp.int32(7),
+        )
+    else:
+        grp_col_off = jnp.int32(0)
+
+    def _merge_128_folded(c_base_val) -> None:
+        for hh in range(2):
+            h_off = pl.multiple_of(hh * 64, 64)
+            _v64_quad_stream_merge_64(
+                blk_t_buf,
+                h_off,
+                c_base_val + grp_col_off + jnp.int32(h_off),
+                top_v_buf,
+                top_i_buf,
+                0,
+                work_v_buf,
+                work_i_buf,
+                arg_v_buf,
+                arg_i_buf,
+                0,
+                org_count=org_count,
+                added_count=added_count,
+                org_vocab_padded_count=org_vocab_padded_count,
+                exact_tie_break=exact_tie_break,
+            )
+
+    def _process_tile(tile_idx, slot: int, has_next_prefetch: bool, cols_w: int = tn) -> None:
+        _wait_w(slot, cols_w)
         c_tile = pl.multiple_of(tile_idx * tn, tn)
+        cur_subs = cols_w // 512
+
+        if n_grp == 8 and cols_w == 1024:
+            s0 = scale_ref[0:1, pl.ds(c_tile, 512)]
+            s1 = scale_ref[0:1, pl.ds(c_tile + 512, 512)]
+            if logit_scale != 1.0:
+                s0 = s0 * jnp.float32(logit_scale)
+                s1 = s1 * jnp.float32(logit_scale)
+            a0 = jnp.dot(
+                x_ref[...], w_buf[slot, :, pl.ds(0, 512)], preferred_element_type=jnp.float32
+            ) * s0
+            a1 = jnp.dot(
+                x_ref[...], w_buf[slot, :, pl.ds(512, 512)], preferred_element_type=jnp.float32
+            ) * s1
+            stacked = jnp.concatenate(
+                [a0[:, pl.ds(q * 128, 128)] for q in range(4)]
+                + [a1[:, pl.ds(q * 128, 128)] for q in range(4)],
+                axis=0,
+            )
+            blk_t_buf[...] = stacked.T
+            if has_next_prefetch:
+                @pl.when(tile_idx + 2 < n_full_tiles)
+                def _pf():
+                    _start_w(slot, tile_idx + 2, tn)
+                if has_tail_512:
+                    @pl.when(tile_idx + 2 == n_full_tiles)
+                    def _pf_tail():
+                        _start_w(slot, tile_idx + 2, 512)
+            _merge_128_folded(c_tile)
+            return
 
         def _sub_body(isub, _):
             c_sub = pl.multiple_of(isub * 512, 512)
@@ -1006,39 +1089,62 @@ def _fp8_lm_head_fused_topk64_kernel(
                 )
                 tile_buf[...] = acc * s_vec
 
-                def _q_body(q, _):
-                    q_off = pl.multiple_of(q * 128, 128)
-                    blk = tile_buf[:, pl.ds(q_off, 128)]
-                    if bm_mxu < 128:
-                        blk = jnp.pad(blk, ((0, 128 - bm_mxu), (0, 0)), constant_values=-jnp.inf)
-                    blk_t_buf[...] = blk.T
+                if n_grp > 1:
+                    n_packs = 1 if n_grp >= 4 else 2
+                    cols_per_pk = n_grp * 128 if n_grp <= 4 else 512
+                    for pk in range(n_packs):
+                        c_pk = c_base + pk * cols_per_pk
+                        if n_grp == 8:
+                            st = jnp.concatenate(
+                                [tile_buf[:, pl.ds(q * 128, 128)] for q in range(4)], axis=0
+                            )
+                            st = jnp.pad(st, ((0, 64), (0, 0)), constant_values=-jnp.inf)
+                        else:
+                            st = jnp.concatenate(
+                                [
+                                    tile_buf[:, pl.ds(pk * cols_per_pk + q * 128, 128)]
+                                    for q in range(n_grp)
+                                ],
+                                axis=0,
+                            )
+                        blk_t_buf[...] = st.T
+                        _merge_128_folded(c_pk)
+                else:
+                    def _q_body(q, _):
+                        q_off = pl.multiple_of(q * 128, 128)
+                        blk = tile_buf[:, pl.ds(q_off, 128)]
+                        if bm_mxu < 128:
+                            blk = jnp.pad(
+                                blk, ((0, 128 - bm_mxu), (0, 0)), constant_values=-jnp.inf
+                            )
+                        blk_t_buf[...] = blk.T
 
-                    def _h_body(h, _):
-                        h_off = pl.multiple_of(h * 64, 64)
-                        c0 = c_base + q_off + h_off
-                        _v64_quad_stream_merge_64(
-                            blk_t_buf,
-                            h_off,
-                            c0,
-                            top_v_buf,
-                            top_i_buf,
-                            m_base,
-                            work_v_buf,
-                            work_i_buf,
-                            arg_v_buf,
-                            arg_i_buf,
-                            a_base,
-                            org_count=org_count,
-                            added_count=added_count,
-                            org_vocab_padded_count=org_vocab_padded_count,
-                            exact_tie_break=exact_tie_break,
-                        )
+                        def _h_body(h, _):
+                            h_off = pl.multiple_of(h * 64, 64)
+                            c0 = c_base + q_off + h_off
+                            _v64_quad_stream_merge_64(
+                                blk_t_buf,
+                                h_off,
+                                c0,
+                                top_v_buf,
+                                top_i_buf,
+                                m_base,
+                                work_v_buf,
+                                work_i_buf,
+                                arg_v_buf,
+                                arg_i_buf,
+                                a_base,
+                                org_count=org_count,
+                                added_count=added_count,
+                                org_vocab_padded_count=org_vocab_padded_count,
+                                exact_tie_break=exact_tie_break,
+                            )
+                            return jnp.int32(0)
+
+                        lax.fori_loop(0, 2, _h_body, jnp.int32(0))
                         return jnp.int32(0)
 
-                    lax.fori_loop(0, 2, _h_body, jnp.int32(0))
-                    return jnp.int32(0)
-
-                lax.fori_loop(0, 4, _q_body, jnp.int32(0))
+                    lax.fori_loop(0, 4, _q_body, jnp.int32(0))
                 return jnp.int32(0)
 
             if n_m == 1:
@@ -1047,20 +1153,30 @@ def _fp8_lm_head_fused_topk64_kernel(
                 lax.fori_loop(0, n_m, _m_step, jnp.int32(0))
             return jnp.int32(0)
 
-        if n_sub == 1:
+        if cur_subs == 1:
             _sub_body(jnp.int32(0), jnp.int32(0))
         else:
-            lax.fori_loop(0, n_sub, _sub_body, jnp.int32(0))
+            lax.fori_loop(0, cur_subs, _sub_body, jnp.int32(0))
 
         if has_next_prefetch:
-            @pl.when(tile_idx + 2 < n_tiles)
+            @pl.when(tile_idx + 2 < n_full_tiles)
             def _pf():
-                _start_w(slot, tile_idx + 2)
+                _start_w(slot, tile_idx + 2, tn)
+            if has_tail_512:
+                @pl.when(tile_idx + 2 == n_full_tiles)
+                def _pf_tail():
+                    _start_w(slot, tile_idx + 2, 512)
 
-    n_pairs = n_tiles // 2
+    n_pairs = n_full_tiles // 2
     if n_pairs == 1:
-        _process_tile(jnp.int32(0), 0, has_next_prefetch=(n_tiles > 2))
-        _process_tile(jnp.int32(1), 1, has_next_prefetch=(n_tiles > 3))
+        _process_tile(
+            jnp.int32(0), 0, has_next_prefetch=(n_full_tiles > 2 or has_tail_512)
+        )
+        _process_tile(
+            jnp.int32(1),
+            1,
+            has_next_prefetch=(n_full_tiles > 3 or (n_full_tiles == 2 and has_tail_512)),
+        )
     elif n_pairs > 1:
         def _pair_body(p, _):
             t0 = p * 2
@@ -1069,10 +1185,17 @@ def _fp8_lm_head_fused_topk64_kernel(
             return jnp.int32(0)
 
         lax.fori_loop(0, n_pairs, _pair_body, jnp.int32(0))
-    if n_tiles % 2 == 1:
-        _process_tile(jnp.int32(n_tiles - 1), 0, has_next_prefetch=False)
+    if n_full_tiles % 2 == 1:
+        _process_tile(jnp.int32(n_full_tiles - 1), 0, has_next_prefetch=has_tail_512)
+    if has_tail_512:
+        _process_tile(
+            jnp.int32(n_full_tiles),
+            1 if (n_full_tiles % 2 == 1) else 0,
+            has_next_prefetch=False,
+            cols_w=512,
+        )
 
-    # Convert local indices -> global IDs, enforce exact min-ID col 0 locally, and stage for AG!
+    # Convert local indices -> global IDs, fold batch lanes (n_grp > 1), enforce exact min-ID col 0!
     for im in range(n_m):
         mb = im * 64
         for k in range(8):
@@ -1096,8 +1219,44 @@ def _fp8_lm_head_fused_topk64_kernel(
                 org_vocab_padded_count=org_vocab_padded_count,
                 added_width=added_width,
             )
-            _, exact_gid = _v64_sublane_exact_argmax(av, ai_g)
-            _v64_inject_exact_col0(top_i_buf, mb, exact_gid)
+            av, exact_gid = _v64_sublane_exact_argmax(av, ai_g)
+            arg_v_buf[pl.ds(im * 8, 8), :] = av
+            arg_i_buf[pl.ds(im * 8, 8), :] = exact_gid
+
+        if n_grp > 1:
+            sub_perm = jnp.bitwise_xor(
+                lax.broadcasted_iota(jnp.int32, (8, 128), 0), jnp.int32(7)
+            )
+            sh = 64
+            while sh >= bm_mxu:
+                for k in range(8):
+                    sl_rev = pl.ds((7 - k) * 8, 8)
+                    sl_t = pl.ds(k * 8, 8)
+                    sl_w = pl.ds(k * 8, 8)
+                    rv_rev = pltpu.roll(top_v_buf[sl_rev, :], 128 - sh, axis=1)
+                    ri_rev = pltpu.roll(top_i_buf[sl_rev, :], 128 - sh, axis=1)
+                    rv_asc = jnp.take_along_axis(rv_rev, sub_perm, axis=0)
+                    ri_asc = jnp.take_along_axis(ri_rev, sub_perm, axis=0)
+                    cv = top_v_buf[sl_t, :]
+                    ci = top_i_buf[sl_t, :]
+                    take = rv_asc > cv
+                    work_v_buf[sl_w, :] = jnp.where(take, rv_asc, cv)
+                    work_i_buf[sl_w, :] = jnp.where(take, ri_asc, ci)
+                _v64_quad_merge_work_to_top_desc(
+                    work_v_buf, work_i_buf, top_v_buf, top_i_buf, 0
+                )
+                if exact_tie_break:
+                    av_p = pltpu.roll(arg_v_buf[pl.ds(0, 8), :], 128 - sh, axis=1)
+                    ai_p = pltpu.roll(arg_i_buf[pl.ds(0, 8), :], 128 - sh, axis=1)
+                    cur_av = arg_v_buf[pl.ds(0, 8), :]
+                    cur_ai = arg_i_buf[pl.ds(0, 8), :]
+                    take_a = (av_p > cur_av) | ((av_p == cur_av) & (ai_p < cur_ai))
+                    arg_v_buf[pl.ds(0, 8), :] = jnp.where(take_a, av_p, cur_av)
+                    arg_i_buf[pl.ds(0, 8), :] = jnp.where(take_a, ai_p, cur_ai)
+                sh //= 2
+
+        if exact_tie_break:
+            _v64_inject_exact_col0(top_i_buf, mb, arg_i_buf[pl.ds(im * 8, 8), :])
     if use_xor_butterfly:
         n_hops = 3 if world_size == 8 else 4
         z_idx = jnp.zeros((8, 128), dtype=jnp.int32)
@@ -1255,6 +1414,7 @@ def fp8_lm_head_fused_topk64_jax(
     tn: int = 512,
     exact_tie_break: bool = True,
     use_xor_butterfly: bool = False,
+    use_pack_fold: bool = True,
     collective_id: int = _DEFAULT_COLLECTIVE_ID + 2,
 ):
     """1-kernel fused FP8 LM head + exact global Top-K (``1 <= k <= 64``) with zero HBM logits."""
@@ -1271,7 +1431,7 @@ def fp8_lm_head_fused_topk64_jax(
         raise ValueError(f"Unsupported world_size={world_size}")
     if not 1 <= k <= MAX_DISTRIBUTED_TOP_K:
         raise ValueError(f"Expected 1 <= k <= 64, got {k}")
-    eff_tn = tn if (vp % tn == 0) else 512
+    eff_tn = tn if (vp % tn == 0 or (vp >= tn and tn == 1024 and vp % 512 == 0)) else 512
     n_hops = 3 if world_size == 8 else 4
     n_recv = n_hops if use_xor_butterfly else world_size
     n_send_sems = (2 * n_hops) if use_xor_butterfly else (2 * (world_size - 1))
@@ -1279,6 +1439,7 @@ def fp8_lm_head_fused_topk64_jax(
     b_pad = _pad_batch_pow2(tokens)
     bm_mxu = min(b_pad, 128)
     n_m = b_pad // bm_mxu
+    eff_pack_fold = bool(use_pack_fold and bm_mxu < 128 and n_m == 1)
     x_in = x.astype(jnp.bfloat16)
     if b_pad > tokens:
         x_in = jnp.pad(x_in, ((0, b_pad - tokens), (0, 0)))
@@ -1302,6 +1463,7 @@ def fp8_lm_head_fused_topk64_jax(
             bm_mxu=bm_mxu,
             exact_tie_break=bool(exact_tie_break),
             use_xor_butterfly=bool(use_xor_butterfly),
+            use_pack_fold=eff_pack_fold,
         ),
         out_shape=(
             jax.ShapeDtypeStruct((b_pad, 128), jnp.float32),
@@ -1336,7 +1498,7 @@ def fp8_lm_head_fused_topk64_jax(
         ),
         name=(
             f"muse_fp8_lm_head_fused_topk64_b{b_pad}_tp{world_size}_tn{eff_tn}"
-            f"{'_xbf' if use_xor_butterfly else ''}"
+            f"{'_pf' if eff_pack_fold else ''}{'_xbf' if use_xor_butterfly else ''}"
         ),
     )(x_in, w8k, scale.reshape(1, vp).astype(jnp.float32))
 
@@ -2384,10 +2546,11 @@ def fp8_lm_head_distributed_topk_jax(
                 tn=1024 if tn is None else tn,
             )
         # Preserve exact lowest-ID col-0 tie-breaking unless fast_topk is explicitly enabled;
-        # Wave-17 silicon: 4-hop XOR butterfly cuts TP=16 Top-64 -10.5..-11.5 us with id_diff=0,
-        # and tn=1024 + XOR butterfly cuts TP=8 B>=64 Top-64 -4.0..-5.7 us with id_diff=0.
+        # Wave-17/19 silicon: tn=1024 (+tail512 on TP=16) + batch-lane folding (B <= 64) cuts
+        # TP=8 B=1..64 Top-64 -30.9%..-46.3% and TP=16 B=1..64 Top-64 -27.7%..-39.4% with id_diff=0.
+        small_b_fold = x.shape[0] <= 64
         tp8_large_b = world_size == 8 and x.shape[0] > 32
-        eff_tn = (1024 if (fast_topk or tp8_large_b) else 512) if tn is None else tn
+        eff_tn = (1024 if (fast_topk or tp8_large_b or small_b_fold) else 512) if tn is None else tn
         eff_tie = False if (fast_topk and k > 1) else exact_tie_break
         eff_xor_bfly = bool(fast_topk or world_size == 16 or tp8_large_b)
         return fp8_lm_head_fused_topk64_jax(
@@ -2404,6 +2567,7 @@ def fp8_lm_head_distributed_topk_jax(
             tn=eff_tn,
             exact_tie_break=eff_tie,
             use_xor_butterfly=eff_xor_bfly,
+            use_pack_fold=small_b_fold,
         )
     local_logits = fp8_lm_head_zsp_jax(x, w8k, scale, out_bf16=False, logit_scale=logit_scale)
     from sglang_tpu.kernels.distributed_topk import distributed_top_k as orig_dist_topk

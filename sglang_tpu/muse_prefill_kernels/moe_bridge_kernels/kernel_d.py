@@ -165,6 +165,18 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
     d_opt_env = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_D_OPT", None)
     eff_d_opt = int(d_opt_env.get()) if d_opt_env is not None else 0
     d_fast_dma = (eff_d_opt & 1) != 0
+    if (
+        t64_sub_n == 512
+        and not use_zero_spill
+        and not loop_slabs
+        and tok_tile_eff == 128
+        and num_steps <= 2
+        and use_blk_fp8_unpool
+        and emit_static_fp8_attn_in
+        and use_salu_overlap
+        and d_fast_dma
+    ):
+        t64_sub_n = 2048
     d_fuse_p34 = (
         ((eff_d_opt & 2) != 0) and not emit_fp8_attn_in and tok_tile_eff <= 64
     )

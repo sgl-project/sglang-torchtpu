@@ -97,36 +97,30 @@ def pallas_local_inv_perm_and_counts(
         l_128 = (row_128 > lane_128).astype(jnp.bfloat16)
         u_128 = (row_128 < lane_128).astype(jnp.bfloat16)
         if use_native_pack:
-            sub_8 = lax.broadcasted_iota(jnp.int32, (8, LANE), 0)
-            base_lane = (row_128 & jnp.int32(15)) * jnp.int32(8)
-            slot_masks = [lane_128 == (base_lane + k) for k in range(topk)]
+            lane_8_128 = lax.broadcasted_iota(jnp.int32, (8, LANE), 1)
+            tok_mod16_8 = lane_8_128 & jnp.int32(15)
+            pack_mask_128 = (row_128 & jnp.int32(15)) == lax.shift_right_logical(
+                lane_128, jnp.int32(3)
+            )
 
-            def _load_cols_k(b_idx: int):
+            def _load_cols_rows(b_idx: int):
                 blk_8 = local_pad_ref[pl.ds(pl.multiple_of(b_idx * 8, 8), 8), :]
                 rows_128 = jnp.concatenate(
                     [
-                        jnp.broadcast_to(
-                            jnp.sum(
-                                jnp.where(sub_8 == r, blk_8, 0),
-                                axis=0,
-                                keepdims=True,
-                            ),
-                            (16, LANE),
-                        )
+                        jnp.broadcast_to(blk_8[r : r + 1, :], (16, LANE))
                         for r in range(8)
                     ],
                     axis=0,
                 )
-                return [
-                    jnp.sum(
-                        jnp.where(slot_masks[k], rows_128, 0),
-                        axis=1,
-                        keepdims=True,
+                r_t = rows_128.T
+                cols_8 = jnp.zeros((8, LANE), dtype=jnp.int32)
+                for g in range(16):
+                    cols_8 = jnp.where(
+                        tok_mod16_8 == g, r_t[pl.ds(g * 8, 8), :], cols_8
                     )
-                    for k in range(topk)
-                ]
+                return cols_8
+
         else:
-            slot_masks = None
 
             def _load_cols_k(b_idx: int):
                 ids_blk = local_pad_ref[pl.ds(b_idx * LANE, LANE), :]
@@ -146,14 +140,16 @@ def pallas_local_inv_perm_and_counts(
             )
 
             def _pass1_np(b, cnts_acc):
-                cols_k = _load_cols_k(b)
+                cols_8 = _load_cols_rows(b)
+                cols_r = [cols_8[k : k + 1, :] for k in range(topk)]
                 r0 = pl.multiple_of(b * LANE, LANE)
                 new_cnts = []
                 for s in range(b_strips):
-                    iota_s = s * LANE + lane_128
-                    oh_bs = (cols_k[0] == iota_s).astype(jnp.bfloat16)
+                    row_s_iota = s * LANE + row_128
+                    oh_et = (cols_r[0] == row_s_iota).astype(jnp.bfloat16)
                     for k in range(1, topk):
-                        oh_bs = oh_bs + (cols_k[k] == iota_s).astype(jnp.bfloat16)
+                        oh_et = oh_et + (cols_r[k] == row_s_iota).astype(jnp.bfloat16)
+                    oh_bs = oh_et.T
                     oh_vmem_ref[pl.ds(r0, LANE), pl.ds(s * LANE, LANE)] = oh_bs
                     b_cnt = jnp.broadcast_to(
                         jnp.sum(oh_bs.astype(jnp.int32), axis=0, keepdims=True),
@@ -185,9 +181,10 @@ def pallas_local_inv_perm_and_counts(
                 )
 
             def _pass2_np(b, run_strips):
-                cols_k = _load_cols_k(b)
+                cols_8 = _load_cols_rows(b)
+                cols_r = [cols_8[k : k + 1, :] for k in range(topk)]
                 r0 = pl.multiple_of(b * LANE, LANE)
-                rank_strips = []
+                rank_s_t_list = []
                 next_run = []
                 for s in range(b_strips):
                     oh_bs = oh_vmem_ref[pl.ds(r0, LANE), pl.ds(s * LANE, LANE)]
@@ -195,38 +192,34 @@ def pallas_local_inv_perm_and_counts(
                         l_128, oh_bs, preferred_element_type=jnp.float32
                     ).astype(jnp.int32)
                     run_s = run_strips[s]
-                    rank_strips.append(
-                        (
-                            intra_s.reshape(LANE // 8, 8, LANE) + run_s[None, :, :]
-                        ).reshape(LANE, LANE)
-                    )
+                    rank_s = (
+                        intra_s.reshape(LANE // 8, 8, LANE) + run_s[None, :, :]
+                    ).reshape(LANE, LANE)
+                    rank_s_t_list.append(rank_s.T)
                     b_cnt = jnp.broadcast_to(
                         jnp.sum(oh_bs.astype(jnp.int32), axis=0, keepdims=True),
                         (8, LANE),
                     )
                     next_run.append(run_s + b_cnt)
-                out_blk = jnp.zeros((LANE, LANE), dtype=jnp.int32)
+                val_rows = []
                 for k in range(topk):
-                    ck = cols_k[k]
-                    val_k = jnp.zeros((LANE, 1), dtype=jnp.int32)
+                    ck_r = cols_r[k]
+                    val_r = jnp.zeros((1, LANE), dtype=jnp.int32)
+                    for j in range(k):
+                        val_r = val_r + (ck_r == cols_r[j]).astype(jnp.int32)
                     for s in range(b_strips):
-                        iota_s = s * LANE + lane_128
-                        m_ks = ck == iota_s
-                        val_k = val_k + jnp.sum(
-                            jnp.where(m_ks, rank_strips[s], 0),
-                            axis=1,
+                        row_s_iota = s * LANE + row_128
+                        val_r = val_r + jnp.sum(
+                            jnp.where(ck_r == row_s_iota, rank_s_t_list[s], 0),
+                            axis=0,
                             keepdims=True,
                         )
-                        rank_strips[s] = jnp.where(
-                            m_ks, rank_strips[s] + 1, rank_strips[s]
-                        )
-                    out_blk = jnp.where(
-                        slot_masks[k],
-                        jnp.broadcast_to(val_k, (LANE, LANE)),
-                        out_blk,
-                    )
+                    val_rows.append(val_r)
+                val_8 = jnp.concatenate(val_rows, axis=0)
+                val_128_t = jnp.concatenate([val_8] * 16, axis=0).T
                 inv_pad_out_ref[pl.ds(pl.multiple_of(b * 8, 8), 8), :] = jnp.sum(
-                    out_blk.reshape(8, 16, LANE), axis=1
+                    jnp.where(pack_mask_128, val_128_t, 0).reshape(8, 16, LANE),
+                    axis=1,
                 )
                 return tuple(next_run)
 
@@ -623,27 +616,31 @@ def pallas_qblock_remap_virtual_ids(
     total_elems = t_global * topk
     n_blocks, q_eff = resolve_qblock_params(total_elems, ep_size, quantum)
     blk_elems = total_elems // n_blocks
+    total_rows = total_elems // LANE
     assert ep_size in (8, 16) and num_base_local in (16, 32) and 1 <= num_replicas <= 16
     assert n_blocks <= 128 or num_replicas <= 12
-    assert total_elems % (n_blocks * 512) == 0
-    base_shift = num_base_local.bit_length() - 1
-    base_mask = num_base_local - 1
-    blks_per_step = 2 if blk_elems == 512 else 1
-    assert (blks_per_step * blk_elems) % (8 * LANE) == 0
-    assert not (blks_per_step == 2 and n_blocks > 128)
-    use_two_halves = n_blocks > 128
-    n_steps = n_blocks // blks_per_step
-    rows_per_step = (blks_per_step * blk_elems) // LANE
-    total_rows = total_elems // LANE
-    rows_per_rank = (t_local * topk) // LANE
-    assert rows_per_rank % 8 == 0
-
     use_macro_vec = (
         total_rows % LANE == 0
         and n_blocks <= 256
         and n_blocks % (total_rows // LANE) == 0
-        and (n_blocks // (total_rows // LANE)) in (2, 4, 8, 16)
+        and (n_blocks // (total_rows // LANE)) in (2, 4, 8, 16, 32, 64)
     )
+    if use_macro_vec:
+        assert total_elems % (n_blocks * 256) == 0
+    else:
+        assert total_elems % (n_blocks * 512) == 0
+    base_shift = num_base_local.bit_length() - 1
+    base_mask = num_base_local - 1
+    blks_per_step = 2 if blk_elems == 512 else 1
+    if not use_macro_vec:
+        assert (blks_per_step * blk_elems) % (8 * LANE) == 0
+    assert not (blks_per_step == 2 and n_blocks > 128)
+    use_two_halves = n_blocks > 128
+    n_steps = n_blocks // blks_per_step
+    rows_per_step = (blks_per_step * blk_elems) // LANE
+    rows_per_rank = (t_local * topk) // LANE
+    assert rows_per_rank % 8 == 0
+
     n_macro = total_rows // LANE if use_macro_vec else 0
     blks_per_macro = (n_blocks // n_macro) if use_macro_vec else 0
     rows_per_blk = (LANE // blks_per_macro) if use_macro_vec else 0

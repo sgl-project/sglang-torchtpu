@@ -74,6 +74,13 @@ def fused_rs_smem_rows(size_m: int, ep_size: int, expert_tp: bool) -> int:
     u16_env = int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_PACK_U16_LHS.get() or 0)
     force_u16 = u16_env >= 1
     pq_lhs_on = int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8.get() or 0) >= 1
+    if ep_size >= 8 and pq_lhs_on and u16_env < 0 and size_m >= 65_536:
+        skew_mult = 6 if ep_size >= 16 else 4
+        target = (size_m // ep_size) * skew_mult
+        aligned = (
+            (target + _LOCAL_ROWS_ALIGN - 1) // _LOCAL_ROWS_ALIGN
+        ) * _LOCAL_ROWS_ALIGN
+        return min(size_m, aligned)
     auto_ep16 = ep_size >= 16 and size_m >= 131_072
     auto_pq_win = (u16_env >= 0) and pq_lhs_on and size_m >= 131_072
     if ep_size >= 4 and (

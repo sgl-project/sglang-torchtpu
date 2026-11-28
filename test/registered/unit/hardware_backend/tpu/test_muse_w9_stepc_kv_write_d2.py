@@ -838,8 +838,8 @@ def test_wave10_flush_pending_step_c_kv_writes_grouping():
         ("m5d", 11, {"kv_pack_dense2": True, "kv_pack_bd4": False}, (True,) * 11, (32, 1, 4, 128), 27),
     ]
 
-    # Verify 45 layers chunk as [29, 16] and 27 layers chunk as [16, 11] (all in {2..16, 29}, <=64 args).
-    for n_chk, exp_k in ((45, [29, 16]), (27, [16, 11])):
+    # Verify 45 layers chunk as [29, 16], 46 layers (L0 + 45 SWA) chunk as [29, 17], and 27 as [16, 11].
+    for n_chk, exp_k in ((45, [29, 16]), (46, [29, 17]), (27, [16, 11])):
         p_big = [
             (
                 torch.zeros((8, 128, 1, 4, 128), dtype=torch.float8_e4m3fn),
@@ -1665,6 +1665,17 @@ def test_wave11_step_c_rpa_plan_shared_and_large_b():
     )
     assert ok_512_256 is False
 
+    _, _, _, _, ok_512_256_lb = resolve_step_c_rpa_plan(
+        "w8,s4,batchfull,g4k,foldcol",
+        sliding_window=None,
+        pages_per_seq=32,
+        phys_page_rows=512,
+        b_tokens=256,
+        max_num_seqs=256,
+        allow_large_b=True,
+    )
+    assert ok_512_256_lb is True
+
     _, _, _, _, ok_smem_over = resolve_step_c_rpa_plan(
         "w8,s4,batchfull,g4k,foldcol",
         sliding_window=None,
@@ -2460,8 +2471,8 @@ def test_wave18_step_c_d2_swa_g4_and_shared64_shsub_aot():
         shared_group_size=64,
         has_shared_prefix=True,
     )
-    assert (ok_sh_d2, cfg_sh_d2.chunk_sz, cfg_sh_d2.shared_q_tile, cfg_sh_d2.sh_sub_chunk, cfg_sh_d2.fold_col, cfg_sh_d2.priv_group_size) == (
-        True, 4096, 512, 2048, True, 1
+    assert (ok_sh_d2, cfg_sh_d2.chunk_sz, cfg_sh_d2.shared_q_tile, cfg_sh_d2.sh_sub_chunk, cfg_sh_d2.fold_col, cfg_sh_d2.priv_group_size, cfg_sh_d2.hoist_new_kv) == (
+        True, 8192, 1024, 2048, True, 1, True
     )
 
     cfg_sh_bd4, _, slot_sh_bd4, _, ok_sh_bd4 = resolve_step_c_rpa_plan(
@@ -2475,8 +2486,8 @@ def test_wave18_step_c_d2_swa_g4_and_shared64_shsub_aot():
         shared_group_size=64,
         has_shared_prefix=True,
     )
-    assert (ok_sh_bd4, cfg_sh_bd4.chunk_sz, cfg_sh_bd4.shared_q_tile, cfg_sh_bd4.sh_sub_chunk, cfg_sh_bd4.fold_col, cfg_sh_bd4.priv_group_size, slot_sh_bd4) == (
-        True, 4096, 512, 2048, True, 4, 32
+    assert (ok_sh_bd4, cfg_sh_bd4.chunk_sz, cfg_sh_bd4.shared_q_tile, cfg_sh_bd4.sh_sub_chunk, cfg_sh_bd4.fold_col, cfg_sh_bd4.priv_group_size, cfg_sh_bd4.hoist_new_kv, slot_sh_bd4) == (
+        True, 8192, 512, 2048, True, 4, True, 32
     )
 
     for tp_a, b_a, pps_a, sw_a, d2_a, bd4_a, dist_a, rope_a, mode_a in (
@@ -2569,7 +2580,7 @@ def test_wave17_step_c_ring_grp_and_priv_grp_aot_and_interpret():
         shared_group_size=64,
         has_shared_prefix=True,
     )
-    assert ok_sh_d2 is True and (cfg_sh_d2.priv_group_size, cfg_sh_d2.priv_blk_pages, slot_sh_d2) == (1, 0, 8)
+    assert ok_sh_d2 is True and (cfg_sh_d2.priv_group_size, cfg_sh_d2.priv_blk_pages, slot_sh_d2) == (1, 0, 16)
 
     for tp_a, b_a, pps_a, d2_a, bd4_a, dist_a, mode_a in (
         (8, 64, 20, True, False, 3, "w8,c1024,batchfull,dyn4k"),
@@ -2957,7 +2968,11 @@ def test_wave18_fuse_l0_and_fuse_l61_ops_and_killswitches():
             side_effect=lambda name, *a, **kw: exported.append(name) or (lambda *x: x),
         ),
         mock.patch.object(b1_moe_ops, "get_step_c_kv_write_op", return_value=lambda *x: None),
-        mock.patch.object(b1_moe_ops, "get_step_c_kv_write_multi_5d_op", return_value=lambda *x: None),
+        mock.patch.object(
+            b1_moe_ops,
+            "get_step_c_kv_write_multi_5d_op",
+            side_effect=lambda k, **kw: (exported.append(f"kv5d_{k}") or (lambda *x: None)),
+        ),
         mock.patch.object(b1_moe_ops, "get_step_c_kv_write_multi_6d_op", return_value=lambda *x: None),
     ):
         b1_moe_ops.prewarm_b1_moe_superkernel_ops(
@@ -2973,22 +2988,24 @@ def test_wave18_fuse_l0_and_fuse_l61_ops_and_killswitches():
         assert len(b1_moe_ops._EMBED_L0_RPAD_B16_OPS) == 1
         assert any("muse_w18_embed_l0_rpad_tp16_bd4" in n for n in exported)
         assert any("muse_w18_embed_l0_rpad_rep_b16_tp16_bd4" in n for n in exported)
+        assert "kv5d_17" in exported and "kv5d_29" in exported
 
-    # Verify 45 SWA layers (L0 + 44 SWA) flush as exactly 2 batched chunks [29, 16].
-    chunk_sizes: list[int] = []
+    # Verify 45 SWA layers flush as [29, 16] and 46 SWA layers (Fused L0 + 45 Step c SWA) flush as [29, 17].
     meta = tuple(torch.zeros((1,), dtype=torch.int32) for _ in range(5))
     kv0 = torch.zeros((16, 1, 4, 128), dtype=torch.float8_e4m3fn)
-    entries = [
-        (torch.zeros((2, 128, 1, 4, 128), dtype=torch.float8_e4m3fn), *meta, None, kv0, False, True, (False, True, 0, False, True), li)
-        for li in range(45)
-    ]
-    with mock.patch.object(
-        b1_moe_ops,
-        "get_step_c_kv_write_multi_5d_op",
-        side_effect=lambda k, **kw: (chunk_sizes.append(k) or (lambda *a: None)),
-    ):
-        b1_moe_ops.flush_pending_step_c_kv_writes(entries)
-    assert chunk_sizes == [29, 16]
+    for n_swa, want_chunks in ((45, [29, 16]), (46, [29, 17])):
+        chunk_sizes: list[int] = []
+        entries = [
+            (torch.zeros((2, 128, 1, 4, 128), dtype=torch.float8_e4m3fn), *meta, None, kv0, False, True, (False, True, 0, False, True), li)
+            for li in range(n_swa)
+        ]
+        with mock.patch.object(
+            b1_moe_ops,
+            "get_step_c_kv_write_multi_5d_op",
+            side_effect=lambda k, **kw: (chunk_sizes.append(k) or (lambda *a: None)),
+        ):
+            b1_moe_ops.flush_pending_step_c_kv_writes(entries)
+        assert chunk_sizes == want_chunks
 
 
 
@@ -3100,3 +3117,316 @@ def test_wave18_w31_safe_wm_stream3_and_tp8_b256_hoistkv_split34_aot():
         dense2=True, bd4=False, dist_len=3, has_rope=True, allow_large_b=True,
     )
     assert "muse_w9_b1_moe_b2_rpad_b256_tp8_" in hlo_8_swa_hk
+
+
+def test_wave19_w32_b3_s12_wpre_hoist_unsplit_and_bkv_in_ici_aot():
+    """Verify 3-scope s12 scoping, w_pre/w_qkv/w_gate prestart hoisting, exact Scope-3 slicing, and 10 MiB split guard."""
+    import dataclasses
+    from unittest import mock
+
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.experimental import topologies
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    import sglang_tpu.attention.pallas.rpa_v3_decode_fast as rpad
+    import sglang_tpu.muse_megakernel.decode.b1_moe_b2_kernel as mkb
+
+    orig_def_cfg = mkb.default_sparse_decode_config
+    orig_parse = rpad.parse_decode_fast_config
+    prod_mode = "w8,noadapt,hoistkv,g4k,foldcol,batch2,batch4"
+
+    # 1. Verify s12 tiering, w_pre/w_gate hoisting, and exact Scope-3 VMEM sizing (no exp_3d / mate_recv bloat).
+    for ws, qkv_c, gate_c, fnorm in ((8, 1280, 1024, False), (16, 640, 512, False), (8, 0, 0, True)):
+        r_pair = 256 // (ws // 2)
+        o_in = 1024 if ws == 8 else 512
+        e_loc = 256 // ws
+        args_abs = (
+            jax.ShapeDtypeStruct((1,), jnp.int32),
+            jax.ShapeDtypeStruct((r_pair, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((256, o_in), jnp.bfloat16),
+            jax.ShapeDtypeStruct((o_in, 8192), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((8192, 2048), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, 2048), jnp.float32),
+            jax.ShapeDtypeStruct((8192, 256), jnp.bfloat16),
+            jax.ShapeDtypeStruct((1, 4096), jnp.float32),
+            jax.ShapeDtypeStruct((1, 256), jnp.float32),
+            jax.ShapeDtypeStruct((e_loc, 4096, 8192), jnp.float4_e2m1fn),
+            jax.ShapeDtypeStruct((e_loc, 8, 8192), jnp.bfloat16),
+            jax.ShapeDtypeStruct((e_loc, 4096, 4096), jnp.float4_e2m1fn),
+            jax.ShapeDtypeStruct((e_loc, 8, 4096), jnp.bfloat16),
+            jax.ShapeDtypeStruct((1, 4096), jnp.float32),
+            jax.ShapeDtypeStruct((4096, 4096), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, 4096), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+        )
+        if not fnorm:
+            args_abs = args_abs + (
+                jax.ShapeDtypeStruct((8192, qkv_c), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((1, qkv_c), jnp.float32),
+                jax.ShapeDtypeStruct((8192, gate_c), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((1, gate_c), jnp.float32),
+            )
+        st_box = []
+
+        def _trace_b3(*a, _ws=ws, _fn=fnorm):
+            tail = (None, None, None, None) if _fn else a[24:28]
+            st_box.append(
+                mkb._prepare_chip_b1_moe_b2_setup(
+                    *a[:24], *tail, None, None, None, None, None, None, None, None,
+                    world_size=_ws, fuse_qkv_epi=(not _fn), config=None, interpret=False,
+                    has_rpad=(not _fn), final_norm_only=_fn,
+                )
+            )
+            return jnp.int32(0)
+
+        jax.eval_shape(_trace_b3, *args_abs)
+        st = st_box[0]
+        want_hoist = (not fnorm) and (qkv_c + gate_c <= 2048)
+        assert st["use_3scope"] is True
+        assert st["step_b3_hoist_w_pre"] is want_hoist
+        assert st["step_b3_hoist_w_gate"] is want_hoist
+        assert 1 in st["step_b3_moe_scope_tier"] and len(st["step_b3_s12_shapes"]) >= 5
+        s3_shapes = [tuple(sp.shape) for sp in st["step_b3_scope3_shapes"]]
+        if fnorm:
+            assert s3_shapes[:2] == [(r_pair, 4096), (256 // ws, 4096)]
+            assert len(s3_shapes) == 5
+        else:
+            assert s3_shapes[:4] == [(256, 8192), (256, qkv_c), (r_pair, 4096), (256 // ws, 4096)]
+            assert len(s3_shapes) == (7 if want_hoist else 9)  # no exp_3d; w_qkv/w_gate hoisted on TP=16
+
+    # 2. TPU7x AOT <63 MiB across unsplit (<=10 MiB bkv+init_sv) and split (>10 MiB, pps=18 8K hk) paths + Step (b) B=256.
+    with mock.patch.object(
+        mkb,
+        "default_sparse_decode_config",
+        side_effect=lambda b, ep, sb: dataclasses.replace(orig_def_cfg(b, ep, sb), weight_mode="stream3"),
+    ):
+        with mock.patch.object(
+            rpad,
+            "parse_decode_fast_config",
+            side_effect=lambda *a, **kw: orig_parse(*a, **{**kw, "b_tokens": 16}),
+        ):
+            # pps=6 (bkv=4M + init_sv=2M = 6M <= 10M -> unsplit + bkv_in_ici)
+            # pps=18 (bkv=10M + init_sv=2M = 12M > 10M -> split_b2_rpad + prestart w_qkv/w_gate, avoids Mosaic spill)
+            for pps_t in (6, 18):
+                hlo = _compile_step_c_aot(
+                    tp=8, B=256, pps=pps_t, sw=-1, mode=prod_mode,
+                    dense2=True, bd4=False, dist_len=3, has_rope=False, allow_large_b=True,
+                )
+                assert "muse_w9_b1_moe_b2_rpad_b256_tp8_" in hlo
+
+        tpu8 = topologies.get_topology_desc("tpu7x:2x2x1", platform="tpu").devices
+        mesh8 = Mesh(np.array(sorted(tpu8, key=lambda d: (d.coords[1], d.coords[0], d.core_on_chip))), ("model",))
+        sb_shapes = (
+            jax.ShapeDtypeStruct((1,), jnp.int32),
+            jax.ShapeDtypeStruct((64, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((256, 1024), jnp.bfloat16),
+            jax.ShapeDtypeStruct((1024, 8192), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((8192, 2048), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, 2048), jnp.float32),
+            jax.ShapeDtypeStruct((8192, 256), jnp.bfloat16),
+            jax.ShapeDtypeStruct((1, 4096), jnp.float32),
+            jax.ShapeDtypeStruct((1, 256), jnp.float32),
+            jax.ShapeDtypeStruct((32, 4096, 8192), jnp.float4_e2m1fn),
+            jax.ShapeDtypeStruct((32, 8, 8192), jnp.bfloat16),
+            jax.ShapeDtypeStruct((32, 4096, 4096), jnp.float4_e2m1fn),
+            jax.ShapeDtypeStruct((32, 8, 4096), jnp.bfloat16),
+            jax.ShapeDtypeStruct((1, 4096), jnp.float32),
+            jax.ShapeDtypeStruct((4096, 4096), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, 4096), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((8192, 1280), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, 1280), jnp.float32),
+            jax.ShapeDtypeStruct((8192, 1024), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, 1024), jnp.float32),
+        )
+        in_sp = (P(),) * len(sb_shapes)
+        fn_sb = jax.jit(jax.shard_map(
+            lambda *a: mkb.b1_moe_b2_chip_sharded_jax(*a, world_size=8, fuse_qkv_epi=True),
+            mesh=mesh8, in_specs=in_sp, out_specs=(P(), P(), P(), P()), check_vma=False,
+        ))
+        with jax.set_mesh(mesh8):
+            sh_a = tuple(jax.ShapeDtypeStruct(s.shape, s.dtype, sharding=NamedSharding(mesh8, P())) for s in sb_shapes)
+            hlo_sb = fn_sb.lower(*sh_a).compile().as_text()
+        assert "muse_w9_b1_moe_b2_b256_tp8_" in hlo_sb
+
+
+def test_wave19_w33_swabatch_g16_g8_step_c_plan_and_aot():
+    """Verify resolve_step_c_rpa_plan caps wide swabatch at g8 inside Step (c) & TPU7x AOT <60/63 MiB."""
+    import dataclasses
+    from unittest import mock
+
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.experimental import topologies
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    import sglang_tpu.attention.pallas.rpa_v3_decode_fast as rpad
+    import sglang_tpu.muse_megakernel.decode.b1_moe_b2_kernel as mkb
+
+    orig_parse = rpad.parse_decode_fast_config
+    prod_mode = "w8,noadapt,hoistkv,g4k,foldcol,batch2,batch4"
+    b4_only_mode = "w8,noadapt,hoistkv,g4k,foldcol,batch4"
+
+    # 1. Planner routing when parse_decode_fast_config emits wide swabatch_group_size (16/8) as in dec-rpa-w30:
+    # Step (c) caps g16 -> g8 (silicon-optimal across B=64/128/256 BD4 and D2; -50% BD4 bkv VMEM).
+    plan_cases = [
+        # (label, B, sw, pps, phys, d2, bd4, req_g, want_s, want_g)
+        ("tp16_b64_bd4_1k_cap_g16_to_g8", 64, None, 3, 128, False, True, 16, 3, 8),
+        ("tp16_b64_bd4_swa_cap_g16_to_g8", 64, 2049, 8, 128, False, True, 16, 3, 8),
+        ("tp16_b128_bd4_swa_cap_g16_to_g8", 128, 2049, 8, 128, False, True, 16, 3, 8),
+        ("tp16_b256_bd4_swa_cap_g16_to_g8", 256, 2049, 8, 128, False, True, 16, 3, 8),
+        ("tp8_b64_d2_1k_cap_g16_to_g8", 64, None, 3, 256, True, False, 16, 4, 8),
+        ("tp8_b64_d2_swa_g8", 64, 2049, 8, 256, True, False, 8, 3, 8),
+        ("tp8_b128_d2_swa_g8", 128, 2049, 8, 256, True, False, 8, 2, 8),
+        ("tp8_b256_d2_swa_g8", 256, 2049, 8, 256, True, False, 8, 2, 8),
+    ]
+    for label, B, sw, pps, phys, d2, bd4, req_g, want_s, want_g in plan_cases:
+        max_rp = 5 if sw is not None else pps
+        with mock.patch.object(
+            rpad,
+            "parse_decode_fast_config",
+            side_effect=lambda *a, _rg=req_g, _mrp=max_rp, **kw: dataclasses.replace(
+                orig_parse(*a, **kw),
+                loop_kind="swabatch",
+                num_slots=4,
+                swabatch_group_size=_rg,
+                max_ring_pages=_mrp,
+                hoist_new_kv=False,
+            ),
+        ):
+            cfg, ob, spg, gv, ok = mkb.resolve_step_c_rpa_plan(
+                prod_mode,
+                sliding_window=sw,
+                pages_per_seq=pps,
+                phys_page_rows=phys,
+                kv_pack_dense2=d2,
+                kv_pack_bd4=bd4,
+                b_tokens=B,
+                max_num_seqs=B,
+                allow_large_b=(B > 64),
+            )
+        assert ok is True and gv is True and ob is True, label
+        assert (cfg.num_slots, cfg.swabatch_group_size, spg) == (want_s, want_g, want_g * max_rp), (
+            label, cfg.num_slots, cfg.swabatch_group_size, spg,
+        )
+
+    # 2. Explicit batch4-only mode stays at swabatch_group_size == 4 across cand_w9_29 and dec-rpa-w30.
+    cfg4, _, _, gv4, ok4 = mkb.resolve_step_c_rpa_plan(
+        b4_only_mode, sliding_window=2049, pages_per_seq=8, phys_page_rows=128,
+        kv_pack_bd4=True, b_tokens=256, max_num_seqs=256, allow_large_b=True,
+    )
+    assert ok4 is True and gv4 is True and (cfg4.num_slots, cfg4.swabatch_group_size) == (3, 4)
+
+    # 3. TPU7x AOT <60/63 MiB for Step (c) wide swabatch g8 paths (incl. TP=16 B=128 & B=256 BD4 g8 s3 with _dfp).
+    aot_cases = [
+        (16, 64, 3, -1, False, True, False, 16),
+        (16, 64, 8, 2049, False, True, True, 16),
+        (8, 64, 3, -1, True, False, False, 16),
+        (8, 128, 8, 2049, True, False, True, 8),
+    ]
+    for tp, B, pps, sw, d2, bd4, rope, req_g in aot_cases:
+        max_rp = 5 if sw > 0 else pps
+        with mock.patch.object(
+            rpad,
+            "parse_decode_fast_config",
+            side_effect=lambda *a, _rg=req_g, _mrp=max_rp, **kw: dataclasses.replace(
+                orig_parse(*a, **kw),
+                loop_kind="swabatch",
+                num_slots=4,
+                swabatch_group_size=_rg,
+                max_ring_pages=_mrp,
+                hoist_new_kv=False,
+            ),
+        ):
+            hlo = _compile_step_c_aot(
+                tp=tp, B=B, pps=pps, sw=sw, mode=prod_mode,
+                dense2=d2, bd4=bd4, dist_len=3, has_rope=rope, allow_large_b=(B > 64),
+            )
+            assert f"muse_w9_b1_moe_b2_rpad_b{B}_tp{tp}_" in hlo
+
+    # Explicit TP=16 B=128 & B=256 BD4 SWA 2K g8 s3 (capped from g16) AOT with free_params (_dfp).
+    tpu16 = topologies.get_topology_desc("tpu7x:2x2x2", platform="tpu").devices
+    mesh16 = Mesh(np.array(sorted(tpu16, key=lambda d: (d.coords[2], d.coords[1], d.coords[0], d.core_on_chip))), ("model",))
+    H, pps = 8192, 8
+    for B in (128, 256):
+        n_pg = B * pps
+        r_pair = B // 8
+        s16 = (
+            jax.ShapeDtypeStruct((1,), jnp.int32),
+            jax.ShapeDtypeStruct((r_pair, H), jnp.float32),
+            jax.ShapeDtypeStruct((B, 512), jnp.bfloat16),
+            jax.ShapeDtypeStruct((512, H), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((H,), jnp.float32),
+            jax.ShapeDtypeStruct((H,), jnp.float32),
+            jax.ShapeDtypeStruct((H,), jnp.float32),
+            jax.ShapeDtypeStruct((H,), jnp.float32),
+            jax.ShapeDtypeStruct((H, 2048), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((2048,), jnp.float32),
+            jax.ShapeDtypeStruct((H, 256), jnp.bfloat16),
+            jax.ShapeDtypeStruct((4096,), jnp.float32),
+            jax.ShapeDtypeStruct((1, 256), jnp.float32),
+            jax.ShapeDtypeStruct((16, 4096, 8192), jnp.float4_e2m1fn),
+            jax.ShapeDtypeStruct((16, 8, 8192), jnp.bfloat16),
+            jax.ShapeDtypeStruct((16, 4096, 4096), jnp.float4_e2m1fn),
+            jax.ShapeDtypeStruct((16, 8, 4096), jnp.bfloat16),
+            jax.ShapeDtypeStruct((1, 4096), jnp.float32),
+            jax.ShapeDtypeStruct((4096, 4096), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((4096,), jnp.float32),
+            jax.ShapeDtypeStruct((H,), jnp.float32),
+            jax.ShapeDtypeStruct((H,), jnp.float32),
+            jax.ShapeDtypeStruct((H,), jnp.float32),
+            jax.ShapeDtypeStruct((H,), jnp.float32),
+            jax.ShapeDtypeStruct((H, 640), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((640,), jnp.float32),
+            jax.ShapeDtypeStruct((H, 512), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((512,), jnp.float32),
+            jax.ShapeDtypeStruct((B, 2, 128), jnp.float32),
+            jax.ShapeDtypeStruct((4,), jnp.float32),
+            jax.ShapeDtypeStruct((n_pg, 128, 1, 4, 128), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((B,), jnp.int32),
+            jax.ShapeDtypeStruct((n_pg,), jnp.int32),
+            jax.ShapeDtypeStruct((B + 1,), jnp.int32),
+            jax.ShapeDtypeStruct((B + 1,), jnp.int32),
+            jax.ShapeDtypeStruct((3,), jnp.int32),
+        )
+        with mock.patch.object(
+            rpad,
+            "parse_decode_fast_config",
+            side_effect=lambda *a, **kw: dataclasses.replace(
+                orig_parse(*a, **kw),
+                loop_kind="swabatch",
+                num_slots=4,
+                swabatch_group_size=16,
+                max_ring_pages=5,
+                hoist_new_kv=False,
+            ),
+        ):
+            fn16 = jax.jit(jax.shard_map(
+                lambda *a: mkb.b1_moe_b2_rpad_chip_sharded_jax(
+                    *a[:28], a[30], a[31], a[32], a[33], a[34], a[35],
+                    cos_sin_step=a[28], free_params=a[29],
+                    world_size=16, rpa_sliding_window=2049, rpa_mode_str=prod_mode,
+                    kv_pack_bd4=True, skip_kv_write=True, allow_large_b=True,
+                    replica_cost_mode="tiles",
+                ),
+                mesh=mesh16, in_specs=(P(),) * len(s16), out_specs=(P(), P(), P()), check_vma=False,
+            ))
+            with jax.set_mesh(mesh16):
+                sh16 = tuple(jax.ShapeDtypeStruct(s.shape, s.dtype, sharding=NamedSharding(mesh16, P())) for s in s16)
+                hlo16 = fn16.lower(*sh16).compile().as_text()
+            assert f"muse_w9_b1_moe_b2_rpad_b{B}_tp16_" in hlo16

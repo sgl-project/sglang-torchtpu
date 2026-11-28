@@ -3279,16 +3279,16 @@ def test_w18_m32k_fulln_wla2_interpret_and_aot() -> None:
         },
     ):
         assert fused_rs_smem_rows(32_768, 8, False) == 32_768
-        assert fused_rs_smem_rows(65_536, 8, False) == 65_536
-        assert fused_rs_smem_rows(98_304, 8, False) == 98_304
-        assert fused_rs_smem_rows(131_072, 8, False) == 131_072
+        assert fused_rs_smem_rows(65_536, 8, False) == 32_768
+        assert fused_rs_smem_rows(98_304, 8, False) == 49_152
+        assert fused_rs_smem_rows(131_072, 8, False) == 65_536
         assert fused_rs_smem_rows(196_608, 8, False) == 98_304
         assert fused_rs_smem_rows(262_144, 8, False) == 131_072
         assert fused_rs_smem_rows(32_768, 16, False) == 32_768
-        assert fused_rs_smem_rows(65_536, 16, False) == 65_536
-        assert fused_rs_smem_rows(131_072, 16, False) == 65_536
-        assert fused_rs_smem_rows(196_608, 16, False) == 65_536
-        assert fused_rs_smem_rows(262_144, 16, False) == 131_072
+        assert fused_rs_smem_rows(65_536, 16, False) == 24_576
+        assert fused_rs_smem_rows(131_072, 16, False) == 49_152
+        assert fused_rs_smem_rows(196_608, 16, False) == 73_728
+        assert fused_rs_smem_rows(262_144, 16, False) == 98_304
         assert fused_rs_smem_rows(65_536, 4, False) == 65_536
         assert fused_rs_smem_rows(131_072, 4, False) == 131_072
         assert fused_rs_smem_rows(196_608, 4, False) == 147_456
@@ -3934,15 +3934,146 @@ def test_w18_m32k_fulln_wla2_interpret_and_aot() -> None:
         jax.default_device(jax.devices("cpu")[0]),
     ):
         try:
-            for topo_name, ep_sz, e_loc in (("tpu7x=2x2x1", 8, 36), ("tpu7x=2x2x2", 16, 22)):
-                for m_tok in (32_768,):
+            for topo_name, ep_sz, e_loc, m_list in (
+                ("tpu7x=2x2x1", 8, 36, (32_768, 65_536)),
+                ("tpu7x=2x2x2", 16, 22, (32_768,)),
+            ):
+                for m_tok in m_list:
                     imem_b, hlo_txt = _compile_w18(topo_name, ep_sz, e_loc, m_tok)
                     assert "-pql6-slh8" in hlo_txt
                     assert "-wla2" in hlo_txt and "-w2c1" not in hlo_txt
                     if ep_sz == 8:
                         assert "-i32_12" in hlo_txt
                     assert 0 < imem_b <= 3_385_344, (
-                        f"Wave-18 IMEM over budget: {topo_name} M={m_tok} imem={imem_b} > 3,385,344"
+                        f"Wave-18/19 IMEM over budget: {topo_name} M={m_tok} imem={imem_b} > 3,385,344"
                     )
         finally:
             jax.clear_caches()
+
+
+def test_w19_kernel_b2_subn_kernel_d_subn2048_and_smem_skew_margin():
+    """Verify Wave-19 kernel_b2 sub_n=4096/2048, kernel_d cs<=256 sn2048, and peak-safe SMEM margin."""
+    jax = pytest.importorskip("jax")
+    import jax.numpy as jnp
+    from jax import export
+    from jax.experimental.pallas import tpu as pltpu
+
+    from sglang_tpu.envs import envs as tpu_envs
+    from sglang_tpu.moe.pallas.fused_rs_muse.gmm_fused_rs_nodedup import (
+        fused_rs_smem_rows,
+    )
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels import (
+        kernel_b2,
+        kernel_d,
+    )
+    from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+    with patch.dict(
+        os.environ,
+        {
+            "SGLANG_TPU_MUSE_KERNEL_GMM_PREQUANT_LHS_FP8": "6",
+            "SGLANG_TPU_MUSE_KERNEL_GMM_PACK_U16_LHS": "-1",
+            "SGLANG_TPU_MUSE_KERNEL_GMM_SMEM_WINDOW_ROWS": "0",
+        },
+    ):
+        for m_tok in (65_536, 98_304, 131_072, 196_608, 262_144):
+            assert fused_rs_smem_rows(m_tok, 8, False) >= int(np.ceil((m_tok / 8.0) * 3.5))
+            assert fused_rs_smem_rows(m_tok, 16, False) >= int(np.ceil((m_tok / 16.0) * 5.6))
+
+    on_wait_interp = pltpu.InterpretParams(
+        dma_execution_mode="on_wait",
+        detect_races=True,
+        uninitialized_memory="nan",
+    )
+    rng = np.random.default_rng(20261135)
+    real_pallas_call = kernel_b2.pl.pallas_call
+
+    def _interp_call(*args, **kwargs):
+        kwargs.setdefault("interpret", on_wait_interp)
+        return real_pallas_call(*args, **kwargs)
+
+    with (
+        patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+        tpu_info_for_cpu_export(),
+        jax.default_device(jax.devices("cpu")[0]),
+    ):
+        with (
+            patch.object(kernel_b2.pl, "pallas_call", _interp_call),
+            patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_B1_B2_FAST, "get", return_value=True),
+            patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_B2_DBL_STREAM, "get", return_value=True),
+        ):
+            v8k = jnp.array(rng.uniform(0.5, 1.5, (8192,)).astype(np.float32))
+            wr = jnp.array((rng.standard_normal((8192, 256)) * 0.05).astype(np.float32))
+            eb = jnp.zeros((256,), dtype=jnp.float32)
+            wp = jnp.array((rng.standard_normal((8192, 4096)) * 0.2).astype(np.float32)).astype(
+                jnp.float8_e4m3fn
+            )
+            v4k = jnp.array(rng.uniform(0.5, 1.5, (4096,)).astype(np.float32))
+            pe = jnp.array(rng.uniform(0.5, 1.5, (4096,)).astype(np.float32)).astype(jnp.bfloat16)
+            for t_loc in (128, 256):
+                att = jnp.array((rng.standard_normal((t_loc, 8192)) * 0.25).astype(np.float32)).astype(
+                    jnp.bfloat16
+                )
+                stm = jnp.array((rng.standard_normal((t_loc, 8192)) * 0.3).astype(np.float32))
+                res = kernel_b2.pallas_fused_b1_b2_wpool_quant(
+                    att, stm, v8k, v8k, v8k, wr, eb, wp, v4k, pe,
+                    router_mode="bf16_hilo_pre", fp8_wpool=True, emit_fp8_gmm=True, static_fp8_scale=8.0,
+                )
+                assert res[0].shape == (t_loc, 32, 128)
+                assert not np.any(np.isnan(np.asarray(res[2])))
+
+        with (
+            patch.object(kernel_d.pl, "pallas_call", _interp_call),
+            patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_OPT, "get", return_value=7),
+            patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_MXU_COMBINE, "get", return_value=True),
+            patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_T128_FAST, "get", return_value=True),
+            patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_SALU_OVERLAP, "get", return_value=True),
+            patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_FP8_UNPOOL, "get", return_value=512),
+        ):
+            t_d = 256
+            ob = jnp.array((rng.standard_normal((t_d * 8, 32, 128)) * 0.25).astype(np.float32)).astype(
+                jnp.float8_e4m3fn
+            )
+            ip = jnp.array(rng.integers(0, t_d * 8, size=(t_d, 8), dtype=np.int32))
+            tw = jnp.array(rng.uniform(0.05, 0.25, size=(t_d, 8)).astype(np.float32)).astype(jnp.bfloat16)
+            sm = jnp.array(rng.standard_normal((t_d, 8192)).astype(np.float32))
+            wu = jnp.array((rng.standard_normal((4096, 8192)) * 0.3).astype(np.float32)).astype(
+                jnp.float8_e4m3fn
+            )
+            v_d = jnp.array(rng.uniform(0.5, 1.5, (8192,)).astype(np.float32))
+            ns_auto, ni_auto = kernel_d.pallas_combine_unpool_residual_nextnorm_4slab(
+                ob, ip, tw, sm, wu, v_d, v_d, v_d, v_d, v_d,
+                tok_tile=128, fp8_unpool=True, fp8_unpool_qbs=512,
+                emit_static_fp8_attn_in=True, salu_overlap=True, scrub_mxu_nan=False,
+            )
+            assert not np.any(np.isnan(np.asarray(ns_auto)))
+            assert not np.any(np.isnan(np.asarray(ni_auto.astype(jnp.float32))))
+
+        with (
+            patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_OPT, "get", return_value=7),
+            patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_MXU_COMBINE, "get", return_value=True),
+            patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_T128_FAST, "get", return_value=True),
+            patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_SALU_OVERLAP, "get", return_value=True),
+            patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_FP8_UNPOOL, "get", return_value=512),
+        ):
+            def _exp_d(cs_val: int) -> str:
+                return export.export(
+                    jax.jit(
+                        lambda o, i, w, s, u, v: kernel_d.pallas_combine_unpool_residual_nextnorm_4slab(
+                            o, i, w, s, u, v, v, v, v, v,
+                            tok_tile=128, fp8_unpool=True, fp8_unpool_qbs=512,
+                            emit_static_fp8_attn_in=True, salu_overlap=True, scrub_mxu_nan=False,
+                        )
+                    ),
+                    platforms=("tpu",),
+                )(
+                    jax.ShapeDtypeStruct((cs_val * 8, 32, 128), jnp.float8_e4m3fn),
+                    jax.ShapeDtypeStruct((cs_val, 8), jnp.int32),
+                    jax.ShapeDtypeStruct((cs_val, 8), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((cs_val, 8192), jnp.float32),
+                    jax.ShapeDtypeStruct((4096, 8192), jnp.float8_e4m3fn),
+                    jax.ShapeDtypeStruct((8192,), jnp.float32),
+                ).mlir_module()
+
+            assert "_sn2048_fp8q512" in _exp_d(256)
+            assert "_sn2048" not in _exp_d(512)

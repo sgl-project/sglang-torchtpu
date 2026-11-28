@@ -313,8 +313,8 @@ class TestMuseFp8LmHead(unittest.TestCase):
                 continue
             mesh = Mesh(np.array(all_devs[:tp]), ("model",))
             v_loc = 202048 // tp
-            vp = -(-v_loc // 1024) * 1024
-            for b in (16, 32, 64, 128, 256):
+            vp = -(-v_loc // 512) * 512 if tp == 16 else -(-v_loc // 1024) * 1024
+            for b in (1, 16, 32, 64, 128, 256):
                 with self.subTest(tp=tp, b=b):
                     xs = jax.ShapeDtypeStruct((b, 8192), jnp.bfloat16)
                     ws = jax.ShapeDtypeStruct((8192, vp * tp), jnp.float8_e4m3fn)

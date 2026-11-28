@@ -1531,7 +1531,15 @@ class PrefillEplbManager:
             _wait_for(gate_km)
         bias_2d = moe_bufs.get("_fused_decode_bias_2d")
         if bias_2d is not None:
-            bias_2d.copy_(moe.e_score_correction_bias.data.detach().reshape(1, -1))
+            # Move 1D->2D reshape via host so TorchTPU updates a clean 2D buffer
+            # instead of emitting a lazy as_strided copy across every decode step.
+            src_bias = moe.e_score_correction_bias.data.detach()
+            if src_bias.device.type != "cpu":
+                src_bias = src_bias.cpu().reshape(1, -1).contiguous().to(bias_2d.device)
+            else:
+                src_bias = src_bias.reshape(1, -1).contiguous().clone()
+            bias_2d.copy_(src_bias)
+            del src_bias
             _wait_for(bias_2d)
 
         if moe_bufs.get("_decode_fp4_w1") is not None:

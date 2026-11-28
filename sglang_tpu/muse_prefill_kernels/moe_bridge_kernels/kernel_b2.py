@@ -1529,7 +1529,7 @@ def pallas_fused_b1_b2_wpool_quant(
     use_dbl_stream = False if use_bm256 else (b2_dbl_enabled and num_steps >= 2)
     if use_bm256 or use_2d_out:
         strip_w = 256
-        sub_n = 1024
+        sub_n = 2048 if use_bm256 else (4096 if out_rows in (128, 512) else 2048)
     else:
         strip_w = 256 if use_b12_fast else 2048
         sub_n = 256

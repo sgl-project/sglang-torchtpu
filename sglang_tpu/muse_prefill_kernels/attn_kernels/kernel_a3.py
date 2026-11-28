@@ -4171,3 +4171,180 @@ def pallas_ulysses_wo_local(
         ),
         name=f"pallas_ulysses_wo_tiled_t{t_total}_tb{t_blk}_k{k_dim}_bn{eff_bn}",
     )(q_cat, wo_fp8, wo_scale_2d)
+
+
+def pallas_ulysses_gate_fuse_wo(
+    attn_3d: jax.Array,
+    gate_2d: jax.Array,
+    wo_fp8: jax.Array,
+    wo_scale_2d: jax.Array,
+    *,
+    bm_g: int = 256,
+    bm_w: int = 256,
+    bn: int = 1024,
+    vmem_limit_mb: int = 62,
+) -> jax.Array:
+    """Fused ``sigmoid(gate) * attn_3d -> static-FP8`` + token-local ``Wo`` without ``q_fp8`` HBM roundtrip.
+
+    Streams ``attn_3d [tp_deg, c_k, q_local]`` and ``gate_2d [c_k, H]`` once into a VMEM-pinned
+    ``q_vmem [c_k, H]`` buffer while prefetching the first ``Wo`` column tile, then streams ``Wo``
+    once from HBM across ``n_dim // eff_bn`` column tiles (`-17.3 us/L` `-10.1%` at `c_k=1536`).
+    """
+    tp_deg, c_k, q_local = attn_3d.shape
+    g_rows, n_full = gate_2d.shape
+    k_dim, n_dim = wo_fp8.shape
+    assert g_rows == c_k and n_full == tp_deg * q_local and k_dim == n_full and q_local % 128 == 0
+    eff_bm_g = next(t for t in (bm_g, 256, 128, 64, 32, 16, 8) if t <= c_k and c_k % t == 0)
+    eff_bm_w = next(t for t in (bm_w, 256, 128, 64, 32, 16, 8) if t <= c_k and c_k % t == 0)
+    eff_bn = next(b for b in (bn, 1024, 512, 256, 128) if b <= n_dim and n_dim % b == 0)
+    n_tiles_g = c_k // eff_bm_g
+    n_tiles_w = n_dim // eff_bn
+    sub_r = min(128, eff_bm_g)
+
+    def _kernel(
+        a_hbm,
+        g_hbm,
+        w_hbm,
+        w_sc_ref,
+        out_hbm,
+        q_vmem,
+        a_vmem,
+        g_vmem,
+        w_vmem,
+        out_vmem,
+        a_sems,
+        g_sems,
+        w_sems,
+        out_sems,
+    ):
+        pltpu.make_async_copy(
+            w_hbm.at[:, pl.ds(0, eff_bn)],
+            w_vmem.at[0, :, :],
+            w_sems.at[0],
+        ).start()
+        pltpu.make_async_copy(
+            a_hbm.at[:, pl.ds(0, eff_bm_g), :],
+            a_vmem.at[0, :, :, :],
+            a_sems.at[0],
+        ).start()
+        pltpu.make_async_copy(
+            g_hbm.at[pl.ds(0, eff_bm_g), :],
+            g_vmem.at[0, :, :],
+            g_sems.at[0],
+        ).start()
+
+        for gi in range(n_tiles_g):
+            cur = gi % 2
+            if gi + 1 < n_tiles_g:
+                nxt = (gi + 1) % 2
+                r_nxt = (gi + 1) * eff_bm_g
+                pltpu.make_async_copy(
+                    a_hbm.at[:, pl.ds(r_nxt, eff_bm_g), :],
+                    a_vmem.at[nxt, :, :, :],
+                    a_sems.at[nxt],
+                ).start()
+                pltpu.make_async_copy(
+                    g_hbm.at[pl.ds(r_nxt, eff_bm_g), :],
+                    g_vmem.at[nxt, :, :],
+                    g_sems.at[nxt],
+                ).start()
+            pltpu.make_async_copy(
+                a_vmem.at[cur, :, :, :],
+                a_hbm.at[:, pl.ds(0, eff_bm_g), :],
+                a_sems.at[cur],
+            ).wait()
+            pltpu.make_async_copy(
+                g_vmem.at[cur, :, :],
+                g_hbm.at[pl.ds(0, eff_bm_g), :],
+                g_sems.at[cur],
+            ).wait()
+            r_base = gi * eff_bm_g
+            for r0 in range(0, eff_bm_g, sub_r):
+                r1 = r0 + sub_r
+                for h in range(tp_deg):
+                    c0, c1 = h * q_local, (h + 1) * q_local
+                    g_sig = jax.nn.sigmoid(
+                        g_vmem[cur, r0:r1, c0:c1].astype(jnp.float32)
+                    ).astype(jnp.bfloat16)
+                    prod = (
+                        g_sig * a_vmem[cur, h, r0:r1, :].astype(jnp.bfloat16)
+                    ).astype(jnp.float32)
+                    q_vmem[r_base + r0 : r_base + r1, c0:c1] = jnp.clip(
+                        prod, -FP8_MAX, FP8_MAX
+                    ).astype(jnp.float8_e4m3fn)
+
+        for j in range(n_tiles_w):
+            cur = j % 2
+            if j + 1 < n_tiles_w:
+                nxt = (j + 1) % 2
+                pltpu.make_async_copy(
+                    w_hbm.at[:, pl.ds((j + 1) * eff_bn, eff_bn)],
+                    w_vmem.at[nxt, :, :],
+                    w_sems.at[nxt],
+                ).start()
+            if j >= 2:
+                pltpu.make_async_copy(
+                    out_vmem.at[cur, :, :],
+                    out_hbm.at[:, pl.ds(0, eff_bn)],
+                    out_sems.at[cur],
+                ).wait()
+            pltpu.make_async_copy(
+                w_vmem.at[cur, :, :],
+                w_hbm.at[:, pl.ds(0, eff_bn)],
+                w_sems.at[cur],
+            ).wait()
+            w_tile = w_vmem[cur, :, :]
+            sc_vec = (
+                w_sc_ref[:, j * eff_bn : (j + 1) * eff_bn] * STATIC_A3_ACT_SCALE
+            )
+            for m0 in range(0, c_k, eff_bm_w):
+                acc = jnp.dot(
+                    q_vmem[m0 : m0 + eff_bm_w, :],
+                    w_tile,
+                    preferred_element_type=jnp.float32,
+                )
+                out_vmem[cur, m0 : m0 + eff_bm_w, :] = (acc * sc_vec).astype(
+                    jnp.bfloat16
+                )
+            pltpu.make_async_copy(
+                out_vmem.at[cur, :, :],
+                out_hbm.at[:, pl.ds(j * eff_bn, eff_bn)],
+                out_sems.at[cur],
+            ).start()
+
+        for s in range(min(2, n_tiles_w)):
+            pltpu.make_async_copy(
+                out_vmem.at[s, :, :],
+                out_hbm.at[:, pl.ds(0, eff_bn)],
+                out_sems.at[s],
+            ).wait()
+
+    any_spec = pl.BlockSpec(memory_space=getattr(pltpu, "ANY", pltpu.HBM))
+    return pl.pallas_call(
+        _kernel,
+        grid=(1,),
+        in_specs=[
+            any_spec,
+            any_spec,
+            any_spec,
+            pl.BlockSpec((1, n_dim), lambda _: (0, 0)),
+        ],
+        out_specs=any_spec,
+        out_shape=jax.ShapeDtypeStruct((c_k, n_dim), jnp.bfloat16),
+        scratch_shapes=[
+            pltpu.VMEM((c_k, k_dim), jnp.float8_e4m3fn),
+            pltpu.VMEM((2, tp_deg, eff_bm_g, q_local), jnp.float8_e4m3fn),
+            pltpu.VMEM((2, eff_bm_g, n_full), jnp.bfloat16),
+            pltpu.VMEM((2, k_dim, eff_bn), jnp.float8_e4m3fn),
+            pltpu.VMEM((2, c_k, eff_bn), jnp.bfloat16),
+            pltpu.SemaphoreType.DMA((2,)),
+            pltpu.SemaphoreType.DMA((2,)),
+            pltpu.SemaphoreType.DMA((2,)),
+            pltpu.SemaphoreType.DMA((2,)),
+        ],
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            vmem_limit_bytes=vmem_limit_mb * (1 << 20),
+        ),
+        name=f"pallas_ulysses_gate_wo_c{c_k}_q{q_local}_bn{eff_bn}",
+    )(attn_3d, gate_2d, wo_fp8, wo_scale_2d)
