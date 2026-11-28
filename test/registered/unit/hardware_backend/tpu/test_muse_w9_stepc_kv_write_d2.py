@@ -3100,3 +3100,149 @@ def test_wave18_w31_safe_wm_stream3_and_tp8_b256_hoistkv_split34_aot():
         dense2=True, bd4=False, dist_len=3, has_rope=True, allow_large_b=True,
     )
     assert "muse_w9_b1_moe_b2_rpad_b256_tp8_" in hlo_8_swa_hk
+
+
+def test_wave19_w32_b3_s12_wpre_hoist_unsplit_and_bkv_in_ici_aot():
+    """Verify 3-scope s12 scoping, w_pre/w_qkv/w_gate prestart hoisting, exact Scope-3 slicing, and 10 MiB split guard."""
+    import dataclasses
+    from unittest import mock
+
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.experimental import topologies
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    import sglang_tpu.attention.pallas.rpa_v3_decode_fast as rpad
+    import sglang_tpu.muse_megakernel.decode.b1_moe_b2_kernel as mkb
+
+    orig_def_cfg = mkb.default_sparse_decode_config
+    orig_parse = rpad.parse_decode_fast_config
+    prod_mode = "w8,noadapt,hoistkv,g4k,foldcol,batch2,batch4"
+
+    # 1. Verify s12 tiering, w_pre/w_gate hoisting, and exact Scope-3 VMEM sizing (no exp_3d / mate_recv bloat).
+    for ws, qkv_c, gate_c, fnorm in ((8, 1280, 1024, False), (16, 640, 512, False), (8, 0, 0, True)):
+        r_pair = 256 // (ws // 2)
+        o_in = 1024 if ws == 8 else 512
+        e_loc = 256 // ws
+        args_abs = (
+            jax.ShapeDtypeStruct((1,), jnp.int32),
+            jax.ShapeDtypeStruct((r_pair, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((256, o_in), jnp.bfloat16),
+            jax.ShapeDtypeStruct((o_in, 8192), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((8192, 2048), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, 2048), jnp.float32),
+            jax.ShapeDtypeStruct((8192, 256), jnp.bfloat16),
+            jax.ShapeDtypeStruct((1, 4096), jnp.float32),
+            jax.ShapeDtypeStruct((1, 256), jnp.float32),
+            jax.ShapeDtypeStruct((e_loc, 4096, 8192), jnp.float4_e2m1fn),
+            jax.ShapeDtypeStruct((e_loc, 8, 8192), jnp.bfloat16),
+            jax.ShapeDtypeStruct((e_loc, 4096, 4096), jnp.float4_e2m1fn),
+            jax.ShapeDtypeStruct((e_loc, 8, 4096), jnp.bfloat16),
+            jax.ShapeDtypeStruct((1, 4096), jnp.float32),
+            jax.ShapeDtypeStruct((4096, 4096), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, 4096), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+        )
+        if not fnorm:
+            args_abs = args_abs + (
+                jax.ShapeDtypeStruct((8192, qkv_c), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((1, qkv_c), jnp.float32),
+                jax.ShapeDtypeStruct((8192, gate_c), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((1, gate_c), jnp.float32),
+            )
+        st_box = []
+
+        def _trace_b3(*a, _ws=ws, _fn=fnorm):
+            tail = (None, None, None, None) if _fn else a[24:28]
+            st_box.append(
+                mkb._prepare_chip_b1_moe_b2_setup(
+                    *a[:24], *tail, None, None, None, None, None, None, None, None,
+                    world_size=_ws, fuse_qkv_epi=(not _fn), config=None, interpret=False,
+                    has_rpad=(not _fn), final_norm_only=_fn,
+                )
+            )
+            return jnp.int32(0)
+
+        jax.eval_shape(_trace_b3, *args_abs)
+        st = st_box[0]
+        want_hoist = (not fnorm) and (qkv_c + gate_c <= 2048)
+        assert st["use_3scope"] is True
+        assert st["step_b3_hoist_w_pre"] is want_hoist
+        assert st["step_b3_hoist_w_gate"] is want_hoist
+        assert 1 in st["step_b3_moe_scope_tier"] and len(st["step_b3_s12_shapes"]) >= 5
+        s3_shapes = [tuple(sp.shape) for sp in st["step_b3_scope3_shapes"]]
+        if fnorm:
+            assert s3_shapes[:2] == [(r_pair, 4096), (256 // ws, 4096)]
+            assert len(s3_shapes) == 5
+        else:
+            assert s3_shapes[:4] == [(256, 8192), (256, qkv_c), (r_pair, 4096), (256 // ws, 4096)]
+            assert len(s3_shapes) == (7 if want_hoist else 9)  # no exp_3d; w_qkv/w_gate hoisted on TP=16
+
+    # 2. TPU7x AOT <63 MiB across unsplit (<=10 MiB bkv+init_sv) and split (>10 MiB, pps=18 8K hk) paths + Step (b) B=256.
+    with mock.patch.object(
+        mkb,
+        "default_sparse_decode_config",
+        side_effect=lambda b, ep, sb: dataclasses.replace(orig_def_cfg(b, ep, sb), weight_mode="stream3"),
+    ):
+        with mock.patch.object(
+            rpad,
+            "parse_decode_fast_config",
+            side_effect=lambda *a, **kw: orig_parse(*a, **{**kw, "b_tokens": 16}),
+        ):
+            # pps=6 (bkv=4M + init_sv=2M = 6M <= 10M -> unsplit + bkv_in_ici)
+            # pps=18 (bkv=10M + init_sv=2M = 12M > 10M -> split_b2_rpad + prestart w_qkv/w_gate, avoids Mosaic spill)
+            for pps_t in (6, 18):
+                hlo = _compile_step_c_aot(
+                    tp=8, B=256, pps=pps_t, sw=-1, mode=prod_mode,
+                    dense2=True, bd4=False, dist_len=3, has_rope=False, allow_large_b=True,
+                )
+                assert "muse_w9_b1_moe_b2_rpad_b256_tp8_" in hlo
+
+        tpu8 = topologies.get_topology_desc("tpu7x:2x2x1", platform="tpu").devices
+        mesh8 = Mesh(np.array(sorted(tpu8, key=lambda d: (d.coords[1], d.coords[0], d.core_on_chip))), ("model",))
+        sb_shapes = (
+            jax.ShapeDtypeStruct((1,), jnp.int32),
+            jax.ShapeDtypeStruct((64, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((256, 1024), jnp.bfloat16),
+            jax.ShapeDtypeStruct((1024, 8192), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((8192, 2048), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, 2048), jnp.float32),
+            jax.ShapeDtypeStruct((8192, 256), jnp.bfloat16),
+            jax.ShapeDtypeStruct((1, 4096), jnp.float32),
+            jax.ShapeDtypeStruct((1, 256), jnp.float32),
+            jax.ShapeDtypeStruct((32, 4096, 8192), jnp.float4_e2m1fn),
+            jax.ShapeDtypeStruct((32, 8, 8192), jnp.bfloat16),
+            jax.ShapeDtypeStruct((32, 4096, 4096), jnp.float4_e2m1fn),
+            jax.ShapeDtypeStruct((32, 8, 4096), jnp.bfloat16),
+            jax.ShapeDtypeStruct((1, 4096), jnp.float32),
+            jax.ShapeDtypeStruct((4096, 4096), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, 4096), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((1, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((8192, 1280), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, 1280), jnp.float32),
+            jax.ShapeDtypeStruct((8192, 1024), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, 1024), jnp.float32),
+        )
+        in_sp = (P(),) * len(sb_shapes)
+        fn_sb = jax.jit(jax.shard_map(
+            lambda *a: mkb.b1_moe_b2_chip_sharded_jax(*a, world_size=8, fuse_qkv_epi=True),
+            mesh=mesh8, in_specs=in_sp, out_specs=(P(), P(), P(), P()), check_vma=False,
+        ))
+        with jax.set_mesh(mesh8):
+            sh_a = tuple(jax.ShapeDtypeStruct(s.shape, s.dtype, sharding=NamedSharding(mesh8, P())) for s in sb_shapes)
+            hlo_sb = fn_sb.lower(*sh_a).compile().as_text()
+        assert "muse_w9_b1_moe_b2_b256_tp8_" in hlo_sb
