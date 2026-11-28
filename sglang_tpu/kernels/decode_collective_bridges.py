@@ -891,10 +891,13 @@ def _run_oproj_ar_and_post_attn_norm(
                         d3_slot = scatter_ref.at[j] if j < n_chips - 1 else own_chunk
                         c_h0 = pl.ds(pl.multiple_of(j * chunk + c0, _COL_STRIP), _COL_STRIP)
                         c_h1 = pl.ds(pl.multiple_of(half + j * chunk + c0, _COL_STRIP), _COL_STRIP)
+                        # Symmetric pairwise f32 reduction: (a_c + a_{c^1}) + (a_{c^2} + a_{c^3})
+                        # evaluates to (a0 + a1) + (a2 + a3) on all 4 chips by IEEE-754 commutativity.
                         tot = (
                             own_half[rs, c_h0].astype(jnp.float32)
                             + h_out_buf[rs, c_h0].astype(jnp.float32)
-                            + h_out_buf[rs, c_h1].astype(jnp.float32)
+                        ) + (
+                            h_out_buf[rs, c_h1].astype(jnp.float32)
                             + d3_slot[rs, c_l].astype(jnp.float32)
                         )
                         own_half[rs, c_h0] = tot.astype(own_half.dtype)

@@ -4875,7 +4875,11 @@ def test_w17_tp8_inplace_xy_stepc_rep_1shot_and_lmhead_on_wait_and_aot():
     peg_r = jax.device_put(jnp.full((1, HP_r), 1.03, jnp.float32), NamedSharding(mesh8, P()))
     for br in (8, 32):
         st_r = jax.device_put(jnp.asarray(rng.standard_normal((br, H_r)) * 0.3, jnp.float32), NamedSharding(mesh8, P()))
-        ga_r = jax.device_put(jnp.asarray(rng.standard_normal((br, H_r)) * 0.25, jnp.bfloat16), NamedSharding(mesh8, P(None, "model")))
+        # Wide cross-chip dynamic range exposes any non-associative f32 reduction divergence across TP=8 chips.
+        ga_np = rng.standard_normal((br, H_r)).astype(np.float32) * 0.25
+        for c_idx, sc_c in enumerate((10.0, 0.05, -10.0, 0.25)):
+            ga_np[:, c_idx * (H_r // 4) : (c_idx + 1) * (H_r // 4)] *= sc_c
+        ga_r = jax.device_put(jnp.asarray(ga_np, jnp.bfloat16), NamedSharding(mesh8, P(None, "model")))
         s_o, l_o, e_o = jax.jit(
             jax.shard_map(
                 lambda *a: w7.attn_to_moe_bridge_jax(
@@ -4883,13 +4887,19 @@ def test_w17_tp8_inplace_xy_stepc_rep_1shot_and_lmhead_on_wait_and_aot():
                 ),
                 mesh=mesh8,
                 in_specs=(P(), P(None, "model"), P("model", None), P(), P(), P(), P(), P(None, "model"), P(None, "model"), P(), P()),
-                out_specs=P(),
+                out_specs=(P("model", None), P("model", None), P("model", None)),
                 check_vma=False,
             )
         )(st_r, ga_r, wo_r, wos_r, paa_r, pab_r, pfg_r, wpre_r, spre_r, wr_r, peg_r)
-        assert np.isfinite(np.asarray(s_o)).all()
-        assert np.isfinite(np.asarray(l_o)).all()
-        assert np.isfinite(np.asarray(e_o)).all()
+        for arr, cols_a in ((s_o, H_r), (l_o, E_r), (e_o, HP_r)):
+            arr_np = np.asarray(arr).reshape(8, br, cols_a)
+            assert np.isfinite(arr_np).all()
+            if br == 8:
+                for r_idx in range(1, 8):
+                    np.testing.assert_array_equal(arr_np[0], arr_np[r_idx])
+            else:
+                for r_idx in range(1, 8):
+                    np.testing.assert_allclose(arr_np[0], arr_np[r_idx], rtol=1e-5, atol=1e-5)
 
     # 2. TP=8 B=128 (r_pair=32) in-place 2D-XY with dead post_ici sem reuse (`on_wait` + `detect_races`, 0-ULP parity).
     B128, H_c, HP_c, qkv_c, gate_c = 128, 8192, 512, 1280, 1024
