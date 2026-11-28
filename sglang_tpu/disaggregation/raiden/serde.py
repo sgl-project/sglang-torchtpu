@@ -101,7 +101,7 @@ class PullReq(WireMessage, omit_defaults=True):
         _require_port(self.decode_port)
 
 
-class PrefixPull(WireMessage):
+class PrefixPull(WireMessage, omit_defaults=True):
     """Ask the decode to register offered pages [first_page, first_page + num_pages),
     and with them the whole offered window of a hybrid model."""
 
@@ -109,6 +109,9 @@ class PrefixPull(WireMessage):
     room: int
     first_page: int
     num_pages: int
+    # Asymmetric attention TP (src_tp > dst_tp): writer slot (0..ratio-1) on the
+    # decode rank that hosts this prefill rank's pool; -1 on symmetric TP.
+    writer: int = -1
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
@@ -162,11 +165,21 @@ class VictimPush(WireMessage, omit_defaults=True):
     # Hybrid sliding-window models: the page-aligned trailing SWA window in
     # the producer's SWA host pool, registered under the same UUID there.
     swa_blocks: list[int] = msgspec.field(default_factory=list)
+    swa_uuid: int = 0
     swa_address: str = ""
     extra_key: Optional[str] = None
     cache_salt: Optional[str] = None
     page_metadata: list[bytes] = msgspec.field(default_factory=list)
     swa_page_metadata: list[bytes] = msgspec.field(default_factory=list)
+    # Asymmetric attention TP (src_tp > dst_tp): writer slot (0..writers-1)
+    # and per-tensor host block layout for the decode's reshard host store.
+    writer: int = -1
+    writers: int = 0
+    window_pages: int = 0
+    layout: list = msgspec.field(default_factory=list)
+    page_bytes: int = 0
+    swa_layout: list = msgspec.field(default_factory=list)
+    swa_page_bytes: int = 0
 
 
 class VictimAck(WireMessage):
@@ -243,8 +256,12 @@ class ReshardReq(WireMessage, omit_defaults=True):
     dst_attn_tp: int
     decode_swa_blocks: list[int]
     swa_push_endpoint: str
+    # Host page ids offered out of the decode's reshard-layout store for recall,
+    # valid across every writer pool; empty offers nothing.
+    prefix_blocks: list[int] = msgspec.field(default_factory=list)
+    prefix_swa_blocks: list[int] = msgspec.field(default_factory=list)
     # Whether the decode runs with the KV offload to decode DRAM switched on;
-    # the prefill fails the room when the switch is on on either side.
+    # the prefill fails the room when the switch differs between roles.
     kv_offload: bool = False
 
     def __post_init__(self) -> None:

@@ -355,6 +355,13 @@ class TpuEnvs:
 
     # Raiden: a DP or TP decode receives KV from a pipeline-parallel prefill.
     SGLANG_RAIDEN_PIPELINE_TRANSFER = EnvBool(False)
+    # KV offload to decode DRAM under asymmetric attention TP (src_tp > dst_tp):
+    # host RAM per decode rank reserved for the per-writer prefill-layout store.
+    # 0 defaults to the byte budget of the decode rank's own HiCache host pool.
+    SGLANG_PD_OFFLOAD_RESHARD_STORE_GB = EnvFloat(0.0)
+    # Full pages budgeted per SWA window page inside the reshard store; 0 uses
+    # DEFAULT_PAGES_PER_WINDOW_PAGE (4).
+    SGLANG_PD_OFFLOAD_RESHARD_PAGES_PER_WINDOW_PAGE = EnvInt(0)
     # Raiden: stage each transfer (and reshard plan) in its own host-pool pages
     # instead of fixed max-length slots; asymmetric attention TP needs it.
     SGLANG_RAIDEN_DYNAMIC_HOST_STAGING = EnvBoolWithAlias(

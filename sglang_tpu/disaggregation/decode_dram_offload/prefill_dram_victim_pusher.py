@@ -38,6 +38,9 @@ from sglang_tpu.disaggregation.decode_dram_offload.rank_lockstep import (
     DramOffloadWorkerContext,
     push_manifest,
 )
+from sglang_tpu.disaggregation.decode_dram_offload.reshard_host_store import (
+    reshard_pool_layout,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -91,8 +94,9 @@ def victim_transfer_id(prefill: str, seq: int, *, swa: bool = False) -> str:
     return f"victim:{prefill}:{seq}" + (":swa" if swa else "")
 
 
-def _transfer_uuid(prefill: str, seq: int) -> int:
-    digest = hashlib.blake2b(f"{prefill}:{seq}".encode(), digest_size=8).digest()
+def _transfer_uuid(prefill: str, seq: int, *, swa: bool = False) -> int:
+    label = f"{prefill}:{seq}" + (":swa" if swa else "")
+    digest = hashlib.blake2b(label.encode(), digest_size=8).digest()
     return (int.from_bytes(digest, "little") & ((1 << 63) - 1)) or 1
 
 
@@ -128,12 +132,16 @@ class PrefillDramVictimPusher:
         decode, which therefore holds it."""
         peer = self._channel.decode_peer(req.bootstrap_room)
         if peer is not None:
-            req._pd_victim_decode_peer = peer
+            reshard_fn = getattr(self._channel, "reshard_route", None)
+            reshard = reshard_fn(req.bootstrap_room) if callable(reshard_fn) else None
+            if not isinstance(reshard, tuple):
+                reshard = None
+            req._pd_victim_decode_peer = (peer, reshard)
         self.track_host_leaf(req, on_decode=recalled)
 
     def track_host_leaf(self, req: Any, *, on_decode: bool = False) -> None:
         # Set by note_decode_of(); a request that never reached its commit has none.
-        peer = getattr(req, "_pd_victim_decode_peer", None)
+        peer_info = getattr(req, "_pd_victim_decode_peer", None)
         node_id = req.last_node
         if node_id is None:
             # Matching can split a node, so every rank matches, with a peer or
@@ -146,10 +154,19 @@ class PrefillDramVictimPusher:
             match = self._cache.match_prefix(MatchPrefixParams(key=key))
             node_id = match.best_match_node
         node = leaf_of(self._cache, node_id)
-        if node is not None and peer is not None:
+        if node is not None and peer_info is not None:
+            if (
+                isinstance(peer_info, tuple)
+                and len(peer_info) == 2
+                and isinstance(peer_info[0], tuple)
+            ):
+                peer, reshard = peer_info
+            else:
+                peer, reshard = peer_info, None
             tokens = path_tokens(self._cache, node)
             self._routes[node] = (
                 peer,
+                reshard,
                 push_manifest(tokens, node.key.extra_key, node.key.cache_salt),
             )
             if on_decode:
@@ -236,16 +253,18 @@ class PrefillDramVictimPusher:
             else None
         )
         # [picked, the leaf's fingerprint (2 values), its tokens, its host
-        # pages, its window pages]
-        row = [0, 0, 0, 0, 0, 0]
+        # pages, its window pages, writers]
+        row = [0, 0, 0, 0, 0, 0, 0]
         if picked is not None:
-            decode, leaf, path, pages, swa_pages = picked
+            decode, reshard, leaf, path, pages, swa_pages = picked
+            writers = reshard[0] if reshard is not None else 0
             row = [
                 1,
                 *push_manifest(path, leaf.key.extra_key, leaf.key.cache_salt),
                 len(path),
                 len(pages),
                 len(swa_pages),
+                writers,
             ]
         low, high = self._lockstep.min_max(row)
         if not low[0] or low != high:
@@ -255,6 +274,9 @@ class PrefillDramVictimPusher:
         seq = self._next_seq
         self._next_seq += 1
         uuid = _transfer_uuid(self._namespace, seq)
+        swa_uuid = _transfer_uuid(self._namespace, seq, swa=True) if swa_pages else 0
+        if swa_pages and swa_uuid == uuid:
+            swa_uuid = (uuid % ((1 << 63) - 2)) + 1
         push = _PushInFlight(
             seq=seq,
             leaf=leaf,
@@ -274,50 +296,105 @@ class PrefillDramVictimPusher:
         if not self._lockstep.all(metadata is not None and swa_metadata is not None):
             push.stored = False
             return
-        push.registered = self._register_leaf_pages(push, uuid, pages, swa_pages)
-        if not self._lockstep.all(push.registered) or not (
-            self._channel.send_victim_push(
-                decode=decode,
-                prefill=self._namespace,
-                seq=seq,
-                tokens=path,
-                blocks=pages,
-                swa_blocks=swa_pages,
-                uuid=uuid,
-                extra_key=leaf.key.extra_key,
-                cache_salt=leaf.key.cache_salt,
-                page_metadata=metadata,
-                swa_page_metadata=swa_metadata,
-            )
-        ):
+        push.registered = self._register_leaf_pages(
+            push, uuid, pages, swa_pages, swa_uuid=swa_uuid
+        )
+        sent = False
+        if self._lockstep.all(push.registered):
+            if reshard is not None and reshard[0] > 1:
+                writers, writer = reshard
+                sent = self._channel.send_reshard_victim_push(
+                    decode=decode,
+                    prefill=self._namespace,
+                    seq=seq,
+                    writer=writer,
+                    writers=writers,
+                    tokens=path,
+                    blocks=pages,
+                    swa_blocks=swa_pages,
+                    uuid=uuid,
+                    swa_uuid=swa_uuid,
+                    extra_key=leaf.key.extra_key,
+                    cache_salt=leaf.key.cache_salt,
+                    window_pages=self._window_tokens // self._page_size,
+                    layout=reshard_pool_layout(
+                        self._host_pool, writer=writer, writers=writers
+                    ),
+                    swa_layout=(
+                        reshard_pool_layout(
+                            self._swa_host_pool,
+                            writer=writer,
+                            writers=writers,
+                            window=True,
+                        )
+                        if self._swa_host_pool is not None
+                        else None
+                    ),
+                    page_metadata=metadata,
+                    swa_page_metadata=swa_metadata,
+                )
+            else:
+                sent = self._channel.send_victim_push(
+                    decode=decode,
+                    prefill=self._namespace,
+                    seq=seq,
+                    tokens=path,
+                    blocks=pages,
+                    swa_blocks=swa_pages,
+                    uuid=uuid,
+                    extra_key=leaf.key.extra_key,
+                    cache_salt=leaf.key.cache_salt,
+                    page_metadata=metadata,
+                    swa_page_metadata=swa_metadata,
+                    **(dict(swa_uuid=swa_uuid) if swa_pages else {}),
+                )
+        if not sent:
             push.stored = False
 
     def _register_leaf_pages(
-        self, push: _PushInFlight, uuid: int, pages: List[int], swa_pages: List[int]
+        self,
+        push: _PushInFlight,
+        uuid: int,
+        pages: List[int],
+        swa_pages: List[int],
+        *,
+        swa_uuid: int = 0,
     ) -> bool:
         """Register the leaf's host pages as the sources of the decode's reads:
-        the full pages, and on a hybrid model the window pages under the same
-        UUID on their own pool. An accepted registration stays in ``read_ids``
-        when a later one is refused: it drains before the push settles."""
-        for swa, part in ((False, pages), (True, swa_pages)):
+        the full pages, and on a hybrid model the window pages on their own
+        pool. An accepted registration stays in ``read_ids`` when a later one
+        is refused: it drains before the push settles."""
+        for swa, part, part_uuid in (
+            (False, pages, uuid),
+            (True, swa_pages, swa_uuid or uuid),
+        ):
             if not part:
                 continue
             read_id = victim_transfer_id(self._namespace, push.seq, swa=swa)
-            if not self._channel.register_host_read(read_id, uuid, part, swa=swa):
+            if not self._channel.register_host_read(read_id, part_uuid, part, swa=swa):
                 return False
             push.read_ids.append(read_id)
         return True
 
     def _pick_coldest_host_leaf(
         self,
-    ) -> Optional[Tuple[Tuple[str, int], Any, List[int], List[int], List[int]]]:
-        """(decode peer, leaf, its path tokens, its host pages, its window
-        pages) of the oldest leaf owned by a known decode whose whole path,
-        and window, is in host RAM now. A leaf whose backup is still pending
-        is a candidate again once it completed."""
+    ) -> Optional[
+        Tuple[
+            Tuple[str, int],
+            Optional[Tuple[int, int]],
+            Any,
+            List[int],
+            List[int],
+            List[int],
+        ]
+    ]:
+        """(decode peer, reshard route, leaf, its path tokens, its host pages,
+        its window pages) of the oldest leaf owned by a known decode whose whole
+        path, and window, is in host RAM now. A leaf whose backup is still
+        pending is a candidate again once it completed."""
         busy = {push.leaf for push in self._pushes.values()}
         candidates = []
-        for node, (peer, fingerprint) in list(self._routes.items()):
+        for node, (peer, reshard, fingerprint) in list(self._routes.items()):
             pushable = is_live_host_backed_leaf(self._cache, node)
             if pushable is None:
                 self._routes.pop(node, None)
@@ -339,9 +416,20 @@ class PrefillDramVictimPusher:
             if swa_pages is None:
                 continue
             candidates.append(
-                (node.last_access_time, fingerprint, peer, node, path, pages, swa_pages)
+                (
+                    node.last_access_time,
+                    fingerprint,
+                    peer,
+                    reshard,
+                    node,
+                    path,
+                    pages,
+                    swa_pages,
+                )
             )
         if not candidates:
             return None
-        _, _, peer, node, path, pages, swa_pages = min(candidates, key=lambda x: x[:2])
-        return peer, node, path, pages, swa_pages
+        _, _, peer, reshard, node, path, pages, swa_pages = min(
+            candidates, key=lambda x: x[:2]
+        )
+        return peer, reshard, node, path, pages, swa_pages
