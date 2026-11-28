@@ -5,6 +5,19 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 import pytest
 
 from sglang.srt.runtime_context import get_context
+from sglang_tpu.pp_chunk_fit import (
+    FitCalibration,
+    FitFingerprint,
+    fit_key,
+    guard_points,
+    guard_report,
+    load_saved_fit,
+    read_saved_fits,
+    saved_cost_model,
+    saved_fit,
+    upsert_saved_fit,
+    weak_fingerprint_fields,
+)
 from sglang_tpu.pp_chunks import (
     StepCostModel,
     chunk_buckets,
@@ -12,6 +25,7 @@ from sglang_tpu.pp_chunks import (
     chunk_pairs,
     longest_prompt,
     profile_points,
+    stage_min_samples,
     uses_dynamic_chunks,
 )
 
@@ -260,6 +274,362 @@ def test_dynamic_chunks_use_resolved_defaults_and_exclude_decode(monkeypatch):
         assert uses_dynamic_chunks()
         get_context().override("test.no_chunks", chunked_prefill_size=-1)
         assert not uses_dynamic_chunks()
+
+
+FINGERPRINT = FitFingerprint(
+    profile_points=[(2048, 0), (4096, 0), (4096, 4096)],
+    schedule=(4096, 256, 512),
+    kernel_version="k1",
+    runtime_version="torch_tpu=1;libtpu=2",
+)
+REAL = FitCalibration(weights="real", routing="real", date="2026-11-07")
+MODEL = StepCostModel([2048, 4096], {2048: 30.0, 4096: 55.0}, 1e-6, 0.0, 512)
+# One calibrated time per guard point of FINGERPRINT.
+GUARD = [(2048, 0, 32.0), (4096, 0, 57.0), (4096, 4096, 75.0)]
+
+
+def _entry():
+    return saved_fit(
+        MODEL, slack=0.1, fingerprint=FINGERPRINT, calibration=REAL, guard_points=GUARD
+    )
+
+
+def _table(tmp_path, *, calibration=REAL, slack=0.1):
+    path = str(tmp_path / "fits.json")
+    entry = saved_fit(
+        MODEL,
+        slack=slack,
+        fingerprint=FINGERPRINT,
+        calibration=calibration,
+        guard_points=GUARD,
+    )
+    upsert_saved_fit(path, "shape", entry)
+    return path
+
+
+def test_stage_min_takes_fastest_device_per_point_and_keeps_stages_apart():
+    reports = [
+        (1, [(2048, 0, 30.0)]),
+        (0, [(2048, 0, 21.0), (4096, 0, 40.0)]),
+        (0, [(2048, 0, 20.0), (4096, 0, 44.0)]),
+        (1, [(2048, 0, 33.0)]),
+    ]
+    assert stage_min_samples(reports) == [
+        [(2048, 0, 20.0), (4096, 0, 40.0)],
+        [(2048, 0, 30.0)],
+    ]
+
+
+def test_fit_key_is_the_table_file_format():
+    """Saved tables are keyed by this string; changing it orphans every entry."""
+    key = fit_key(
+        model_type="m",
+        num_layers=48,
+        hidden_size=5120,
+        model_shape="cfg0123abcd",
+        dtype="bfloat16",
+        quantization=None,
+        kv_cache_dtype="bfloat16",
+        attention_backend="Rpa",
+        moe_runner_backend="auto",
+        moe_a2a_backend="none",
+        device_kind="TPU7x",
+        pp_size=8,
+        tp_size=2,
+        attn_cp_size=1,
+        attn_dcp_size=1,
+        moe_ep_size=2,
+        moe_tp_size=1,
+        moe_dense_tp_size=2,
+        attn_dp_size=1,
+        chunk_tokens=8192,
+        extend_batch_cap=8,
+        page_size=512,
+        layer_partition="",
+    )
+    assert key == (
+        "m/L48xH5120/cfg0123abcd/bfloat16/none/kvbfloat16/Rpa/auto/a2anone/TPU7x/pp8xtp2xcp1xdcp1xep2xmoetp1xdensetp2xdp1/chunk8192/extendbs8/page512/spliteven"
+    )
+
+
+def test_saved_fit_round_trips_and_takes_the_launch_slack(tmp_path):
+    path = _table(tmp_path, slack=0.5)
+    entry, reason = load_saved_fit(
+        table_path=path, key="shape", fingerprint=FINGERPRINT, check=True
+    )
+    model = saved_cost_model(entry, slack=0.1, granularity=512)
+    assert model.linear_ms == MODEL.linear_ms
+    assert model.schedule == (4096, 256, 512)
+    assert model.target_ms == pytest.approx((55.0 + 1e-6 * 4096 * 4096 / 2) * 1.1)
+    assert entry.guard_points == GUARD
+    assert "2026-11-07" in reason
+
+
+@pytest.mark.parametrize(
+    "case, expected",
+    [
+        ("no_table", "no fit table"),
+        ("no_entry", "no saved fit for other"),
+        ("dummy", "only real weights and routing"),
+        ("stale", "kernel_version differs"),
+        ("corrupt", "cannot read fit table"),
+        ("bad_ladder", "has buckets [2048], not [2048, 4096]"),
+        ("zero_guard", "guard time that is not positive"),
+        ("no_guard", "no calibrated time at [(2048, 0), (4096, 0), (4096, 4096)]"),
+        ("no_attention_guard", "no calibrated time at [(4096, 4096)]"),
+        ("negative_attention", "negative, zero or unbounded step cost"),
+        ("negative_linear", "negative, zero or unbounded step cost"),
+        ("zero_step", "negative, zero or unbounded step cost"),
+        ("unbounded_step", "negative, zero or unbounded step cost"),
+    ],
+)
+def test_unusable_saved_fit_says_why(tmp_path, case, expected):
+    calibration = (
+        FitCalibration(weights="dummy", routing="balanced") if case == "dummy" else REAL
+    )
+    path = _table(tmp_path, calibration=calibration)
+    key = "other" if case == "no_entry" else "shape"
+    fingerprint = FINGERPRINT
+    if case == "stale":
+        fingerprint = FitFingerprint(
+            profile_points=FINGERPRINT.profile_points,
+            schedule=FINGERPRINT.schedule,
+            kernel_version="k2",
+            runtime_version=FINGERPRINT.runtime_version,
+        )
+    if case == "no_table":
+        path = str(tmp_path / "missing.json")
+    if case == "corrupt":
+        (tmp_path / "fits.json").write_text('{"shape": {"linear_ms": ')
+    if case == "bad_ladder":
+        short = StepCostModel([2048], {2048: 30.0}, 1e-6, 0.0, 512)
+        entry = saved_fit(
+            short, slack=0.1, fingerprint=FINGERPRINT, calibration=REAL, guard_points=[]
+        )
+        upsert_saved_fit(path, "shape", entry)
+    if case == "zero_guard":
+        entry = saved_fit(
+            MODEL,
+            slack=0.1,
+            fingerprint=FINGERPRINT,
+            calibration=REAL,
+            guard_points=[(4096, 0, 0.0)],
+        )
+        upsert_saved_fit(path, "shape", entry)
+    bad_costs = {
+        "negative_attention": ({2048: 30.0, 4096: 55.0}, -1e-6),
+        "negative_linear": ({2048: -1.0, 4096: 55.0}, 1e-6),
+        "zero_step": ({2048: 0.0, 4096: 0.0}, 0.0),
+        # Finite terms whose full step overflows.
+        "unbounded_step": ({2048: 30.0, 4096: 55.0}, 1e305),
+    }
+    if case in bad_costs:
+        linear, attn = bad_costs[case]
+        bad = StepCostModel([2048, 4096], linear, attn, 0.0, 512)
+        entry = saved_fit(
+            bad,
+            slack=0.1,
+            fingerprint=FINGERPRINT,
+            calibration=REAL,
+            guard_points=GUARD,
+        )
+        upsert_saved_fit(path, "shape", entry)
+    if case == "no_attention_guard":
+        entry = saved_fit(
+            MODEL,
+            slack=0.1,
+            fingerprint=FINGERPRINT,
+            calibration=REAL,
+            guard_points=GUARD[:2],
+        )
+        upsert_saved_fit(path, "shape", entry)
+    if case == "no_guard":
+        entry = saved_fit(
+            MODEL, slack=0.1, fingerprint=FINGERPRINT, calibration=REAL, guard_points=[]
+        )
+        upsert_saved_fit(path, "shape", entry)
+    entry, reason = load_saved_fit(
+        table_path=path, key=key, fingerprint=fingerprint, check=True
+    )
+    assert entry is None
+    assert expected in reason
+
+
+def test_a_fit_with_a_zero_linear_term_loads(tmp_path):
+    """The fitter clamps a bucket's linear term at zero when attention dominates."""
+    path = str(tmp_path / "fits.json")
+    zero = StepCostModel([2048, 4096], {2048: 0.0, 4096: 55.0}, 1e-6, 0.0, 512)
+    upsert_saved_fit(
+        path,
+        "shape",
+        saved_fit(
+            zero,
+            slack=0.1,
+            fingerprint=FINGERPRINT,
+            calibration=REAL,
+            guard_points=GUARD,
+        ),
+    )
+    entry, reason = load_saved_fit(
+        table_path=path, key="shape", fingerprint=FINGERPRINT, check=True
+    )
+    assert entry is not None, reason
+
+
+def test_guard_points_cover_both_ends_and_the_attention_term():
+    """Drift at either end of the ladder, or in the attention cost alone,
+    must reach the guard."""
+    points = [(512, 0), (2048, 0), (2048, 8192), (4096, 0), (4096, 8192), (4096, 16384)]
+    assert guard_points(points) == [(512, 0), (4096, 0), (4096, 16384)]
+    # Near the context length the top bucket has no prefix; a smaller one stands in.
+    short = [(2048, 0), (2048, 8192), (2048, 16384), (4096, 0), (8192, 0)]
+    assert guard_points(short) == [(2048, 0), (2048, 16384), (8192, 0)]
+    # Without a prefixed point there is nothing to time the attention term on.
+    assert guard_points([(512, 0), (4096, 0)]) == [(512, 0), (4096, 0)]
+
+
+def test_guard_tolerance_is_capped_below_a_wide_slack():
+    """A wide slack must not widen the guard past 10%."""
+    saved = [(4096, 0, 100.0)]
+    _, drift = guard_report(saved, [(4096, 0, 112.0)], slack=0.2)
+    assert drift
+
+
+def test_a_bad_entry_costs_only_its_own_key(tmp_path):
+    """One bad or newer-schema entry in a shared table must not turn saved fits
+    off for every other shape; upserting its key replaces it."""
+    import json
+
+    path = _table(tmp_path)
+    table = json.loads(open(path).read())
+    table["broken"] = {"linear_ms": "not a ladder"}
+    table["newer"] = {**table["shape"], "field_from_a_newer_schema": 1}
+    open(path, "w").write(json.dumps(table))
+
+    def load(key):
+        return load_saved_fit(
+            table_path=path, key=key, fingerprint=FINGERPRINT, check=True
+        )
+
+    entry, reason = load("shape")
+    assert entry is not None, reason
+    for key in ("broken", "newer"):
+        entry, reason = load(key)
+        assert entry is None
+        assert f"saved fit for {key} is unreadable" in reason
+    assert sorted(read_saved_fits(path)[1]) == ["broken", "newer"]
+
+    good = load("shape")[0]
+    upsert_saved_fit(path, "broken", good)
+    assert load("broken")[0] == good
+    # The other bad entry stays as written, for its owner to replace.
+    assert sorted(read_saved_fits(path)[1]) == ["newer"]
+
+
+@pytest.mark.parametrize("text", ['{"shape": {"linear_ms": ', '["not", "a", "table"]'])
+def test_a_table_that_does_not_parse_fails_as_a_whole(tmp_path, text):
+    path = _table(tmp_path)
+    open(path, "w").write(text)
+    entry, reason = load_saved_fit(
+        table_path=path, key="shape", fingerprint=FINGERPRINT, check=True
+    )
+    assert entry is None
+    assert "cannot read fit table" in reason
+
+
+def test_upsert_through_a_symlink_updates_its_target(tmp_path):
+    """A table published through a symlink must stay a symlink."""
+    target = tmp_path / "tables" / "fits.json"
+    target.parent.mkdir()
+    upsert_saved_fit(str(target), "shape", _entry())
+    link = tmp_path / "fits.json"
+    link.symlink_to(target)
+    upsert_saved_fit(str(link), "other", _entry())
+    assert link.is_symlink()
+    assert sorted(read_saved_fits(str(target))[0]) == ["other", "shape"]
+
+
+def test_a_failed_upsert_leaves_no_staging_file(monkeypatch, tmp_path):
+    import sglang_tpu.pp_chunk_fit as pp_chunk_fit
+
+    def full_disk(src, dst):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(pp_chunk_fit.os, "replace", full_disk)
+    with pytest.raises(OSError):
+        upsert_saved_fit(str(tmp_path / "fits.json"), "shape", _entry())
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_an_unreadable_table_is_a_vote_not_an_error(monkeypatch, tmp_path):
+    """A rank that raises before the saved-fit vote leaves the others waiting in
+    its gather, so any read failure must come back as a reason."""
+    import pathlib
+
+    def denied(self):
+        raise PermissionError(13, "Permission denied", str(self))
+
+    monkeypatch.setattr(pathlib.Path, "is_file", denied)
+    entry, reason = load_saved_fit(
+        table_path=str(tmp_path / "fits.json"),
+        key="shape",
+        fingerprint=FINGERPRINT,
+        check=True,
+    )
+    assert entry is None
+    assert "cannot read fit table" in reason
+
+
+def test_vacuous_fingerprint_fields_are_named():
+    """An empty kernel version or an unknown package version matches every
+    entry, so the launch must say the guard is the only check left."""
+    weak = FitFingerprint(
+        profile_points=FINGERPRINT.profile_points,
+        schedule=None,
+        kernel_version="",
+        runtime_version="torch_tpu=none;libtpu=2",
+    )
+    assert weak_fingerprint_fields(weak) == [
+        "kernel_version is empty",
+        "runtime_version is torch_tpu=none;libtpu=2",
+    ]
+    assert weak_fingerprint_fields(FINGERPRINT) == []
+
+
+def test_guard_reports_drift_at_every_point():
+    saved = [(4096, 0, 50.0), (4096, 4096, 100.0)]
+    timed = [(4096, 0, 52.0), (4096, 4096, 150.0), (2048, 0, 10.0)]
+    report, drifted = guard_report(saved, timed, slack=0.1)
+    assert report == [
+        "(4096, 0) measured 52.0 ms, saved 50.0 ms (+4.0%)",
+        "(4096, 4096) measured 150.0 ms, saved 100.0 ms (+50.0%)",
+        "(2048, 0) measured 10.0 ms, no calibrated time",
+    ]
+    assert drifted == report[1:]
+    # A slack below the tolerance tightens it: +4% leaves the step past a 3% target.
+    _, tight = guard_report(saved, timed, slack=0.03)
+    assert tight == report
+    # A zero slack keeps a noise floor instead of rejecting every fit.
+    _, floor = guard_report([(4096, 0, 50.0)], [(4096, 0, 50.5)], slack=0.0)
+    assert floor == []
+
+
+def test_upsert_keeps_other_entries_sorted(tmp_path):
+    path = _table(tmp_path)
+    upsert_saved_fit(
+        path,
+        "another",
+        saved_fit(
+            MODEL, slack=0.1, fingerprint=FINGERPRINT, calibration=REAL, guard_points=[]
+        ),
+    )
+    text = (tmp_path / "fits.json").read_text()
+    assert text.index('"another"') < text.index('"shape"')
+    for key in ("shape", "another"):
+        entry, _ = load_saved_fit(
+            table_path=path, key=key, fingerprint=FINGERPRINT, check=False
+        )
+        assert entry.linear_ms == MODEL.linear_ms
 
 
 if __name__ == "__main__":
