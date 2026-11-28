@@ -119,18 +119,40 @@ class TestTpuDMAKVTransfer(CustomTestCase):
             with self.subTest(swa=is_swa):
                 pool = TpuDMAUnifiedHostKVPool.__new__(TpuDMAUnifiedHostKVPool)
                 pool.page_size, pool.page_num = 4, 4
+                pool._is_swa = is_swa
                 pool.lock = threading.RLock()
                 pool.pool_label = "swa" if is_swa else "full"
-                pool._state = SimpleNamespace(free=Mock(return_value=4), clear=Mock())
+                groups = torch.tensor([[4, 5, 6, 7]])
+                side = SimpleNamespace(
+                    live_pages={0, 1},
+                    pages_per_logical=2 if is_swa else 1,
+                )
+                pool._state = SimpleNamespace(
+                    page_num=8,
+                    swa_group_pages=groups,
+                    sides={pool.pool_label: side},
+                    free=Mock(return_value=4),
+                    clear=Mock(),
+                )
                 table = HostPageMetadata(pool)
-                table.restore([0, 1], [b"old", b"kept"])
+                if is_swa:
+                    table.restore([0, 4, 1, 5], [b"old", b"old_c", b"kept", b"kept_c"])
+                else:
+                    table.restore([0, 1], [b"old", b"kept"])
                 indices = torch.arange(4)
                 self.assertEqual(pool.free(indices), 4)
                 pool._state.free.assert_called_once_with(pool.pool_label, indices)
-                self.assertEqual(table.export([0, 1]), [b"", b"kept"])
+                if is_swa:
+                    self.assertEqual(
+                        table.export([0, 4, 1, 5]), [b"", b"", b"kept", b"kept_c"]
+                    )
+                    side.live_pages.remove(0)
+                else:
+                    self.assertEqual(table.export([0, 1]), [b"", b"kept"])
+                    side.live_pages.remove(0)
                 pool.clear()
                 pool._state.clear.assert_called_once_with(pool.pool_label)
-                self.assertEqual(table.export([0, 1]), [])
+                self.assertEqual(table.export([0, 4, 1, 5] if is_swa else [0, 1]), [])
 
     def test_unified_backup_invalidates_logical_rows_for_expanded_physical_pages(self):
         for is_swa in (False, True):
@@ -140,10 +162,13 @@ class TestTpuDMAKVTransfer(CustomTestCase):
                 pool._is_swa = is_swa
                 groups = torch.tensor([[4, 5, 6, 7]])
                 pool._unified_pool = SimpleNamespace(swa_group_pages=groups)
-                pool._state = SimpleNamespace(swa_group_pages=groups)
+                pool._state = SimpleNamespace(page_num=8, swa_group_pages=groups)
                 pool.transfer = _Engine(None, 8)
                 table = HostPageMetadata(pool)
-                table.restore([0, 1], [b"old", b"kept"])
+                if is_swa:
+                    table.restore([0, 4, 1, 5], [b"old", b"old_c", b"kept", b"kept_c"])
+                else:
+                    table.restore([0, 1], [b"old", b"kept"])
                 pool.backup_from_device_all_layer(
                     None, torch.arange(4), torch.arange(4, 8), ENGINE
                 )
@@ -151,7 +176,12 @@ class TestTpuDMAKVTransfer(CustomTestCase):
                     ("backup", [1, 5], [0, 4]) if is_swa else ("backup", [1], [0])
                 )
                 self.assertEqual(pool.transfer.calls, [expected])
-                self.assertEqual(table.export([0, 1]), [b"", b"kept"])
+                if is_swa:
+                    self.assertEqual(
+                        table.export([0, 4, 1, 5]), [b"", b"", b"kept", b"kept_c"]
+                    )
+                else:
+                    self.assertEqual(table.export([0, 1]), [b"", b"kept"])
 
     def test_registration(self):
         self.assertTrue(is_tpu_dma_hicache_backend("raiden"))

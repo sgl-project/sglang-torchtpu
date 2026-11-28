@@ -465,22 +465,60 @@ def _build_full_swa_host_stack(
     )
     allocator = params.token_to_kv_pool_allocator
     memory = get_memory()
-    kv_host_size, swa_host_size = _upstream_host_pool_sizes(memory, kvcache)
-    host_pool_group = hybrid_pool_assembler.build_hybrid_swa_group(
-        page_size=params.page_size,
-        full_kv_pool=kvcache.full_kv_pool,
-        swa_kv_pool=kvcache.swa_kv_pool,
-        full_layer_mapping=full_layer_mapping,
-        swa_layer_mapping=swa_layer_mapping,
-        kv_host_size=kv_host_size,
-        swa_host_size=swa_host_size,
-        host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
-        device_swa_evict_fn=lambda n: hybrid_pool_assembler._evict_swa_for_device_alloc(
-            cache, n
-        ),
-        swa_attn_allocator=allocator.swa_attn_allocator,
-        transfer_layer_id_max=transfer_layer_id_max,
-    )
+    if isinstance(kvcache, TpuUnifiedSWAKVPool):
+        from sglang_tpu.kv_pool_host import TpuDMAUnifiedHostKVPool
+
+        kv_host_pool, swa_host_pool = TpuDMAUnifiedHostKVPool.build_pair(
+            kvcache,
+            io_backend=memory.hicache_io_backend,
+            host_to_device_ratio=memory.hicache_ratio,
+            host_size=memory.hicache_size,
+            page_size=params.page_size,
+        )
+        swa_alloc = allocator.swa_attn_allocator
+        host_pool_group = HostPoolGroup(
+            [
+                hybrid_pool_assembler.build_pool_entry(
+                    name=PoolName.KV,
+                    host_pool=kv_host_pool,
+                    device_pool=kvcache,
+                    layer_mapping=full_layer_mapping,
+                    transfer_layer_id_max=transfer_layer_id_max,
+                    is_anchor=True,
+                    host_evict_fn=lambda n: cache.evict_host(n, ComponentType.FULL),
+                ),
+                hybrid_pool_assembler.build_pool_entry(
+                    name=PoolName.SWA,
+                    host_pool=swa_host_pool,
+                    device_pool=kvcache,
+                    layer_mapping=swa_layer_mapping,
+                    transfer_layer_id_max=transfer_layer_id_max,
+                    host_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
+                    device_evict_fn=lambda n: (
+                        hybrid_pool_assembler._evict_swa_for_device_alloc(cache, n)
+                    ),
+                    device_alloc_fn=swa_alloc.alloc,
+                    device_free_fn=swa_alloc.free,
+                ),
+            ]
+        )
+    else:
+        kv_host_size, swa_host_size = _upstream_host_pool_sizes(memory, kvcache)
+        host_pool_group = hybrid_pool_assembler.build_hybrid_swa_group(
+            page_size=params.page_size,
+            full_kv_pool=kvcache.full_kv_pool,
+            swa_kv_pool=kvcache.swa_kv_pool,
+            full_layer_mapping=full_layer_mapping,
+            swa_layer_mapping=swa_layer_mapping,
+            kv_host_size=kv_host_size,
+            swa_host_size=swa_host_size,
+            host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
+            device_swa_evict_fn=lambda n: (
+                hybrid_pool_assembler._evict_swa_for_device_alloc(cache, n)
+            ),
+            swa_attn_allocator=allocator.swa_attn_allocator,
+            transfer_layer_id_max=transfer_layer_id_max,
+        )
     cache_controller = _create_cache_controller(
         params=params,
         host_pool_group=host_pool_group,

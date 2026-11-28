@@ -589,6 +589,10 @@ class TpuDMAHostKVPool(HostKVCache):
         # by construction (see ``alloc``).
         return (token_indices[:: self.page_size] // self.page_size).tolist()
 
+    def transfer_page_ids(self, token_indices: torch.Tensor) -> List[int]:
+        """Physical host transfer block IDs backing ``token_indices``."""
+        return self._to_page_ids(token_indices)
+
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ) -> TransferEvent:
@@ -1031,6 +1035,11 @@ class TpuDMAUnifiedHostKVPool(TpuDMAHostKVPool):
     def shared_allocation_domain(self) -> _SharedUnifiedDMAHostState:
         return self._state
 
+    @property
+    def transfer_page_limit(self) -> int:
+        """Upper bound (exclusive) for physical arena page IDs from ``transfer_page_ids``."""
+        return self._state.page_num
+
     def live_tokens(self) -> int:
         return self._state.live_tokens(self.pool_label)
 
@@ -1039,6 +1048,16 @@ class TpuDMAUnifiedHostKVPool(TpuDMAHostKVPool):
 
     def clear(self) -> None:
         with self.lock:
+            side = self._state.sides[self.pool_label]
+            if side.live_pages:
+                phys_pages = list(side.live_pages)
+                if (
+                    side.pages_per_logical > 1
+                    and self._state.swa_group_pages.shape[0] > 0
+                ):
+                    for pid in side.live_pages:
+                        phys_pages.extend(self._state.swa_group_pages[:, pid].tolist())
+                discard_host_page_metadata(self, phys_pages)
             discard_host_page_metadata(self)
             self._state.clear(self.pool_label)
 
@@ -1047,7 +1066,7 @@ class TpuDMAUnifiedHostKVPool(TpuDMAHostKVPool):
 
     def free(self, indices: torch.Tensor) -> int:
         with self.lock:
-            discard_host_page_metadata(self, self._to_page_ids(indices))
+            discard_host_page_metadata(self, self.transfer_page_ids(indices))
             return self._state.free(self.pool_label, indices)
 
     def destroy(self) -> None:
@@ -1085,6 +1104,13 @@ class TpuDMAUnifiedHostKVPool(TpuDMAHostKVPool):
         expanded = torch.cat([primaries.unsqueeze(0), companions], dim=0)
         return expanded.T.reshape(-1).tolist()
 
+    def transfer_page_ids(self, token_indices: torch.Tensor) -> List[int]:
+        """Physical host transfer block IDs backing ``token_indices`` (primary
+        plus companion SWA group pages when ``is_swa`` and ``M_swa > 1``)."""
+        if token_indices.numel() == 0:
+            return []
+        return self._expand_pages(token_indices, self._state.swa_group_pages)
+
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ) -> TransferEvent:
@@ -1094,7 +1120,7 @@ class TpuDMAUnifiedHostKVPool(TpuDMAHostKVPool):
             device_indices, self._unified_pool.swa_group_pages
         )
         host_pages = self._expand_pages(host_indices, self._state.swa_group_pages)
-        discard_host_page_metadata(self, self._to_page_ids(host_indices))
+        discard_host_page_metadata(self, host_pages)
         return self.transfer.backup(device_pages, host_pages)
 
     def load_all_layer(

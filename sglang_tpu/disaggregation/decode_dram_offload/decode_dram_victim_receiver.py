@@ -25,7 +25,9 @@ from sglang_tpu.disaggregation.decode_dram_offload.prefill_dram_victim_pusher im
 )
 from sglang_tpu.disaggregation.decode_dram_offload.radix_host_ops import (
     host_page_ids,
+    host_pages_per_logical_page,
     insert_host_prefix,
+    make_shared_host_room,
 )
 from sglang_tpu.disaggregation.decode_dram_offload.rank_lockstep import (
     DramOffloadWorkerContext,
@@ -149,7 +151,12 @@ class DecodeDramVictimReceiver:
         """Reserve host pages for the push's full KV and, on a hybrid model,
         its window, then start the native reads into them."""
         num_tokens = len(push.tokens)
-        swa_tokens = len(push.swa_blocks) * self._page_size
+        m_swa = host_pages_per_logical_page(self._swa_host_pool)
+        if push.swa_blocks and (
+            self._swa_host_pool is None or len(push.swa_blocks) % m_swa
+        ):
+            return False
+        swa_tokens = (len(push.swa_blocks) // m_swa) * self._page_size
         self._make_host_room(num_tokens, swa_tokens)
         allocated = alloc_host_pages_agreed(
             lockstep=self._lockstep,
@@ -174,6 +181,10 @@ class DecodeDramVictimReceiver:
         manifest agreement made the push's tokens and blocks the same on every
         rank; collective maxima find the room any rank is short of."""
         pool, swa_pool = self._host_pool, self._swa_host_pool
+        if make_shared_host_room(
+            self._cache, self._lockstep, pool, swa_pool, num_tokens, swa_tokens
+        ):
+            return
         short, swa_short = self._lockstep.reduce(
             [
                 [
@@ -212,12 +223,12 @@ class DecodeDramVictimReceiver:
 
     def _start_window_read(self, landing: _DramLanding) -> bool:
         """Read the pushed window pages into the landing's SWA pages; the
-        prefill registered them under the push's UUID on its SWA pool."""
+        prefill registered them under ``swa_uuid`` (or ``uuid``) on its SWA pool."""
         push = landing.push
         read_id = victim_transfer_id(push.prefill, push.seq, swa=True)
         started = self._channel.start_host_read(
             read_id,
-            push.uuid,
+            getattr(push, "swa_uuid", 0) or push.uuid,
             push.swa_address,
             list(push.swa_blocks),
             host_page_ids(self._swa_host_pool, landing.swa_indices),
