@@ -1815,7 +1815,7 @@ def pallas_fused_b1_b2_wpool_quant(
             jnp.pad(ws_k_bm.astype(jnp.bfloat16), ((0, LANE - topk), (0, 0))), 0, 1
         )
 
-        # Pass 4: wpool MXU sub-tiled [128, 256] (32 VREGs, 0 spills) + pre_expert_norm + packed int8
+        # Pass 4: wpool MXU sub-tiled [bm, sub_n] + pre_expert_norm + output quant
         sq_pe_128 = jnp.zeros((bm, LANE), dtype=jnp.float32)
         for ns in range(he_dim // sub_n):
             nc0, nc1 = ns * sub_n, (ns + 1) * sub_n
