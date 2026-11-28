@@ -1496,8 +1496,13 @@ def pallas_fused_b1_b2_wpool_quant(
                 f"static_fp8_scale must be in [0, 32], got {static_fp8_val}"
             )
     use_static_fp8 = bool(emit_fp8_gmm and static_fp8_val > 0.0)
+    b2_dbl_env = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_B2_DBL_STREAM", None)
+    b2_dbl_enabled = bool(b2_dbl_env is not None and b2_dbl_env.get())
+    # Double-buffered bm=128 (~54 MiB VMEM) hides stream DMAs and beats bm=256 (OOMs VMEM if dbl).
+    prefer_bm128_dbl = bool(b2_dbl_enabled and (out_rows // LANE) >= 2)
     use_bm256 = bool(
-        use_b12_fast
+        not prefer_bm128_dbl
+        and use_b12_fast
         and use_static_fp8
         and fp8_wpool
         and row_start_eff % 256 == 0
@@ -1521,18 +1526,10 @@ def pallas_fused_b1_b2_wpool_quant(
         )
 
     num_steps = out_rows // bm
-    b2_dbl_env = getattr(envs, "SGLANG_TPU_MUSE_KERNEL_B2_DBL_STREAM", None)
-    use_dbl_stream = (
-        False
-        if use_bm256
-        else (bool(b2_dbl_env is not None and b2_dbl_env.get()) and num_steps >= 2)
-    )
-    if use_bm256:
-        strip_w = 512
-        sub_n = 512
-    elif use_2d_out:
-        strip_w = 1024
-        sub_n = 512
+    use_dbl_stream = False if use_bm256 else (b2_dbl_enabled and num_steps >= 2)
+    if use_bm256 or use_2d_out:
+        strip_w = 256
+        sub_n = 1024
     else:
         strip_w = 256 if use_b12_fast else 2048
         sub_n = 256
@@ -1749,11 +1746,12 @@ def pallas_fused_b1_b2_wpool_quant(
                 r_lo = (r_f32 - r_bf16.astype(jnp.float32)).astype(jnp.bfloat16)
                 w_hi_sub = w_hi_ref[c0:c1, :]
                 if skip_zero_wlo:
-                    logits = (
-                        logits
-                        + jnp.dot(r_bf16, w_hi_sub, preferred_element_type=jnp.float32)
-                        + jnp.dot(r_lo, w_hi_sub, preferred_element_type=jnp.float32)
+                    hl = jnp.dot(
+                        jnp.concatenate([r_bf16, r_lo], axis=0),
+                        w_hi_sub,
+                        preferred_element_type=jnp.float32,
                     )
+                    logits = logits + hl[:bm, :] + hl[bm:, :]
                 else:
                     w_lo_sub = w_lo_ref[c0:c1, :]
                     logits = (
@@ -2118,7 +2116,7 @@ def pallas_fused_b1_b2_wpool_quant(
             ],
         ),
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel",),
+            dimension_semantics=("arbitrary",),
             disable_bounds_checks=True,
             vmem_limit_bytes=62 * 1024 * 1024,
         ),

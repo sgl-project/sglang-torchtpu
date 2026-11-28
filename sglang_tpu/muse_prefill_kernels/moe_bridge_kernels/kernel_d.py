@@ -248,6 +248,38 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
             vals_raw = vals_raw.astype(jnp.bfloat16)
         return _scrub_vals(vals_raw).reshape(16 * topk, c_grp * lanes)
 
+    def _combine_mxu_phase1(
+        buf_2x_ref, slot, w_vmem_ref, u_scratch_ref, *, track_amax: bool
+    ):
+        """Combine top-k expert outputs via MXU dot at 2048-col strips (c_grp=16)."""
+        c_grp = 16 if n2_cols % 16 == 0 else 8
+        amax_groups = []
+        for b_16 in range(tok_tile_eff // 16):
+            r0, r1 = b_16 * 16, (b_16 + 1) * 16
+            m0, m1 = r0 * topk, r1 * topk
+            w_16x128 = w_vmem_ref[r0:r1, :]
+            amax_b = jnp.zeros((16, LANE), dtype=jnp.float32)
+            for c_blk in range(n2_cols // c_grp):
+                c0, c1 = c_blk * c_grp, (c_blk + 1) * c_grp
+                u0, u1 = c0 * lanes, c1 * lanes
+                vals_tile = _load_mxu_tile_128x1024(
+                    buf_2x_ref, slot, m0, m1, c0, c1, c_grp
+                )
+                u_sub_bf16 = jnp.dot(
+                    w_16x128,
+                    vals_tile,
+                    preferred_element_type=jnp.float32,
+                ).astype(jnp.bfloat16)
+                u_scratch_ref[r0:r1, u0:u1] = u_sub_bf16
+                if track_amax:
+                    amax_b = jnp.maximum(
+                        amax_b,
+                        vpu_tree_max_128(jnp.abs(u_sub_bf16.astype(jnp.float32))),
+                    )
+            if track_amax:
+                amax_groups.append(amax_b)
+        return jnp.concatenate(amax_groups, axis=0) if track_amax else None
+
     if use_zero_spill:
         t_sub = min(32, tok_tile_eff)
         vecs_3d = vecs_8x8192.reshape(8, num_slabs, slab_w).swapaxes(0, 1)
@@ -371,36 +403,15 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
             if in_buf_is_fp8 and not kmajor_buf and not eff_mxu_combine:
                 _combine_fp8_phase1(buf_2x_ref, slot, w_vmem_ref, u_scratch_ref)
             elif eff_mxu_combine:
-                c_grp_zs = 8
-                amax_groups_zs = []
-                for b_16 in range(tok_tile_eff // 16):
-                    r0, r1 = b_16 * 16, (b_16 + 1) * 16
-                    m0, m1 = r0 * topk, r1 * topk
-                    w_16x128 = w_vmem_ref[r0:r1, :]
-                    amax_b_zs = jnp.zeros((16, LANE), dtype=jnp.float32)
-                    for c_blk in range(n2_cols // c_grp_zs):
-                        c0, c1 = c_blk * c_grp_zs, (c_blk + 1) * c_grp_zs
-                        u0, u1 = c0 * lanes, c1 * lanes
-                        vals_128x1024 = _load_mxu_tile_128x1024(
-                            buf_2x_ref, slot, m0, m1, c0, c1, c_grp_zs
-                        )
-                        u_sub_bf16 = jnp.dot(
-                            w_16x128,
-                            vals_128x1024,
-                            preferred_element_type=jnp.float32,
-                        ).astype(jnp.bfloat16)
-                        u_scratch_ref[r0:r1, u0:u1] = u_sub_bf16
-                        if fp8_unpool:
-                            amax_b_zs = jnp.maximum(
-                                amax_b_zs,
-                                vpu_tree_max_128(
-                                    jnp.abs(u_sub_bf16.astype(jnp.float32))
-                                ),
-                            )
-                    if fp8_unpool:
-                        amax_groups_zs.append(amax_b_zs)
+                amax_mxu = _combine_mxu_phase1(
+                    buf_2x_ref,
+                    slot,
+                    w_vmem_ref,
+                    u_scratch_ref,
+                    track_amax=fp8_unpool,
+                )
                 if fp8_unpool:
-                    amax_u_128 = jnp.concatenate(amax_groups_zs, axis=0)
+                    amax_u_128 = amax_mxu
             else:
                 for tb in range(tok_tile_eff // t_sub):
                     t0, t1 = tb * t_sub, (tb + 1) * t_sub
@@ -811,36 +822,16 @@ def pallas_combine_unpool_residual_nextnorm_4slab(
                         ),
                     )
         elif eff_mxu_combine:
-            c_grp = 8
-            amax_groups = []
-            for b_16 in range(tok_tile_eff // 16):
-                r0, r1 = b_16 * 16, (b_16 + 1) * 16
-                m0, m1 = r0 * topk, r1 * topk
-                w_16x128 = w_vmem_ref[r0:r1, :]
-                amax_b = jnp.zeros((16, LANE), dtype=jnp.float32)
-                for c_blk in range(n2_cols // c_grp):
-                    c0, c1 = c_blk * c_grp, (c_blk + 1) * c_grp
-                    u0, u1 = c0 * lanes, c1 * lanes
-                    vals_128x1024 = _load_mxu_tile_128x1024(
-                        buf_2x_ref, slot, m0, m1, c0, c1, c_grp
-                    )
-                    u_sub_bf16 = jnp.dot(
-                        w_16x128,
-                        vals_128x1024,
-                        preferred_element_type=jnp.float32,
-                    ).astype(jnp.bfloat16)
-                    u_scratch_ref[r0:r1, u0:u1] = u_sub_bf16
-                    if fp8_unpool and not use_blk_fp8_unpool:
-                        amax_b = jnp.maximum(
-                            amax_b,
-                            vpu_tree_max_128(
-                                jnp.abs(u_sub_bf16.astype(jnp.float32))
-                            ),
-                        )
-                if fp8_unpool and not use_blk_fp8_unpool:
-                    amax_groups.append(amax_b)
-            if fp8_unpool and not use_blk_fp8_unpool:
-                amax_u_128 = jnp.concatenate(amax_groups, axis=0)
+            track_mxu_amax = fp8_unpool and not use_blk_fp8_unpool
+            amax_mxu = _combine_mxu_phase1(
+                buf_2x_ref,
+                slot,
+                w_vmem_ref,
+                u_scratch_ref,
+                track_amax=track_mxu_amax,
+            )
+            if track_mxu_amax:
+                amax_u_128 = amax_mxu
         elif use_c16_half:
             w_tok = w_vmem_ref[:, :topk].reshape(tok_tile_eff, topk, 1, 1)
             for h_t in range(tok_tile_eff // 32):
