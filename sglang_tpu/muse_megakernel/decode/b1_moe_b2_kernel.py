@@ -1904,7 +1904,11 @@ def _prepare_chip_b1_moe_b2_setup(
         import dataclasses
 
         base_cfg = default_sparse_decode_config(rows, world_size, scale_block)
-        safe_wm = "stream3" if rows <= 64 else "half_n"
+        safe_wm = (
+            base_cfg.weight_mode
+            if base_cfg.weight_mode in ("stream3", "half_n")
+            else ("stream3" if rows <= 64 else "half_n")
+        )
         config = dataclasses.replace(
             base_cfg,
             weight_mode=safe_wm,
@@ -3239,7 +3243,12 @@ def b1_moe_b2_rpad_chip_sharded_jax(
             split_b2_rpad=bool(
                 st["use_3scope"]
                 and (not kv_pack_bd4)
-                and (run_cfg.num_slots * run_slot_pg * phys_page_rows > _STEP_C_LARGE_B_MAX_BKV_ROWS)
+                and (
+                    world_size == 8
+                    or run_cfg.num_slots * run_slot_pg * phys_page_rows > _STEP_C_LARGE_B_MAX_BKV_ROWS
+                    or run_cfg.hoist_new_kv
+                    or run_grp_vec
+                )
             ),
             step_b3_moe_is_scope2=st["step_b3_moe_is_scope2"],
             step_b3_n_moe_outer=st["step_b3_n_moe_outer"],

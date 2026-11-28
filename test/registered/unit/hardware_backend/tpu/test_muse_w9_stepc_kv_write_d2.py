@@ -2905,3 +2905,114 @@ def test_wave18_fuse_l0_and_fuse_l61_ops_and_killswitches():
     ):
         b1_moe_ops.flush_pending_step_c_kv_writes(entries)
     assert chunk_sizes == [29, 16]
+
+
+
+def test_wave18_w31_safe_wm_stream3_and_tp8_b256_hoistkv_split34_aot():
+    """Verify safe_wm delegates stream3/half_n from default_sparse_decode_config & TP=8 B=256 hoistkv Split34 AOT."""
+    import dataclasses
+    from unittest import mock
+
+    import jax
+    import jax.numpy as jnp
+
+    from sglang_tpu.attention.pallas import rpa_v3_decode_fast as rpad
+    from sglang_tpu.muse_megakernel.decode import b1_moe_b2_kernel as mkb
+
+    # 1. Verify _prepare_chip_b1_moe_b2_setup directly honors base_cfg.weight_mode in ("stream3", "half_n")
+    #    at B=128/256 (unlocking dec-moe-w29 stream3 inside Step (c)) while guarding unsupported modes.
+    orig_def_cfg = mkb.default_sparse_decode_config
+    s = lambda sh, dt: jax.ShapeDtypeStruct(sh, dt)
+    for B_wm, ws_wm, want_wm, mock_wm in (
+        (128, 8, "stream3", "stream3"),
+        (256, 16, "stream3", "stream3"),
+        (256, 16, "half_n", "half_n"),
+        (128, 8, "half_n", "stream3_k2"),
+        (64, 8, "stream3", "stream3_k2"),
+    ):
+        r_p = B_wm // (ws_wm // 2)
+        g_c = 512 if ws_wm == 16 else 1024
+        q_c = 640 if ws_wm == 16 else 1280
+        e_l = 256 // ws_wm
+        with mock.patch.object(
+            mkb,
+            "default_sparse_decode_config",
+            side_effect=lambda b, ep, sb, _m=mock_wm: dataclasses.replace(
+                orig_def_cfg(b, ep, sb), weight_mode=_m
+            ),
+        ):
+            seen_wm: list[str] = []
+            args_abs = (
+                s((1,), jnp.int32), s((r_p, 8192), jnp.float32), s((B_wm, g_c), jnp.bfloat16),
+                s((g_c, 8192), jnp.float8_e4m3fn), s((8192,), jnp.float32),
+                s((8192,), jnp.float32), s((8192,), jnp.float32), s((8192,), jnp.float32),
+                s((8192, 2048), jnp.float8_e4m3fn), s((2048,), jnp.float32),
+                s((8192, 256), jnp.bfloat16), s((4096,), jnp.float32),
+                s((1, 256), jnp.float32),
+                s((e_l, 512, 8192), jnp.uint32), s((e_l, 8, 8192), jnp.bfloat16),
+                s((e_l, 512, 4096), jnp.uint32), s((e_l, 8, 4096), jnp.bfloat16),
+                s((4096,), jnp.float32),
+                s((4096, 4096), jnp.float8_e4m3fn), s((4096,), jnp.float32),
+                s((8192,), jnp.float32), s((8192,), jnp.float32), s((8192,), jnp.float32),
+                s((8192,), jnp.float32),
+                s((8192, q_c), jnp.float8_e4m3fn), s((q_c,), jnp.float32),
+                s((8192, g_c), jnp.float8_e4m3fn), s((g_c,), jnp.float32),
+            )
+
+            def _trace_setup(*a, _ws=ws_wm):
+                st = mkb._prepare_chip_b1_moe_b2_setup(
+                    *a, None, None, None, None, None, None, None, None,
+                    world_size=_ws, fuse_qkv_epi=False, config=None, interpret=False,
+                )
+                seen_wm.append(st["config"].weight_mode)
+                return jnp.int32(0)
+
+            jax.eval_shape(_trace_setup, *args_abs)
+            assert seen_wm == [want_wm]
+
+    # 2. TPU7x AOT compile <63 MiB:
+    #    (a) TP=16 B=256 BD4 Step (c) SWA 2K & Full prod_mode (hoistkv) with weight_mode="stream3"
+    #    (b) TP=8 B=256 Full D2 & SWA D2 with production hoistkv (w8,noadapt,hoistkv,g4k,foldcol,batch2,batch4),
+    #        verifying split_b2_rpad avoids both Full hoistkv (67.35 MiB) and SWA s=4 (63.01 MiB) VMEM overflows.
+    orig_parse = rpad.parse_decode_fast_config
+    prod_mode = "w8,noadapt,hoistkv,g4k,foldcol,batch2,batch4"
+    with mock.patch.object(
+        mkb,
+        "default_sparse_decode_config",
+        side_effect=lambda b, ep, sb: dataclasses.replace(
+            orig_def_cfg(b, ep, sb), weight_mode="stream3"
+        ),
+    ):
+        hlo_16_s3 = _compile_step_c_aot(
+            tp=16, B=256, pps=8, sw=2049,
+            mode="w8,s4,c2048,coal,noz,pbf16,batchfull,b4",
+            dense2=False, bd4=True, dist_len=3, has_rope=True, allow_large_b=True,
+        )
+        assert "muse_w9_b1_moe_b2_rpad_b256_tp16_" in hlo_16_s3
+        with mock.patch.object(
+            rpad,
+            "parse_decode_fast_config",
+            side_effect=lambda *a, **kw: orig_parse(*a, **{**kw, "b_tokens": 16}),
+        ):
+            hlo_16_full_s3_hk = _compile_step_c_aot(
+                tp=16, B=256, pps=32, sw=-1, mode=prod_mode,
+                dense2=False, bd4=True, dist_len=3, has_rope=False, allow_large_b=True,
+            )
+            assert "muse_w9_b1_moe_b2_rpad_b256_tp16_" in hlo_16_full_s3_hk
+
+    with mock.patch.object(
+        rpad,
+        "parse_decode_fast_config",
+        side_effect=lambda *a, **kw: orig_parse(*a, **{**kw, "b_tokens": 16}),
+    ):
+        hlo_8_full_hk = _compile_step_c_aot(
+            tp=8, B=256, pps=32, sw=-1, mode=prod_mode,
+            dense2=True, bd4=False, dist_len=3, has_rope=False, allow_large_b=True,
+        )
+        assert "muse_w9_b1_moe_b2_rpad_b256_tp8_" in hlo_8_full_hk
+
+    hlo_8_swa_hk = _compile_step_c_aot(
+        tp=8, B=256, pps=8, sw=2049, mode=prod_mode,
+        dense2=True, bd4=False, dist_len=3, has_rope=True, allow_large_b=True,
+    )
+    assert "muse_w9_b1_moe_b2_rpad_b256_tp8_" in hlo_8_swa_hk
