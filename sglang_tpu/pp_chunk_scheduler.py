@@ -140,7 +140,12 @@ class TpuPipelinePrefillAdder(PrefillAdder):
             self.step_limit,
             self.step_schedule,
         )
-        if cap == 0 and not self.can_run_list and original > 0:
+        # A cap under one page admits nothing once page-aligned below.
+        if (
+            cap < min(remaining, self.page_size)
+            and not self.can_run_list
+            and original > 0
+        ):
             cap = min(remaining, self.cost.granularity)
             if (
                 self.cost.schedule is not None
