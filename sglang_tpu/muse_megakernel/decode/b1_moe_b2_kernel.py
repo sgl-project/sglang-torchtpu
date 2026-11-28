@@ -2796,7 +2796,10 @@ def _step_c_max_bkv_rows(
     allow_large_b: bool,
     base_rows: int,
 ) -> int:
-    if eff_b in (128, 256) and not kv_pack_bd4 and (not kv_pack_dense2 or allow_large_b):
+    if not kv_pack_bd4 and (
+        (eff_b == 128 and (not kv_pack_dense2 or allow_large_b))
+        or (eff_b == 256 and allow_large_b)
+    ):
         return _STEP_C_B128_MAX_BKV_ROWS
     return _STEP_C_LARGE_B_MAX_BKV_ROWS if eff_b > 64 else base_rows
 
@@ -2958,13 +2961,14 @@ def resolve_step_c_rpa_plan(
             if kv_pack_bd4
             else min(grp_limit, _STEP_C_SWABATCH_WIDE_GRP_MAX_BKV_ROWS)
         )
+        # Cap fused Step (c) swabatch grouping at g=8: on TP=16 BD4 silicon, g8 s3 (7.5 MiB bkv)
+        # beats both g4 and g16 s3 (15 MiB bkv) across B=64 (-1.74 / -6.41 us/L), B=128 (-3.25 /
+        # -1.17 us/L), and B=256 (-6.57 / -0.76 us/L); on TP=8 D2, g8 beats g4 across B=64..256.
         grp_cands = []
-        for g in (16, 8, 4, 2):
+        for g in (8, 4, 2):
             if g > cfg_rpa.swabatch_group_size:
                 continue
-            if g == 16:
-                slot_opts = (3,) if kv_pack_bd4 else (cfg_rpa.num_slots, 3)
-            elif g == 8:
+            if g == 8:
                 slot_opts = (
                     (3, 4)
                     if (kv_pack_bd4 and cfg_rpa.num_slots == 4)
