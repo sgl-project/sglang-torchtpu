@@ -5241,6 +5241,8 @@ def gmm_v2_fused_rs(
     )
     use_dedicated_w2_fp8_cache = (
         int(envs.SGLANG_TPU_MUSE_KERNEL_GMM_W2_FP8_CACHE.get() or 0) >= 1
+        and not eff_weight_lookahead
+        and not eff_wla2
         and is_quantized
         and not fp8_direct_write
         and not use_w2_prequant_cache

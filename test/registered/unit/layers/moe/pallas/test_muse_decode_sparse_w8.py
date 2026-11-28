@@ -5151,6 +5151,136 @@ class TestMuseDecodeSparseW8(unittest.TestCase):
             self.assertIn("_lmm32", comp_s3.as_text())
             self.assertGreater(comp_s3.memory_analysis().generated_code_size_in_bytes, 0)
 
+    def test_w17_tile_m128_imem_unroll_gate_and_fast_gs_b256(self):
+        """Verify tile_m>=128 strip-unroll IMEM reduction and fast_gs B=256 on_wait parity."""
+        import dataclasses
+        import numpy as np
+
+        v1_mod = _load_pkg_module(
+            "fused_decode_sparse", _MUSE_DIR / "fused_decode_sparse.py"
+        )
+        clean_env = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith("SGLANG_TPU_MUSE_")
+        }
+
+        try:
+            import jax
+            import jax.numpy as jnp
+            from jax.experimental import pallas as pl
+            from jax.experimental.pallas import tpu as pltpu
+            from jax.experimental.topologies import get_topology_desc
+            from jax.sharding import Mesh, PartitionSpec as P
+        except Exception as exc:
+            self.skipTest(f"JAX/Pallas TPU unavailable: {exc}")
+
+        # 1. Non-eager on_wait Interpret parity for fast_gs B=256 unrolled _reshape_x_to_3d.
+        interp_p = {
+            "dma_execution_mode": "on_wait",
+            "detect_races": True,
+            **(
+                {"uninitialized_memory": "nan"}
+                if "uninitialized_memory" in pltpu.InterpretParams.__annotations__
+                else {}
+            ),
+        }
+        rng = np.random.default_rng(20261217)
+        x_b256 = jnp.asarray(rng.normal(0.0, 0.5, size=(256, 4096)), jnp.bfloat16)
+        cfg_ref = dataclasses.replace(
+            v1_mod.default_sparse_decode_config(256, 16, 512),
+            fast_gs=False,
+            fast_b64_epi_pro=False,
+        )
+        cfg_fast = dataclasses.replace(
+            cfg_ref,
+            fast_gs=True,
+        )
+
+        def _run_reshape(cfg):
+            def _kern(x_r, o_r, x3_s):
+                v1_mod._reshape_x_to_3d(x_r, x3_s, 256, cfg)
+                o_r[...] = x3_s[...]
+
+            return np.asarray(
+                pl.pallas_call(
+                    _kern,
+                    out_shape=jax.ShapeDtypeStruct((256, 32, 128), jnp.bfloat16),
+                    in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)],
+                    out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
+                    scratch_shapes=[pltpu.VMEM((256, 32, 128), jnp.bfloat16)],
+                    interpret=pltpu.InterpretParams(**interp_p),
+                )(x_b256),
+                dtype=np.float32,
+            )
+
+        np.testing.assert_array_equal(_run_reshape(cfg_fast), _run_reshape(cfg_ref))
+
+        # 2. AOT IMEM check on tpu7x:2x2x2: B=256 (tile_m=128) unroll_strips=True + fast_gs=True
+        # must stay compact (< 4 MiB standalone vs ~5.0 MiB before gating), and B=128 (tile_m=64) compiles.
+        tpu_devs = get_topology_desc("tpu7x:2x2x2", platform="tpu").devices
+        if len(tpu_devs) >= 16:
+            tpu_mesh = Mesh(
+                np.array(
+                    sorted(tpu_devs, key=lambda d: (d.coords[2], d.coords[1], d.coords[0], d.core_on_chip))
+                ),
+                ("model",),
+            )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    **clean_env,
+                    "SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_B64": "4",
+                    "SGLANG_TPU_MUSE_KERNEL_DECODE_LHS_FP8": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_DECODE_TILE_M128": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_DECODE_UNROLL_STRIPS": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_DECODE_FAST_GS": "1",
+                },
+                clear=True,
+            ):
+                cfg_b256 = v1_mod.default_sparse_decode_config(256, 16, 512)
+                cfg_b128 = v1_mod.default_sparse_decode_config(128, 16, 512)
+            self.assertTrue(cfg_b256.unroll_strips and cfg_b256.fast_gs and cfg_b256.tile_m == 128)
+            self.assertTrue(cfg_b128.unroll_strips and cfg_b128.fast_gs and cfg_b128.tile_m == 64)
+
+            ep, h, n1, i_dim, sb = 16, 4096, 8192, 4096, 512
+            e_local = 256 // ep
+            for cur_b, cur_cfg, max_code_bytes in (
+                (256, cfg_b256, 4_000_000),
+                (128, cfg_b128, 6_000_000),
+            ):
+                shapes = (
+                    jax.ShapeDtypeStruct((1,), jnp.int32),
+                    jax.ShapeDtypeStruct((cur_b, 256), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((1, 256), jnp.float32),
+                    jax.ShapeDtypeStruct((cur_b, h), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((e_local, h, n1), jnp.float4_e2m1fn),
+                    jax.ShapeDtypeStruct((e_local, h // sb, n1), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((e_local, i_dim, h), jnp.float4_e2m1fn),
+                    jax.ShapeDtypeStruct((e_local, i_dim // sb, h), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((1, h), jnp.bfloat16),
+                )
+                comp = (
+                    jax.jit(
+                        jax.shard_map(
+                            lambda *args, _cfg=cur_cfg: v1_mod.fused_decode_sparse_from_logits(
+                                *args, ep=ep, return_sharded=True, config=_cfg
+                            ),
+                            mesh=tpu_mesh,
+                            in_specs=(P(),) * len(shapes),
+                            out_specs=P(),
+                            check_vma=False,
+                        )
+                    )
+                    .trace(*shapes)
+                    .lower(lowering_platforms=("tpu",))
+                    .compile()
+                )
+                code_bytes = comp.memory_analysis().generated_code_size_in_bytes
+                self.assertIn("tpu_custom_call", comp.as_text())
+                self.assertGreater(code_bytes, 0)
+                self.assertLess(code_bytes, max_code_bytes)
+
 
 if __name__ == "__main__":
     unittest.main()

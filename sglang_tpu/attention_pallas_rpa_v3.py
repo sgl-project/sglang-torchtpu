@@ -618,6 +618,8 @@ def _invoke_v3_kernel(
                 and num_q_tokens >= 512
             ):
                 bkv_sz = 32768
+                if bq_sz > 4096:
+                    bq_sz = 4096
             elif (
                 is_lc_full
                 and (

@@ -4764,19 +4764,19 @@ def _use_tp8_parallel_xy_ag(
     half_h: int,
     n_ici_sems: int = 5,
 ) -> bool:
-    """Return True when 2-slab parallel XY doubling beats 3-peer AG on TP=8 silicon.
+    """Return True when in-place 2-slab parallel XY doubling beats 3-peer AG on TP=8 silicon.
 
-    Verified bit-exact on 2x2x1 TPU7x for ``B >= 256, H >= 8192`` (``r_pair >= 64,
-    half_h >= 4096``: ``-11.0%`` on isolated ``ag_capture``, ``-4.0%`` on standalone
-    ``ChipB2 B=256``). Smaller ``B=64/128`` batches stay on 3-peer because fused
-    ``Step (b)/(c)`` overlap regressed under 2-slab VPU permute + ``op_dx`` overhead.
-    Requires ``>= 5`` ICI send/recv semaphores (Steps 1-2 disjoint + ``op_dx``).
+    Verified bit-exact on 2x2x1 TPU7x for ``B >= 128, H >= 8192`` (``r_pair >= 32,
+    half_h >= 4096``: ``-3.74 us/L`` on ``B=128`` ``Step (c)``, ``-2.47..-2.60 us/L``
+    on ``B=128/256`` ``ChipB2_epi``, ``-3.22 us`` on ``L61_Final B=256``). Smaller
+    ``B <= 64`` (`r_pair=16`) or ``half_h < 4096`` stay on 3-peer 1-shot.
+    Requires ``>= 5`` ICI send/recv semaphores (Hop 1-2 disjoint + 2nd X-slab chunk).
     """
     return (
         world_size == 8
         and not is_3d_out
         and n_ici_sems >= 5
-        and r_pair >= 64
+        and r_pair >= 32
         and (r_pair % 16 == 0)
         and half_h >= 4096
         and (half_h % 128 == 0)
@@ -4955,6 +4955,27 @@ def _tp16_parallel_xyz_ag(
     op_dyx.wait()
 
 
+class _CombinedSemSeq:
+    """Concatenate semaphore slices behind ``.shape`` and ``.at[idx]`` without allocation."""
+
+    def __init__(self, sems):
+        self._sems = tuple(sems)
+
+    @property
+    def shape(self) -> tuple[int]:
+        return (len(self._sems),)
+
+    @property
+    def at(self):
+        sems = self._sems
+
+        class _At:
+            def __getitem__(self, idx):
+                return sems[idx]
+
+        return _At()
+
+
 def _tp8_parallel_xy_ag(
     pair_ref,
     out_full_ref,
@@ -4974,8 +4995,16 @@ def _tp8_parallel_xy_ag(
     during_ici_fn,
     during_d2d2_fn,
     copy_local_from_pair: bool,
+    during_ici_early: bool = False,
 ) -> None:
-    """2-slab parallel XY doubling all-gather for TP=8 (``0`` extra VMEM, ``0`` extra sems)."""
+    """In-place zero-permute 2-slab parallel XY doubling all-gather for TP=8.
+
+    Both slabs (`slab_x` via X->Y and `slab_y` via Y->X) write strictly into their own
+    canonical row slots on `side_c0`, avoiding both `perm_y` VPU permutes and the serial
+    `op_dx` sync barrier: `other_c0` stays untouched until one single `op_d2d2` swaps
+    `[B, H/2]` cleanly with `mate`.
+    """
+    del side, other_side
     import jax.numpy as jnp
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
@@ -4984,98 +5013,101 @@ def _tp8_parallel_xy_ag(
     cy = (chip >> jnp.int32(1)) & jnp.int32(1)
     peer_x = me ^ jnp.int32(2)
     peer_y = me ^ jnp.int32(4)
-    other_c0 = pl.multiple_of(other_side * half_h, 128)
     chip_r0 = pl.multiple_of(chip * r_pair, 16)
 
     n_tiles = half_h // 128
     t_x = n_tiles // 2
     t_y = n_tiles - t_x
     w_x, w_y = t_x * 128, t_y * 128
-    q_y = (cx << jnp.int32(1)) | cy
-    qy_r0 = pl.multiple_of(q_y * r_pair, 16)
 
     slab_x = out_full_ref.at[:, pl.ds(pl.multiple_of(side_c0, 128), w_x)]
-    slab_y_dst = out_full_ref.at[:, pl.ds(pl.multiple_of(side_c0 + w_x, 128), w_y)]
-    slab_y = out_full_ref.at[:, pl.ds(pl.multiple_of(other_c0 + w_x, 128), w_y)]
-
-    bm = _pick_strip(r_pair, 32)
-    spans_x = _tile_spans(w_x, 1024)
-    spans_y = _tile_spans(w_y, 1024)
+    slab_y = out_full_ref.at[:, pl.ds(pl.multiple_of(side_c0 + w_x, 128), w_y)]
 
     if copy_local_from_pair:
         assert pair_ref is not None
+        bm = _pick_strip(r_pair, 32)
+        spans_all = _tile_spans(half_h, 1024)
         for r0 in range(0, r_pair, bm):
             rs_l = pl.ds(r0, bm)
             rs_ch = pl.ds(pl.multiple_of(chip_r0 + r0, 16), bm)
-            rs_qy = pl.ds(pl.multiple_of(qy_r0 + r0, 16), bm)
-            for off, cw in spans_x:
-                slab_x[rs_ch, pl.ds(pl.multiple_of(off, 128), cw)] = pair_ref[
-                    rs_l, pl.ds(pl.multiple_of(side_c0 + off, 128), cw)
-                ]
-            for off, cw in spans_y:
-                slab_y[rs_qy, pl.ds(pl.multiple_of(off, 128), cw)] = pair_ref[
-                    rs_l, pl.ds(pl.multiple_of(side_c0 + w_x + off, 128), cw)
-                ]
-    else:
-        for r0 in range(0, r_pair, bm):
-            rs_src = pl.ds(pl.multiple_of(chip_r0 + r0, 16), bm)
-            rs_qy = pl.ds(pl.multiple_of(qy_r0 + r0, 16), bm)
-            for off, cw in spans_y:
-                cs = pl.ds(pl.multiple_of(off, 128), cw)
-                slab_y[rs_qy, cs] = slab_y_dst[rs_src, cs]
+            for off, cw in spans_all:
+                cs = pl.ds(pl.multiple_of(side_c0 + off, 128), cw)
+                out_full_ref[rs_ch, cs] = pair_ref[rs_l, cs]
 
-    _run_ag_ici_step(
-        ((slab_x, chip * r_pair, peer_x), (slab_y, q_y * r_pair, peer_y)),
-        ici_send,
-        ici_recv,
-        sem_base=0,
-        n_r=r_pair,
-    )
-    # Disjoint Step-2 semaphores (2..3) avoid racing diagonal peer Step-1 signals under skew.
-    _run_ag_ici_step(
-        ((slab_x, cy * (2 * r_pair), peer_y), (slab_y, cx * (2 * r_pair), peer_x)),
-        ici_send,
-        ici_recv,
-        sem_base=2,
-        n_r=2 * r_pair,
-        overlap_fn=during_ici_fn,
-    )
-
-    perm_y = (0, 2, 1, 3)
-    for q in range(4):
-        cy_dst = perm_y[q] * r_pair
-        q_r0 = q * r_pair
-        for r0 in range(0, r_pair, bm):
-            rs_q = pl.ds(pl.multiple_of(q_r0 + r0, 16), bm)
-            rs_yd = pl.ds(pl.multiple_of(cy_dst + r0, 16), bm)
-            for off, cw in spans_y:
-                cs = pl.ds(pl.multiple_of(off, 128), cw)
-                slab_y_dst[rs_yd, cs] = slab_y[rs_q, cs]
-
-    # Swap slab_x first on disjoint ici[4] so wait(op_dx) syncs mate before op_dy overwrites other_c0[w_x:].
-    op_dx = pltpu.make_async_remote_copy(
-        slab_x,
-        slab_x,
-        ici_send.at[4],
-        ici_recv.at[4],
-        device_id=(mate,),
+    # Hop 1: slab_x -> peer_x (slot chip_r0) and slab_y -> peer_y (slot chip_r0).
+    op1_x = pltpu.make_async_remote_copy(
+        slab_x.at[pl.ds(chip_r0, r_pair), :],
+        slab_x.at[pl.ds(chip_r0, r_pair), :],
+        ici_send.at[0],
+        ici_recv.at[0],
+        device_id=(peer_x,),
         device_id_type=pl.DeviceIdType.MESH,
     )
-    op_dx.start()
-    op_dx.wait()
+    op1_y = pltpu.make_async_remote_copy(
+        slab_y.at[pl.ds(chip_r0, r_pair), :],
+        slab_y.at[pl.ds(chip_r0, r_pair), :],
+        ici_send.at[1],
+        ici_recv.at[1],
+        device_id=(peer_y,),
+        device_id_type=pl.DeviceIdType.MESH,
+    )
+    op1_x.start()
+    op1_y.start()
+    if during_ici_early and during_ici_fn is not None:
+        during_ici_fn()
+    op1_x.wait()
+    op1_y.wait()
 
-    op_dy = pltpu.make_async_remote_copy(
-        slab_y_dst,
-        slab_y_dst,
+    # Hop 2: slab_x sends contiguous 2*r_pair on Y; slab_y sends its two r_pair chunks on X.
+    x2_r0 = pl.multiple_of(cy * (2 * r_pair), 16)
+    y2_r0a = pl.multiple_of(cx * r_pair, 16)
+    y2_r0b = pl.multiple_of((2 + cx) * r_pair, 16)
+    op2_x = pltpu.make_async_remote_copy(
+        slab_x.at[pl.ds(x2_r0, 2 * r_pair), :],
+        slab_x.at[pl.ds(x2_r0, 2 * r_pair), :],
+        ici_send.at[2],
+        ici_recv.at[2],
+        device_id=(peer_y,),
+        device_id_type=pl.DeviceIdType.MESH,
+    )
+    op2_ya = pltpu.make_async_remote_copy(
+        slab_y.at[pl.ds(y2_r0a, r_pair), :],
+        slab_y.at[pl.ds(y2_r0a, r_pair), :],
+        ici_send.at[3],
+        ici_recv.at[3],
+        device_id=(peer_x,),
+        device_id_type=pl.DeviceIdType.MESH,
+    )
+    op2_yb = pltpu.make_async_remote_copy(
+        slab_y.at[pl.ds(y2_r0b, r_pair), :],
+        slab_y.at[pl.ds(y2_r0b, r_pair), :],
+        ici_send.at[4],
+        ici_recv.at[4],
+        device_id=(peer_x,),
+        device_id_type=pl.DeviceIdType.MESH,
+    )
+    op2_x.start()
+    op2_ya.start()
+    op2_yb.start()
+    if (not during_ici_early) and during_ici_fn is not None:
+        during_ici_fn()
+    op2_x.wait()
+    op2_ya.wait()
+    op2_yb.wait()
+
+    # Single intra-chip D2D swap: `other_c0` was untouched during ICI.
+    op_d2d2 = pltpu.make_async_remote_copy(
+        out_full_ref.at[:, pl.ds(side_c0, half_h)],
+        out_full_ref.at[:, pl.ds(side_c0, half_h)],
         d2d2_send.at[0],
         d2d2_recv.at[0],
         device_id=(mate,),
         device_id_type=pl.DeviceIdType.MESH,
     )
-    op_dy.start()
+    op_d2d2.start()
     if during_d2d2_fn is not None:
         during_d2d2_fn()
-    op_dy.wait()
+    op_d2d2.wait()
 
 
 def _ag_chip_sharded_half_col_xor1(
@@ -5176,6 +5208,7 @@ def _ag_chip_sharded_half_col_xor1(
             during_ici_fn=during_ici_fn,
             during_d2d2_fn=during_d2d2_fn,
             copy_local_from_pair=copy_local_from_pair,
+            during_ici_early=during_ici_early,
         )
         return
 
@@ -7687,15 +7720,36 @@ def _run_chip_b2_vmem_core(
         skip_stream_load=skip_stream_load,
     )
 
+    # When is_tp2_wpost=True, post_ici_send/recv (ag_log) are unused after PAIR_RS / barrier;
+    # borrow 2 disjoint semaphores so TP=8 B>=128 Step (c) unlocks 5-sem in-place 2D-XY in_ag.
+    eff_in_s, eff_in_r = in_ici_send, in_ici_recv
+    is_tp2_wpost = (2 * w_post_buf.shape[1]) == s_buf.shape[1]
+    if (
+        world_size == 8
+        and r_pair >= 32
+        and is_tp2_wpost
+        and post_ici_send is not in_ici_send
+        and post_ici_recv is not in_ici_recv
+        and min(int(in_ici_send.shape[0]), int(in_ici_recv.shape[0])) < 5
+        and int(post_ici_send.shape[0]) >= 2
+        and int(post_ici_recv.shape[0]) >= 2
+    ):
+        eff_in_s = _CombinedSemSeq(
+            [in_ici_send.at[0], in_ici_send.at[1], in_ici_send.at[2], post_ici_send.at[0], post_ici_send.at[1]]
+        )
+        eff_in_r = _CombinedSemSeq(
+            [in_ici_recv.at[0], in_ici_recv.at[1], in_ici_recv.at[2], post_ici_recv.at[0], post_ici_recv.at[1]]
+        )
+
     _ag_chip_sharded_half_col_xor1(
         next_in_pair if r_pair == 8 else None, next_in_vmem,
-        in_ici_send, in_ici_recv, in_d2d2_send, in_d2d2_recv,
+        eff_in_s, eff_in_r, in_d2d2_send, in_d2d2_recv,
         me=me, world_size=world_size, ag_3d_buf=ag_3d_buf,
         during_ici_fn=during_in_ici_fn,
         during_d2d2_fn=lambda: _dma_wait(w_qkv_buf, w_qkv_sem.at[0]),
         r_pair_in=r_pair,
         copy_local_from_pair=(r_pair == 8),
-        during_ici_early=during_in_ici_early,
+        during_ici_early=(during_in_ici_early or (world_size == 8 and r_pair >= 32)),
     )
 
     qkv_dst = qkv_vmem if fuse_qkv_epi else out_qkv_or_q_ref

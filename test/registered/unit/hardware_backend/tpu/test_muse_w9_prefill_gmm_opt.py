@@ -2775,8 +2775,23 @@ def test_w4a8_k_chain_scaled_fp8_interpret_and_aot() -> None:
                 },
                 nb=8,
             )
-            assert "-wla2" in hlo_nb8 and "-w2c1" in hlo_nb8 and "-kc" not in hlo_nb8
+            assert "-wla2" in hlo_nb8 and "-w2c1" not in hlo_nb8 and "-kc" not in hlo_nb8
             assert 0 < code_nb8 <= 3_385_344
+
+            # Without WLA, W2_FP8_CACHE=1 stays active on tile_m=256 (matching caller_tile_m=256).
+            code_w2c, hlo_w2c = _compile_topo(
+                "tpu7x=2x2x1",
+                8,
+                36,
+                {
+                    "SGLANG_TPU_MUSE_KERNEL_PREFILL_GMM_TILES": "256,4096,2048,4096,2048,2,1",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_W4A8_K_CHAIN": "4096",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_W2_FP8_CACHE": "1",
+                    "SGLANG_TPU_MUSE_KERNEL_GMM_WEIGHT_LOOKAHEAD": "0",
+                },
+                nb=8,
+            )
+            assert "-wla" not in hlo_w2c and "-w2c1" in hlo_w2c and 0 < code_w2c <= 3_385_344
 
             # Wave-15: half-N n2048 (2,2) on nb=16 cleanly suppresses k_chain (no 4.84 MiB IMEM bloat).
             code_n2048, hlo_n2048 = _compile_topo(
@@ -2866,22 +2881,18 @@ def test_w4a8_k_chain_scaled_fp8_interpret_and_aot() -> None:
                     "SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_LHS": "0",
                 },
             ):
-                assert (
-                    _select_fused_rs_block_sizes(
-                        size_m=65536, quant_block_size=512, **base_bs_kw
-                    ).tile_n1
-                    != 4096
+                bs_no_slh = _select_fused_rs_block_sizes(
+                    size_m=65536, quant_block_size=512, **base_bs_kw
                 )
+                assert (bs_no_slh.tile_m, bs_no_slh.tile_n1) != (256, 4096)
             with patch.dict(
                 os.environ,
                 {**slh_wla2_env, "SGLANG_TPU_MUSE_KERNEL_GMM_WEIGHT_LOOKAHEAD": "0"},
             ):
-                assert (
-                    _select_fused_rs_block_sizes(
-                        size_m=65536, quant_block_size=512, **base_bs_kw
-                    ).tile_n1
-                    != 4096
+                bs_no_wla = _select_fused_rs_block_sizes(
+                    size_m=65536, quant_block_size=512, **base_bs_kw
                 )
+                assert (bs_no_wla.tile_m, bs_no_wla.tile_n1) != (256, 4096)
             with patch.dict(
                 os.environ,
                 {**slh_wla2_env, "SGLANG_TPU_MUSE_KERNEL_GMM_EXPERT_OUTER_FP8": "3"},
@@ -2897,7 +2908,7 @@ def test_w4a8_k_chain_scaled_fp8_interpret_and_aot() -> None:
 
 
 def test_w16_b2_bm256_hbm_and_kd_smid4_interpret_and_aot() -> None:
-    """Verify Wave-16 kernel_b2 bm=256+HBM_OUT and kernel_d smid_4x+p256+do5_t128 under on_wait Interpret and TPU7x AOT."""
+    """Verify kernel_b2 bm128_dbl/bm256+s256_n1024_chi and kernel_d c_grp=16+smid_4x under on_wait Interpret and TPU7x AOT."""
     jax = pytest.importorskip("jax")
     jnp = pytest.importorskip("jax.numpy")
     from jax.experimental import pallas as pl
@@ -2934,7 +2945,7 @@ def test_w16_b2_bm256_hbm_and_kd_smid4_interpret_and_aot() -> None:
         ),
         jax.default_device(jax.devices("cpu")[0]),
     ):
-        # 1. kernel_b2 bm=256+HBM_OUT (multi-step + 256-aligned row_range) vs bm=128 reference.
+        # 1. kernel_b2 bm128_dbl (B2_DBL_STREAM=True) and bm256+HBM_OUT (B2_DBL_STREAM=False) parity.
         attn = jnp.array(
             (rng.standard_normal((t_loc, h_dim)) * 0.25).astype(np.float32)
         ).astype(jnp.bfloat16)
@@ -2952,7 +2963,6 @@ def test_w16_b2_bm256_hbm_and_kd_smid4_interpret_and_aot() -> None:
             jnp.bfloat16
         )
 
-        # 128-aligned slice forces bm=128 fallback as ground-truth reference.
         r_ref0 = kernel_b2.pallas_fused_b1_b2_wpool_quant(
             attn, stream, v8k, v8k, v8k, wr, eb, wp, v4k_f, pe_w,
             router_mode="bf16_hilo_pre", fp8_wpool=True, row_range=(0, 128),
@@ -2963,7 +2973,7 @@ def test_w16_b2_bm256_hbm_and_kd_smid4_interpret_and_aot() -> None:
             router_mode="bf16_hilo_pre", fp8_wpool=True, row_range=(128, t_loc),
             stream_mid_prev=r_ref0[2], emit_fp8_gmm=True, static_fp8_scale=8.0,
         )
-        full_bm256 = kernel_b2.pallas_fused_b1_b2_wpool_quant(
+        full_bm128_dbl = kernel_b2.pallas_fused_b1_b2_wpool_quant(
             attn, stream, v8k, v8k, v8k, wr, eb, wp, v4k_f, pe_w,
             router_mode="bf16_hilo_pre", fp8_wpool=True,
             emit_fp8_gmm=True, static_fp8_scale=8.0,
@@ -2978,22 +2988,29 @@ def test_w16_b2_bm256_hbm_and_kd_smid4_interpret_and_aot() -> None:
             router_mode="bf16_hilo_pre", fp8_wpool=True, row_range=(256, 512),
             stream_mid_prev=c256_0[2], emit_fp8_gmm=True, static_fp8_scale=8.0,
         )
-        assert full_bm256[0].shape == (t_loc, he_dim // 128, 128)
-        assert full_bm256[1] is None
+        with patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_B2_DBL_STREAM, "get", return_value=False):
+            full_bm256 = kernel_b2.pallas_fused_b1_b2_wpool_quant(
+                attn, stream, v8k, v8k, v8k, wr, eb, wp, v4k_f, pe_w,
+                router_mode="bf16_hilo_pre", fp8_wpool=True,
+                emit_fp8_gmm=True, static_fp8_scale=8.0,
+            )
         ref_fp8 = np.asarray(jnp.concatenate([r_ref0[0], r_ref1[0]], axis=0).astype(jnp.float32))
         ref_ids = np.asarray(jnp.concatenate([r_ref0[3], r_ref1[3]], axis=0))
         ref_ws = np.asarray(jnp.concatenate([r_ref0[4], r_ref1[4]], axis=0).astype(jnp.float32))
-        np.testing.assert_array_equal(np.asarray(full_bm256[0].astype(jnp.float32)), ref_fp8)
-        np.testing.assert_array_equal(np.asarray(full_bm256[2]), np.asarray(r_ref1[2]))
-        np.testing.assert_array_equal(np.asarray(full_bm256[3]), ref_ids)
-        np.testing.assert_array_equal(np.asarray(full_bm256[4].astype(jnp.float32)), ref_ws)
+        for res_b2 in (full_bm128_dbl, full_bm256):
+            assert res_b2[0].shape == (t_loc, he_dim // 128, 128)
+            assert res_b2[1] is None
+            np.testing.assert_array_equal(np.asarray(res_b2[0].astype(jnp.float32)), ref_fp8)
+            np.testing.assert_array_equal(np.asarray(res_b2[2]), np.asarray(r_ref1[2]))
+            np.testing.assert_array_equal(np.asarray(res_b2[3]), ref_ids)
+            np.testing.assert_array_equal(np.asarray(res_b2[4].astype(jnp.float32)), ref_ws)
         np.testing.assert_array_equal(
             np.asarray(jnp.concatenate([c256_0[0], c256_1[0]], axis=0).astype(jnp.float32)),
             ref_fp8,
         )
         np.testing.assert_array_equal(np.asarray(c256_1[2]), np.asarray(r_ref1[2]))
 
-        # 2. kernel_d smid_4x+p256 (fp8q=4096) and t128 d_fuse_p34 suppression (fp8q=512).
+        # 2. kernel_d c_grp=16 MXU combine (fp8q=4096 & 512) parity with non-MXU VPU reference.
         t_d = 256
         ob_fp8 = jnp.array(
             (rng.standard_normal((t_d * 8, 32, 128)) * 0.25).astype(np.float32)
@@ -3028,6 +3045,7 @@ def test_w16_b2_bm256_hbm_and_kd_smid4_interpret_and_aot() -> None:
             with (
                 patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_T128_FAST, "get", return_value=False),
                 patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_OPT, "get", return_value=5),
+                patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_MXU_COMBINE, "get", return_value=False),
             ):
                 ns_ref_d, ni_ref_d = kernel_d.pallas_combine_unpool_residual_nextnorm_4slab(
                     ob_fp8, ip_d, tw_d, sm_d, wu_d, ws_d, wv_d, wv_d, wv_d, wv_d,
@@ -3070,8 +3088,27 @@ def test_w16_b2_bm256_hbm_and_kd_smid4_interpret_and_aot() -> None:
                 np.asarray(ni_do7.astype(jnp.float32)),
                 np.asarray(ni_do5.astype(jnp.float32)),
             )
+            with patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_D_MXU_COMBINE, "get", return_value=False):
+                ns_vpu512, ni_vpu512 = kernel_d.pallas_combine_unpool_residual_nextnorm_4slab(
+                    ob_fp8, ip_d, tw_d, sm_d, wu_d, ws_d, wv_d, wv_d, wv_d, wv_d,
+                    tok_tile=64, fp8_unpool=True, fp8_unpool_qbs=512,
+                    emit_static_fp8_attn_in=True, scrub_mxu_nan=False,
+                )
+            np.testing.assert_array_equal(np.asarray(ns_do7), np.asarray(ns_vpu512))
+            cos_ni512 = float(
+                np.dot(
+                    np.asarray(ni_do7.astype(jnp.float32), np.float64).ravel(),
+                    np.asarray(ni_vpu512.astype(jnp.float32), np.float64).ravel(),
+                )
+                / (
+                    np.linalg.norm(ni_do7.astype(jnp.float32))
+                    * np.linalg.norm(ni_vpu512.astype(jnp.float32))
+                    + 1e-30
+                )
+            )
+            assert cos_ni512 > 0.9999, f"kernel_d 512 cgrp16 cos_ni={cos_ni512}"
 
-    # 3. TPU7x AOT compile + HLO checks across 2x2x1 (TP=8, t=2048) & 2x2x2 (TP=16, t=1024).
+    # 3. TPU7x AOT compile + HLO/IMEM checks across 2x2x1 (TP=8, t=2048) & 2x2x2 (TP=16, t=1024).
     with (
         patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
         tpu_info_for_cpu_export(),
@@ -3123,8 +3160,8 @@ def test_w16_b2_bm256_hbm_and_kd_smid4_interpret_and_aot() -> None:
                     jax.ShapeDtypeStruct((4096,), jnp.float32),
                 )
                 for ck_cfg, expected_tag in (
-                    ((t_loc_aot,), "_bm256_"),
-                    *(([(512, 512), "_bm256_"], [(128, 896), "_bm128_"]) if t_loc_aot == 1024 else ()),
+                    ((t_loc_aot,), "_bm128_f256_dbl"),
+                    *(([(512, 512), "_bm128_f256_dbl"], [(128, 896), "_bm128_"]) if t_loc_aot == 1024 else ()),
                 ):
                     sm_b2 = jax.jit(
                         jax.shard_map(
@@ -3137,7 +3174,25 @@ def test_w16_b2_bm256_hbm_and_kd_smid4_interpret_and_aot() -> None:
                     )
                     low_b2 = sm_b2.trace(*b2_specs).lower(lowering_platforms=("tpu",))
                     assert expected_tag in low_b2.as_text("stablehlo")
-                    low_b2.compile()
+                    comp_b2 = low_b2.compile()
+                    imem_b2 = getattr(comp_b2.memory_analysis(), "generated_code_size_in_bytes", -1)
+                    assert 0 < imem_b2 <= 3_385_344, f"{topo_name} {ck_cfg} b2 imem={imem_b2}"
+
+                with patch.object(tpu_envs.SGLANG_TPU_MUSE_KERNEL_B2_DBL_STREAM, "get", return_value=False):
+                    sm_b2_256 = jax.jit(
+                        jax.shard_map(
+                            lambda *a: _b2_chunks(*a, chunks=(t_loc_aot,)),
+                            mesh=aot_mesh,
+                            in_specs=(P("model", None), P("model", None)) + (P(),) * 8,
+                            out_specs=(P("model"),) * 4,
+                            check_vma=False,
+                        )
+                    )
+                    low_b2_256 = sm_b2_256.trace(*b2_specs).lower(lowering_platforms=("tpu",))
+                    assert "_bm256_" in low_b2_256.as_text("stablehlo")
+                    comp_b2_256 = low_b2_256.compile()
+                    imem_b2_256 = getattr(comp_b2_256.memory_analysis(), "generated_code_size_in_bytes", -1)
+                    assert 0 < imem_b2_256 <= 3_385_344
 
                 for ob_dt, qbs_aot in (
                     (jnp.float8_e4m3fn, 4096),
@@ -3179,6 +3234,8 @@ def test_w16_b2_bm256_hbm_and_kd_smid4_interpret_and_aot() -> None:
                         hlo_d = low_d.as_text("stablehlo")
                         if qbs_aot == 4096:
                             assert "_sm4" in hlo_d and "_p256_" in hlo_d
-                        low_d.compile()
+                        comp_d = low_d.compile()
+                        imem_d = getattr(comp_d.memory_analysis(), "generated_code_size_in_bytes", -1)
+                        assert 0 < imem_d <= 3_385_344, f"{topo_name} q={qbs_aot} d imem={imem_d}"
         finally:
             jax.clear_caches()

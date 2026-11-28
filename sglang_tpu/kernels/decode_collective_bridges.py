@@ -601,6 +601,7 @@ def _run_oproj_ar_and_post_attn_norm(
     skip_stream_load: bool = False,
     skip_stream_store: bool = False,
     prestarted_wo_dma: bool = False,
+    c2b_into_send_half: bool = False,
 ) -> None:
     """Shared core: D2D-overlapped FP8 ``o_proj`` + ``XOR=1`` AR + ``pa_ln + res + pre_ffn_ln``.
 
@@ -829,62 +830,141 @@ def _run_oproj_ar_and_post_attn_norm(
         ag2_a.wait()
         ag2_b.wait()
     else:
-        # Small-B / TP16 latency-optimal 1-shot symmetric XOR RS + AG.
-        c1b = []
-        for d in range(1, n_chips):
-            peer = me ^ jnp.int32(d << 1)
-            peer_chip = chip ^ jnp.int32(d)
-            op = pltpu.make_async_remote_copy(
-                own_half.at[:, pl.ds(pl.multiple_of(peer_chip * chunk, 128), chunk)],
-                scatter_ref.at[d - 1],
-                ar_s1b_send.at[d - 1],
-                ar_s1b_recv.at[d - 1],
-                device_id=(peer,),
-                device_id_type=pl.DeviceIdType.MESH,
+        if (
+            c2b_into_send_half
+            and world_size == 8
+            and rows <= 8
+            and h_out_buf.shape == (rows, hidden)
+            and scatter_ref.shape == (n_chips - 1, rows, chunk)
+            and own_chunk.shape == (rows, chunk)
+            and int(ar_s2a_send.shape[0]) >= n_chips - 1
+            and int(ar_s2a_recv.shape[0]) >= n_chips - 1
+            and r_out_buf is not h_out_buf
+        ):
+            # TP=8 B<=8 latency-optimal 1-shot AR over causally dead buffers (0 extra VMEM,
+            # -1 ICI round-trip): d=1,2 -> h_out_buf[0:H/2, H/2:H]; d=3 -> scatter_ref[0..2] + own_chunk.
+            # Leaves mate_recv untouched after _sum_s1 so remote c1b cannot race under skew.
+            h_slots = (
+                h_out_buf.at[:, pl.ds(0, half)],
+                h_out_buf.at[:, pl.ds(half, half)],
             )
-            op.start()
-            c1b.append(op)
-        for op in c1b:
-            op.wait()
+            c1b = []
+            for d in (1, 2):
+                peer = me ^ jnp.int32(d << 1)
+                op = pltpu.make_async_remote_copy(
+                    own_half,
+                    h_slots[d - 1],
+                    ar_s1b_send.at[d - 1],
+                    ar_s1b_recv.at[d - 1],
+                    device_id=(peer,),
+                    device_id_type=pl.DeviceIdType.MESH,
+                )
+                op.start()
+                c1b.append(op)
+            peer3 = me ^ jnp.int32(6)
+            for j in range(n_chips):
+                dst3 = scatter_ref.at[j] if j < n_chips - 1 else own_chunk
+                s_sem3 = ar_s1b_send.at[2] if j == 0 else ar_s2a_send.at[j - 1]
+                r_sem3 = ar_s1b_recv.at[2] if j == 0 else ar_s2a_recv.at[j - 1]
+                op = pltpu.make_async_remote_copy(
+                    own_half.at[:, pl.ds(pl.multiple_of(j * chunk, 128), chunk)],
+                    dst3,
+                    s_sem3,
+                    r_sem3,
+                    device_id=(peer3,),
+                    device_id_type=pl.DeviceIdType.MESH,
+                )
+                op.start()
+                c1b.append(op)
+            if not skip_stream_load:
+                _dma_wait(s_buf, s_in_sem.at[0])
+            _prescale_s_buf_in_vmem(s_buf, pa_alpha_ref, rows=rows, hidden=hidden, bm=bm64)
+            for op in c1b:
+                op.wait()
 
-        def _sum_s2(r0):
-            rs = pl.ds(r0, bm64)
-            for s in range(chunk_strips):
-                off = s * _COL_STRIP
-                c_l = pl.ds(pl.multiple_of(off, _COL_STRIP), _COL_STRIP)
-                c_h = pl.ds(pl.multiple_of(chip_c0 + off, _COL_STRIP), _COL_STRIP)
-                tot = own_half[rs, c_h].astype(jnp.float32)
-                for slot in range(n_chips - 1):
-                    tot = tot + scatter_ref[slot, rs, c_l].astype(jnp.float32)
-                vb = tot.astype(own_chunk.dtype)
-                own_chunk[rs, c_l] = vb
-                own_half[rs, c_h] = vb
+            def _sum_1shot(r0):
+                rs = pl.ds(r0, bm64)
 
-        _fori_strips(rows, bm64, _sum_s2)
+                def _col_1shot(c0):
+                    c_l = pl.ds(pl.multiple_of(c0, _COL_STRIP), _COL_STRIP)
+                    for j in range(n_chips):
+                        d3_slot = scatter_ref.at[j] if j < n_chips - 1 else own_chunk
+                        c_h0 = pl.ds(pl.multiple_of(j * chunk + c0, _COL_STRIP), _COL_STRIP)
+                        c_h1 = pl.ds(pl.multiple_of(half + j * chunk + c0, _COL_STRIP), _COL_STRIP)
+                        # Symmetric pairwise f32 reduction: (a_c + a_{c^1}) + (a_{c^2} + a_{c^3})
+                        # evaluates to (a0 + a1) + (a2 + a3) on all 4 chips by IEEE-754 commutativity.
+                        tot = (
+                            own_half[rs, c_h0].astype(jnp.float32)
+                            + h_out_buf[rs, c_h0].astype(jnp.float32)
+                        ) + (
+                            h_out_buf[rs, c_h1].astype(jnp.float32)
+                            + d3_slot[rs, c_l].astype(jnp.float32)
+                        )
+                        own_half[rs, c_h0] = tot.astype(own_half.dtype)
 
-        c2a = []
-        for d in range(1, n_chips):
-            peer = me ^ jnp.int32(d << 1)
-            op = pltpu.make_async_remote_copy(
-                own_chunk,
-                own_half.at[:, pl.ds(chip_c0, chunk)],
-                ar_s2a_send.at[d - 1],
-                ar_s2a_recv.at[d - 1],
-                device_id=(peer,),
-                device_id_type=pl.DeviceIdType.MESH,
-            )
-            op.start()
-            c2a.append(op)
-        if not skip_stream_load:
-            _dma_wait(s_buf, s_in_sem.at[0])
-        _prescale_s_buf_in_vmem(s_buf, pa_alpha_ref, rows=rows, hidden=hidden, bm=bm64)
-        for op in c2a:
-            op.wait()
+                _fori_strips(chunk, _COL_STRIP, _col_1shot)
 
-    # Phase 2b: Single [B, H/2] D2D AG into mate_recv OVERLAPPED with remaining own_half sum(b^2)!
+            _fori_strips(rows, bm64, _sum_1shot)
+        else:
+            # Small-B / TP16 latency-optimal 1-shot symmetric XOR RS + AG.
+            c1b = []
+            for d in range(1, n_chips):
+                peer = me ^ jnp.int32(d << 1)
+                peer_chip = chip ^ jnp.int32(d)
+                op = pltpu.make_async_remote_copy(
+                    own_half.at[:, pl.ds(pl.multiple_of(peer_chip * chunk, 128), chunk)],
+                    scatter_ref.at[d - 1],
+                    ar_s1b_send.at[d - 1],
+                    ar_s1b_recv.at[d - 1],
+                    device_id=(peer,),
+                    device_id_type=pl.DeviceIdType.MESH,
+                )
+                op.start()
+                c1b.append(op)
+            for op in c1b:
+                op.wait()
+
+            def _sum_s2(r0):
+                rs = pl.ds(r0, bm64)
+                for s in range(chunk_strips):
+                    off = s * _COL_STRIP
+                    c_l = pl.ds(pl.multiple_of(off, _COL_STRIP), _COL_STRIP)
+                    c_h = pl.ds(pl.multiple_of(chip_c0 + off, _COL_STRIP), _COL_STRIP)
+                    tot = own_half[rs, c_h].astype(jnp.float32)
+                    for slot in range(n_chips - 1):
+                        tot = tot + scatter_ref[slot, rs, c_l].astype(jnp.float32)
+                    vb = tot.astype(own_chunk.dtype)
+                    own_chunk[rs, c_l] = vb
+                    own_half[rs, c_h] = vb
+
+            _fori_strips(rows, bm64, _sum_s2)
+
+            c2a = []
+            for d in range(1, n_chips):
+                peer = me ^ jnp.int32(d << 1)
+                op = pltpu.make_async_remote_copy(
+                    own_chunk,
+                    own_half.at[:, pl.ds(chip_c0, chunk)],
+                    ar_s2a_send.at[d - 1],
+                    ar_s2a_recv.at[d - 1],
+                    device_id=(peer,),
+                    device_id_type=pl.DeviceIdType.MESH,
+                )
+                op.start()
+                c2a.append(op)
+            if not skip_stream_load:
+                _dma_wait(s_buf, s_in_sem.at[0])
+            _prescale_s_buf_in_vmem(s_buf, pa_alpha_ref, rows=rows, hidden=hidden, bm=bm64)
+            for op in c2a:
+                op.wait()
+
+    # Phase 2b: Single [B, H/2] D2D AG into c2b_dst OVERLAPPED with remaining own_half sum(b^2)!
+    # When c2b_into_send_half=True, c2b writes send_half (causally dead after c1a RX on mate),
+    # eliminating the vector-clock race against mate's _sum_s1 read of mate_recv.
+    c2b_dst = send_half if c2b_into_send_half else mate_recv
     c2b = pltpu.make_async_remote_copy(
         own_half,
-        mate_recv,
+        c2b_dst,
         ar_s2b_send.at[0],
         ar_s2b_recv.at[0],
         device_id=(mate,),
@@ -928,7 +1008,7 @@ def _run_oproj_ar_and_post_attn_norm(
         rs = pl.ds(r0, bm)
 
         def _oth_sq(c_sl, acc):
-            bf = mate_recv[rs, c_sl].astype(jnp.float32)
+            bf = c2b_dst[rs, c_sl].astype(jnp.float32)
             sq = bf * bf
             return acc + (sq[:, 0:128] + sq[:, 128:256])
 
@@ -951,7 +1031,7 @@ def _run_oproj_ar_and_post_attn_norm(
                 own_half[rs, c_l].astype(jnp.float32) * inv_pa
             )
             ns_oth = s_buf[rs, c_oth] + pa_beta_ref[0:1, c_oth] * (
-                mate_recv[rs, c_l].astype(jnp.float32) * inv_pa
+                c2b_dst[rs, c_l].astype(jnp.float32) * inv_pa
             )
             s_buf[rs, c_own] = ns_own
             s_buf[rs, c_oth] = ns_oth
@@ -1333,6 +1413,7 @@ def _run_rep_b1_vmem_core(
         skip_stream_load=skip_stream_load,
         skip_stream_store=skip_stream_store,
         prestarted_wo_dma=prestarted_wo_dma,
+        c2b_into_send_half=True,
     )
 
     # W_pre is ALREADY resident in VMEM! Run FP8 pre_expert_proj [B, 8192] @ [8192, 512]!
@@ -1394,8 +1475,9 @@ def _run_rep_b1_vmem_core(
             out_expert_3d_ref=out_expert_3d_ref,
         )
 
-    # Reuse dead send_half VMEM buffer when h_pre == half (saves 3 MiB @ B=384!).
-    eff_pre_a = send_half.at[pl.ds(0, pre_buf_rows), :] if h_pre == half else pre_half_a
+    # Reuse causally dead mate_recv when h_pre == half (`c2b_into_send_half=True` leaves
+    # mate_recv dead after _sum_s1 / 1-shot AR, and c2b.wait() syncs send_half!).
+    eff_pre_a = mate_recv.at[pl.ds(0, pre_buf_rows), :] if h_pre == half else pre_half_a
 
     # Note: no second barrier needed! Every rank already synchronized at Phase 2b c2b.wait()
     # and all ranks enter Stage 1 with pre_half_a live from kernel start!
@@ -1473,7 +1555,7 @@ def _run_rep_b1_vmem_core(
             _dma_wait(out_stream_hbm, s_out_sem.at[0])
         s3.wait()
     else:
-        eff_pre_b = mate_recv.at[pl.ds(0, pre_buf_rows), :] if h_pre == half else pre_half_b
+        eff_pre_b = send_half.at[pl.ds(0, pre_buf_rows), :] if h_pre == half else pre_half_b
         _gather_shard_xor1(
             pre_shard,
             eff_pre_a,

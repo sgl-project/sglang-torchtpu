@@ -3875,6 +3875,7 @@ def _prefix_score_kernel(
     topk_k_pair: int = 1,
     topk_sink_slices: int = 0,
     topk_tail_local: int = 0,
+    stage2_bq_sz: int | None = None,
 ):
     """Stage-1 prefix All-QK scorer (read-only on Q and KV cache)."""
     start_seq_idx, end_seq_idx = case.get_range(distribution_ref)
@@ -3905,6 +3906,7 @@ def _prefix_score_kernel(
     w_q = q_k1_bf16_ref.shape[3]
     w_red = sc_k1_ref.shape[2]
     eff_bq = bq_sz if static_q_len is None else min(bq_sz, static_q_len)
+    s2_bq_sz = eff_bq if stage2_bq_sz is None else stage2_bq_sz
     n_qgrps_per_bq = eff_bq // q_grp_sz
 
     sc_k1_ref[...] = jnp.zeros(sc_k1_ref.shape, jnp.bfloat16)
@@ -4094,7 +4096,10 @@ def _prefix_score_kernel(
             )
             tail_bkv_start = (
                 jnp.clip(
-                    cdiv(jnp.maximum(last_qgrp_start - topk_tail_local, 0), bkv_sz),
+                    jnp.maximum(
+                        last_qgrp_start // bkv_sz,
+                        cdiv(jnp.maximum(last_qgrp_start - topk_tail_local, 0), bkv_sz),
+                    ),
                     0,
                     end_bkv_idx,
                 )
@@ -4481,22 +4486,26 @@ def _prefix_score_kernel(
 
                     neg_col = jnp.bfloat16(-1e4)
 
+                    prefix_min_qgrp = jnp.maximum(
+                        cdiv((bkv_idx + 1) * bkv_sz - processed_q_len, q_grp_sz),
+                        0,
+                    )
                     min_qgrp = (
-                        jnp.maximum(
-                            cdiv(
-                                bkv_idx * bkv_sz
-                                + topk_tail_local
-                                + 256
-                                - processed_q_len,
-                                q_grp_sz,
+                        jnp.minimum(
+                            prefix_min_qgrp,
+                            jnp.maximum(
+                                cdiv(
+                                    bkv_idx * bkv_sz
+                                    + topk_tail_local
+                                    + 256
+                                    - processed_q_len,
+                                    q_grp_sz,
+                                ),
+                                0,
                             ),
-                            0,
                         )
                         if topk_tail_local > 0
-                        else jnp.maximum(
-                            cdiv((bkv_idx + 1) * bkv_sz - processed_q_len, q_grp_sz),
-                            0,
-                        )
+                        else prefix_min_qgrp
                     )
 
                     @pl.loop(min_qgrp, valid_qgrps, unroll=False)
@@ -4701,10 +4710,24 @@ def _prefix_score_kernel(
                                     q_h_iota == kv_h, s_vec[None, :], sc_pair_f32
                                 )
                         if topk_tail_local > 0:
-                            q_grp_abs = processed_q_len + g_idx * q_grp_sz
-                            half_end_abs = bkv_idx * bkv_sz + (tk_iota_w + 1) * 128
+                            q_off_s2 = bq_idx * actual_bq_sz + g_idx * q_grp_sz
+                            q_grp_abs = kv_q_gap + q_off_s2
+                            processed_q_len_s2 = (
+                                kv_q_gap + (q_off_s2 // s2_bq_sz) * s2_bq_sz
+                            )
+                            tail_bkv_start_s2 = processed_q_len_s2 // bkv_sz
+                            is_tail_blk = bkv_idx >= tail_bkv_start_s2
+                            dense_unm_lo = jnp.clip(
+                                (q_grp_abs - topk_tail_local - bkv_idx * bkv_sz)
+                                // 256,
+                                0,
+                                num_s,
+                            )
                             sc_pair_f32 = jnp.where(
-                                half_end_abs <= (q_grp_abs - topk_tail_local),
+                                jnp.logical_or(
+                                    jnp.logical_not(is_tail_blk),
+                                    tk_iota_w < (2 * dense_unm_lo),
+                                ),
                                 sc_pair_f32,
                                 jnp.float32(-1e30),
                             )
@@ -9529,6 +9552,7 @@ def ragged_paged_attention(
                     num_h_per_bkv <= 256
                     and _prefill_topk_in_kernel
                     and _prefill_topk_gqa_batch > 1
+                    and 8 % _prefill_topk_gqa_batch == 0
                 )
             )
             and (pages_per_seq * page_size) > bkv_sz
@@ -9622,6 +9646,7 @@ def ragged_paged_attention(
                     topk_k_pair=_prefill_topk_k_pair,
                     topk_sink_slices=topk_sink_slices_eff,
                     topk_tail_local=topk_tail_local_eff,
+                    stage2_bq_sz=eff_bq_topk,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=6,

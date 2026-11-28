@@ -815,7 +815,7 @@ def test_wave10_flush_pending_step_c_kv_writes_grouping():
         torch.zeros((32, 1, 4, 128), dtype=torch.float8_e4m3fn),
         False, True, (True, True, 0, False, True), 14,
     ))
-    # 11 Full unified 5D layers -> must split cleanly into chunks [8, 3] via pure layer_num.
+    # 11 Full unified 5D layers -> stays in a single m5d(11) call (<=32 limit, <=16 prewarmed).
     for i in range(11):
         pending.append((
             torch.zeros((8, 256, 1, 4, 128), dtype=torch.float8_e4m3fn),
@@ -828,16 +828,34 @@ def test_wave10_flush_pending_step_c_kv_writes_grouping():
     with (
         mock.patch.object(b1_moe_ops, "get_step_c_kv_write_op", side_effect=lambda **kw: lambda *a: calls.append(("single", kw, len(a)))),
         mock.patch.object(b1_moe_ops, "get_step_c_kv_write_multi_6d_op", side_effect=lambda **kw: lambda *a: calls.append(("m6d", kw, tuple(a[0].shape), tuple(a[-1].tolist())))),
-        mock.patch.object(b1_moe_ops, "get_step_c_kv_write_multi_5d_op", side_effect=lambda k, **kw: lambda *a: calls.append(("m5d", k, kw, tuple(x is pending[i + 3][7] if k == 8 else x is pending[i + 11][7] for i, x in enumerate(a[:k])), tuple(a[0].shape), len(a)))),
+        mock.patch.object(b1_moe_ops, "get_step_c_kv_write_multi_5d_op", side_effect=lambda k, **kw: lambda *a: calls.append(("m5d", k, kw, tuple(x is pending[i + 3][7] for i, x in enumerate(a[:k])), tuple(a[0].shape), len(a)))),
     ):
         b1_moe_ops.flush_pending_step_c_kv_writes(pending)
 
     assert calls == [
         ("m6d", {"kv_pack_dense2": False, "kv_pack_bd4": True}, (2, 32, 1, 4, 128), (0, 1)),
         ("single", {"kv_pack_dense2": False, "kv_pack_bd4": True}, 8),
-        ("m5d", 8, {"kv_pack_dense2": True, "kv_pack_bd4": False}, (True,) * 8, (32, 1, 4, 128), 21),
-        ("m5d", 3, {"kv_pack_dense2": True, "kv_pack_bd4": False}, (True,) * 3, (32, 1, 4, 128), 11),
+        ("m5d", 11, {"kv_pack_dense2": True, "kv_pack_bd4": False}, (True,) * 11, (32, 1, 4, 128), 27),
     ]
+
+    # Verify 45 layers chunk as [29, 16] and 27 layers chunk as [16, 11] (all in {2..16, 29}, <=64 args).
+    for n_chk, exp_k in ((45, [29, 16]), (27, [16, 11])):
+        p_big = [
+            (
+                torch.zeros((8, 128, 1, 4, 128), dtype=torch.float8_e4m3fn),
+                kvl, pg_full, cq, ckv, dist_full, None,
+                torch.zeros((32, 1, 4, 128), dtype=torch.float8_e4m3fn),
+                False, True, (False, False, -1, False, True), 100 + i,
+            )
+            for i in range(n_chk)
+        ]
+        chk_calls: list[int] = []
+        with mock.patch.object(
+            b1_moe_ops, "get_step_c_kv_write_multi_5d_op",
+            side_effect=lambda k, **_kw: lambda *_a, _k=k: chk_calls.append(_k),
+        ):
+            b1_moe_ops.flush_pending_step_c_kv_writes(p_big)
+        assert chk_calls == exp_k
 
     # Verify torch.compile(..., fullgraph=True) traces flush_pending_step_c_kv_writes with 0 id() failures.
     b1_moe_ops.get_step_c_kv_write_multi_6d_op(kv_pack_dense2=False, kv_pack_bd4=True)
@@ -891,10 +909,10 @@ def test_wave16_step_c_kv_write_multi_5d_op_schema_and_compile():
     from torch._subclasses.fake_tensor import FakeTensorMode
     from sglang_tpu.muse_megakernel.decode import b1_moe_ops
 
-    with pytest.raises(ValueError, match="2 <= num_layers <= 8"):
+    with pytest.raises(ValueError, match="2 <= num_layers <= 29"):
         b1_moe_ops.get_step_c_kv_write_multi_5d_op(1)
-    with pytest.raises(ValueError, match="2 <= num_layers <= 8"):
-        b1_moe_ops.get_step_c_kv_write_multi_5d_op(9)
+    with pytest.raises(ValueError, match="2 <= num_layers <= 29"):
+        b1_moe_ops.get_step_c_kv_write_multi_5d_op(30)
 
     fake_calls: list[tuple[int, int]] = []
     with (
@@ -1599,7 +1617,7 @@ def test_wave11_step_c_rpa_plan_shared_and_large_b():
     )
     assert ok_swa_128_b1 is True
 
-    # BD4 B=256 Full 8K/1K (pps=32) auto-clamps to ring8k (s4, c8192, nocoal) cleanly without LARGE_B;
+    # BD4 B=256 Full 8K/1K (pps=32) upgrades to Wave-17 group-vectorized ring4k (s3, c4096, rg=4, nocoal, 12,288 rows <= 24*512);
     # DENSE2 B=128 Full stays gated by default; 512B B=256 and pps=512 B=256 stay gated to Step (b).
     cfg_full_256, one_full_256, slot_full_256, grp_full_256, ok_full_256 = resolve_step_c_rpa_plan(
         "w8,s4,batchfull,g4k,foldcol",
@@ -1610,12 +1628,19 @@ def test_wave11_step_c_rpa_plan_shared_and_large_b():
         b_tokens=256,
         max_num_seqs=256,
     )
-    assert ok_full_256 is True and one_full_256 is False and grp_full_256 is False
-    assert (cfg_full_256.loop_kind, cfg_full_256.num_slots, cfg_full_256.chunk_sz, slot_full_256) == (
+    assert ok_full_256 is True and one_full_256 is False and grp_full_256 is True
+    assert (
+        cfg_full_256.loop_kind,
+        cfg_full_256.num_slots,
+        cfg_full_256.chunk_sz,
+        cfg_full_256.ring_group_size,
+        slot_full_256,
+    ) == (
         "ring4k",
+        3,
+        4096,
         4,
-        8192,
-        16,
+        32,
     )
     assert cfg_full_256.coalesce_dma is False
 
@@ -2324,8 +2349,8 @@ def test_wave16_step_c_bd4_swa_s3_b4_and_streamdyn_ring8k():
         resolve_step_c_rpa_plan,
     )
 
-    # TP=16 B=256 BD4 8k1k ("tp16,w8,c1024,batchfull,dyn4k", pps=20) upgrades from
-    # streamdyn (12,288 > 8,192 fallback) to Step (c) ring8k (4 * 16 * 128 == 8,192).
+    # TP=16 B=256 BD4 8k1k ("tp16,w8,c1024,batchfull,dyn4k", pps=20) upgrades in Wave-17 to
+    # group-vectorized Step (c) ring4k s3_b4 (3 * 4 * 8 * 128 == 12,288 <= 24*512).
     cfg_dyn_bd4, one_blk_dyn, slot_dyn, grp_dyn, ok_dyn = resolve_step_c_rpa_plan(
         "tp16,w8,c1024,batchfull,dyn4k",
         sliding_window=None,
@@ -2335,12 +2360,19 @@ def test_wave16_step_c_bd4_swa_s3_b4_and_streamdyn_ring8k():
         b_tokens=256,
         max_num_seqs=256,
     )
-    assert (ok_dyn, one_blk_dyn, grp_dyn) == (True, False, False)
-    assert (cfg_dyn_bd4.loop_kind, cfg_dyn_bd4.num_slots, cfg_dyn_bd4.chunk_sz, slot_dyn) == (
+    assert (ok_dyn, one_blk_dyn, grp_dyn) == (True, False, True)
+    assert (
+        cfg_dyn_bd4.loop_kind,
+        cfg_dyn_bd4.num_slots,
+        cfg_dyn_bd4.chunk_sz,
+        cfg_dyn_bd4.ring_group_size,
+        slot_dyn,
+    ) == (
         "ring4k",
+        3,
+        4096,
         4,
-        8192,
-        16,
+        32,
     )
 
     # TPU7x AOT (<63 MiB VMEM) for BD4 B=256 SWA s3_b4, BD4 B=256 dyn4k->ring8k, & D2 B=64 shared64 s4.
@@ -2382,3 +2414,93 @@ def test_wave16_step_c_bd4_swa_s3_b4_and_streamdyn_ring8k():
         has_rope=False,
     )
     assert "muse_w9_b1_moe_b2_rpad_b64_tp8_" in hlo_sh64_s4
+
+
+def test_wave17_step_c_ring_grp_and_priv_grp_aot_and_interpret():
+    """Verify Wave-17 Step (c) ring4k_b4 / ring8k_b4 & shared64 priv_grp=4 routing + TPU7x <63 MiB AOT."""
+    from sglang_tpu.muse_megakernel.decode.b1_moe_b2_kernel import (
+        resolve_step_c_rpa_plan,
+    )
+
+    cfg_64_d2, one_64_d2, slot_64_d2, grp_64_d2, ok_64_d2 = resolve_step_c_rpa_plan(
+        "w8,c1024,batchfull,dyn4k",
+        sliding_window=None,
+        pages_per_seq=20,
+        phys_page_rows=256,
+        kv_pack_dense2=True,
+        b_tokens=64,
+        max_num_seqs=64,
+    )
+    assert (ok_64_d2, one_64_d2, grp_64_d2) == (True, False, True)
+    assert (cfg_64_d2.loop_kind, cfg_64_d2.num_slots, cfg_64_d2.chunk_sz, cfg_64_d2.ring_group_size, slot_64_d2) == (
+        "ring4k", 4, 4096, 4, 32
+    )
+
+    cfg_64_bd4, one_64_bd4, slot_64_bd4, grp_64_bd4, ok_64_bd4 = resolve_step_c_rpa_plan(
+        "tp16,w8,c1024,batchfull,dyn4k",
+        sliding_window=None,
+        pages_per_seq=20,
+        phys_page_rows=128,
+        kv_pack_bd4=True,
+        b_tokens=64,
+        max_num_seqs=64,
+    )
+    assert (ok_64_bd4, one_64_bd4, grp_64_bd4) == (True, False, True)
+    assert (cfg_64_bd4.loop_kind, cfg_64_bd4.num_slots, cfg_64_bd4.chunk_sz, cfg_64_bd4.ring_group_size, slot_64_bd4) == (
+        "ring4k", 3, 8192, 4, 64
+    )
+
+    cfg_8_d2, _, slot_8_d2, grp_8_d2, ok_8_d2 = resolve_step_c_rpa_plan(
+        "w8,c1024,batchfull,dyn4k",
+        sliding_window=None,
+        pages_per_seq=20,
+        phys_page_rows=256,
+        kv_pack_dense2=True,
+        b_tokens=8,
+        max_num_seqs=8,
+    )
+    assert ok_8_d2 is True and grp_8_d2 is False and cfg_8_d2.ring_group_size == 1 and slot_8_d2 == 24
+
+    cfg_sh_bd4, _, slot_sh_bd4, _, ok_sh_bd4 = resolve_step_c_rpa_plan(
+        "tp16,w8,c4096,shared64,coal,noz,pbf16,q1024,shfp8,batchfull,foldcol",
+        sliding_window=None,
+        pages_per_seq=516,
+        phys_page_rows=128,
+        kv_pack_bd4=True,
+        b_tokens=64,
+        max_num_seqs=64,
+        shared_group_size=64,
+        has_shared_prefix=True,
+    )
+    assert ok_sh_bd4 is True and (cfg_sh_bd4.priv_group_size, cfg_sh_bd4.priv_blk_pages, slot_sh_bd4) == (4, 8, 32)
+
+    cfg_sh_d2, _, slot_sh_d2, _, ok_sh_d2 = resolve_step_c_rpa_plan(
+        "w8,c4096,shared64,coal,noz,pbf16,q1024,shfp8,batchfull,foldcol",
+        sliding_window=None,
+        pages_per_seq=516,
+        phys_page_rows=256,
+        kv_pack_dense2=True,
+        b_tokens=64,
+        max_num_seqs=64,
+        shared_group_size=64,
+        has_shared_prefix=True,
+    )
+    assert ok_sh_d2 is True and (cfg_sh_d2.priv_group_size, cfg_sh_d2.priv_blk_pages, slot_sh_d2) == (1, 0, 8)
+
+    for tp_a, b_a, pps_a, d2_a, bd4_a, dist_a, mode_a in (
+        (8, 64, 20, True, False, 3, "w8,c1024,batchfull,dyn4k"),
+        (16, 64, 20, False, True, 3, "tp16,w8,c1024,batchfull,dyn4k"),
+        (16, 64, 516, False, True, 4, "tp16,w8,c4096,shared64,coal,noz,pbf16,q1024,shfp8,batchfull,foldcol"),
+    ):
+        hlo = _compile_step_c_aot(
+            tp=tp_a,
+            B=b_a,
+            pps=pps_a,
+            sw=-1,
+            mode=mode_a,
+            dense2=d2_a,
+            bd4=bd4_a,
+            dist_len=dist_a,
+            has_rope=False,
+        )
+        assert f"muse_w9_b1_moe_b2_rpad_b{b_a}_tp{tp_a}_" in hlo
