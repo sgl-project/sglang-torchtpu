@@ -322,7 +322,7 @@ def test_wave10_step_c_rpa_plan_full_attn_unlock():
     )
 
     mode = "w8,s4,batchfull,g4k,foldcol,shared16"
-    cfg_bd4, one_bd4, _, _, ok_bd4 = resolve_step_c_rpa_plan(
+    cfg_bd4, one_bd4, _, grp_bd4, ok_bd4 = resolve_step_c_rpa_plan(
         mode,
         sliding_window=None,
         pages_per_seq=32,
@@ -332,10 +332,10 @@ def test_wave10_step_c_rpa_plan_full_attn_unlock():
         max_num_seqs=64,
         has_shared_prefix=False,
     )
-    assert ok_bd4 is True and one_bd4 is True
-    assert cfg_bd4.loop_kind == "w7auto" and cfg_bd4.shared_group_size == 0
+    assert ok_bd4 is True and one_bd4 is False and grp_bd4 is True
+    assert cfg_bd4.loop_kind == "ring4k" and cfg_bd4.ring_group_size == 4 and cfg_bd4.shared_group_size == 0
 
-    cfg_d2, one_d2, _, _, ok_d2 = resolve_step_c_rpa_plan(
+    cfg_d2, one_d2, _, grp_d2, ok_d2 = resolve_step_c_rpa_plan(
         mode,
         sliding_window=None,
         pages_per_seq=40,
@@ -345,8 +345,8 @@ def test_wave10_step_c_rpa_plan_full_attn_unlock():
         max_num_seqs=64,
         has_shared_prefix=False,
     )
-    assert ok_d2 is True and one_d2 is True
-    assert cfg_d2.loop_kind == "w7auto" and cfg_d2.shared_group_size == 0
+    assert ok_d2 is True and one_d2 is False and grp_d2 is True
+    assert cfg_d2.loop_kind == "ring4k" and cfg_d2.ring_group_size == 4 and cfg_d2.shared_group_size == 0
 
     _, one_ring4k, _, _, ok_ring4k = resolve_step_c_rpa_plan(
         mode,
@@ -2414,6 +2414,90 @@ def test_wave16_step_c_bd4_swa_s3_b4_and_streamdyn_ring8k():
         has_rope=False,
     )
     assert "muse_w9_b1_moe_b2_rpad_b64_tp8_" in hlo_sh64_s4
+
+
+def test_wave18_step_c_d2_swa_g4_and_shared64_shsub_aot():
+    """Verify Wave-18 Step (c) D2/BD4 SWA grp=4 & shared64 q512/shsub2k routing + TPU7x <60/63 MiB AOT."""
+    from sglang_tpu.muse_megakernel.decode.b1_moe_b2_kernel import (
+        resolve_step_c_rpa_plan,
+    )
+
+    cfg_swa_d2, one_swa_d2, slot_swa_d2, grp_swa_d2, ok_swa_d2 = resolve_step_c_rpa_plan(
+        "w8,c1024,batchfull,dyn4k",
+        sliding_window=2049,
+        pages_per_seq=32,
+        phys_page_rows=256,
+        kv_pack_dense2=True,
+        b_tokens=64,
+        max_num_seqs=64,
+    )
+    assert (ok_swa_d2, one_swa_d2, grp_swa_d2) == (True, True, True)
+    assert (cfg_swa_d2.loop_kind, cfg_swa_d2.num_slots, cfg_swa_d2.swabatch_group_size, cfg_swa_d2.fold_col, slot_swa_d2) == (
+        "swabatch", 4, 4, True, 20
+    )
+
+    cfg_swa_bd4, _, _, grp_swa_bd4, ok_swa_bd4 = resolve_step_c_rpa_plan(
+        "tp16,w8,c1024,batchfull,dyn4k",
+        sliding_window=2049,
+        pages_per_seq=32,
+        phys_page_rows=128,
+        kv_pack_bd4=True,
+        b_tokens=256,
+        max_num_seqs=256,
+    )
+    assert (ok_swa_bd4, grp_swa_bd4, cfg_swa_bd4.num_slots, cfg_swa_bd4.swabatch_group_size, cfg_swa_bd4.fold_col) == (
+        True, True, 3, 4, True
+    )
+
+    cfg_sh_d2, _, _, _, ok_sh_d2 = resolve_step_c_rpa_plan(
+        "w8,c4096,shared64,shsplit,pbf16,batchfull",
+        sliding_window=None,
+        pages_per_seq=516,
+        phys_page_rows=256,
+        kv_pack_dense2=True,
+        b_tokens=64,
+        max_num_seqs=64,
+        shared_group_size=64,
+        has_shared_prefix=True,
+    )
+    assert (ok_sh_d2, cfg_sh_d2.chunk_sz, cfg_sh_d2.shared_q_tile, cfg_sh_d2.sh_sub_chunk, cfg_sh_d2.fold_col, cfg_sh_d2.priv_group_size) == (
+        True, 4096, 512, 2048, True, 1
+    )
+
+    cfg_sh_bd4, _, slot_sh_bd4, _, ok_sh_bd4 = resolve_step_c_rpa_plan(
+        "tp16,w8,c4096,shared64,q256,pbf16,batchfull",
+        sliding_window=None,
+        pages_per_seq=516,
+        phys_page_rows=128,
+        kv_pack_bd4=True,
+        b_tokens=64,
+        max_num_seqs=64,
+        shared_group_size=64,
+        has_shared_prefix=True,
+    )
+    assert (ok_sh_bd4, cfg_sh_bd4.chunk_sz, cfg_sh_bd4.shared_q_tile, cfg_sh_bd4.sh_sub_chunk, cfg_sh_bd4.fold_col, cfg_sh_bd4.priv_group_size, slot_sh_bd4) == (
+        True, 4096, 512, 2048, True, 4, 32
+    )
+
+    for tp_a, b_a, pps_a, sw_a, d2_a, bd4_a, dist_a, rope_a, mode_a in (
+        (8,  64, 32, 2049, True, False, 3, True, "w8,c1024,batchfull,dyn4k"),
+        (16, 64, 32, 2049, False, True, 3, True, "tp16,w8,c1024,batchfull,dyn4k"),
+        (16, 256, 32, 2049, False, True, 3, True, "tp16,w8,c1024,batchfull,dyn4k"),
+        (8,  64, 516, -1, True, False, 4, False, "w8,c4096,shared64,shsplit,pbf16,batchfull"),
+        (16, 64, 516, -1, False, True, 4, False, "tp16,w8,c4096,shared64,q256,pbf16,batchfull"),
+    ):
+        hlo = _compile_step_c_aot(
+            tp=tp_a,
+            B=b_a,
+            pps=pps_a,
+            sw=sw_a,
+            mode=mode_a,
+            dense2=d2_a,
+            bd4=bd4_a,
+            dist_len=dist_a,
+            has_rope=rope_a,
+        )
+        assert f"muse_w9_b1_moe_b2_rpad_b{b_a}_tp{tp_a}_" in hlo
 
 
 def test_wave17_step_c_ring_grp_and_priv_grp_aot_and_interpret():

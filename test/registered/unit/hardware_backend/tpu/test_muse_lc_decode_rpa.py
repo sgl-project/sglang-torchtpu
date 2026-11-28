@@ -3612,7 +3612,7 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
                     lambda q_, kv_, g_, c_, kl_, pi_, cq_, ckv_, d_: run_decode_fast_rpa(
                         q_, kv_, None, c_, kl_, pi_, cq_, ckv_, d_,
                         sm_scale=128.0 ** -0.5, sliding_window=2049, k_scale=1.0, v_scale=1.0,
-                        mode_str="w8,s4,batchfull,g4k,foldcol,batch4,dense2",
+                        mode_str="w8,s4,batchfull,g4k,foldcol,batch4,dense2,nod2grp",
                         decode_query_size=1, fused_out_pack=2, prepared_inputs=True,
                         gate=g_, out_norm_eps=1e-5, kv_pack_dense2=True,
                     )
@@ -3630,6 +3630,29 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
                 jax.ShapeDtypeStruct((3,), jnp.int32),
             ).mlir_module()
             self.assertIn("stablehlo.case", hlo_adapt)
+            hlo_d2grp = jax_export.export(
+                jax.jit(
+                    lambda q_, kv_, g_, c_, kl_, pi_, cq_, ckv_, d_: run_decode_fast_rpa(
+                        q_, kv_, None, c_, kl_, pi_, cq_, ckv_, d_,
+                        sm_scale=128.0 ** -0.5, sliding_window=2049, k_scale=1.0, v_scale=1.0,
+                        mode_str="w8,s4,batchfull,g4k,foldcol",
+                        decode_query_size=1, fused_out_pack=2, prepared_inputs=True,
+                        gate=g_, out_norm_eps=1e-5, kv_pack_dense2=True,
+                    )
+                ),
+                platforms=["tpu"],
+            )(
+                jax.ShapeDtypeStruct((1, 64, 8, 2, 128), jnp.bfloat16),
+                jax.ShapeDtypeStruct((64, 1, 4, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((64, 1024), jnp.bfloat16),
+                jax.ShapeDtypeStruct((264, 256, 1, 4, 128), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((64,), jnp.int32),
+                jax.ShapeDtypeStruct((256,), jnp.int32),
+                jax.ShapeDtypeStruct((65,), jnp.int32),
+                jax.ShapeDtypeStruct((65,), jnp.int32),
+                jax.ShapeDtypeStruct((3,), jnp.int32),
+            ).mlir_module()
+            self.assertNotIn("stablehlo.case", hlo_d2grp)
             hlo_direct = jax_export.export(
                 jax.jit(
                     lambda q_, kv_, g_, c_, kl_, pi_, cq_, ckv_, d_: run_decode_fast_rpa(
@@ -5579,6 +5602,295 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
                         lambda q_, km_, gt_, c_, kl_, pi_, cq_, ckv_, dt_, sp_, m=mode_a, d2=d2_a, b4=bd4_a, us=sh_a: run_decode_fast_rpa(
                             q_, km_, None, c_, kl_, pi_, cq_, ckv_, dt_,
                             sm_scale=64.0 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                            mode_str=m, decode_query_size=1, fused_out_pack=2,
+                            prepared_inputs=True, gate=gt_, out_norm_eps=1e-5,
+                            kv_pack_dense2=d2, kv_pack_bd4=b4,
+                            shared_pages=sp_ if us else None,
+                        ),
+                        mesh=mesh,
+                        in_specs=(P(),) * 10,
+                        out_specs=(P(), P()),
+                        check_vma=False,
+                    )
+                ).lower(*abs_in).compile()
+            self.assertIsNotNone(comp)
+            del comp
+            jax.clear_caches()
+            gc.collect()
+
+    def test_wave18_swa_group_and_shared_subchunk_and_dyn4k_guard(self):
+        """Verify #5468 plain dyn4k guard, auto swabatch b4/d2grp, shared sh_sub_chunk/q512/foldcol race/NaN/0x7F parity, and TPU7x AOT."""
+        import gc
+        from unittest.mock import patch
+
+        from jax.experimental import topologies
+        from jax.experimental.pallas import tpu as pltpu
+        from jax.sharding import Mesh, PartitionSpec as P
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
+            parse_decode_fast_config,
+            run_decode_fast_rpa,
+        )
+
+        # 1. #5468: plain "dyn4k" (no w7/batchfull/b4/b2) stays streamdyn instead of ungrouped ring4k.
+        cfg_plain_dyn4k = parse_decode_fast_config(
+            "dyn4k",
+            sliding_window=None,
+            pages_per_seq=20,
+            page_size=512,
+            kv_pack_dense2=True,
+            b_tokens=64,
+        )
+        self.assertEqual(cfg_plain_dyn4k.loop_kind, "streamdyn")
+        self.assertEqual(cfg_plain_dyn4k.ring_group_size, 1)
+
+        # #5581: batch4 takes precedence over batch2 in eff_ring_grp (matching swabatch_group_size).
+        cfg_b2_b4 = parse_decode_fast_config(
+            "w8,noadapt,hoistkv,g4k,foldcol,batch2,batch4",
+            sliding_window=None,
+            pages_per_seq=32,
+            page_size=512,
+            kv_pack_dense2=True,
+            b_tokens=128,
+        )
+        self.assertEqual((cfg_b2_b4.loop_kind, cfg_b2_b4.ring_group_size), ("ring4k", 4))
+        cfg_b2_only = parse_decode_fast_config(
+            "w8,noadapt,hoistkv,g4k,foldcol,batch2",
+            sliding_window=None,
+            pages_per_seq=32,
+            page_size=512,
+            kv_pack_dense2=True,
+            b_tokens=128,
+        )
+        self.assertEqual((cfg_b2_only.loop_kind, cfg_b2_only.ring_group_size), ("ring4k", 2))
+
+        # Auto swabatch b4 + d2grp + foldcol at B>=32 (D2 & BD4), while B<32 & nod2grp stay safe.
+        cfg_swa_d2_64 = parse_decode_fast_config(
+            "w8,c1024,batchfull,dyn4k",
+            sliding_window=2049,
+            pages_per_seq=8,
+            page_size=512,
+            kv_pack_dense2=True,
+            b_tokens=64,
+        )
+        self.assertEqual(
+            (cfg_swa_d2_64.loop_kind, cfg_swa_d2_64.swabatch_group_size, cfg_swa_d2_64.dense2_group, cfg_swa_d2_64.fold_col),
+            ("swabatch", 4, True, True),
+        )
+        cfg_swa_d2_16 = parse_decode_fast_config(
+            "w8,c1024,batchfull,dyn4k",
+            sliding_window=2049,
+            pages_per_seq=8,
+            page_size=512,
+            kv_pack_dense2=True,
+            b_tokens=16,
+        )
+        self.assertEqual((cfg_swa_d2_16.swabatch_group_size, cfg_swa_d2_16.dense2_group), (1, False))
+
+        # Shared c4096/c8192 auto-enables foldcol, q512, and sh_sub_chunk=2048 for shared>=16 (0 for shared8).
+        cfg_sh64 = parse_decode_fast_config(
+            "w8,c4096,shared64,shsplit,pbf16,batchfull",
+            sliding_window=None,
+            pages_per_seq=529,
+            page_size=512,
+            shared_group=64,
+            kv_pack_dense2=True,
+            b_tokens=64,
+        )
+        self.assertEqual(
+            (cfg_sh64.chunk_sz, cfg_sh64.shared_q_tile, cfg_sh64.sh_sub_chunk, cfg_sh64.fold_col),
+            (4096, 512, 2048, True),
+        )
+        cfg_sh8 = parse_decode_fast_config(
+            "w8,c4096,shared64,shsplit,pbf16,batchfull",
+            sliding_window=None,
+            pages_per_seq=529,
+            page_size=512,
+            shared_group=8,
+            kv_pack_dense2=True,
+            b_tokens=8,
+        )
+        self.assertEqual((cfg_sh8.chunk_sz, cfg_sh8.sh_sub_chunk, cfg_sh8.fold_col), (8192, 0, True))
+
+        def _poison_kvc(kvc_u8, pg_mat, kvl_np, start_pg, bd4, n_act):
+            pps = pg_mat.shape[1]
+            for s in range(pg_mat.shape[0]):
+                end_tok = max(int(kvl_np[s]) - 1, 0) if s < n_act else 0
+                hi_pg = end_tok // 512
+                for p in range(start_pg, pps):
+                    if p > hi_pg or s >= n_act:
+                        kvc_u8[pg_mat[s, p], :, :, :, :] = 0x7F
+                    elif p == hi_pg:
+                        for t in range(end_tok % 512, 512):
+                            if bd4:
+                                r, pair, c0 = t // 4, (t % 4) // 2, (t % 2) * 64
+                                kvc_u8[pg_mat[s, p], r, 0, pair * 2 : pair * 2 + 2, c0 : c0 + 64] = 0x7F
+                            else:
+                                kvc_u8[pg_mat[s, p], t // 2, 0, (t % 2) * 2 :, :] = 0x7F
+
+        rng = np.random.default_rng(20261801)
+        ip_race = pltpu.InterpretParams(detect_races=True, uninitialized_memory="nan")
+
+        # 2. Eager race + NaN + 0x7F + mixed-len + inactive SWA parity (D2 & BD4 at B=32).
+        B_sw, pps_sw, n_act_sw = 32, 6, 30
+        kvl_sw = np.full((B_sw,), 2049, dtype=np.int32)
+        kvl_sw[0], kvl_sw[1], kvl_sw[2], kvl_sw[3], kvl_sw[4] = 1, 350, 513, 1400, 2400
+        for d2, bd4 in ((True, False), (False, True)):
+            phys_rows = 128 if bd4 else 256
+            cols = 512 if bd4 else 1024
+            pg_mat = rng.permutation(B_sw * pps_sw).astype(np.int32).reshape(B_sw, pps_sw)
+            kvc_u8 = rng.integers(0x30, 0x3D, size=(B_sw * pps_sw + 4, phys_rows, 1, 4, 128), dtype=np.uint8)
+            _poison_kvc(kvc_u8, pg_mat, kvl_sw, 0, bd4, n_act_sw)
+            kvc = jax.lax.bitcast_convert_type(jnp.asarray(kvc_u8, jnp.uint8), jnp.float8_e4m3fn)
+            q_5d = jnp.asarray(rng.standard_normal((1, B_sw, 8, 2, 128)) * 0.1, jnp.bfloat16)
+            kvm = jax.lax.bitcast_convert_type(
+                jnp.asarray(rng.integers(0x30, 0x3D, size=(B_sw, 1, 4, 128), dtype=np.uint8), jnp.uint8),
+                jnp.float8_e4m3fn,
+            )
+            gate = jnp.asarray(rng.standard_normal((B_sw, cols)) * 0.1, jnp.bfloat16)
+            kvl = jnp.asarray(kvl_sw, jnp.int32)
+            pg = jnp.asarray(pg_mat.reshape(-1), jnp.int32)
+            cuq = jnp.asarray(np.concatenate([np.arange(n_act_sw + 1), np.full((B_sw - n_act_sw,), n_act_sw)], dtype=np.int32))
+            cukv = jnp.arange(B_sw + 1, dtype=jnp.int32) * (pps_sw * 512)
+            dist = jnp.asarray([n_act_sw, n_act_sw, n_act_sw], jnp.int32)
+            base_m = ("tp16," if bd4 else "") + "w8,c1024,batchfull,dyn4k"
+            ref_o, ref_kv = run_decode_fast_rpa(
+                q_5d, kvm, None, kvc, kvl, pg, cuq, cukv, dist,
+                sm_scale=64.0 ** -0.5, sliding_window=2049, k_scale=1.0, v_scale=1.0,
+                mode_str=f"{base_m},b1,nofold", decode_query_size=1, fused_out_pack=2, prepared_inputs=True,
+                gate=gate, out_norm_eps=1e-5, kv_pack_dense2=d2, kv_pack_bd4=bd4, interpret=ip_race,
+            )
+            grp_o, grp_kv = run_decode_fast_rpa(
+                q_5d, kvm, None, kvc, kvl, pg, cuq, cukv, dist,
+                sm_scale=64.0 ** -0.5, sliding_window=2049, k_scale=1.0, v_scale=1.0,
+                mode_str=base_m, decode_query_size=1, fused_out_pack=2, prepared_inputs=True,
+                gate=gate, out_norm_eps=1e-5, kv_pack_dense2=d2, kv_pack_bd4=bd4, interpret=ip_race,
+            )
+            r_np, g_np = np.asarray(ref_o, np.float64).ravel(), np.asarray(grp_o, np.float64).ravel()
+            self.assertTrue(np.all(np.isfinite(g_np)))
+            cos_sw = float(np.dot(r_np, g_np) / (np.linalg.norm(r_np) * np.linalg.norm(g_np) + 1e-12))
+            self.assertGreater(cos_sw, 0.99999, f"swa_grp bd4={bd4} cos={cos_sw}")
+            self.assertTrue(np.array_equal(np.asarray(ref_kv).view(np.uint8), np.asarray(grp_kv).view(np.uint8)))
+
+        # 3. Eager race + NaN + 0x7F shared sh_sub_chunk=2048 + q512 + foldcol parity (D2 & BD4 shared16).
+        B_sh, sh_pgs, pps_sh = 16, 8, 12  # 4096 shared + up to 4 priv pages -> tests shsub2k across full 4096 block
+        kvl_sh = np.full((B_sh,), sh_pgs * 512 + 1200, dtype=np.int32)
+        kvl_sh[0], kvl_sh[1] = sh_pgs * 512, sh_pgs * 512 + 350
+        for d2, bd4 in ((True, False), (False, True)):
+            phys_rows = 128 if bd4 else 256
+            cols = 512 if bd4 else 1024
+            nb_s = sh_pgs + B_sh * (pps_sh - sh_pgs) + 8
+            pg_mat_s = np.zeros((B_sh, pps_sh), dtype=np.int32)
+            pg_mat_s[:, :sh_pgs] = np.arange(sh_pgs, dtype=np.int32)
+            pg_mat_s[:, sh_pgs:] = (sh_pgs + rng.permutation(B_sh * (pps_sh - sh_pgs)).astype(np.int32)).reshape(B_sh, pps_sh - sh_pgs)
+            kvc_s_u8 = rng.integers(0x30, 0x3D, size=(nb_s, phys_rows, 1, 4, 128), dtype=np.uint8)
+            _poison_kvc(kvc_s_u8, pg_mat_s, kvl_sh, sh_pgs, bd4, B_sh)
+            kvc_s = jax.lax.bitcast_convert_type(jnp.asarray(kvc_s_u8, jnp.uint8), jnp.float8_e4m3fn)
+            q_s5 = jnp.asarray(rng.standard_normal((1, B_sh, 8, 2, 128)) * 0.1, jnp.bfloat16)
+            km_s = jax.lax.bitcast_convert_type(
+                jnp.asarray(rng.integers(0x30, 0x3D, size=(B_sh, 1, 4, 128), dtype=np.uint8), jnp.uint8),
+                jnp.float8_e4m3fn,
+            )
+            gt_s = jnp.asarray(rng.standard_normal((B_sh, cols)) * 0.1, jnp.bfloat16)
+            kvl_s = jnp.asarray(kvl_sh, jnp.int32)
+            pg_s = jnp.asarray(pg_mat_s.reshape(-1), jnp.int32)
+            cuq_s = jnp.arange(B_sh + 1, dtype=jnp.int32)
+            ckv_s = jnp.arange(B_sh + 1, dtype=jnp.int32) * (pps_sh * 512)
+            dist_s = jnp.asarray([B_sh, B_sh, B_sh], jnp.int32)
+            sp_s = jnp.asarray([sh_pgs], jnp.int32)
+            base_sh = ("tp16," if bd4 else "") + "w8,c4096,shared64,pbf16,batchfull"
+            ref_so, ref_sk = run_decode_fast_rpa(
+                q_s5, km_s, None, kvc_s, kvl_s, pg_s, cuq_s, ckv_s, dist_s,
+                sm_scale=64.0 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                mode_str=f"{base_sh},noshsub,nofold,forceq256", decode_query_size=1, fused_out_pack=2, prepared_inputs=True,
+                gate=gt_s, out_norm_eps=1e-5, kv_pack_dense2=d2, kv_pack_bd4=bd4, shared_pages=sp_s, interpret=ip_race,
+            )
+            sub_so, sub_sk = run_decode_fast_rpa(
+                q_s5, km_s, None, kvc_s, kvl_s, pg_s, cuq_s, ckv_s, dist_s,
+                sm_scale=64.0 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                mode_str=base_sh, decode_query_size=1, fused_out_pack=2, prepared_inputs=True,
+                gate=gt_s, out_norm_eps=1e-5, kv_pack_dense2=d2, kv_pack_bd4=bd4, shared_pages=sp_s, interpret=ip_race,
+            )
+            rs_np, ss_np = np.asarray(ref_so, np.float64).ravel(), np.asarray(sub_so, np.float64).ravel()
+            self.assertTrue(np.all(np.isfinite(ss_np)))
+            cos_sh = float(np.dot(rs_np, ss_np) / (np.linalg.norm(rs_np) * np.linalg.norm(ss_np) + 1e-12))
+            self.assertGreater(cos_sh, 0.99999, f"sh_sub_chunk bd4={bd4} cos={cos_sh}")
+            self.assertTrue(np.array_equal(np.asarray(ref_sk).view(np.uint8), np.asarray(sub_sk).view(np.uint8)))
+
+        # 3b. Eager race + NaN + 0x7F ring4k/ring8k tail_short_pg=2 parity across >8K blocks (17..18 pgs).
+        B_t2, pps_t2, n_act_t2 = 32, 20, 30
+        kvl_t2 = np.full((B_t2,), 8192, dtype=np.int32)
+        kvl_t2[:4] = [350, 8192, 8705, 9216]   # block-0 / block-1 / rem_pg=1 / rem_pg=2
+        kvl_t2[4:8] = [900, 1024, 512, 17]     # b_i==0 short_pg=2 group
+        kvl_t2[8:12] = [8704, 7000, 6500, 8193]
+        for d2, bd4 in ((True, False), (False, True)):
+            phys_rows = 128 if bd4 else 256
+            cols = 512 if bd4 else 1024
+            pg_mat_t = rng.permutation(B_t2 * pps_t2).astype(np.int32).reshape(B_t2, pps_t2)
+            kvc_t_u8 = rng.integers(0x30, 0x3D, size=(B_t2 * pps_t2 + 4, phys_rows, 1, 4, 128), dtype=np.uint8)
+            _poison_kvc(kvc_t_u8, pg_mat_t, kvl_t2, 0, bd4, n_act_t2)
+            kvc_t = jax.lax.bitcast_convert_type(jnp.asarray(kvc_t_u8, jnp.uint8), jnp.float8_e4m3fn)
+            q_t5 = jnp.asarray(rng.standard_normal((1, B_t2, 8, 2, 128)) * 0.1, jnp.bfloat16)
+            km_t = jax.lax.bitcast_convert_type(
+                jnp.asarray(rng.integers(0x30, 0x3D, size=(B_t2, 1, 4, 128), dtype=np.uint8), jnp.uint8),
+                jnp.float8_e4m3fn,
+            )
+            gt_t = jnp.asarray(rng.standard_normal((B_t2, cols)) * 0.1, jnp.bfloat16)
+            kvl_tj = jnp.asarray(kvl_t2, jnp.int32)
+            pg_t = jnp.asarray(pg_mat_t.reshape(-1), jnp.int32)
+            cuq_t = jnp.asarray(np.concatenate([np.arange(n_act_t2 + 1), np.full((B_t2 - n_act_t2,), n_act_t2)], dtype=np.int32))
+            cukv_t = jnp.arange(B_t2 + 1, dtype=jnp.int32) * (pps_t2 * 512)
+            dist_t = jnp.asarray([n_act_t2, n_act_t2, n_act_t2], jnp.int32)
+            base_t = ("tp16," if bd4 else "") + "w8,noadapt,hoistkv,g4k,foldcol,batch2,batch4"
+            ref_to, ref_tk = run_decode_fast_rpa(
+                q_t5, km_t, None, kvc_t, kvl_tj, pg_t, cuq_t, cukv_t, dist_t,
+                sm_scale=64.0 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                mode_str=f"{base_t},b1", decode_query_size=1, fused_out_pack=2, prepared_inputs=True,
+                gate=gt_t, out_norm_eps=1e-5, kv_pack_dense2=d2, kv_pack_bd4=bd4, interpret=ip_race,
+            )
+            grp_to, grp_tk = run_decode_fast_rpa(
+                q_t5, km_t, None, kvc_t, kvl_tj, pg_t, cuq_t, cukv_t, dist_t,
+                sm_scale=64.0 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                mode_str=base_t, decode_query_size=1, fused_out_pack=2, prepared_inputs=True,
+                gate=gt_t, out_norm_eps=1e-5, kv_pack_dense2=d2, kv_pack_bd4=bd4, interpret=ip_race,
+            )
+            rt_np, gt_np = np.asarray(ref_to, np.float64).ravel(), np.asarray(grp_to, np.float64).ravel()
+            self.assertTrue(np.all(np.isfinite(gt_np)))
+            cos_t2 = float(np.dot(rt_np, gt_np) / (np.linalg.norm(rt_np) * np.linalg.norm(gt_np) + 1e-12))
+            self.assertGreater(cos_t2, 0.99999, f"tail_short_pg2 bd4={bd4} cos={cos_t2}")
+            self.assertTrue(np.array_equal(np.asarray(ref_tk).view(np.uint8), np.asarray(grp_tk).view(np.uint8)))
+
+        # 4. TPU7x AOT (<32 MiB VMEM) for Wave-18 SWA grp4 & shared* c4096/c8192 q512 shsub2k.
+        aot_w18 = [
+            ("tpu7x:2x2x2", 256, 8,  False, True,  2049, False, "tp16,w8,c1024,batchfull,dyn4k"),
+            ("tpu7x:2x2x1",  64, 8,  True,  False, 2049, False, "w8,c1024,batchfull,dyn4k"),
+            ("tpu7x:2x2x2",  64, 8,  False, True,  2049, False, "tp16,w8,c1024,batchfull,dyn4k"),
+            ("tpu7x:2x2x1",  64, 520, True, False, None, True,  "w8,c4096,shared64,shsplit,pbf16,batchfull"),
+            ("tpu7x:2x2x2",  64, 520, False, True, None, True,  "tp16,w8,c4096,shared64,q256,pbf16,batchfull"),
+            ("tpu7x:2x2x1",   8, 520, True, False, None, True,  "w8,c4096,shared64,shsplit,pbf16,batchfull"),
+        ]
+        for topo, bs_a, pps_a, d2_a, bd4_a, sw_a, sh_a, mode_a in aot_w18:
+            phys_r = 128 if bd4_a else 256
+            tpu_devs = topologies.get_topology_desc(topo, platform="tpu").devices
+            mesh = Mesh(np.array(tpu_devs[:1]), ("x",))
+            s = lambda sh, dt: jax.ShapeDtypeStruct(sh, dt)
+            abs_in = (
+                s((1, bs_a, 8, 2, 128), jnp.bfloat16),
+                s((bs_a, 1, 4, 128), jnp.float8_e4m3fn),
+                s((bs_a, 512 if bd4_a else 1024), jnp.bfloat16),
+                s((bs_a * pps_a + 8, phys_r, 1, 4, 128), jnp.float8_e4m3fn),
+                s((bs_a,), jnp.int32),
+                s((bs_a * pps_a,), jnp.int32),
+                s((bs_a + 1,), jnp.int32),
+                s((bs_a + 1,), jnp.int32),
+                s((4 if sh_a else 3,), jnp.int32),
+                s((1,), jnp.int32),
+            )
+            with patch("sglang_tpu.attention.pallas.util.get_torch_tpu_device_kind", return_value="TPU v7"):
+                comp = jax.jit(
+                    jax.shard_map(
+                        lambda q_, km_, gt_, c_, kl_, pi_, cq_, ckv_, dt_, sp_, m=mode_a, d2=d2_a, b4=bd4_a, sw=sw_a, us=sh_a: run_decode_fast_rpa(
+                            q_, km_, None, c_, kl_, pi_, cq_, ckv_, dt_,
+                            sm_scale=64.0 ** -0.5, sliding_window=sw, k_scale=1.0, v_scale=1.0,
                             mode_str=m, decode_query_size=1, fused_out_pack=2,
                             prepared_inputs=True, gate=gt_, out_norm_eps=1e-5,
                             kv_pack_dense2=d2, kv_pack_bd4=b4,
