@@ -399,6 +399,19 @@ class TpuEnvs:
     # polled, from issue. Past it the scheduler exits with TimeoutError, so keep
     # it far above a healthy transfer.
     SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S = EnvFloat(60.0)
+    # Decode-DRAM offload: free-token threshold on prefill host pool below which
+    # cold host-backed sessions are pushed to decode DRAM. 0 keeps the built-in
+    # default (65536 tokens).
+    SGLANG_PD_OFFLOAD_PUSH_FREE_TOKENS = EnvInt(0)
+    # Decode-DRAM offload: when True, stamp a stored branch as the next eviction
+    # victim on prefill (mark_next_victim). False by default so hot multi-turn
+    # sessions keep their UnifiedRadixCache LRU recency when decode DRAM is
+    # smaller than the active footprint.
+    SGLANG_PD_OFFLOAD_EVICT_STORED_FIRST = EnvBool(False)
+    # KV offload to decode DRAM with speculative decoding (equal-TP pairing):
+    # move HiCache draft sidecar pools (DRAFT / DRAFT_SWA) with the pages.
+    # Opt-in on both roles; without it the offload refuses a draft.
+    SGLANG_PD_OFFLOAD_ALLOW_DRAFT = EnvBool(False)
 
     # HiCache write_back on raiden (see hicache_write_back_copy_ahead.py): tokens
     # of the next eviction victims kept copied to host. Unset: four chunked-prefill

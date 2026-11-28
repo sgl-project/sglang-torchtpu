@@ -99,6 +99,9 @@ class DramOffloadWorkerContext(msgspec.Struct, frozen=True):
     # window in tokens, rounded up to whole pages. None and 0 on other models.
     swa_host_pool: Any = None
     window_tokens: int = 0
+    # HiCache draft sidecar host pools (draft KV, draft window), addressed by
+    # the page ids of ``host_pool`` and ``swa_host_pool`` when opt-in is active.
+    draft_pools: Tuple[Any, Any] = (None, None)
 
 
 def push_manifest(tokens, extra_key, cache_salt, *geometry):

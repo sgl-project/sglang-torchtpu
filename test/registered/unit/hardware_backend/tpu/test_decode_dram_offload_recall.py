@@ -1051,5 +1051,274 @@ class TestDecodeQueueHooksExtra(DecodeQueueHooksFixture, CustomTestCase):
                 upstream.assert_called_once_with(queue, "dst", {"b": False})
 
 
+class TestEqualTpDraftSidecarPushAndRecall(CustomTestCase):
+    """Equal-TP push and recall move FULL, SWA, DRAFT, and DRAFT_SWA sidecar
+    host pools under lockstep host page ids when SGLANG_PD_OFFLOAD_ALLOW_DRAFT=1."""
+
+    def _hybrid_with_sidecars(self, *, host_capacity=4096, swa_capacity=1024):
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+        from sglang_tpu.testing.decode_dram_offload import FakeHostPool
+
+        cache, allocator = hybrid_cache()
+        cache.cache_controller.host.capacity = host_capacity
+        cache.components[ComponentType.SWA]._swa_kv_pool_host.capacity = swa_capacity
+        draft = FakeHostPool(host_capacity, page_size=HYBRID_PAGE)
+        draft_swa = FakeHostPool(swa_capacity, page_size=HYBRID_PAGE)
+        draft.transfer.host_control_address = lambda ip: f"{ip}:7101"
+        draft_swa.transfer.host_control_address = lambda ip: f"{ip}:7102"
+        cache.cache_controller.host.transfer.host_control_address = lambda ip: (
+            f"{ip}:7001"
+        )
+        cache.components[
+            ComponentType.SWA
+        ]._swa_kv_pool_host.transfer.host_control_address = lambda ip: f"{ip}:7002"
+        pools = {
+            PoolName.KV: cache.cache_controller.host,
+            PoolName.SWA: cache.components[ComponentType.SWA]._swa_kv_pool_host,
+            PoolName.DRAFT: draft,
+            PoolName.DRAFT_SWA: draft_swa,
+        }
+        cache.host_pool_group = SimpleNamespace(
+            get_pool=pools.get,
+            entry_map={
+                name: SimpleNamespace(host_pool=pool) for name, pool in pools.items()
+            },
+            free=lambda indices, pool=PoolName.KV: pools[pool].free(indices),
+        )
+        return cache, allocator, pools
+
+    def test_equal_tp_push_and_recall_transfer_draft_and_draft_swa_sidecars(self):
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+        from sglang_tpu.disaggregation.decode_dram_offload.host_page_metadata import (
+            register_host_page_metadata,
+        )
+
+        p_cache, _, p_pools = self._hybrid_with_sidecars(
+            host_capacity=512, swa_capacity=256
+        )
+        d_cache, _, d_pools = self._hybrid_with_sidecars(
+            host_capacity=512, swa_capacity=256
+        )
+        meta_stores = {
+            PoolName.KV: {i: f"kv-{i}".encode() for i in range(4)},
+            PoolName.SWA: {i: f"swa-{i}".encode() for i in range(2)},
+            PoolName.DRAFT: {i: f"dr-{i}".encode() for i in range(4)},
+            PoolName.DRAFT_SWA: {i: f"drs-{i}".encode() for i in range(2)},
+        }
+        restored_meta: dict[PoolName, list[bytes]] = {}
+        for name, store in meta_stores.items():
+            restored_meta[name] = []
+            register_host_page_metadata(
+                p_pools[name],
+                export=lambda pages, s=store: [s.get(p, b"") for p in pages],
+                restore=lambda pages, rows, out=restored_meta[name]: out.extend(rows),
+            )
+
+        p_mgr = prefill_manager()
+        d_mgr = decode_manager()
+        d_mgr.kv_args = SimpleNamespace(page_size=HYBRID_PAGE)
+
+        def deliver(dst_mgr):
+            def _send(endpoint, frames):
+                dst_mgr._message_handlers[frames[0]](frames)
+
+            return _send
+
+        p_mgr._send_multipart_locked.side_effect = deliver(d_mgr)
+        d_mgr._send_multipart_locked.side_effect = deliver(p_mgr)
+
+        p_sched = SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace(page_size=HYBRID_PAGE),
+            attn_tp_cpu_group=None,
+        )
+        d_queue = SimpleNamespace(queue=[], _deferred_releases=[])
+        with patch.dict("os.environ", {"SGLANG_PD_OFFLOAD_ALLOW_DRAFT": "1"}):
+            p_ext = dram_offload_hooks.attach_dram_offload_extension(
+                cache=p_cache, channel=p_mgr.dram_offload_channel, scheduler=p_sched
+            )
+            d_ext = dram_offload_hooks.attach_dram_offload_extension(
+                cache=d_cache,
+                channel=d_mgr.dram_offload_channel,
+                scheduler=p_sched,
+                decode_queue=d_queue,
+            )
+
+        self.assertEqual(
+            p_mgr.dram_offload_channel._draft_pools,
+            (p_pools[PoolName.DRAFT], p_pools[PoolName.DRAFT_SWA]),
+        )
+        self.assertEqual(
+            d_mgr.dram_offload_channel._draft_pools,
+            (d_pools[PoolName.DRAFT], d_pools[PoolName.DRAFT_SWA]),
+        )
+
+        tokens = list(range(1000, 1000 + 4 * HYBRID_PAGE))
+        radix_host_ops.insert_host_prefix(
+            p_cache,
+            RadixKey(array("q", tokens)),
+            p_pools[PoolName.KV].alloc(len(tokens)),
+            HYBRID_PAGE,
+            swa_indices=p_pools[PoolName.SWA].alloc(2 * HYBRID_PAGE),
+        )
+        p_mgr._prefill.decode_addr[1] = ("10.0.0.2", 5555)
+        p_ext.push.note_decode_of(pushed_req(room=1, tokens=tokens), recalled=False)
+        p_ext.push.advance(serving=True)
+        self.assertEqual(p_ext.push.stats["started"], 1)
+        for name in (PoolName.KV, PoolName.SWA, PoolName.DRAFT, PoolName.DRAFT_SWA):
+            self.assertEqual(len(p_pools[name].transfer.registrations), 1, name)
+
+        for _ in range(decode_dram_victim_receiver._CADENCE):
+            d_ext.landing.advance()
+        self.assertTrue(d_ext.landing.has_host_landings())
+        for name in (PoolName.KV, PoolName.SWA, PoolName.DRAFT, PoolName.DRAFT_SWA):
+            self.assertEqual(len(d_pools[name].transfer.reads), 1, name)
+
+        for name in (PoolName.KV, PoolName.SWA, PoolName.DRAFT, PoolName.DRAFT_SWA):
+            d_pools[name].transfer.complete("received")
+            p_pools[name].transfer.complete("sent")
+        for _ in range(decode_dram_victim_receiver._CADENCE):
+            d_ext.landing.advance()
+        p_ext.push.advance(serving=True)
+        self.assertEqual(d_ext.landing.stats["landed"], 1)
+        self.assertEqual(p_ext.push.stats["stored"], 1)
+
+        p_cache.evict_host(len(tokens), FULL)
+        self.assertEqual(host_hit(p_cache, tokens), 0)
+
+        next_turn_tokens = tokens + list(range(5000, 5000 + HYBRID_PAGE))
+        req = SimpleNamespace(
+            bootstrap_room=99,
+            origin_input_ids=next_turn_tokens,
+            extra_key=None,
+            cache_salt=None,
+        )
+        decode_req = SimpleNamespace(req=req)
+        d_queue.queue = [decode_req]
+        d_ext.source.offer_host_prefix(decode_req)
+        offered_full, offered_swa = d_mgr.dram_offload_channel.offered_blocks_locked(
+            99, [{"rank_ip": "10.0.0.2", "rank_port": 5555}]
+        )
+        self.assertEqual((len(offered_full), len(offered_swa)), (4, 2))
+        with p_mgr._state_lock:
+            p_mgr.request_status[99] = KVPoll.Bootstrapping
+            p_mgr._prefill.decode_addr[99] = ("10.0.0.2", 5555)
+            p_mgr.dram_offload_channel.accept_prefix_offer_locked(
+                99, offered_full, offered_swa
+            )
+
+        p_ext.recall.advance([req], waiting_reqs=[])
+        ready = p_mgr.dram_offload_channel.prefix_ready(99)
+        self.assertIsNotNone(ready)
+        self.assertFalse(ready.refused)
+        self.assertEqual(ready.draft_endpoint, "10.0.0.2:7101")
+        self.assertEqual(ready.draft_swa_endpoint, "10.0.0.2:7102")
+
+        p_ext.recall.advance([req], waiting_reqs=[])
+        plan = p_ext.recall._plans[99]
+        self.assertEqual(plan.read_ids, ["99#px", "99#pxd", "99#pxs", "99#pxsd"])
+        for name in (PoolName.KV, PoolName.SWA, PoolName.DRAFT, PoolName.DRAFT_SWA):
+            p_pools[name].transfer.complete("received")
+            d_pools[name].transfer.complete("sent")
+
+        p_ext.recall.advance([req], waiting_reqs=[])
+        self.assertTrue(p_ext.recall.insert_recalled_host_prefix(req))
+        self.assertEqual(p_ext.recall.stats["pulls"], 1)
+        self.assertEqual(host_hit(p_cache, tokens), len(tokens))
+        self.assertEqual(
+            restored_meta[PoolName.DRAFT], [b"dr-0", b"dr-1", b"dr-2", b"dr-3"]
+        )
+        self.assertEqual(restored_meta[PoolName.DRAFT_SWA], [b"drs-0", b"drs-1"])
+
+        d_queue.queue = []
+        d_ext.source.settle_offers()
+        self.assertEqual(d_ext.source.offers, {})
+
+    def test_mismatched_draft_sidecar_between_peers_fails_closed(self):
+        from sglang_tpu.disaggregation.raiden.serde import VictimPush
+
+        d_cache, _ = hybrid_cache()
+        d_mgr = decode_manager()
+        p_sched = SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace(page_size=HYBRID_PAGE),
+            attn_tp_cpu_group=None,
+        )
+        d_ext = dram_offload_hooks.attach_dram_offload_extension(
+            cache=d_cache,
+            channel=d_mgr.dram_offload_channel,
+            scheduler=p_sched,
+            decode_queue=SimpleNamespace(queue=[], _deferred_releases=[]),
+        )
+        push = VictimPush(
+            prefill="p0",
+            seq=1,
+            ack_endpoint="tcp://10.0.0.1:4444",
+            tokens=list(range(2 * HYBRID_PAGE)),
+            blocks=[0, 1],
+            uuid=7,
+            address="10.0.0.1:7001",
+            swa_blocks=[0, 1],
+            swa_address="10.0.0.1:7002",
+            draft_swa_address="10.0.0.1:7102",
+        )
+        d_mgr.dram_offload_channel._on_victim_push(push.to_frames())
+        for _ in range(decode_dram_victim_receiver._CADENCE):
+            d_ext.landing.advance()
+        self.assertEqual(d_ext.landing.stats["no_room"], 1)
+        self.assertEqual(d_ext.landing.stats["granted"], 0)
+
+    def test_failed_metadata_restore_discards_draft_sidecar_metadata(self):
+        from sglang_tpu.disaggregation.raiden.serde import VictimPush
+
+        d_cache, _, d_pools = self._hybrid_with_sidecars(
+            host_capacity=256, swa_capacity=128
+        )
+        d_mgr = decode_manager()
+        sched = SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace(page_size=HYBRID_PAGE),
+            attn_tp_cpu_group=None,
+        )
+        with patch.dict("os.environ", {"SGLANG_PD_OFFLOAD_ALLOW_DRAFT": "1"}):
+            d_ext = dram_offload_hooks.attach_dram_offload_extension(
+                cache=d_cache,
+                channel=d_mgr.dram_offload_channel,
+                scheduler=sched,
+                decode_queue=SimpleNamespace(queue=[], _deferred_releases=[]),
+            )
+        push = VictimPush(
+            prefill="p0",
+            seq=9,
+            ack_endpoint="tcp://10.0.0.1:4444",
+            tokens=list(range(2 * HYBRID_PAGE)),
+            blocks=[0, 1],
+            uuid=11,
+            address="10.0.0.1:7001",
+            swa_blocks=[0, 1],
+            swa_address="10.0.0.1:7002",
+            draft_address="10.0.0.1:7101",
+            draft_swa_address="10.0.0.1:7102",
+            page_metadata=[b"kv0", b"kv1"],
+            draft_page_metadata=[b"dr0", b"dr1"],
+            swa_page_metadata=[b"bad-length"],
+            draft_swa_page_metadata=[b"drs0", b"drs1"],
+        )
+        d_mgr.dram_offload_channel._on_victim_push(push.to_frames())
+        for _ in range(decode_dram_victim_receiver._CADENCE):
+            d_ext.landing.advance()
+        self.assertEqual(d_ext.landing.stats["granted"], 1)
+        for pool in d_pools.values():
+            pool.transfer.complete("received")
+        for _ in range(decode_dram_victim_receiver._CADENCE):
+            d_ext.landing.advance()
+        self.assertEqual(d_ext.landing.stats["failed"], 1)
+        self.assertEqual(
+            d_mgr.dram_offload_channel.export_host_metadata([0, 1], draft=True),
+            [],
+        )
+        self.assertEqual(
+            d_mgr.dram_offload_channel.export_host_metadata([0, 1]),
+            [],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

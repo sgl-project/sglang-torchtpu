@@ -119,6 +119,7 @@ class PrefillDramPrefixPuller:
         self._page_size = ctx.page_size
         self._host_pool = ctx.host_pool
         self._swa_host_pool = ctx.swa_host_pool
+        self._draft_pool, self._draft_swa_pool = ctx.draft_pools
         self._window_pages = ctx.window_tokens // ctx.page_size
         self._lockstep = ctx.lockstep
         # Landing pages of in-flight recalls sit outside the tree until
@@ -339,17 +340,34 @@ class PrefillDramPrefixPuller:
             return False
         restored = False
         try:
+            full_pages = host_page_ids(self._host_pool, plan.new_indices)
             self._channel.restore_host_metadata(
-                host_page_ids(self._host_pool, plan.new_indices),
+                full_pages,
                 plan.ready.page_metadata,
             )
-            self._channel.restore_host_metadata(
+            if self._draft_pool is not None:
+                self._channel.restore_host_metadata(
+                    full_pages,
+                    getattr(plan.ready, "draft_page_metadata", []),
+                    draft=True,
+                )
+            swa_pages = (
                 host_page_ids(self._swa_host_pool, plan.swa_indices)
                 if plan.swa_indices is not None
-                else [],
+                else []
+            )
+            self._channel.restore_host_metadata(
+                swa_pages,
                 plan.ready.swa_page_metadata,
                 swa=True,
             )
+            if self._draft_swa_pool is not None and plan.swa_indices is not None:
+                self._channel.restore_host_metadata(
+                    swa_pages,
+                    getattr(plan.ready, "draft_swa_page_metadata", []),
+                    swa=True,
+                    draft=True,
+                )
             restored = True
         except Exception:  # noqa: BLE001 - decline on every rank before insertion
             logger.exception("Cannot restore recalled host page metadata")
@@ -481,7 +499,8 @@ class PrefillDramPrefixPuller:
 
     def _start_read(self, room: int) -> bool:
         """Start the pull's native reads from the pages the decode registered:
-        the full pages, then the window pages of a hybrid model."""
+        the full pages, the window pages of a hybrid model, and any bound draft
+        sidecar pools."""
         plan = self._plans[room]
         plan.started = True
         # None once an abort dropped the room since the ranks agreed on READY.
@@ -490,12 +509,28 @@ class PrefillDramPrefixPuller:
             return False
         if ready.has_window != bool(plan.swa_remote):
             return False
+        if bool(getattr(ready, "draft_endpoint", "")) != (self._draft_pool is not None):
+            return False
+        if plan.swa_remote and bool(getattr(ready, "draft_swa_endpoint", "")) != (
+            self._draft_swa_pool is not None
+        ):
+            return False
         plan.ready = ready
-        # A read that started keeps its landing owned also when the other one
+        # A read that started keeps its landing owned also when another read
         # of the pull does not start.
         if not self._start_full_read(room, plan, ready):
             return False
-        return not plan.swa_remote or self._start_window_read(room, plan, ready)
+        if self._draft_pool is not None and not self._start_draft_read(
+            room, plan, ready
+        ):
+            return False
+        if not plan.swa_remote:
+            return True
+        if not self._start_window_read(room, plan, ready):
+            return False
+        return self._draft_swa_pool is None or self._start_window_draft_read(
+            room, plan, ready
+        )
 
     def _start_full_read(
         self, room: int, plan: DramPrefixPullPlan, ready: PrefixRegistration
@@ -512,6 +547,22 @@ class PrefillDramPrefixPuller:
             plan.read_ids.append(read_id)
         return started
 
+    def _start_draft_read(
+        self, room: int, plan: DramPrefixPullPlan, ready: PrefixRegistration
+    ) -> bool:
+        read_id = self._channel.prefix_req_id(room, draft=True)
+        started = self._channel.start_host_read(
+            read_id,
+            ready.uuid,
+            ready.draft_endpoint,
+            plan.remote,
+            host_page_ids(self._host_pool, plan.new_indices),
+            draft=True,
+        )
+        if started:
+            plan.read_ids.append(read_id)
+        return started
+
     def _start_window_read(
         self, room: int, plan: DramPrefixPullPlan, ready: PrefixRegistration
     ) -> bool:
@@ -523,6 +574,23 @@ class PrefillDramPrefixPuller:
             plan.swa_remote,
             host_page_ids(self._swa_host_pool, plan.swa_indices),
             swa=True,
+        )
+        if started:
+            plan.read_ids.append(read_id)
+        return started
+
+    def _start_window_draft_read(
+        self, room: int, plan: DramPrefixPullPlan, ready: PrefixRegistration
+    ) -> bool:
+        read_id = self._channel.prefix_req_id(room, swa=True, draft=True)
+        started = self._channel.start_host_read(
+            read_id,
+            ready.swa_uuid,
+            ready.draft_swa_endpoint,
+            plan.swa_remote,
+            host_page_ids(self._swa_host_pool, plan.swa_indices),
+            swa=True,
+            draft=True,
         )
         if started:
             plan.read_ids.append(read_id)
