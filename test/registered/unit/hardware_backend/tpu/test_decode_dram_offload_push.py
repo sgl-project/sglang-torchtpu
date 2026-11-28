@@ -9,9 +9,14 @@ the raiden manager is a fake.
 """
 
 import heapq
+import os
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
@@ -29,7 +34,12 @@ from sglang_tpu.disaggregation.decode_dram_offload.dram_offload_hooks import (
     DecodeDramOffloadExtension,
     PrefillDramOffloadExtension,
 )
-from sglang_tpu.disaggregation.raiden.serde import VictimAck, VictimPush
+from sglang_tpu.disaggregation.raiden.serde import (
+    VictimAck,
+    VictimOffer,
+    VictimOfferAck,
+    VictimPush,
+)
 from sglang_tpu.testing.decode_dram_offload import (
     FULL,
     DecodeReceiverFixture,
@@ -52,6 +62,7 @@ class TestPrefillPusher(PrefillPusherFixture, CustomTestCase):
     def test_metadata_export_failure_declines_before_native_registration(self):
         self.mgr.export_host_metadata.side_effect = RuntimeError("unsealed source")
         self.pusher.advance(serving=True)
+        self.pusher.advance(serving=False)
         self.mgr.send_victim_push.assert_not_called()
         self.assertFalse(self.host.transfer.registrations)
         self.pusher.retire_settled_pushes()
@@ -158,6 +169,7 @@ class TestPrefillPusher(PrefillPusherFixture, CustomTestCase):
         self.assertIsNotNone(shared.component_data[FULL].value)
         pusher.note_decode_of(pushed_req(room=1, tokens=session), recalled=False)
         pusher.advance(serving=True)
+        pusher.advance(serving=False)
         pushed = channel.send_victim_push.call_args.kwargs["blocks"]
         self.assertEqual(len(pushed), 8)
         cache.evict_host(4)
@@ -190,6 +202,7 @@ class TestPrefillPusher(PrefillPusherFixture, CustomTestCase):
         cache.cache_controller.start_writing()
         cache.writing_check()
         pusher.advance(serving=True)
+        pusher.advance(serving=False)
         channel.send_victim_push.assert_called_once()
 
     def test_native_failure_declines_the_push_and_unlocks_the_host_source(self):
@@ -546,6 +559,7 @@ class TestPrefillPusherExtra(PrefillPusherFixture, CustomTestCase):
         self.pusher.note_decode_of(pushed_req(room=3, tokens=c), recalled=False)
         for _ in range(3):
             self.pusher.advance(serving=True)
+            self.pusher.advance(serving=False)
             self.host.transfer.complete("failed")
             seq = self.mgr.send_victim_push.call_args.kwargs["seq"]
             self.replies[seq] = False
@@ -820,6 +834,653 @@ class TestEvictionWalkSkipsDeletedLeaves(CustomTestCase):
             ),
             dram_offload_hooks._patch_targets(),
         )
+
+
+class TestThrashingFixes(PrefillPusherFixture, CustomTestCase):
+    def test_evict_stored_first_defaults_false_and_opts_in(self):
+        from sglang_tpu.envs import envs as tpu_envs
+
+        self.assertFalse(tpu_envs.SGLANG_PD_OFFLOAD_EVICT_STORED_FIRST.get())
+        for opt_in in (False, True):
+            with self.subTest(opt_in=opt_in):
+                self.setUp()
+                with (
+                    patch.object(
+                        tpu_envs.SGLANG_PD_OFFLOAD_EVICT_STORED_FIRST,
+                        "get",
+                        return_value=opt_in,
+                    ),
+                    patch.object(
+                        prefill_dram_victim_pusher,
+                        "mark_next_victim",
+                        wraps=prefill_dram_victim_pusher.mark_next_victim,
+                    ) as mark_mock,
+                ):
+                    sent = self.offer_once()
+                    self.replies[sent["seq"]] = True
+                    self.host.transfer.complete("sent")
+                    self.pusher.advance(serving=True)
+                    self.assertEqual(self.pusher.stats["stored"], 1)
+                    if opt_in:
+                        mark_mock.assert_called_once()
+                    else:
+                        mark_mock.assert_not_called()
+
+    def test_push_free_tokens_env_overrides_pressure_threshold(self):
+        from sglang_tpu.envs import envs as tpu_envs
+
+        with patch.object(
+            tpu_envs.SGLANG_PD_OFFLOAD_PUSH_FREE_TOKENS, "get", return_value=1
+        ):
+            self.assertFalse(self.pusher._under_host_pressure())
+        with patch.object(
+            tpu_envs.SGLANG_PD_OFFLOAD_PUSH_FREE_TOKENS, "get", return_value=1024
+        ):
+            self.assertTrue(self.pusher._under_host_pressure())
+
+    def test_write_through_host_only_push_skips_device_resident_leaf(self):
+        cache, allocator = full_cache(kv_size=16, host_capacity=32)
+        cache.tree_core.is_write_back = cache.is_write_back = False
+        cache.cache_controller.write_policy = "write_through"
+        cache.write_through_threshold = 1
+        channel = push_channel(cache.cache_controller.host)
+        channel.decode_peer.return_value = ("10.0.0.1", 5001)
+        pusher = prefill_dram_victim_pusher.PrefillDramVictimPusher(
+            offload_context(cache=cache, channel=channel)
+        )
+        seq = list(range(100, 108))
+        insert_tokens(cache, allocator, seq)
+        cache.cache_controller.start_writing()
+        cache.writing_check()
+        req = pushed_req(room=1, tokens=seq)
+        pusher.note_decode_of(req, recalled=False)
+        self.assertTrue(pusher._host_only_push_only())
+        pusher.advance(serving=True)
+        channel.send_victim_push.assert_not_called()
+        cache.evict(EvictParams(num_tokens=8))
+        pusher.advance(serving=True)
+        pusher.advance(serving=False)
+        channel.send_victim_push.assert_called_once()
+
+
+class TestDeltaLanding(DecodeReceiverFixture, CustomTestCase):
+    def test_decode_delta_landing_reads_and_allocates_only_missing_suffix(self):
+        self.pushes.clear()
+        p1 = list(range(500, 508))
+        p2 = list(range(500, 512))
+        push1 = VictimPush(
+            prefill="p0",
+            seq=1,
+            ack_endpoint="tcp://10.0.0.1:6001",
+            tokens=p1,
+            blocks=list(range(10, 18)),
+            swa_blocks=[],
+            uuid=111,
+            address="tcp://10.0.0.1:7001",
+            swa_address="",
+            page_metadata=[f"m{i}".encode() for i in range(8)],
+            swa_page_metadata=[],
+        )
+        self.pushes[("p0", 1)] = push1
+        self.round()
+        self.host.transfer.complete("received")
+        self.round()
+        self.assertEqual(self.receiver.stats["landed"], 1)
+        self.assertEqual(self.receiver.stats["landed_tokens"], 8)
+        self.assertEqual(host_hit(self.cache, p1), 8)
+        self.host.transfer.reads.clear()
+        push2 = VictimPush(
+            prefill="p0",
+            seq=2,
+            ack_endpoint="tcp://10.0.0.1:6001",
+            tokens=p2,
+            blocks=list(range(10, 22)),
+            swa_blocks=[],
+            uuid=222,
+            address="tcp://10.0.0.1:7001",
+            swa_address="",
+            page_metadata=[f"m{i}".encode() for i in range(12)],
+            swa_page_metadata=[],
+        )
+        self.pushes[("p0", 2)] = push2
+        self.round()
+        self.assertEqual(len(self.host.transfer.reads), 1)
+        read = next(iter(self.host.transfer.reads.values()))
+        self.assertEqual(read["remote_block_ids"], list(range(18, 22)))
+        self.assertEqual(len(read["local_block_ids"]), 4)
+        self.host.transfer.complete("received")
+        self.round()
+        self.assertEqual(self.receiver.stats["landed"], 2)
+        self.assertEqual(self.receiver.stats["landed_tokens"], 12)
+        self.assertEqual(host_hit(self.cache, p2), 12)
+
+
+class TestPreflightVictimOffer(PrefillPusherFixture, CustomTestCase):
+    def test_declined_offer_registers_zero_host_reads_and_retires_in_one_tick(self):
+        self.auto_accept_offers = False
+        self.pusher.advance(serving=True)
+        self.mgr.send_victim_offer.assert_called_once()
+        self.mgr.register_host_read.assert_not_called()
+        self.mgr.send_victim_push.assert_not_called()
+        self.assertTrue(self.pusher.has_pushes_in_flight())
+        seq = self.mgr.send_victim_offer.call_args.kwargs["seq"]
+        # Decode declines (e.g. MAX_INFLIGHT or no host room).
+        self.offer_replies[seq] = VictimOfferAck(seq=seq, accepted=False)
+        self.pusher.advance(serving=False)
+        self.mgr.register_host_read.assert_not_called()
+        self.mgr.send_victim_push.assert_not_called()
+        self.assertEqual(self.pusher.stats["declined"], 1)
+        self.assertFalse(self.pusher.has_pushes_in_flight())
+        # Host locks released: leaf can be evicted immediately.
+        self.cache.evict_host(8, FULL)
+        self.assertEqual(host_hit(self.cache, self.a), 0)
+
+    def test_accepted_offer_with_skip_prefix_registers_only_delta_suffix(self):
+        self.auto_accept_offers = False
+        self.pusher.advance(serving=True)
+        seq = self.mgr.send_victim_offer.call_args.kwargs["seq"]
+        self.offer_replies[seq] = VictimOfferAck(
+            seq=seq, accepted=True, skip_prefix_pages=4
+        )
+        self.pusher.advance(serving=False)
+        self.mgr.register_host_read.assert_called_once()
+        reg_pages = self.mgr.register_host_read.call_args.args[2]
+        self.assertEqual(len(reg_pages), 4)
+        self.mgr.send_victim_push.assert_called_once()
+        push_kwargs = self.mgr.send_victim_push.call_args.kwargs
+        self.assertEqual(push_kwargs["skip_prefix_pages"], 4)
+        self.assertEqual(push_kwargs["blocks"], reg_pages)
+
+    def test_offer_ack_timeout_retires_with_zero_registrations(self):
+        self.auto_accept_offers = False
+        self.pusher.advance(serving=True)
+        self.assertTrue(self.pusher.has_pushes_in_flight())
+        seq = self.mgr.send_victim_offer.call_args.kwargs["seq"]
+        self.pusher._pushes[seq].sent_at -= (
+            prefill_dram_victim_pusher.OFFER_ACK_TIMEOUT_S + 1.0
+        )
+        self.pusher.advance(serving=False)
+        self.mgr.register_host_read.assert_not_called()
+        self.assertEqual(self.pusher.stats["declined"], 1)
+        self.assertFalse(self.pusher.has_pushes_in_flight())
+
+    def test_fully_held_offer_ack_registers_zero_host_reads_and_stores(self):
+        self.auto_accept_offers = False
+        self.pusher.advance(serving=True)
+        seq = self.mgr.send_victim_offer.call_args.kwargs["seq"]
+        self.offer_replies[seq] = VictimOfferAck(
+            seq=seq, accepted=True, skip_prefix_pages=8, skip_swa=True
+        )
+        self.pusher.advance(serving=False)
+        self.mgr.register_host_read.assert_not_called()
+        self.mgr.send_victim_push.assert_called_once()
+        push_kwargs = self.mgr.send_victim_push.call_args.kwargs
+        self.assertEqual(push_kwargs["blocks"], [])
+        self.assertEqual(push_kwargs["swa_blocks"], [])
+        self.assertEqual(push_kwargs["skip_prefix_pages"], 8)
+        self.replies[seq] = True
+        self.pusher.advance(serving=False)
+        self.assertEqual(self.pusher.stats["stored"], 1)
+        self.assertFalse(self.pusher.has_pushes_in_flight())
+
+
+class TestDecodePreflightOffer(DecodeReceiverFixture, CustomTestCase):
+    def test_decode_preflight_offer_reserves_delta_and_lands_suffix_push(self):
+        self.pushes.clear()
+        p1 = list(range(600, 608))
+        p2 = list(range(600, 612))
+        # Seed p1 in decode host cache first.
+        self.pushes[("p0", 1)] = VictimPush(
+            prefill="p0",
+            seq=1,
+            ack_endpoint="tcp://10.0.0.1:6001",
+            tokens=p1,
+            blocks=list(range(10, 18)),
+            uuid=111,
+            address="tcp://10.0.0.1:7001",
+        )
+        self.round()
+        self.host.transfer.complete("received")
+        self.round()
+        self.assertEqual(host_hit(self.cache, p1), 8)
+        self.host.transfer.reads.clear()
+        # Prefill sends 2-phase VictimOffer for p2 (12 tokens).
+        self.offers[("p0", 2)] = VictimOffer(
+            prefill="p0",
+            seq=2,
+            ack_endpoint="tcp://10.0.0.1:6001",
+            tokens=p2,
+            num_blocks=12,
+        )
+        self.round()
+        self.mgr.send_victim_offer_ack.assert_called_once_with(
+            endpoint="tcp://10.0.0.1:6001",
+            seq=2,
+            accepted=True,
+            skip_prefix_pages=8,
+            skip_swa=False,
+        )
+        # Prefill sends VictimPush with only the 4 suffix blocks.
+        self.pushes[("p0", 2)] = VictimPush(
+            prefill="p0",
+            seq=2,
+            ack_endpoint="tcp://10.0.0.1:6001",
+            tokens=p2,
+            blocks=[18, 19, 20, 21],
+            uuid=222,
+            address="tcp://10.0.0.1:7001",
+            skip_prefix_pages=8,
+        )
+        self.round()
+        self.assertEqual(len(self.host.transfer.reads), 1)
+        read = next(iter(self.host.transfer.reads.values()))
+        self.assertEqual(read["remote_block_ids"], [18, 19, 20, 21])
+        self.assertEqual(len(read["local_block_ids"]), 4)
+        self.host.transfer.complete("received")
+        self.round()
+        self.assertEqual(self.receiver.stats["landed"], 2)
+        self.assertEqual(host_hit(self.cache, p2), 12)
+
+    def test_suffix_push_without_reservation_declines_when_prefix_evicted(self):
+        """If a reserved offer expires and decode evicts the skipped prefix,
+        the late suffix-only VictimPush must be declined cleanly instead of
+        issuing a mismatched host read."""
+        self.pushes.clear()
+        p2 = list(range(620, 632))
+        self.pushes[("p0", 9)] = VictimPush(
+            prefill="p0",
+            seq=9,
+            ack_endpoint="tcp://10.0.0.1:6001",
+            tokens=p2,
+            blocks=[18, 19, 20, 21],
+            uuid=999,
+            address="tcp://10.0.0.1:7001",
+            page_metadata=[b"m0", b"m1", b"m2", b"m3"],
+            skip_prefix_pages=8,
+        )
+        self.round()
+        self.assertFalse(self.host.transfer.reads)
+        self.assertFalse(self.receiver.has_host_landings())
+        self.assertEqual(self.receiver.stats["no_room"], 1)
+        self.assertFalse(self.answered())
+
+    def test_reserved_offer_swa_block_mismatch_frees_reservation_and_declines(self):
+        self.pushes.clear()
+        p1 = list(range(640, 648))
+        self.offers[("p0", 10)] = VictimOffer(
+            prefill="p0",
+            seq=10,
+            ack_endpoint="tcp://10.0.0.1:6001",
+            tokens=p1,
+            num_blocks=8,
+        )
+        self.round()
+        self.assertEqual(self.host.used, 8)
+        self.pushes[("p0", 10)] = VictimPush(
+            prefill="p0",
+            seq=10,
+            ack_endpoint="tcp://10.0.0.1:6001",
+            tokens=p1,
+            blocks=list(range(10, 18)),
+            swa_blocks=[99],
+            uuid=1010,
+            address="tcp://10.0.0.1:7001",
+            skip_prefix_pages=0,
+        )
+        self.round()
+        self.assertFalse(self.host.transfer.reads)
+        self.assertFalse(self.receiver.has_host_landings())
+        self.assertEqual(self.host.used, 0)
+        self.assertFalse(self.answered())
+
+    def test_reserved_offer_survives_concurrent_one_phase_pushes_at_max_inflight(self):
+        self.pushes.clear()
+        self.host.capacity = 128
+        max_inflight = prefill_dram_victim_pusher.MAX_INFLIGHT
+        p_offer = list(range(660, 668))
+        self.offers[("p0", 100)] = VictimOffer(
+            prefill="p0",
+            seq=100,
+            ack_endpoint="tcp://10.0.0.1:6001",
+            tokens=p_offer,
+            num_blocks=8,
+        )
+        self.round()
+        self.assertEqual(len(self.receiver._reserved_offers), 1)
+        # Concurrent 1-phase pushes must count reserved offers against MAX_INFLIGHT.
+        for i in range(max_inflight):
+            base = 700 + i * 16
+            self.pushes[("p1", 200 + i)] = VictimPush(
+                prefill="p1",
+                seq=200 + i,
+                ack_endpoint="tcp://10.0.0.2:6002",
+                tokens=list(range(base, base + 8)),
+                blocks=list(range(base, base + 8)),
+                uuid=2000 + i,
+                address="tcp://10.0.0.2:7002",
+            )
+        self.round()
+        self.assertEqual(len(self.receiver._landings), max_inflight - 1)
+        self.assertEqual(self.receiver.stats["no_room"], 1)
+        self.assertEqual(len(self.receiver._reserved_offers), 1)
+        # The reserved offer's VictimPush must still be admitted without hitting
+        # the MAX_INFLIGHT gate or leaking its reservation.
+        self.pushes[("p0", 100)] = VictimPush(
+            prefill="p0",
+            seq=100,
+            ack_endpoint="tcp://10.0.0.1:6001",
+            tokens=p_offer,
+            blocks=list(range(10, 18)),
+            uuid=1100,
+            address="tcp://10.0.0.1:7001",
+            skip_prefix_pages=0,
+        )
+        self.round()
+        self.assertEqual(len(self.receiver._reserved_offers), 0)
+        self.assertEqual(len(self.receiver._landings), max_inflight)
+        self.assertEqual(self.receiver.stats["no_room"], 1)
+        self.host.transfer.complete("received")
+        self.round()
+        self.assertEqual(self.receiver.stats["landed"], max_inflight)
+        self.assertEqual(host_hit(self.cache, p_offer), 8)
+        self.assertFalse(self.receiver.has_host_landings())
+
+    def test_fully_held_offer_registers_zero_reads_and_stores_without_leak(self):
+        self.pushes.clear()
+        p1 = list(range(680, 688))
+        self.pushes[("p0", 1)] = VictimPush(
+            prefill="p0",
+            seq=1,
+            ack_endpoint="tcp://10.0.0.1:6001",
+            tokens=p1,
+            blocks=list(range(10, 18)),
+            uuid=111,
+            address="tcp://10.0.0.1:7001",
+        )
+        self.round()
+        self.host.transfer.complete("received")
+        self.round()
+        self.assertEqual(host_hit(self.cache, p1), 8)
+        self.host.transfer.reads.clear()
+        self.mgr.send_victim_offer_ack.reset_mock()
+        self.mgr.send_victim_ack.reset_mock()
+
+        self.offers[("p0", 2)] = VictimOffer(
+            prefill="p0",
+            seq=2,
+            ack_endpoint="tcp://10.0.0.1:6001",
+            tokens=p1,
+            num_blocks=8,
+        )
+        self.round()
+        self.mgr.send_victim_offer_ack.assert_called_once_with(
+            endpoint="tcp://10.0.0.1:6001",
+            seq=2,
+            accepted=True,
+            skip_prefix_pages=8,
+            skip_swa=True,
+        )
+        self.pushes[("p0", 2)] = VictimPush(
+            prefill="p0",
+            seq=2,
+            ack_endpoint="tcp://10.0.0.1:6001",
+            tokens=p1,
+            blocks=[],
+            swa_blocks=[],
+            uuid=222,
+            address="tcp://10.0.0.1:7001",
+            skip_prefix_pages=8,
+        )
+        self.round()
+        self.assertFalse(self.host.transfer.reads)
+        self.assertTrue(self.answered())
+        self.assertFalse(self.receiver.has_host_landings())
+        self.assertEqual(self.host.used, 8)
+
+    def test_start_full_read_raises_when_first_page_precedes_skip(self):
+        from sglang_tpu.disaggregation.decode_dram_offload.decode_dram_victim_receiver import (
+            _DramLanding,
+        )
+
+        push = VictimPush(
+            prefill="p0",
+            seq=99,
+            ack_endpoint="tcp://10.0.0.1:6001",
+            tokens=list(range(690, 698)),
+            blocks=[10, 11, 12, 13],
+            uuid=999,
+            address="tcp://10.0.0.1:7001",
+            skip_prefix_pages=4,
+        )
+        landing = _DramLanding(push=push, indices=None, first_page=2)
+        with self.assertRaises(ValueError):
+            self.receiver._start_full_read(landing)
+
+    def test_hybrid_fully_held_full_kv_offer_reads_only_swa_window(self):
+        from array import array
+
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        from sglang_tpu.disaggregation.decode_dram_offload import (
+            decode_dram_victim_receiver,
+        )
+        from sglang_tpu.testing.decode_dram_offload import HYBRID_PAGE, hybrid_cache
+
+        cache, _ = hybrid_cache(window=128)
+        host = cache.cache_controller.host
+        swa_host = radix_host_ops.swa_host_pool(cache)
+        mgr = push_channel(host, swa_host)
+        offers, pushes = {}, {}
+        mgr.received_victim_offers.side_effect = lambda: dict(offers)
+        mgr.take_victim_offer.side_effect = lambda k: offers.pop(k, None)
+        mgr.received_pushes.side_effect = lambda: dict(pushes)
+        mgr.take_push.side_effect = lambda k: pushes.pop(k, None)
+        receiver = decode_dram_victim_receiver.DecodeDramVictimReceiver(
+            offload_context(cache=cache, channel=mgr, page_size=HYBRID_PAGE)
+        )
+
+        toks = list(range(1000, 1000 + 4 * HYBRID_PAGE))
+        node_id, _ = radix_host_ops.insert_host_prefix(
+            cache, RadixKey(array("q", toks)), host.alloc(len(toks)), HYBRID_PAGE
+        )
+        offers[("p0", 1)] = VictimOffer(
+            prefill="p0",
+            seq=1,
+            ack_endpoint="tcp://10.0.0.1:6001",
+            tokens=toks,
+            num_blocks=4,
+            num_swa_blocks=2,
+        )
+        for _ in range(decode_dram_victim_receiver._CADENCE):
+            receiver.advance()
+        mgr.send_victim_offer_ack.assert_called_once_with(
+            endpoint="tcp://10.0.0.1:6001",
+            seq=1,
+            accepted=True,
+            skip_prefix_pages=4,
+            skip_swa=False,
+        )
+        pushes[("p0", 1)] = VictimPush(
+            prefill="p0",
+            seq=1,
+            ack_endpoint="tcp://10.0.0.1:6001",
+            tokens=toks,
+            blocks=[],
+            swa_blocks=[50, 51],
+            uuid=777,
+            address="tcp://10.0.0.1:7001",
+            swa_address="tcp://10.0.0.1:7002",
+            skip_prefix_pages=4,
+        )
+        for _ in range(decode_dram_victim_receiver._CADENCE):
+            receiver.advance()
+        self.assertFalse(host.transfer.reads)
+        self.assertEqual(len(swa_host.transfer.reads), 1)
+        swa_host.transfer.complete("received")
+        for _ in range(decode_dram_victim_receiver._CADENCE):
+            receiver.advance()
+        mgr.send_victim_ack.assert_called_once_with(
+            endpoint="tcp://10.0.0.1:6001", seq=1, stored=True
+        )
+        self.assertFalse(receiver.has_host_landings())
+        self.assertEqual(host.used, len(toks))
+        self.assertEqual(swa_host.used, 2 * HYBRID_PAGE)
+        self.assertIsNotNone(
+            radix_host_ops.window_host_pages(
+                cache,
+                swa_host,
+                cache.tree_core.node_by_id(node_id),
+                tokens=len(toks),
+                window_tokens=128,
+            )
+        )
+
+
+def _two_rank_receiver_skip_divergence_worker(rank: int, store_path: str) -> None:
+    store = dist.FileStore(store_path, 2)
+    dist.init_process_group(backend="gloo", store=store, rank=rank, world_size=2)
+    try:
+        from sglang_tpu.disaggregation.decode_dram_offload import (
+            decode_dram_victim_receiver,
+        )
+        from sglang_tpu.disaggregation.decode_dram_offload.rank_lockstep import (
+            DramOffloadWorkerContext,
+            RankLockstep,
+        )
+
+        group = dist.new_group(ranks=[0, 1], backend="gloo")
+        cache, _ = full_cache(host_capacity=32)
+        host = cache.cache_controller.host
+        mgr = push_channel(host)
+        pushes = {
+            ("p0", 1): VictimPush(
+                prefill="p0",
+                seq=1,
+                ack_endpoint="tcp://10.0.0.1:6001",
+                tokens=list(range(800, 808)),
+                blocks=[10, 11, 12, 13] if rank == 0 else [12, 13, 14, 15],
+                uuid=555,
+                address="tcp://10.0.0.1:7001",
+                skip_prefix_pages=4 if rank == 0 else 2,
+            )
+        }
+        mgr.received_pushes.side_effect = lambda: dict(pushes)
+        mgr.take_push.side_effect = lambda k: pushes.pop(k, None)
+        ctx = DramOffloadWorkerContext(
+            cache=cache,
+            channel=mgr,
+            page_size=1,
+            host_pool=host,
+            lockstep=RankLockstep(group),
+        )
+        recv = decode_dram_victim_receiver.DecodeDramVictimReceiver(ctx)
+        for _ in range(decode_dram_victim_receiver._MAX_UNAGREED_ROUNDS + 2):
+            for _ in range(decode_dram_victim_receiver._CADENCE):
+                recv.advance()
+        assert not recv.has_host_landings()
+        assert recv.stats["dropped"] == 1
+        assert not host.transfer.reads
+        assert host.used == 0
+    finally:
+        dist.destroy_process_group()
+
+
+def _two_rank_offer_preflight_worker(rank: int, store_path: str) -> None:
+    store = dist.FileStore(store_path, 2)
+    dist.init_process_group(backend="gloo", store=store, rank=rank, world_size=2)
+    try:
+        from sglang_tpu.disaggregation.decode_dram_offload.prefill_dram_victim_pusher import (
+            PrefillDramVictimPusher,
+        )
+        from sglang_tpu.disaggregation.decode_dram_offload.rank_lockstep import (
+            DramOffloadWorkerContext,
+            RankLockstep,
+        )
+
+        group = dist.new_group(ranks=[0, 1], backend="gloo")
+        for scenario in ("asymmetric_decline", "one_rank_timeout", "both_accept_delta"):
+            cache, allocator = full_cache(host_capacity=32)
+            host = cache.cache_controller.host
+            mgr = push_channel(host)
+            offer_replies = {}
+            mgr.victim_offer_reply.side_effect = offer_replies.get
+            mgr.send_victim_offer.side_effect = lambda **kwargs: True
+            peers = {1: ("10.0.0.1", 5001)}
+            mgr.decode_peer.side_effect = peers.get
+            ctx = DramOffloadWorkerContext(
+                cache=cache,
+                channel=mgr,
+                page_size=1,
+                host_pool=host,
+                lockstep=RankLockstep(group),
+            )
+            pusher = PrefillDramVictimPusher(ctx)
+            toks = list(range(700, 708))
+            insert_tokens(cache, allocator, toks)
+            cache.evict(EvictParams(num_tokens=8))
+            pusher.note_decode_of(pushed_req(room=1, tokens=toks), recalled=False)
+            pusher.advance(serving=True)
+            assert mgr.send_victim_offer.call_count == 1
+            assert mgr.register_host_read.call_count == 0
+            seq = mgr.send_victim_offer.call_args.kwargs["seq"]
+
+            if scenario == "asymmetric_decline":
+                offer_replies[seq] = (
+                    VictimOfferAck(seq=seq, accepted=True, skip_prefix_pages=4)
+                    if rank == 0
+                    else VictimOfferAck(seq=seq, accepted=False)
+                )
+                pusher.advance(serving=False)
+                assert mgr.register_host_read.call_count == 0
+                assert mgr.send_victim_push.call_count == 0
+                assert pusher.stats["declined"] == 1
+                assert not pusher.has_pushes_in_flight()
+            elif scenario == "one_rank_timeout":
+                if rank == 0:
+                    offer_replies[seq] = VictimOfferAck(
+                        seq=seq, accepted=True, skip_prefix_pages=4
+                    )
+                else:
+                    pusher._pushes[seq].sent_at -= (
+                        prefill_dram_victim_pusher.OFFER_ACK_TIMEOUT_S + 1.0
+                    )
+                pusher.advance(serving=False)
+                assert mgr.register_host_read.call_count == 0
+                assert mgr.send_victim_push.call_count == 0
+                assert pusher.stats["declined"] == 1
+                assert not pusher.has_pushes_in_flight()
+            elif scenario == "both_accept_delta":
+                offer_replies[seq] = VictimOfferAck(
+                    seq=seq, accepted=True, skip_prefix_pages=4
+                )
+                pusher.advance(serving=False)
+                assert mgr.register_host_read.call_count == 1
+                assert len(mgr.register_host_read.call_args.args[2]) == 4
+                assert mgr.send_victim_push.call_count == 1
+                assert mgr.send_victim_push.call_args.kwargs["skip_prefix_pages"] == 4
+    finally:
+        dist.destroy_process_group()
+
+
+class TestPreflightVictimOfferMultiRank(CustomTestCase):
+    def test_two_rank_gloo_offer_lockstep(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store_path = os.path.join(tmpdir, "gloo_offer_store")
+            mp.spawn(
+                _two_rank_offer_preflight_worker,
+                args=(store_path,),
+                nprocs=2,
+                join=True,
+            )
+
+    def test_two_rank_gloo_receiver_skip_prefix_divergence_drops_cleanly(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store_path = os.path.join(tmpdir, "gloo_receiver_skip_store")
+            mp.spawn(
+                _two_rank_receiver_skip_divergence_worker,
+                args=(store_path,),
+                nprocs=2,
+                join=True,
+            )
 
 
 if __name__ == "__main__":

@@ -669,8 +669,12 @@ class TestPushThenRecallBetweenTwoEngines(CustomTestCase):
         p.cache.evict(EvictParams(num_tokens=16))
         self.assertEqual(host_hit(p.cache, session), 16)
 
-        # Push: the prefill offers the pages, the decode reads and inserts
-        # them, and its answer makes the prefill's copy the next victim.
+        # Push: 2-phase preflight VictimOffer -> VictimOfferAck, then VictimPush.
+        self._prefill_step(prefill, [])
+        self._deliver(p, d)
+        for _ in range(decode_dram_victim_receiver._CADENCE):
+            self._decode_step(decode)
+        self._deliver(d, p)
         self._prefill_step(prefill, [])
         self._deliver(p, d)
         for _ in range(decode_dram_victim_receiver._CADENCE):
@@ -787,7 +791,13 @@ class TestHybridWindowTravelsWithTheBranch(TestPushThenRecallBetweenTwoEngines):
         p.mgr._prefill.decode_addr[1] = ("10.0.0.2", 5555)
         self._commit(prefill, pushed_req(room=1, tokens=session))
 
-        # Push: four full pages and the two window pages, each to its pool.
+        # Push: 2-phase preflight VictimOffer -> VictimOfferAck, then VictimPush
+        # (four full pages and the two window pages, each to its pool).
+        self._prefill_step(prefill, [])
+        self._deliver(p, d)
+        for _ in range(decode_dram_victim_receiver._CADENCE):
+            self._decode_step(decode)
+        self._deliver(d, p)
         self._prefill_step(prefill, [])
         self._deliver(p, d)
         (push,) = d.mgr.dram_offload_channel.received_pushes().values()

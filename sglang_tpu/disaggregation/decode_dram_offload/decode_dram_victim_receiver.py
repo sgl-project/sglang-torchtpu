@@ -10,12 +10,15 @@ host-only path and the prefill is told whether it was stored (VICTIM_ACK).
 from __future__ import annotations
 
 import logging
+import time
 from array import array
 from typing import Any, Dict, List, Tuple
 
 import msgspec
+import torch
 import torch.distributed as dist
 
+from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang_tpu.disaggregation.decode_dram_offload.prefill_dram_victim_pusher import (
@@ -24,8 +27,12 @@ from sglang_tpu.disaggregation.decode_dram_offload.prefill_dram_victim_pusher im
     victim_transfer_id,
 )
 from sglang_tpu.disaggregation.decode_dram_offload.radix_host_ops import (
+    host_backed_prefix,
     host_page_ids,
     insert_host_prefix,
+    lock_host_path,
+    unlock_host_path,
+    window_host_pages,
 )
 from sglang_tpu.disaggregation.decode_dram_offload.rank_lockstep import (
     DramOffloadWorkerContext,
@@ -39,11 +46,39 @@ logger = logging.getLogger(__name__)
 # rank received in 8 rounds is dropped.
 _CADENCE = 16
 _MAX_UNAGREED_ROUNDS = 8
+# Bounded hold for a preflight offer whose VictimPush never arrives.
+_OFFER_RESERVE_TIMEOUT_S = 10.0
+
+
+def _slice_full_metadata(push: Any, attr: str, first_page: int) -> List[bytes]:
+    rows = list(getattr(push, attr, ()) or ())
+    if not rows:
+        return []
+    if len(rows) != len(push.blocks):
+        raise ValueError("host page metadata count does not match the transfer")
+    skip = getattr(push, "skip_prefix_pages", 0)
+    if first_page < skip:
+        raise ValueError("first_page precedes push skip_prefix_pages")
+    return rows[first_page - skip :]
+
+
+class _ReservedOffer(msgspec.Struct):
+    offer: Any
+    indices: Any
+    swa_indices: Any
+    have_indices: Any
+    first_page: int
+    skip_swa: bool
+    locks: List[Any]
+    reserved_at: float
 
 
 class _DramLanding(msgspec.Struct):
     push: Any
     indices: Any
+    have_indices: Any = None
+    first_page: int = 0
+    locks: List[Any] = msgspec.field(default_factory=list)
     # Host pages reserved for the window of a hybrid model.
     swa_indices: Any = None
     # The native reads that started, into ``indices`` and ``swa_indices``.
@@ -66,8 +101,10 @@ class DecodeDramVictimReceiver:
         self._lockstep = ctx.lockstep
         self._iterations = 0
         self._rounds = 0
-        # Round a received push was first seen in, by (prefill, seq).
+        # Round a received push or offer was first seen in, by (prefill, seq).
         self._first_seen: Dict[Tuple[str, int], int] = {}
+        self._offer_first_seen: Dict[Tuple[str, int], int] = {}
+        self._reserved_offers: Dict[Tuple[str, int], _ReservedOffer] = {}
         self._landings: Dict[Tuple[str, int], _DramLanding] = {}
         self.stats = dict.fromkeys(
             (
@@ -84,12 +121,12 @@ class DecodeDramVictimReceiver:
         self._last_log = [0.0]
 
     def has_host_landings(self) -> bool:
-        return bool(self._landings)
+        return bool(self._landings or self._reserved_offers)
 
     def release_all(self) -> None:
         """Before a cache reset, which core issues only on an idle engine: no
         landing may be in flight."""
-        if self._landings:
+        if self._landings or self._reserved_offers:
             raise RuntimeError("victim pushes are landing; the engine is not idle")
         self._channel.clear_host_metadata()
 
@@ -99,9 +136,159 @@ class DecodeDramVictimReceiver:
         if self._iterations % _CADENCE:
             return
         self._rounds += 1
+        self._expire_stale_offers()
+        self._admit_agreed_offers()
         self._admit_agreed_pushes()
         self.finish_agreed_landings()
         log_offload_stats(self.stats, "landing", self._last_log)
+
+    def _free_reserved_offer(self, res: _ReservedOffer) -> None:
+        unlock_host_path(self._cache, res.locks)
+        res.locks = []
+        if res.indices is not None:
+            self._host_pool.free(res.indices)
+        if res.swa_indices is not None:
+            self._swa_host_pool.free(res.swa_indices)
+
+    def _expire_stale_offers(self) -> None:
+        if not self._reserved_offers:
+            return
+        now = time.monotonic()
+        keys = sorted(self._reserved_offers)
+        rows = [
+            [int(now - self._reserved_offers[k].reserved_at > _OFFER_RESERVE_TIMEOUT_S)]
+            for k in keys
+        ]
+        agreed = self._lockstep.reduce(rows, dist.ReduceOp.MIN)
+        for key, (expired,) in zip(keys, agreed):
+            if expired:
+                self._free_reserved_offer(self._reserved_offers.pop(key))
+                self.stats["dropped"] += 1
+
+    def _admit_agreed_offers(self) -> None:
+        if not hasattr(self._channel, "received_victim_offers"):
+            return
+        received = {
+            key: offer
+            for key, offer in self._channel.received_victim_offers().items()
+            if key not in self._landings and key not in self._reserved_offers
+        }
+        for key in received:
+            self._offer_first_seen.setdefault(key, self._rounds)
+        manifests = {
+            (
+                *key,
+                *push_manifest(
+                    offer.tokens,
+                    offer.extra_key,
+                    offer.cache_salt,
+                    offer.num_blocks,
+                    offer.num_swa_blocks,
+                ),
+            ): key
+            for key, offer in received.items()
+        }
+        for manifest in self._lockstep.common_to_all_ranks(list(manifests)):
+            key = manifests[manifest]
+            offer = self._channel.take_victim_offer(key)
+            self._offer_first_seen.pop(key, None)
+            inflight = len(self._reserved_offers) + sum(
+                landing.indices is not None or landing.swa_indices is not None
+                for landing in self._landings.values()
+            )
+            res = None if inflight >= MAX_INFLIGHT else self._reserve_for_offer(offer)
+            if res is None:
+                self.stats["no_room"] += 1
+                self._channel.send_victim_offer_ack(
+                    endpoint=offer.ack_endpoint, seq=offer.seq, accepted=False
+                )
+            else:
+                self._reserved_offers[key] = res
+                self._channel.send_victim_offer_ack(
+                    endpoint=offer.ack_endpoint,
+                    seq=offer.seq,
+                    accepted=True,
+                    skip_prefix_pages=res.first_page,
+                    skip_swa=res.skip_swa,
+                )
+        for key, first in list(self._offer_first_seen.items()):
+            if self._rounds - first > _MAX_UNAGREED_ROUNDS:
+                self._offer_first_seen.pop(key)
+                if self._channel.take_victim_offer(key) is not None:
+                    self.stats["dropped"] += 1
+
+    def _reserve_for_offer(self, offer: Any):
+        num_tokens = len(offer.tokens)
+        if num_tokens <= 0 or num_tokens % self._page_size != 0:
+            return None
+        if offer.num_blocks and offer.num_blocks * self._page_size != num_tokens:
+            return None
+        radix_key = RadixKey(
+            array("q", offer.tokens),
+            extra_key=offer.extra_key,
+            cache_salt=offer.cache_salt,
+        )
+        self._cache.match_prefix(MatchPrefixParams(key=radix_key))
+        prefix_node, have_tokens, have_chunks = host_backed_prefix(
+            self._cache, radix_key, num_tokens, self._page_size
+        )
+        raw_swa_tokens = offer.num_swa_blocks * self._page_size
+        local_window_held = int(
+            have_tokens >= num_tokens
+            and (
+                not raw_swa_tokens
+                or window_host_pages(
+                    self._cache,
+                    self._swa_host_pool,
+                    prefix_node,
+                    tokens=num_tokens,
+                    window_tokens=self._window_tokens,
+                )
+                is not None
+            )
+        )
+        agreed_have_tokens, agreed_window_held = self._lockstep.reduce(
+            [[have_tokens, local_window_held]], dist.ReduceOp.MIN
+        )[0]
+        while (
+            prefix_node is not self._cache.tree_core.root_node
+            and have_tokens - len(prefix_node.key) >= agreed_have_tokens
+        ):
+            have_tokens -= len(prefix_node.key)
+            prefix_node = prefix_node.parent
+        have_indices = (
+            torch.cat(have_chunks)[:agreed_have_tokens]
+            if have_chunks and agreed_have_tokens
+            else torch.empty(0, dtype=torch.int64)
+        )
+        first_page = agreed_have_tokens // self._page_size
+        missing_tokens = num_tokens - agreed_have_tokens
+        skip_swa = bool(missing_tokens == 0 and agreed_window_held)
+        swa_tokens = 0 if skip_swa else raw_swa_tokens
+        locks = lock_host_path(self._cache, prefix_node)
+        if missing_tokens or swa_tokens:
+            self._make_host_room(missing_tokens, swa_tokens)
+        allocated = alloc_host_pages_agreed(
+            lockstep=self._lockstep,
+            pools=[
+                (self._host_pool, missing_tokens),
+                (self._swa_host_pool, swa_tokens),
+            ],
+        )
+        if allocated is None:
+            unlock_host_path(self._cache, locks)
+            return None
+        indices, swa_indices = allocated
+        return _ReservedOffer(
+            offer=offer,
+            indices=indices,
+            swa_indices=swa_indices,
+            have_indices=have_indices,
+            first_page=first_page,
+            skip_swa=skip_swa,
+            locks=locks,
+            reserved_at=time.monotonic(),
+        )
 
     def _admit_agreed_pushes(self) -> None:
         received = {
@@ -122,6 +309,7 @@ class DecodeDramVictimReceiver:
                     len(push.blocks),
                     len(push.swa_blocks),
                 ),
+                getattr(push, "skip_prefix_pages", 0),
             ): key
             for key, push in received.items()
         }
@@ -129,9 +317,15 @@ class DecodeDramVictimReceiver:
             key = manifests[manifest]
             push = self._channel.take_push(key)
             self._first_seen.pop(key, None)
-            if len(
-                self._landings
-            ) >= MAX_INFLIGHT or not self._reserve_host_pages_and_read(key, push):
+            reserved = key in self._reserved_offers
+            inflight = sum(
+                landing.indices is not None or landing.swa_indices is not None
+                for landing in self._landings.values()
+            )
+            at_capacity = (
+                not reserved and inflight + len(self._reserved_offers) >= MAX_INFLIGHT
+            )
+            if at_capacity or not self._reserve_host_pages_and_read(key, push):
                 self.stats["no_room"] += 1
                 self._ack_prefill(push, stored=False)
         for key, first in list(self._first_seen.items()):
@@ -146,21 +340,127 @@ class DecodeDramVictimReceiver:
         )
 
     def _reserve_host_pages_and_read(self, key: Tuple[str, int], push: Any) -> bool:
-        """Reserve host pages for the push's full KV and, on a hybrid model,
-        its window, then start the native reads into them."""
+        """Reserve host pages for the push's missing full-KV suffix and, on a
+        hybrid model, its window, then start the native reads into them."""
+        res = self._reserved_offers.pop(key, None)
+        if res is not None:
+            expected_blocks = (
+                0 if res.indices is None else len(res.indices) // self._page_size
+            )
+            expected_swa = (
+                0
+                if res.swa_indices is None
+                else len(res.swa_indices) // self._page_size
+            )
+            push_skip = getattr(push, "skip_prefix_pages", 0)
+            if (
+                push_skip != res.first_page
+                or len(push.blocks) != expected_blocks
+                or len(push.swa_blocks) != expected_swa
+            ):
+                self._free_reserved_offer(res)
+                return False
+            landing = _DramLanding(
+                push=push,
+                indices=res.indices,
+                have_indices=res.have_indices,
+                first_page=res.first_page,
+                locks=res.locks,
+                swa_indices=res.swa_indices,
+            )
+            need_full = bool(push.blocks) and res.indices is not None
+            need_swa = bool(push.swa_blocks) and res.swa_indices is not None
+            started = (not need_full or self._start_full_read(landing)) and (
+                not need_swa or self._start_window_read(landing)
+            )
+            landing.failed = not self._lockstep.all(started)
+            self._landings[key] = landing
+            self.stats["granted"] += 1
+            return True
         num_tokens = len(push.tokens)
-        swa_tokens = len(push.swa_blocks) * self._page_size
-        self._make_host_room(num_tokens, swa_tokens)
+        if num_tokens <= 0 or num_tokens % self._page_size != 0:
+            return False
+        push_skip = getattr(push, "skip_prefix_pages", 0)
+        if (
+            push.blocks
+            and (push_skip + len(push.blocks)) * self._page_size != num_tokens
+        ):
+            return False
+        radix_key = RadixKey(
+            array("q", push.tokens),
+            extra_key=push.extra_key,
+            cache_salt=push.cache_salt,
+        )
+        self._cache.match_prefix(MatchPrefixParams(key=radix_key))
+        prefix_node, have_tokens, have_chunks = host_backed_prefix(
+            self._cache, radix_key, num_tokens, self._page_size
+        )
+        raw_swa_tokens = len(push.swa_blocks) * self._page_size
+        local_window_held = int(
+            have_tokens >= num_tokens
+            and (
+                not raw_swa_tokens
+                or window_host_pages(
+                    self._cache,
+                    self._swa_host_pool,
+                    prefix_node,
+                    tokens=num_tokens,
+                    window_tokens=self._window_tokens,
+                )
+                is not None
+            )
+        )
+        agreed_have_tokens, agreed_window_held = self._lockstep.reduce(
+            [[have_tokens, local_window_held]], dist.ReduceOp.MIN
+        )[0]
+        while (
+            prefix_node is not self._cache.tree_core.root_node
+            and have_tokens - len(prefix_node.key) >= agreed_have_tokens
+        ):
+            have_tokens -= len(prefix_node.key)
+            prefix_node = prefix_node.parent
+        have_indices = (
+            torch.cat(have_chunks)[:agreed_have_tokens]
+            if have_chunks and agreed_have_tokens
+            else torch.empty(0, dtype=torch.int64)
+        )
+        first_page = agreed_have_tokens // self._page_size
+        if first_page < push_skip:
+            # A suffix-only push arrived without a matching reservation (e.g.
+            # after _OFFER_RESERVE_TIMEOUT_S) and decode no longer holds the
+            # skipped prefix pages; decline cleanly instead of reading a
+            # truncated source slice.
+            return False
+        missing_tokens = num_tokens - agreed_have_tokens
+        swa_tokens = (
+            0 if (missing_tokens == 0 and agreed_window_held) else raw_swa_tokens
+        )
+        locks = lock_host_path(self._cache, prefix_node)
+        if missing_tokens or swa_tokens:
+            self._make_host_room(missing_tokens, swa_tokens)
         allocated = alloc_host_pages_agreed(
             lockstep=self._lockstep,
-            pools=[(self._host_pool, num_tokens), (self._swa_host_pool, swa_tokens)],
+            pools=[
+                (self._host_pool, missing_tokens),
+                (self._swa_host_pool, swa_tokens),
+            ],
         )
         if allocated is None:
+            unlock_host_path(self._cache, locks)
             return False
         indices, swa_indices = allocated
-        landing = _DramLanding(push=push, indices=indices, swa_indices=swa_indices)
-        started = (not push.blocks or self._start_full_read(landing)) and (
-            not push.swa_blocks or self._start_window_read(landing)
+        landing = _DramLanding(
+            push=push,
+            indices=indices,
+            have_indices=have_indices,
+            first_page=first_page,
+            locks=locks,
+            swa_indices=swa_indices,
+        )
+        need_full = bool(push.blocks) and indices is not None
+        need_swa = bool(push.swa_blocks) and swa_indices is not None
+        started = (not need_full or self._start_full_read(landing)) and (
+            not need_swa or self._start_window_read(landing)
         )
         # A rank whose read started cannot release its live destination, so
         # all ranks keep their allocations until the started reads settle.
@@ -196,14 +496,18 @@ class DecodeDramVictimReceiver:
             self._cache.evict_host(swa_short, ComponentType.SWA)
 
     def _start_full_read(self, landing: _DramLanding) -> bool:
-        """Read the pushed full pages into the landing's full pages."""
+        """Read the pushed full suffix pages into the landing's full pages."""
         push = landing.push
         read_id = victim_transfer_id(push.prefill, push.seq)
+        skip = getattr(push, "skip_prefix_pages", 0)
+        if landing.first_page < skip:
+            raise ValueError("first_page precedes push skip_prefix_pages")
+        rel_start = landing.first_page - skip
         started = self._channel.start_host_read(
             read_id,
             push.uuid,
             push.address,
-            list(push.blocks),
+            list(push.blocks[rel_start:]),
             host_page_ids(self._host_pool, landing.indices),
         )
         if started:
@@ -255,17 +559,27 @@ class DecodeDramVictimReceiver:
                 # these pages available to a subsequent prefix offer.
                 restored = False
                 try:
-                    self._channel.restore_host_metadata(
-                        host_page_ids(self._host_pool, landing.indices),
-                        landing.push.page_metadata,
-                    )
-                    self._channel.restore_host_metadata(
-                        host_page_ids(self._swa_host_pool, landing.swa_indices)
-                        if landing.swa_indices is not None
-                        else [],
-                        landing.push.swa_page_metadata,
-                        swa=True,
-                    )
+                    if landing.indices is not None:
+                        self._channel.restore_host_metadata(
+                            host_page_ids(self._host_pool, landing.indices),
+                            _slice_full_metadata(
+                                landing.push, "page_metadata", landing.first_page
+                            ),
+                        )
+                    elif not landing.push.blocks and landing.push.page_metadata:
+                        self._channel.restore_host_metadata(
+                            [], landing.push.page_metadata
+                        )
+                    if landing.swa_indices is not None:
+                        self._channel.restore_host_metadata(
+                            host_page_ids(self._swa_host_pool, landing.swa_indices),
+                            landing.push.swa_page_metadata,
+                            swa=True,
+                        )
+                    elif not landing.push.swa_blocks and landing.push.swa_page_metadata:
+                        self._channel.restore_host_metadata(
+                            [], landing.push.swa_page_metadata, swa=True
+                        )
                     restored = True
                 except Exception:  # noqa: BLE001 - decline on every rank
                     logger.exception("Cannot restore victim push host metadata")
@@ -279,26 +593,41 @@ class DecodeDramVictimReceiver:
             self._ack_prefill(landing.push, stored=stored)
 
     def _free_landing(self, landing: _DramLanding) -> None:
-        self._host_pool.free(landing.indices)
+        unlock_host_path(self._cache, landing.locks)
+        landing.locks = []
+        if landing.indices is not None:
+            self._host_pool.free(landing.indices)
         if landing.swa_indices is not None:
             self._swa_host_pool.free(landing.swa_indices)
 
     def _insert_host_only_branch(self, landing: _DramLanding) -> bool:
         push = landing.push
-        inserted, prefix_len = insert_host_prefix(
-            self._cache,
-            RadixKey(
-                array("q", push.tokens),
-                extra_key=push.extra_key,
-                cache_salt=push.cache_salt,
-            ),
-            landing.indices,
-            self._page_size,
-            swa_indices=landing.swa_indices,
-        )
+        reused_tokens = 0 if landing.have_indices is None else len(landing.have_indices)
+        if reused_tokens and landing.indices is not None:
+            full_indices = torch.cat([landing.have_indices, landing.indices])
+        elif reused_tokens:
+            full_indices = landing.have_indices
+        else:
+            full_indices = landing.indices
+        try:
+            inserted, prefix_len = insert_host_prefix(
+                self._cache,
+                RadixKey(
+                    array("q", push.tokens),
+                    extra_key=push.extra_key,
+                    cache_salt=push.cache_salt,
+                ),
+                full_indices,
+                self._page_size,
+                swa_indices=landing.swa_indices,
+                reused_tokens=reused_tokens,
+            )
+        finally:
+            unlock_host_path(self._cache, landing.locks)
+            landing.locks = []
         if inserted is None:
             self.stats["dropped"] += 1
             return False
         self.stats["landed"] += 1
-        self.stats["landed_tokens"] += len(push.tokens) - prefix_len
+        self.stats["landed_tokens"] += len(push.tokens) - max(prefix_len, reused_tokens)
         return True

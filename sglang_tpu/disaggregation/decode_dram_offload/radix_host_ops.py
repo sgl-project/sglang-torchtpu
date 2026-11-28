@@ -52,6 +52,11 @@ def _path_to_root(cache: Any, node: Any) -> Iterator[Any]:
         node = node.parent
 
 
+def path_nodes(cache: Any, leaf: Any) -> List[Any]:
+    """Nodes on the path from ``leaf`` up to, and excluding, the root."""
+    return list(_path_to_root(cache, leaf))
+
+
 def path_tokens(cache: Any, leaf: Any) -> List[int]:
     """The token ids on the path from the root to ``leaf``."""
     path = list(_path_to_root(cache, leaf))

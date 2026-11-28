@@ -63,6 +63,7 @@ from sglang_tpu.disaggregation.raiden.serde import (
     PullReq,
     ReshardReq,
     RoomFailed,
+    VictimOfferAck,
     VictimPush,
 )
 from sglang_tpu.disaggregation.raiden.state import DecodeState, PrefillState
@@ -396,6 +397,15 @@ def push_channel(host, swa_host=None):
     channel.start_host_read.side_effect = start
     channel.poll_host_reads.side_effect = poll
     channel.forget_host_reads.side_effect = forget
+    offer_replies = {}
+    channel.victim_offer_reply.side_effect = offer_replies.get
+
+    def _default_send_offer(**kwargs):
+        offer_replies[kwargs["seq"]] = VictimOfferAck(seq=kwargs["seq"], accepted=True)
+        return True
+
+    channel.send_victim_offer.side_effect = _default_send_offer
+    channel.received_victim_offers.return_value = {}
     return channel
 
 
@@ -415,7 +425,19 @@ class PrefillPusherFixture:
         self.cache, self.allocator = full_cache(host_capacity=32)
         self.host = self.cache.cache_controller.host
         self.mgr = push_channel(self.host)
-        # The decode's answer by seq; None until the test gives one.
+        # The decode's preflight offer answer and final push answer by seq.
+        self.offer_replies = {}
+        self.auto_accept_offers = True
+        self.mgr.victim_offer_reply.side_effect = self.offer_replies.get
+
+        def _send_offer(**kwargs):
+            if self.auto_accept_offers:
+                self.offer_replies[kwargs["seq"]] = VictimOfferAck(
+                    seq=kwargs["seq"], accepted=True
+                )
+            return True
+
+        self.mgr.send_victim_offer.side_effect = _send_offer
         self.replies = {}
         self.mgr.victim_reply.side_effect = self.replies.get
         self.peers = {}
@@ -436,7 +458,11 @@ class PrefillPusherFixture:
         self.cache.evict(EvictParams(num_tokens=16))
 
     def offer_once(self):
+        # Tick 1 sends VictimOffer; tick 2 (serving=False so no 2nd offer starts)
+        # processes VictimOfferAck and sends VictimPush.
         self.pusher.advance(serving=True)
+        if self.auto_accept_offers and not self.mgr.send_victim_push.called:
+            self.pusher.advance(serving=False)
         self.mgr.send_victim_push.assert_called_once()
         return self.mgr.send_victim_push.call_args.kwargs
 
@@ -446,6 +472,9 @@ class DecodeReceiverFixture:
         self.cache, self.allocator = full_cache(host_capacity=64)
         self.host = self.cache.cache_controller.host
         self.mgr = push_channel(self.host)
+        self.offers = {}
+        self.mgr.received_victim_offers.side_effect = lambda: dict(self.offers)
+        self.mgr.take_victim_offer.side_effect = lambda key: self.offers.pop(key, None)
         self.pushes = {}
         self.mgr.received_pushes.side_effect = lambda: dict(self.pushes)
         self.mgr.take_push.side_effect = lambda key: self.pushes.pop(key, None)

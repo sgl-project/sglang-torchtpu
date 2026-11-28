@@ -48,6 +48,8 @@ from sglang_tpu.disaggregation.raiden.serde import (
     PrefixPull,
     PrefixReady,
     VictimAck,
+    VictimOffer,
+    VictimOfferAck,
     VictimPush,
 )
 from sglang_tpu.envs import envs as tpu_envs
@@ -153,10 +155,11 @@ class DramOffloadChannel:
         self._read_transfers: Dict[str, Any] = {}
         self._recalls: Dict[int, _RecallState] = {}
         self._offers: Dict[int, _OfferState] = {}
-        # Push, prefill: the decode's answer by seq of this prefill's open
-        # pushes, None until it arrives.
+        # Push, prefill: preflight offer replies and final push replies by seq.
+        self._victim_offer_replies: Dict[int, Optional[VictimOfferAck]] = {}
         self._replies: Dict[int, Optional[bool]] = {}
-        # Push, decode: pushes received and not yet taken, by (prefill, seq).
+        # Push, decode: preflight offers and pushes received and not yet taken.
+        self._victim_offers: Dict[Tuple[str, int], VictimOffer] = {}
         self._pushes: Dict[Tuple[str, int], VictimPush] = {}
 
     @property
@@ -167,6 +170,8 @@ class DramOffloadChannel:
         return {
             PrefixPull.TAG: self._on_prefix_pull,
             PrefixReady.TAG: self._on_prefix_ready,
+            VictimOffer.TAG: self._on_victim_offer,
+            VictimOfferAck.TAG: self._on_victim_offer_ack,
             VictimPush.TAG: self._on_victim_push,
             VictimAck.TAG: self._on_victim_ack,
         }
@@ -559,6 +564,86 @@ class DramOffloadChannel:
         with self._lock:
             return self._mgr._prefill.decode_addr.get(room)
 
+    def send_victim_offer(
+        self,
+        *,
+        decode: Tuple[str, int],
+        prefill: str,
+        seq: int,
+        tokens: List[int],
+        num_blocks: int,
+        num_swa_blocks: int = 0,
+        extra_key: Optional[str] = None,
+        cache_salt: Optional[str] = None,
+    ) -> bool:
+        """Send a preflight victim-push offer before registering host pages."""
+        with self._lock:
+            self._victim_offer_replies[seq] = None
+        return self._send(
+            endpoint=_tcp_endpoint(ip=decode[0], port=decode[1]),
+            message=VictimOffer(
+                prefill=prefill,
+                seq=seq,
+                ack_endpoint=_tcp_endpoint(
+                    ip=self._mgr.local_ip, port=self._mgr.rank_port
+                ),
+                tokens=tokens,
+                num_blocks=num_blocks,
+                num_swa_blocks=num_swa_blocks,
+                extra_key=extra_key,
+                cache_salt=cache_salt,
+            ),
+        )
+
+    def victim_offer_reply(self, seq: int) -> Optional[VictimOfferAck]:
+        """Decode's preflight answer for ``seq``; None until it arrives."""
+        with self._lock:
+            return self._victim_offer_replies.get(seq)
+
+    def forget_victim_offer(self, seq: int) -> None:
+        with self._lock:
+            self._victim_offer_replies.pop(seq, None)
+
+    def _on_victim_offer_ack(self, msg: List[bytes]) -> None:
+        ack = VictimOfferAck.from_frames(msg)
+        with self._lock:
+            if ack.seq in self._victim_offer_replies:
+                self._victim_offer_replies[ack.seq] = ack
+
+    def _on_victim_offer(self, msg: List[bytes]) -> None:
+        offer = VictimOffer.from_frames(msg)
+        with self._lock:
+            self._victim_offers[(offer.prefill, offer.seq)] = offer
+
+    def received_victim_offers(self) -> Dict[Tuple[str, int], VictimOffer]:
+        """Preflight offers received and not yet taken."""
+        with self._lock:
+            return dict(self._victim_offers)
+
+    def take_victim_offer(self, key: Tuple[str, int]) -> Optional[VictimOffer]:
+        with self._lock:
+            return self._victim_offers.pop(key, None)
+
+    def send_victim_offer_ack(
+        self,
+        *,
+        endpoint: str,
+        seq: int,
+        accepted: bool,
+        skip_prefix_pages: int = 0,
+        skip_swa: bool = False,
+    ) -> None:
+        """Reply to a prefill's preflight ``VictimOffer``."""
+        self._send(
+            endpoint=endpoint,
+            message=VictimOfferAck(
+                seq=seq,
+                accepted=accepted,
+                skip_prefix_pages=skip_prefix_pages,
+                skip_swa=skip_swa,
+            ),
+        )
+
     def send_victim_push(
         self,
         *,
@@ -573,6 +658,7 @@ class DramOffloadChannel:
         swa_blocks: Sequence[int] = (),
         page_metadata: Sequence[bytes] = (),
         swa_page_metadata: Sequence[bytes] = (),
+        skip_prefix_pages: int = 0,
     ) -> bool:
         """Offer registered host pages for decode to pull into its host pools.
         A message that cannot be sent is a declined push."""
@@ -596,6 +682,7 @@ class DramOffloadChannel:
                 cache_salt=cache_salt,
                 page_metadata=list(page_metadata),
                 swa_page_metadata=list(swa_page_metadata),
+                skip_prefix_pages=skip_prefix_pages,
             ),
         )
 
