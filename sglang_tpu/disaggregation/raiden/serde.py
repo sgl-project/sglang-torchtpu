@@ -131,8 +131,13 @@ class PrefixReady(WireMessage, omit_defaults=True):
     # full-only models and on a refusal.
     swa_uuid: int = 0
     swa_endpoint: str = ""
+    # Equal-TP draft sidecar pools registered under ``uuid`` / ``swa_uuid``.
+    draft_endpoint: str = ""
+    draft_swa_endpoint: str = ""
     page_metadata: list[bytes] = msgspec.field(default_factory=list)
     swa_page_metadata: list[bytes] = msgspec.field(default_factory=list)
+    draft_page_metadata: list[bytes] = msgspec.field(default_factory=list)
+    draft_swa_page_metadata: list[bytes] = msgspec.field(default_factory=list)
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
@@ -167,6 +172,10 @@ class VictimPush(WireMessage, omit_defaults=True):
     cache_salt: Optional[str] = None
     page_metadata: list[bytes] = msgspec.field(default_factory=list)
     swa_page_metadata: list[bytes] = msgspec.field(default_factory=list)
+    draft_address: str = ""
+    draft_swa_address: str = ""
+    draft_page_metadata: list[bytes] = msgspec.field(default_factory=list)
+    draft_swa_page_metadata: list[bytes] = msgspec.field(default_factory=list)
 
 
 class VictimAck(WireMessage):

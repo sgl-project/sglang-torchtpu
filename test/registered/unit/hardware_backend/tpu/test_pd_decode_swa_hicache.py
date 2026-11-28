@@ -385,6 +385,33 @@ class TestCacheConstruction(CustomTestCase):
                 ),
             )
 
+    def test_swa_draft_sidecar_is_registered_on_equal_tp_offload_with_opt_in(self):
+        ctx = make_ctx()
+        cache = MagicMock()
+        draft_plan = SimpleNamespace(mode=HiCacheDraftMode.SIDECAR)
+
+        def upstream_build(**kwargs):
+            mark_full_only(cache)
+            return tpu._create_tree_cache(lambda _ctx: cache, ctx)
+
+        with (
+            patch(TPU + ".get_disagg", return_value=disagg()),
+            patch(TPU + ".get_memory", return_value=memory()),
+            patch(TPU + ".auto_size_hicache") as auto_size,
+            patch(BUILDER + ".maybe_register_hicache_draft") as register_draft,
+            tpu_envs.SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM.override(True),
+            tpu_envs.SGLANG_PD_OFFLOAD_ALLOW_DRAFT.override(True),
+        ):
+            built = tpu._build_kv_cache(
+                upstream_build,
+                **build_kwargs(
+                    spec_algorithm=spec(dflash=True), hicache_draft_plan=draft_plan
+                ),
+            )
+        self.assertIs(built, cache)
+        auto_size.assert_called_once_with(ctx.params, draft_plan, enabled=True)
+        register_draft.assert_called_once_with(tree_cache=cache, draft_plan=draft_plan)
+
     def test_full_only_build_requires_the_full_only_stack(self):
         # E.g. a cache type the SWA host strategy does not build.
         def upstream_build(**kwargs):

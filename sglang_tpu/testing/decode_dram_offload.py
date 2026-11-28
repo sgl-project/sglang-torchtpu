@@ -344,7 +344,9 @@ def host_hit(cache, tokens) -> int:
 # ---------------------------------------------------------------------------
 
 
-def offload_context(*, cache, channel, page_size: int = 1) -> DramOffloadWorkerContext:
+def offload_context(
+    *, cache, channel, page_size: int = 1, draft_pools=None
+) -> DramOffloadWorkerContext:
     """One engine's worker context on a fixture cache, as a single rank."""
     return DramOffloadWorkerContext(
         cache=cache,
@@ -354,20 +356,33 @@ def offload_context(*, cache, channel, page_size: int = 1) -> DramOffloadWorkerC
         lockstep=RankLockstep(),
         swa_host_pool=radix_host_ops.swa_host_pool(cache),
         window_tokens=radix_host_ops.window_tokens(cache, page_size),
+        draft_pools=(
+            radix_host_ops.draft_sidecar_host_pools(cache)
+            if draft_pools is None
+            else draft_pools
+        ),
     )
 
 
-def push_channel(host, swa_host=None):
+def push_channel(host, swa_host=None, *, draft_host=None, draft_swa_host=None):
     """A channel double for the push: messages are recorded, and native host
     reads go to the fake transfer of ``host`` (of ``swa_host`` for the window
-    of a hybrid model), which the test completes."""
+    of a hybrid model, and ``draft_host`` / ``draft_swa_host`` for draft
+    sidecars), which the test completes."""
     channel = MagicMock()
     # The transfer of each read, by request id.
     transfers = {}
     channel.export_host_metadata.return_value = []
 
-    def register(req_id, uuid, pages, *, swa=False):
-        transfer = (swa_host if swa else host).transfer
+    def _pool(swa: bool, draft: bool):
+        return (
+            (draft_swa_host if swa else draft_host)
+            if draft
+            else (swa_host if swa else host)
+        )
+
+    def register(req_id, uuid, pages, *, swa=False, draft=False):
+        transfer = _pool(swa, draft).transfer
         try:
             transfer.register_read(req_id, uuid, pages)
         except RuntimeError:
@@ -375,8 +390,8 @@ def push_channel(host, swa_host=None):
         transfers[req_id] = transfer
         return True
 
-    def start(req_id, uuid, endpoint, remote, local, *, swa=False):
-        transfer = (swa_host if swa else host).transfer
+    def start(req_id, uuid, endpoint, remote, local, *, swa=False, draft=False):
+        transfer = _pool(swa, draft).transfer
         try:
             transfer.start_read(req_id, uuid, endpoint, remote, local)
         except RuntimeError:
@@ -514,8 +529,8 @@ def recall_channel(*, offer_pages: int, refused: bool = False, window_pages: int
     channel.prefix_ready.side_effect = lambda room: channel.ready
     channel.take_prefix_offer.side_effect = take
     channel.ask_prefix_pull.return_value = True
-    channel.prefix_req_id.side_effect = lambda room, swa=False: (
-        f"{room}#pxs" if swa else f"{room}#px"
+    channel.prefix_req_id.side_effect = lambda room, swa=False, draft=False: (
+        f"{room}#px{'s' * swa}{'d' * draft}"
     )
     channel.start_host_read.return_value = True
     channel.poll_host_reads.side_effect = lambda req_ids: channel.read_done

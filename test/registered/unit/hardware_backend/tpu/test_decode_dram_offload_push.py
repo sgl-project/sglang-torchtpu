@@ -939,6 +939,13 @@ class TestDeltaLanding(DecodeReceiverFixture, CustomTestCase):
         self.assertEqual(self.receiver.stats["landed_tokens"], 12)
         self.assertEqual(host_hit(self.cache, p2), 12)
 
+    def test_host_page_ids_prefers_transfer_page_ids(self):
+        pool = SimpleNamespace(
+            transfer_page_ids=lambda _idx: [0, 4, 1, 5],
+            _to_page_ids=lambda _idx: [0, 1],
+        )
+        self.assertEqual(radix_host_ops.host_page_ids(pool, [0, 1]), [0, 4, 1, 5])
+
 
 if __name__ == "__main__":
     unittest.main()

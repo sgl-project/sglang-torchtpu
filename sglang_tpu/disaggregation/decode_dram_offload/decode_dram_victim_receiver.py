@@ -20,6 +20,9 @@ import torch.distributed as dist
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang_tpu.disaggregation.decode_dram_offload.host_page_metadata import (
+    discard_host_page_metadata,
+)
 from sglang_tpu.disaggregation.decode_dram_offload.prefill_dram_victim_pusher import (
     MAX_INFLIGHT,
     log_offload_stats,
@@ -30,6 +33,7 @@ from sglang_tpu.disaggregation.decode_dram_offload.radix_host_ops import (
     host_page_ids,
     insert_host_prefix,
     lock_host_path,
+    reclaim_full_host_duplicates,
     unlock_host_path,
     window_host_pages,
 )
@@ -80,6 +84,7 @@ class DecodeDramVictimReceiver:
         self._page_size = ctx.page_size
         self._host_pool = ctx.host_pool
         self._swa_host_pool = ctx.swa_host_pool
+        self._draft_pool, self._draft_swa_pool = ctx.draft_pools
         self._window_tokens = ctx.window_tokens
         self._lockstep = ctx.lockstep
         self._iterations = 0
@@ -139,6 +144,8 @@ class DecodeDramVictimReceiver:
                     push.cache_salt,
                     len(push.blocks),
                     len(push.swa_blocks),
+                    bool(getattr(push, "draft_address", "")),
+                    bool(getattr(push, "draft_swa_address", "")),
                 ),
             ): key
             for key, push in received.items()
@@ -169,7 +176,16 @@ class DecodeDramVictimReceiver:
 
     def _reserve_host_pages_and_read(self, key: Tuple[str, int], push: Any) -> bool:
         """Reserve host pages for the push's missing full-KV suffix and, on a
-        hybrid model, its window, then start the native reads into them."""
+        hybrid model, its window, then start the native reads into them (and
+        into any bound draft sidecar pools, which share the same host page ids)."""
+        if bool(push.blocks and getattr(push, "draft_address", "")) != bool(
+            push.blocks and self._draft_pool is not None
+        ):
+            return False
+        if bool(push.swa_blocks and getattr(push, "draft_swa_address", "")) != bool(
+            push.swa_blocks and self._draft_swa_pool is not None
+        ):
+            return False
         num_tokens = len(push.tokens)
         if num_tokens <= 0 or num_tokens % self._page_size != 0:
             return False
@@ -242,8 +258,19 @@ class DecodeDramVictimReceiver:
         )
         need_full = bool(push.blocks) and indices is not None
         need_swa = bool(push.swa_blocks) and swa_indices is not None
-        started = (not need_full or self._start_full_read(landing)) and (
-            not need_swa or self._start_window_read(landing)
+        started = (
+            (not need_full or self._start_full_read(landing))
+            and (
+                not need_full
+                or self._draft_pool is None
+                or self._start_draft_read(landing)
+            )
+            and (not need_swa or self._start_window_read(landing))
+            and (
+                not need_swa
+                or self._draft_swa_pool is None
+                or self._start_window_draft_read(landing)
+            )
         )
         # A rank whose read started cannot release its live destination, so
         # all ranks keep their allocations until the started reads settle.
@@ -267,7 +294,9 @@ class DecodeDramVictimReceiver:
             dist.ReduceOp.MAX,
         )[0]
         if short:
-            self._cache.evict_host(short, ComponentType.FULL)
+            freed = self._cache.evict_host(short, ComponentType.FULL)
+            if isinstance(freed, int) and freed < short:
+                reclaim_full_host_duplicates(self._cache, short - freed)
             if swa_short:
                 # Removing a full host leaf also frees its SWA pages. Recheck
                 # every rank before evicting additional windows.
@@ -293,6 +322,22 @@ class DecodeDramVictimReceiver:
             landing.read_ids.append(read_id)
         return started
 
+    def _start_draft_read(self, landing: _DramLanding) -> bool:
+        """Read the pushed draft sidecar suffix pages into the landing's full page ids."""
+        push = landing.push
+        read_id = victim_transfer_id(push.prefill, push.seq, draft=True)
+        started = self._channel.start_host_read(
+            read_id,
+            push.uuid,
+            push.draft_address,
+            list(push.blocks[landing.first_page :]),
+            host_page_ids(self._host_pool, landing.indices),
+            draft=True,
+        )
+        if started:
+            landing.read_ids.append(read_id)
+        return started
+
     def _start_window_read(self, landing: _DramLanding) -> bool:
         """Read the pushed window pages into the landing's SWA pages; the
         prefill registered them under the push's UUID on its SWA pool."""
@@ -305,6 +350,23 @@ class DecodeDramVictimReceiver:
             list(push.swa_blocks),
             host_page_ids(self._swa_host_pool, landing.swa_indices),
             swa=True,
+        )
+        if started:
+            landing.read_ids.append(read_id)
+        return started
+
+    def _start_window_draft_read(self, landing: _DramLanding) -> bool:
+        """Read the pushed draft window sidecar pages into the landing's SWA page ids."""
+        push = landing.push
+        read_id = victim_transfer_id(push.prefill, push.seq, swa=True, draft=True)
+        started = self._channel.start_host_read(
+            read_id,
+            push.uuid,
+            push.draft_swa_address,
+            list(push.swa_blocks),
+            host_page_ids(self._swa_host_pool, landing.swa_indices),
+            swa=True,
+            draft=True,
         )
         if started:
             landing.read_ids.append(read_id)
@@ -339,22 +401,43 @@ class DecodeDramVictimReceiver:
                 restored = False
                 try:
                     if landing.indices is not None:
+                        full_pages = host_page_ids(self._host_pool, landing.indices)
                         self._channel.restore_host_metadata(
-                            host_page_ids(self._host_pool, landing.indices),
+                            full_pages,
                             _slice_full_metadata(
                                 landing.push, "page_metadata", landing.first_page
                             ),
                         )
+                        if self._draft_pool is not None:
+                            self._channel.restore_host_metadata(
+                                full_pages,
+                                _slice_full_metadata(
+                                    landing.push,
+                                    "draft_page_metadata",
+                                    landing.first_page,
+                                ),
+                                draft=True,
+                            )
                     elif not landing.push.blocks and landing.push.page_metadata:
                         self._channel.restore_host_metadata(
                             [], landing.push.page_metadata
                         )
                     if landing.swa_indices is not None:
+                        swa_pages = host_page_ids(
+                            self._swa_host_pool, landing.swa_indices
+                        )
                         self._channel.restore_host_metadata(
-                            host_page_ids(self._swa_host_pool, landing.swa_indices),
+                            swa_pages,
                             landing.push.swa_page_metadata,
                             swa=True,
                         )
+                        if self._draft_swa_pool is not None:
+                            self._channel.restore_host_metadata(
+                                swa_pages,
+                                getattr(landing.push, "draft_swa_page_metadata", []),
+                                swa=True,
+                                draft=True,
+                            )
                     elif not landing.push.swa_blocks and landing.push.swa_page_metadata:
                         self._channel.restore_host_metadata(
                             [], landing.push.swa_page_metadata, swa=True
@@ -371,9 +454,30 @@ class DecodeDramVictimReceiver:
                 stored = False
             self._ack_prefill(landing.push, stored=stored)
 
+    def _discard_sidecar_metadata(self, landing: _DramLanding) -> None:
+        if self._draft_pool is not None and landing.indices is not None:
+            discard_host_page_metadata(
+                self._draft_pool, host_page_ids(self._host_pool, landing.indices)
+            )
+        if self._draft_swa_pool is not None and landing.swa_indices is not None:
+            discard_host_page_metadata(
+                self._draft_swa_pool,
+                host_page_ids(self._swa_host_pool, landing.swa_indices),
+            )
+
     def _free_landing(self, landing: _DramLanding) -> None:
         unlock_host_path(self._cache, landing.locks)
         landing.locks = []
+        if landing.indices is not None:
+            discard_host_page_metadata(
+                self._host_pool, host_page_ids(self._host_pool, landing.indices)
+            )
+        if landing.swa_indices is not None:
+            discard_host_page_metadata(
+                self._swa_host_pool,
+                host_page_ids(self._swa_host_pool, landing.swa_indices),
+            )
+        self._discard_sidecar_metadata(landing)
         if landing.indices is not None:
             self._host_pool.free(landing.indices)
         if landing.swa_indices is not None:
@@ -405,6 +509,7 @@ class DecodeDramVictimReceiver:
             unlock_host_path(self._cache, landing.locks)
             landing.locks = []
         if inserted is None:
+            self._discard_sidecar_metadata(landing)
             self.stats["dropped"] += 1
             return False
         self.stats["landed"] += 1

@@ -241,5 +241,47 @@ class TestPairRefusals(CustomTestCase):
             )
 
 
+class TestEqualTpDraftValidation(CustomTestCase):
+    def test_draft_opt_in_and_missing_sidecar_refusal_on_equal_tp(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+        from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
+
+        engine = supported_engine()
+        engine.scheduler.spec_algorithm = SimpleNamespace(is_none=lambda: False)
+        for role in ("prefill", "decode"):
+            with self.assertRaisesRegex(
+                startup_validation.UnsupportedDramOffloadConfig,
+                "SGLANG_PD_OFFLOAD_ALLOW_DRAFT=1 on both roles",
+            ):
+                validate_engine_as(engine, role=role)
+        engine.scheduler.draft_worker = SimpleNamespace(
+            hicache_draft_plan=SimpleNamespace(
+                mode=HiCacheDraftMode.SIDECAR,
+                device_pools=(SimpleNamespace(layer_num=2),),
+            )
+        )
+        with patch.dict("os.environ", {"SGLANG_PD_OFFLOAD_ALLOW_DRAFT": "1"}):
+            engine.scheduler.tree_cache.host_pool_group = SimpleNamespace(
+                entry_map={PoolName.KV: object(), PoolName.SWA: object()}
+            )
+            for role in ("prefill", "decode"):
+                with self.assertRaisesRegex(
+                    startup_validation.UnsupportedDramOffloadConfig,
+                    "would resume without its draft KV",
+                ):
+                    validate_engine_as(engine, role=role)
+            engine.scheduler.tree_cache.host_pool_group = SimpleNamespace(
+                entry_map={
+                    PoolName.KV: object(),
+                    PoolName.SWA: object(),
+                    PoolName.DRAFT_SWA: object(),
+                }
+            )
+            for role in ("prefill", "decode"):
+                validate_engine_as(engine, role=role)
+
+
 if __name__ == "__main__":
     unittest.main()

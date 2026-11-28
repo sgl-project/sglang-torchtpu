@@ -408,6 +408,10 @@ class TpuEnvs:
     # sessions keep their UnifiedRadixCache LRU recency when decode DRAM is
     # smaller than the active footprint.
     SGLANG_PD_OFFLOAD_EVICT_STORED_FIRST = EnvBool(False)
+    # KV offload to decode DRAM with speculative decoding (equal-TP pairing):
+    # move HiCache draft sidecar pools (DRAFT / DRAFT_SWA) with the pages.
+    # Opt-in on both roles; without it the offload refuses a draft.
+    SGLANG_PD_OFFLOAD_ALLOW_DRAFT = EnvBool(False)
 
     # HiCache write_back on raiden (see hicache_write_back_copy_ahead.py): tokens
     # of the next eviction victims kept copied to host. Unset: four chunked-prefill

@@ -64,7 +64,10 @@ def path_tokens(cache: Any, leaf: Any) -> List[int]:
 
 
 def host_page_ids(host_pool: Any, indices: Any) -> List[int]:
-    """The host page ids of the host KV ``indices``."""
+    """The physical host transfer page ids of the host KV ``indices``."""
+    transfer_ids = getattr(host_pool, "transfer_page_ids", None)
+    if callable(transfer_ids):
+        return [int(p) for p in transfer_ids(indices)]
     return [int(p) for p in host_pool._to_page_ids(indices)]
 
 
@@ -154,6 +157,20 @@ def lock_host_path(cache: Any, node: Any) -> List[Any]:
 def unlock_host_path(cache: Any, locks: List[Any]) -> None:
     for node_id, receipt in locks:
         cache.dec_host_lock_ref(node_id, receipt)
+
+
+def draft_sidecar_host_pools(cache: Any) -> Tuple[Any, Any]:
+    """HiCache's draft sidecar host pools (draft KV, draft window), None for
+    each this engine does not have. A sidecar has no allocator of its own:
+    its pages are addressed by the host page ids of the full-attention pool
+    and of the SWA pool."""
+    entries = getattr(cache.host_pool_group, "entry_map", None) or {}
+
+    def pool(name: PoolName) -> Any:
+        entry = entries.get(name)
+        return None if entry is None else entry.host_pool
+
+    return pool(PoolName.DRAFT), pool(PoolName.DRAFT_SWA)
 
 
 def anchor_host_pool(cache: Any) -> Any:

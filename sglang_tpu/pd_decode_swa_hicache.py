@@ -221,15 +221,18 @@ def _validate_full_only_host_cache_config(
             ),
             "EAGLE3, DFlash and DSpark draft KV must use the HiCache draft sidecar",
         ),
-        # The victim push and the host recall move FULL and SWA pages only;
-        # load-back derives DRAFT/DRAFT_SWA reads from the same host slots, so a
-        # transferred prefix would feed untransferred draft bytes to the draft
-        # model. Refuse the combination until sidecars travel with the pages.
+        # Without SGLANG_PD_OFFLOAD_ALLOW_DRAFT, victim push and host recall
+        # move FULL and SWA pages only; load-back derives DRAFT/DRAFT_SWA reads
+        # from the same host slots, so a transferred prefix would feed
+        # untransferred draft bytes to the draft model unless sidecars opt in.
         (
             hicache_draft_plan is None
-            or not tpu_envs.SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM.get(),
+            or not tpu_envs.SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM.get()
+            or tpu_envs.SGLANG_PD_OFFLOAD_ALLOW_DRAFT.get(),
             "the KV offload to decode DRAM does not transfer HiCache draft "
-            "sidecars yet; run the draft without a sidecar or unset "
+            f"sidecars without {tpu_envs.SGLANG_PD_OFFLOAD_ALLOW_DRAFT.name}=1; "
+            f"set {tpu_envs.SGLANG_PD_OFFLOAD_ALLOW_DRAFT.name}=1 on both roles, "
+            "run the draft without a sidecar, or unset "
             "SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM",
         ),
         # A packed draft lives inside the full KV pool, which this build does

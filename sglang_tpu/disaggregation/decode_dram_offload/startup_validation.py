@@ -39,6 +39,48 @@ def _missing_tpu_sync_host_api() -> List[str]:
     ]
 
 
+def _host_pool_problems(scheduler: Any, *, draft_moves: bool) -> List[str]:
+    """What an equal-TP engine's HiCache host tier holds for a cached prefix
+    that a push and a recall would not move."""
+    from sglang.srt.mem_cache.hicache_storage import PoolName
+    from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
+
+    entries = getattr(
+        getattr(scheduler.tree_cache, "host_pool_group", None), "entry_map", None
+    )
+    if not isinstance(entries, dict):
+        entries = {}
+    movable = {PoolName.KV, PoolName.SWA}
+    sidecars = {PoolName.DRAFT, PoolName.DRAFT_SWA}
+    if draft_moves:
+        movable |= sidecars
+    problems = []
+    unmoved = sorted(str(getattr(n, "value", n)) for n in entries if n not in movable)
+    if unmoved:
+        problems.append(
+            "the HiCache host pools "
+            + ", ".join(unmoved)
+            + " hold state of a cached prefix that the offload does not move"
+        )
+    plan = getattr(getattr(scheduler, "draft_worker", None), "hicache_draft_plan", None)
+    if plan is None or not draft_moves:
+        return problems
+    has_draft_kv = any(
+        int(getattr(getattr(pool, "swa_kv_pool", pool), "layer_num", 0) or 0) > 0
+        for pool in plan.device_pools
+    )
+    if (
+        plan.mode == HiCacheDraftMode.SIDECAR
+        and has_draft_kv
+        and not sidecars & set(entries)
+    ):
+        problems.append(
+            "this stage hosts the draft but its KV has no HiCache draft sidecar "
+            "pool, so a recalled prefix would resume without its draft KV"
+        )
+    return problems
+
+
 def _problems(*, role: str, scheduler: Any) -> List[str]:
     from sglang.srt.configs.hybrid_arch import mambaish_config
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
@@ -62,6 +104,7 @@ def _problems(*, role: str, scheduler: Any) -> List[str]:
     # whose transfer manager would hold sliding-window or recurrent-state
     # tensors besides the full-attention KV.
     hybrid_swa = model_config.is_hybrid_swa
+    draft_moves = bool(tpu_envs.SGLANG_PD_OFFLOAD_ALLOW_DRAFT.get())
     requirements = [
         (
             server_args.disaggregation_transfer_backend == "raiden",
@@ -126,8 +169,9 @@ def _problems(*, role: str, scheduler: Any) -> List[str]:
             "context parallelism is not supported",
         ),
         (
-            scheduler.spec_algorithm.is_none(),
-            "speculative decoding is not supported",
+            scheduler.spec_algorithm.is_none() or draft_moves,
+            "speculative decoding is not supported "
+            f"(opt in with {tpu_envs.SGLANG_PD_OFFLOAD_ALLOW_DRAFT.name}=1 on both roles)",
         ),
         (
             mambaish_config(model_config) is None,
@@ -150,6 +194,7 @@ def _problems(*, role: str, scheduler: Any) -> List[str]:
         ),
     ]
     problems = [reason for ok, reason in requirements if not ok]
+    problems += _host_pool_problems(scheduler, draft_moves=draft_moves)
     missing = _missing_tpu_sync_host_api()
     if missing:
         problems.append(

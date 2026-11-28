@@ -45,6 +45,7 @@ from sglang_tpu.disaggregation.decode_dram_offload.prefill_dram_victim_pusher im
 from sglang_tpu.disaggregation.decode_dram_offload.radix_host_ops import (
     anchor_host_pool,
     deletion_orphans_host_only_child,
+    draft_sidecar_host_pools,
     swa_host_pool,
     window_tokens,
 )
@@ -55,6 +56,7 @@ from sglang_tpu.disaggregation.decode_dram_offload.rank_lockstep import (
 from sglang_tpu.disaggregation.decode_dram_offload.startup_validation import (
     validate_engine_args,
 )
+from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.tpu_dma_hybrid_cache_controller import TpuDMAHybridCacheController
 
 _is_installed = False
@@ -85,9 +87,23 @@ def attach_dram_offload_extension(
     """Extend ``cache``'s L2 controller to the peer role's DRAM, reached over
     the raiden ``channel``. A decode passes its transfer queue."""
     host_pool, swa_pool = anchor_host_pool(cache), swa_host_pool(cache)
-    channel.bind_host_pools(
-        host_pool, swa_pool, retain_metadata=decode_queue is not None
+    draft_pools = (
+        draft_sidecar_host_pools(cache)
+        if tpu_envs.SGLANG_PD_OFFLOAD_ALLOW_DRAFT.get()
+        else (None, None)
     )
+    if draft_pools != (None, None):
+        channel.bind_host_pools(
+            host_pool,
+            swa_pool,
+            draft=draft_pools[0],
+            draft_swa=draft_pools[1],
+            retain_metadata=decode_queue is not None,
+        )
+    else:
+        channel.bind_host_pools(
+            host_pool, swa_pool, retain_metadata=decode_queue is not None
+        )
     page_size = int(scheduler.token_to_kv_pool_allocator.page_size)
     ctx = DramOffloadWorkerContext(
         cache=cache,
@@ -97,6 +113,7 @@ def attach_dram_offload_extension(
         lockstep=RankLockstep.of(scheduler),
         swa_host_pool=swa_pool,
         window_tokens=window_tokens(cache, page_size),
+        draft_pools=draft_pools,
     )
     extension = (
         PrefillDramOffloadExtension(

@@ -94,8 +94,12 @@ class PrefixRegistration(msgspec.Struct, frozen=True):
     endpoint: str = ""
     swa_uuid: int = 0
     swa_endpoint: str = ""
+    draft_endpoint: str = ""
+    draft_swa_endpoint: str = ""
     page_metadata: List[bytes] = msgspec.field(default_factory=list)
     swa_page_metadata: List[bytes] = msgspec.field(default_factory=list)
+    draft_page_metadata: List[bytes] = msgspec.field(default_factory=list)
+    draft_swa_page_metadata: List[bytes] = msgspec.field(default_factory=list)
 
     @property
     def refused(self) -> bool:
@@ -142,9 +146,11 @@ class DramOffloadChannel:
             tpu_envs.SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S.get()
         )
         # The HiCache host pools whose pages move, (full, sliding window or
-        # None), bound by the L2 extension.
+        # None), bound by the L2 extension, plus optional draft sidecars.
         self._host_pools: Tuple[Any, Any] = (None, None)
+        self._draft_pools: Tuple[Any, Any] = (None, None)
         self._host_metadata: Tuple[Any, Any] = (None, None)
+        self._draft_metadata: Tuple[Any, Any] = (None, None)
         # This engine's native host reads by request id, as source or as
         # destination: None while raiden may still read or write the pages,
         # then whether the read succeeded. A room's reads outlive its cleanup
@@ -174,9 +180,11 @@ class DramOffloadChannel:
     def forget_room_locked(self, room: int) -> None:
         self._recalls.pop(room, None)
         self._offers.pop(room, None)
-        for req_id in (self.prefix_req_id(room), self.prefix_req_id(room, swa=True)):
-            if self._reads.get(req_id) is not None:
-                del self._reads[req_id]
+        for swa in (False, True):
+            for draft in (False, True):
+                req_id = self.prefix_req_id(room, swa=swa, draft=draft)
+                if self._reads.get(req_id) is not None:
+                    del self._reads[req_id]
 
     def _send(self, *, endpoint: str, message: Any) -> bool:
         # A peer that cannot be reached costs only this recall or push; the
@@ -200,48 +208,86 @@ class DramOffloadChannel:
     # ----- native host reads, shared by recall and push -------------------------
 
     def bind_host_pools(
-        self, full: Any, swa: Any = None, *, retain_metadata: bool = True
+        self,
+        full: Any,
+        swa: Any = None,
+        *,
+        draft: Any = None,
+        draft_swa: Any = None,
+        retain_metadata: bool = True,
     ) -> None:
         with self._lock:
             self._host_pools = (full, swa)
+            self._draft_pools = (draft, draft_swa)
             self._host_metadata = (
                 HostPageMetadata(full, retain=retain_metadata),
                 HostPageMetadata(swa, retain=retain_metadata),
             )
+            self._draft_metadata = (
+                HostPageMetadata(draft, retain=retain_metadata),
+                HostPageMetadata(draft_swa, retain=retain_metadata),
+            )
+
+    def _pool_for(self, *, swa: bool = False, draft: bool = False) -> Any:
+        return (self._draft_pools if draft else self._host_pools)[swa]
+
+    def _metadata_for(self, *, swa: bool = False, draft: bool = False) -> Any:
+        return (self._draft_metadata if draft else self._host_metadata)[swa]
 
     def export_host_metadata(
-        self, pages: List[int], *, swa: bool = False
+        self, pages: List[int], *, swa: bool = False, draft: bool = False
     ) -> List[bytes]:
-        return self._host_metadata[swa].export(pages) if pages else []
+        table = self._metadata_for(swa=swa, draft=draft)
+        return table.export(pages) if pages and table is not None else []
 
     def restore_host_metadata(
-        self, pages: List[int], rows: List[bytes], *, swa: bool = False
+        self,
+        pages: List[int],
+        rows: List[bytes],
+        *,
+        swa: bool = False,
+        draft: bool = False,
     ) -> None:
         if pages or rows:
-            self._host_metadata[swa].restore(pages, rows)
+            self._metadata_for(swa=swa, draft=draft).restore(pages, rows)
 
     def clear_host_metadata(self) -> None:
-        for table in self._host_metadata:
-            table.clear()
+        for table in (*self._host_metadata, *self._draft_metadata):
+            if table is not None:
+                table.clear()
 
-    def host_control_address(self, *, swa: bool = False) -> str:
+    def host_control_address(self, *, swa: bool = False, draft: bool = False) -> str:
         """Where a peer reads this engine's registered host pages from."""
-        transfer = self._host_pools[swa].transfer
+        transfer = self._pool_for(swa=swa, draft=draft).transfer
         return transfer.host_control_address(self._mgr.local_ip)
 
     def register_host_read(
-        self, req_id: str, uuid: int, pages: List[int], *, swa: bool = False
+        self,
+        req_id: str,
+        uuid: int,
+        pages: List[int],
+        *,
+        swa: bool = False,
+        draft: bool = False,
     ) -> bool:
-        """Register this engine's host ``pages`` (of its SWA pool with ``swa``)
-        as the source of a peer's read. An accepted registration keeps the
-        pages owned by the native read until it settles."""
+        """Register this engine's host ``pages`` (of its SWA/draft pool with
+        ``swa``/``draft``) as the source of a peer's read. An accepted
+        registration keeps the pages owned by the native read until it settles."""
         with self._lock:
-            return self._register_host_read_locked(req_id, uuid, pages, swa=swa)
+            return self._register_host_read_locked(
+                req_id, uuid, pages, swa=swa, draft=draft
+            )
 
     def _register_host_read_locked(
-        self, req_id: str, uuid: int, pages: List[int], *, swa: bool = False
+        self,
+        req_id: str,
+        uuid: int,
+        pages: List[int],
+        *,
+        swa: bool = False,
+        draft: bool = False,
     ) -> bool:
-        transfer = self._host_pools[swa].transfer
+        transfer = self._pool_for(swa=swa, draft=draft).transfer
         try:
             transfer.register_read(req_id, uuid, pages)
         except Exception as exc:  # noqa: BLE001 - the caller declines the transfer
@@ -260,16 +306,18 @@ class DramOffloadChannel:
         local: List[int],
         *,
         swa: bool = False,
+        draft: bool = False,
     ) -> bool:
         """Read a peer's registered host pages into this engine's host pages
-        (of its SWA pool with ``swa``); no device page and no staging slot is
-        involved."""
+        (of its SWA/draft pool with ``swa``/``draft``); no device page and no
+        staging slot is involved."""
         with self._lock:
             if self._mgr._room_of(req_id) in self._mgr._aborted:
                 return False
-            transfer = self._host_pools[swa].transfer
+            pool = self._pool_for(swa=swa, draft=draft)
+            transfer = pool.transfer
             try:
-                discard_host_page_metadata(self._host_pools[swa], local)
+                discard_host_page_metadata(pool, local)
                 transfer.start_read(req_id, uuid, endpoint, remote, local)
             except Exception as exc:  # noqa: BLE001 - the caller gives the read up
                 logger.warning("Cannot start host read %s: %s", req_id, exc)
@@ -355,9 +403,9 @@ class DramOffloadChannel:
     # ----- recall, prefill side (prefill_dram_prefix_puller.PrefillDramPrefixPuller) --------------
 
     @staticmethod
-    def prefix_req_id(room: int, *, swa: bool = False) -> str:
+    def prefix_req_id(room: int, *, swa: bool = False, draft: bool = False) -> str:
         # Shaped like a chunk id so the manager's room bookkeeping covers it.
-        return f"{room}#pxs" if swa else f"{room}#px"
+        return f"{room}#px{'s' * swa}{'d' * draft}"
 
     def accept_prefix_offer_locked(
         self, room: int, blocks: List[int], swa_blocks: List[int]
@@ -433,8 +481,12 @@ class DramOffloadChannel:
                     endpoint=ready.endpoint,
                     swa_uuid=ready.swa_uuid,
                     swa_endpoint=ready.swa_endpoint,
+                    draft_endpoint=ready.draft_endpoint,
+                    draft_swa_endpoint=ready.draft_swa_endpoint,
                     page_metadata=ready.page_metadata,
                     swa_page_metadata=ready.swa_page_metadata,
+                    draft_page_metadata=ready.draft_page_metadata,
+                    draft_swa_page_metadata=ready.draft_swa_page_metadata,
                 )
 
     # ----- recall, decode side (decode_dram_prefix_offerer.DecodeDramPrefixOfferer) ---------------
@@ -508,48 +560,86 @@ class DramOffloadChannel:
                 endpoint=registration.endpoint,
                 swa_uuid=registration.swa_uuid,
                 swa_endpoint=registration.swa_endpoint,
+                draft_endpoint=registration.draft_endpoint,
+                draft_swa_endpoint=registration.draft_swa_endpoint,
                 page_metadata=registration.page_metadata,
                 swa_page_metadata=registration.swa_page_metadata,
+                draft_page_metadata=registration.draft_page_metadata,
+                draft_swa_page_metadata=registration.draft_swa_page_metadata,
             ),
         )
 
     def _register_pull_locked(
         self, room: int, pages: List[int], swa_pages: List[int]
     ) -> PrefixRegistration:
-        """Register the pulled ``pages``, and the offered window with them, as
-        the sources of the prefill's reads; a refusal if either registration
-        fails. The prefill reads from the host pools' own control endpoints."""
+        """Register the pulled ``pages``, and the offered window + bound draft
+        sidecar pools with them, as the sources of the prefill's reads; a
+        refusal if any registration fails."""
         # Independent prefills share a decoder's native UUID map; zero means
         # no transfer, as in _announce_chunk.
         try:
             metadata = self.export_host_metadata(pages)
             swa_metadata = self.export_host_metadata(swa_pages, swa=True)
+            draft_metadata = (
+                self.export_host_metadata(pages, draft=True)
+                if self._draft_pools[0] is not None
+                else []
+            )
+            draft_swa_metadata = (
+                self.export_host_metadata(swa_pages, swa=True, draft=True)
+                if self._draft_pools[1] is not None
+                else []
+            )
         except Exception:  # noqa: BLE001 - refuse the recall without registering reads
             logger.exception("Cannot export prefix host metadata for room %s", room)
             return PrefixRegistration()
         uuid = secrets.randbelow((1 << 63) - 1) + 1
         if not self._register_host_read_locked(self.prefix_req_id(room), uuid, pages):
             return PrefixRegistration()
+        draft_endpoint = ""
+        if self._draft_pools[0] is not None:
+            if not self._register_host_read_locked(
+                self.prefix_req_id(room, draft=True), uuid, pages, draft=True
+            ):
+                return PrefixRegistration()
+            draft_endpoint = self.host_control_address(draft=True)
         if not swa_pages:
             return PrefixRegistration(
                 uuid=uuid,
                 endpoint=self.host_control_address(),
+                draft_endpoint=draft_endpoint,
                 page_metadata=metadata,
+                draft_page_metadata=draft_metadata,
             )
-        # The full pages' registration stays owned by its native read when the
-        # window's is refused: raiden cannot withdraw it.
+        # Accepted registrations stay owned by their native reads when a later
+        # one is refused: raiden cannot withdraw them.
         swa_uuid = secrets.randbelow((1 << 63) - 1) + 1
         if not self._register_host_read_locked(
             self.prefix_req_id(room, swa=True), swa_uuid, swa_pages, swa=True
         ):
             return PrefixRegistration()
+        draft_swa_endpoint = ""
+        if self._draft_pools[1] is not None:
+            if not self._register_host_read_locked(
+                self.prefix_req_id(room, swa=True, draft=True),
+                swa_uuid,
+                swa_pages,
+                swa=True,
+                draft=True,
+            ):
+                return PrefixRegistration()
+            draft_swa_endpoint = self.host_control_address(swa=True, draft=True)
         return PrefixRegistration(
             uuid=uuid,
             endpoint=self.host_control_address(),
             swa_uuid=swa_uuid,
             swa_endpoint=self.host_control_address(swa=True),
+            draft_endpoint=draft_endpoint,
+            draft_swa_endpoint=draft_swa_endpoint,
             page_metadata=metadata,
             swa_page_metadata=swa_metadata,
+            draft_page_metadata=draft_metadata,
+            draft_swa_page_metadata=draft_swa_metadata,
         )
 
     # ----- push (prefill_dram_victim_pusher.py, decode_dram_victim_receiver.py) ------------------------
@@ -573,11 +663,24 @@ class DramOffloadChannel:
         swa_blocks: Sequence[int] = (),
         page_metadata: Sequence[bytes] = (),
         swa_page_metadata: Sequence[bytes] = (),
+        draft_page_metadata: Sequence[bytes] = (),
+        draft_swa_page_metadata: Sequence[bytes] = (),
     ) -> bool:
         """Offer registered host pages for decode to pull into its host pools.
         A message that cannot be sent is a declined push."""
         with self._lock:
             self._replies[seq] = None
+            draft, draft_swa = self._draft_pools
+        draft_address = (
+            self.host_control_address(draft=True)
+            if draft is not None and blocks
+            else ""
+        )
+        draft_swa_address = (
+            self.host_control_address(swa=True, draft=True)
+            if draft_swa is not None and swa_blocks
+            else ""
+        )
         return self._send(
             endpoint=_tcp_endpoint(ip=decode[0], port=decode[1]),
             message=VictimPush(
@@ -596,6 +699,10 @@ class DramOffloadChannel:
                 cache_salt=cache_salt,
                 page_metadata=list(page_metadata),
                 swa_page_metadata=list(swa_page_metadata),
+                draft_address=draft_address,
+                draft_swa_address=draft_swa_address,
+                draft_page_metadata=list(draft_page_metadata),
+                draft_swa_page_metadata=list(draft_swa_page_metadata),
             ),
         )
 

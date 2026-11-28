@@ -91,8 +91,14 @@ class _PushInFlight(msgspec.Struct):
     stored: Optional[bool] = None
 
 
-def victim_transfer_id(prefill: str, seq: int, *, swa: bool = False) -> str:
-    return f"victim:{prefill}:{seq}" + (":swa" if swa else "")
+def victim_transfer_id(
+    prefill: str, seq: int, *, swa: bool = False, draft: bool = False
+) -> str:
+    return (
+        f"victim:{prefill}:{seq}"
+        + (":swa" if swa else "")
+        + (":draft" if draft else "")
+    )
 
 
 def _transfer_uuid(prefill: str, seq: int) -> int:
@@ -108,6 +114,7 @@ class PrefillDramVictimPusher:
         self._cache = ctx.cache
         self._host_pool = ctx.host_pool
         self._swa_host_pool = ctx.swa_host_pool
+        self._draft_pool, self._draft_swa_pool = ctx.draft_pools
         self._window_tokens = ctx.window_tokens
         self._page_size = ctx.page_size
         self._lockstep = ctx.lockstep
@@ -323,30 +330,50 @@ class PrefillDramVictimPusher:
         self.stats["started"] += 1
         # Snapshot under the same host pin as the KV read. A metadata owner may
         # need to resolve an outstanding seal before the page can leave.
-        metadata = swa_metadata = None
+        metadata = swa_metadata = draft_metadata = draft_swa_metadata = None
         try:
             metadata = self._channel.export_host_metadata(pages)
             swa_metadata = self._channel.export_host_metadata(swa_pages, swa=True)
+            draft_metadata = (
+                self._channel.export_host_metadata(pages, draft=True)
+                if self._draft_pool is not None
+                else []
+            )
+            draft_swa_metadata = (
+                self._channel.export_host_metadata(swa_pages, swa=True, draft=True)
+                if self._draft_swa_pool is not None
+                else []
+            )
         except Exception:  # noqa: BLE001 - all ranks decline before registering
             logger.exception("Cannot export host metadata for victim push %s", seq)
-        if not self._lockstep.all(metadata is not None and swa_metadata is not None):
+        if not self._lockstep.all(
+            metadata is not None
+            and swa_metadata is not None
+            and draft_metadata is not None
+            and draft_swa_metadata is not None
+        ):
             push.stored = False
             return
         push.registered = self._register_leaf_pages(push, uuid, pages, swa_pages)
+        push_kwargs = {
+            "decode": decode,
+            "prefill": self._namespace,
+            "seq": seq,
+            "tokens": path,
+            "blocks": pages,
+            "swa_blocks": swa_pages,
+            "uuid": uuid,
+            "extra_key": leaf.key.extra_key,
+            "cache_salt": leaf.key.cache_salt,
+            "page_metadata": metadata,
+            "swa_page_metadata": swa_metadata,
+        }
+        if draft_metadata:
+            push_kwargs["draft_page_metadata"] = draft_metadata
+        if draft_swa_metadata:
+            push_kwargs["draft_swa_page_metadata"] = draft_swa_metadata
         if not self._lockstep.all(push.registered) or not (
-            self._channel.send_victim_push(
-                decode=decode,
-                prefill=self._namespace,
-                seq=seq,
-                tokens=path,
-                blocks=pages,
-                swa_blocks=swa_pages,
-                uuid=uuid,
-                extra_key=leaf.key.extra_key,
-                cache_salt=leaf.key.cache_salt,
-                page_metadata=metadata,
-                swa_page_metadata=swa_metadata,
-            )
+            self._channel.send_victim_push(**push_kwargs)
         ):
             push.stored = False
 
@@ -354,14 +381,23 @@ class PrefillDramVictimPusher:
         self, push: _PushInFlight, uuid: int, pages: List[int], swa_pages: List[int]
     ) -> bool:
         """Register the leaf's host pages as the sources of the decode's reads:
-        the full pages, and on a hybrid model the window pages under the same
-        UUID on their own pool. An accepted registration stays in ``read_ids``
-        when a later one is refused: it drains before the push settles."""
-        for swa, part in ((False, pages), (True, swa_pages)):
+        the full pages, on a hybrid model the window pages, and any bound draft
+        sidecar pools under the same UUID. An accepted registration stays in
+        ``read_ids`` when a later one is refused: it drains before the push
+        settles."""
+        kinds = [(False, False, pages), (True, False, swa_pages)]
+        if self._draft_pool is not None:
+            kinds.append((False, True, pages))
+        if self._draft_swa_pool is not None:
+            kinds.append((True, True, swa_pages))
+        for swa, draft, part in kinds:
             if not part:
                 continue
-            read_id = victim_transfer_id(self._namespace, push.seq, swa=swa)
-            if not self._channel.register_host_read(read_id, uuid, part, swa=swa):
+            read_id = victim_transfer_id(
+                self._namespace, push.seq, swa=swa, draft=draft
+            )
+            kwargs = {"swa": swa, **({"draft": True} if draft else {})}
+            if not self._channel.register_host_read(read_id, uuid, part, **kwargs):
                 return False
             push.read_ids.append(read_id)
         return True
