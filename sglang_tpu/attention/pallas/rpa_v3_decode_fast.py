@@ -4199,6 +4199,7 @@ def _run_rpad_vmem_core(
     ):
         """Grouped-sequence blocked ring attention for ``ring4k`` and ``shared*`` private tails."""
         short_pg = 2 if (init_from_hoist and blk_pg > 2 and page_size == 512) else 0
+        mid_pg = 8 if (short_pg > 0 and blk_pg == 16) else 0
         ahead_rg = num_slots - 1
         q_grp_out_rows = q_out_head_rows * dq
         n_grp = cdiv(n_seqs, grp_sz)
@@ -4247,7 +4248,10 @@ def _run_rpad_vmem_core(
                     off_m = meta_base_off + 2 * cur_idx
                     fl = jnp.where(b_i == 0, jnp.int32(1 << 0), jnp.int32(0))
                     if short_pg > 0:
-                        fl = fl | jnp.where((mx_pg - b_i * blk_pg) <= short_pg, jnp.int32(1 << 2), jnp.int32(0))
+                        rem_pg = mx_pg - b_i * blk_pg
+                        fl = fl | jnp.where(rem_pg <= short_pg, jnp.int32(1 << 2), jnp.int32(0))
+                        if mid_pg > 0:
+                            fl = fl | jnp.where((rem_pg > short_pg) & (rem_pg <= mid_pg), jnp.int32(1 << 3), jnp.int32(0))
                     written_cnt_smem_ref[off_m + 0] = (g_i << 16) | b_i
                     written_cnt_smem_ref[off_m + 1] = fl
 
@@ -4293,7 +4297,19 @@ def _run_rpad_vmem_core(
                             sem,
                         ).start()
 
-            if short_pg > 0:
+            if short_pg > 0 and mid_pg > 0:
+                is_s = (fl_val & jnp.int32(1 << 2)) != 0
+                is_m = (fl_val & jnp.int32(1 << 3)) != 0
+                @pl.when(is_s)
+                def _():
+                    _issue_dmas(short_pg)
+                @pl.when(is_m)
+                def _():
+                    _issue_dmas(mid_pg)
+                @pl.when(~(is_s | is_m))
+                def _():
+                    _issue_dmas(blk_pg)
+            elif short_pg > 0:
                 is_s = (fl_val & jnp.int32(1 << 2)) != 0
                 @pl.when(is_s)
                 def _():
@@ -4500,7 +4516,19 @@ def _run_rpad_vmem_core(
                                 slot_pg_cap=wp,
                             )
 
-            if short_pg > 0:
+            if short_pg > 0 and mid_pg > 0:
+                is_s = (fl_val & jnp.int32(1 << 2)) != 0
+                is_m = (fl_val & jnp.int32(1 << 3)) != 0
+                @pl.when(is_s)
+                def _():
+                    _run_blk(short_pg)
+                @pl.when(is_m)
+                def _():
+                    _run_blk(mid_pg)
+                @pl.when(~(is_s | is_m))
+                def _():
+                    _run_blk(blk_pg)
+            elif short_pg > 0:
                 is_s = (fl_val & jnp.int32(1 << 2)) != 0
                 @pl.when(is_s)
                 def _():

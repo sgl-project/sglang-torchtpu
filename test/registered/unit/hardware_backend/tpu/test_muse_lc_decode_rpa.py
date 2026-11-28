@@ -6287,5 +6287,105 @@ class TestMuseLongContextDecodeRpa(unittest.TestCase):
             gc.collect()
 
 
+    def test_wave21_ring8k_mid8_3gear_tail_parity_and_aot(self):
+        """Verify ring8k 3-gear tail [2, 8, 16] (short_pg=2, mid_pg=8) eager race/0x7F parity & TPU7x AOT."""
+        import gc
+        from unittest.mock import patch
+
+        from jax.experimental import topologies
+        from jax.experimental.pallas import tpu as pltpu
+        from jax.sharding import Mesh, PartitionSpec as P
+        from sglang_tpu.attention.pallas.rpa_v3_decode_fast import run_decode_fast_rpa
+
+        B, pps, n_act = 64, 24, 60
+        rng = np.random.default_rng(20262101)
+        # Exercise all 3 tail gears across grp=4 groups:
+        # g0: 17..18 pgs (short_pg=2), g1: 19..20 pgs (mid_pg=8), g2: 24 pgs (mid_pg=8), g3..14: 1..16 or 19..22 pgs.
+        kvl_np = rng.integers(500, 11264, size=(B,), dtype=np.int32)
+        kvl_np[0:4] = [8193, 8705, 8192, 9216]
+        kvl_np[4:8] = [9217, 9730, 8200, 10240]
+        kvl_np[8:12] = [11800, 12288, 10241, 8200]
+        kvl_np[12:16] = [1, 513, 4096, 8192]
+        pg_mat = rng.permutation(B * pps).astype(np.int32).reshape(B, pps)
+        kvc_u8 = rng.integers(0x30, 0x3D, size=(B * pps + 4, 128, 1, 4, 128), dtype=np.uint8)
+        for s in range(B):
+            end_tok = max(int(kvl_np[s]) - 1, 0) if s < n_act else 0
+            hi_pg = end_tok // 512
+            for p in range(pps):
+                if p > hi_pg or s >= n_act:
+                    kvc_u8[pg_mat[s, p], :, :, :, :] = 0x7F
+                elif p == hi_pg:
+                    for t in range(end_tok % 512, 512):
+                        r, pair, c0 = t // 4, (t % 4) // 2, (t % 2) * 64
+                        kvc_u8[pg_mat[s, p], r, 0, pair * 2 : pair * 2 + 2, c0 : c0 + 64] = 0x7F
+
+        kvc = jax.lax.bitcast_convert_type(jnp.asarray(kvc_u8, jnp.uint8), jnp.float8_e4m3fn)
+        q_5d = jnp.asarray(rng.standard_normal((1, B, 8, 2, 128)) * 0.1, jnp.bfloat16)
+        km = jax.lax.bitcast_convert_type(
+            jnp.asarray(rng.integers(0x30, 0x3D, size=(B, 1, 4, 128), dtype=np.uint8), jnp.uint8),
+            jnp.float8_e4m3fn,
+        )
+        gt = jnp.asarray(rng.standard_normal((B, 512)) * 0.1, jnp.bfloat16)
+        kvl = jnp.asarray(kvl_np, jnp.int32)
+        pg = jnp.asarray(pg_mat.reshape(-1), jnp.int32)
+        cq = jnp.asarray(np.concatenate([np.arange(n_act + 1), np.full((B - n_act,), n_act)], dtype=np.int32))
+        ckv = jnp.arange(B + 1, dtype=jnp.int32) * (pps * 512)
+        dt = jnp.asarray([n_act, n_act, n_act], jnp.int32)
+        ip_race = pltpu.InterpretParams(dma_execution_mode="eager", detect_races=True, uninitialized_memory="nan")
+
+        ref_o, ref_kv = run_decode_fast_rpa(
+            q_5d, km, None, kvc, kvl, pg, cq, ckv, dt,
+            sm_scale=64.0 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+            mode_str="tp16,w8,c1024,batchfull,dyn4k,b1", decode_query_size=1, fused_out_pack=2,
+            prepared_inputs=True, gate=gt, out_norm_eps=1e-5, kv_pack_bd4=True, interpret=ip_race,
+        )
+        mid_o, mid_kv = run_decode_fast_rpa(
+            q_5d, km, None, kvc, kvl, pg, cq, ckv, dt,
+            sm_scale=64.0 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+            mode_str="tp16,w8,c1024,batchfull,dyn4k", decode_query_size=1, fused_out_pack=2,
+            prepared_inputs=True, gate=gt, out_norm_eps=1e-5, kv_pack_bd4=True, interpret=ip_race,
+        )
+        r_np, m_np = np.asarray(ref_o, np.float64).ravel(), np.asarray(mid_o, np.float64).ravel()
+        self.assertTrue(np.all(np.isfinite(m_np)))
+        cos_v = float(np.dot(r_np, m_np) / (np.linalg.norm(r_np) * np.linalg.norm(m_np) + 1e-12))
+        self.assertGreater(cos_v, 0.99999, f"ring8k_mid8 cos={cos_v}")
+        self.assertTrue(np.array_equal(np.asarray(ref_kv).view(np.uint8), np.asarray(mid_kv).view(np.uint8)))
+
+        for bs_a in (64, 128, 256):
+            tpu_devs = topologies.get_topology_desc("tpu7x:2x2x2", platform="tpu").devices
+            mesh = Mesh(np.array(tpu_devs[:1]), ("x",))
+            s = lambda sh, dt_: jax.ShapeDtypeStruct(sh, dt_)
+            abs_in = (
+                s((1, bs_a, 8, 2, 128), jnp.bfloat16),
+                s((bs_a, 1, 4, 128), jnp.float8_e4m3fn),
+                s((bs_a, 512), jnp.bfloat16),
+                s((bs_a * pps + 8, 128, 1, 4, 128), jnp.float8_e4m3fn),
+                s((bs_a,), jnp.int32),
+                s((bs_a * pps,), jnp.int32),
+                s((bs_a + 1,), jnp.int32),
+                s((bs_a + 1,), jnp.int32),
+                s((3,), jnp.int32),
+            )
+            with patch("sglang_tpu.attention.pallas.util.get_torch_tpu_device_kind", return_value="TPU v7"):
+                comp = jax.jit(
+                    jax.shard_map(
+                        lambda q_, km_, gt_, c_, kl_, pi_, cq_, ckv_, dt_: run_decode_fast_rpa(
+                            q_, km_, None, c_, kl_, pi_, cq_, ckv_, dt_,
+                            sm_scale=64.0 ** -0.5, sliding_window=None, k_scale=1.0, v_scale=1.0,
+                            mode_str="tp16,w8,c1024,batchfull,dyn4k", decode_query_size=1, fused_out_pack=2,
+                            prepared_inputs=True, gate=gt_, out_norm_eps=1e-5, kv_pack_bd4=True,
+                        ),
+                        mesh=mesh,
+                        in_specs=(P(),) * 9,
+                        out_specs=(P(), P()),
+                        check_vma=False,
+                    )
+                ).lower(*abs_in).compile()
+            self.assertIsNotNone(comp)
+            del comp
+            jax.clear_caches()
+            gc.collect()
+
+
 if __name__ == "__main__":
     unittest.main()
