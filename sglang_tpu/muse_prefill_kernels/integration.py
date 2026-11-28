@@ -1810,6 +1810,16 @@ def _ops(
                 qf1 = a3_ul_gate_fuse_body(a1, gate_k[h:])
                 return kernel_a3.pallas_ulysses_wo_local((qf0, qf1), wo_in, wo_sc)
             attn_3d = a3_ul_rev_a2a_body(raw_attn_k)
+            if (
+                not ulysses_rev_bf16
+                and c_k == 1536
+                and tp_d_ul * q_loc == wo_in.shape[0]
+                and q_loc % 128 == 0
+                and wo_in.shape[1] % 1024 == 0
+            ):
+                return kernel_a3.pallas_ulysses_gate_fuse_wo(
+                    attn_3d, gate_k, wo_in, wo_sc
+                )
             q_fp8 = a3_ul_gate_fuse_body(attn_3d, gate_k)
             return a3_ul_wo_body(q_fp8, wo_in, wo_sc)
 

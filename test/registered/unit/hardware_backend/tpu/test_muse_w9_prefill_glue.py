@@ -4117,3 +4117,193 @@ def test_w19_a1_ulysses_qkvg_c1536_tb1536_ns8_interpret_and_aot():
 
     _compile_tp16(1536, "pallas_a1_ulysses_qkvg_async_a2a_c1536_q512_kv128_tb1536_ns8")
     _compile_tp16(3072, "pallas_a1_ulysses_qkvg_async_a2a_c3072_q512_kv128_tb768_ns16")
+
+
+def test_w19_a3_ulysses_gate_fuse_wo_and_eplb_bias2d_host_copy():
+    """Verify A3 c_k=1536 fused gate+Wo (interpret parity + MLIR + TP=16 AOT) and EPLB bias_2d host copy."""
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    torch = pytest.importorskip("torch")
+    from jax.experimental import pallas as pl
+    from jax.experimental import topologies
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    from sglang_tpu.muse_prefill_kernels import integration
+    from sglang_tpu.muse_prefill_kernels.attn_kernels import kernel_a3
+    from sglang_tpu.muse_prefill_kernels.eplb import PrefillEplbManager
+    from sglang_tpu.pallas_jax_op import _jax_placeholders
+
+    if len(jax.devices()) < 16:
+        pytest.skip("Requires >=16 JAX devices")
+
+    # 1. Mosaic eager+detect_races+nan CPU interpret parity vs gate_fuse + wo_local
+    rng = np.random.default_rng(197)
+    tp_cpu, c_k_cpu, q_loc_cpu, k_cpu = 4, 256, 128, 512
+    a3_cpu = jnp.array(rng.uniform(-4.0, 4.0, (tp_cpu, c_k_cpu, q_loc_cpu)), jnp.float8_e4m3fn)
+    g_cpu = jnp.array(rng.standard_normal((c_k_cpu, k_cpu)) * 0.4, jnp.bfloat16)
+    wo_cpu = jnp.array(rng.standard_normal((k_cpu, k_cpu)) * 0.03, jnp.float8_e4m3fn)
+    ws_cpu = jnp.full((1, k_cpu), 0.02, jnp.float32)
+
+    real_pallas = pl.pallas_call
+
+    def _eager_interpret(*args, **kwargs):
+        kwargs["interpret"] = pltpu.InterpretParams(
+            dma_execution_mode="eager", detect_races=True, uninitialized_memory="nan"
+        )
+        return real_pallas(*args, **kwargs)
+
+    with (
+        mock.patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+        tpu_info_for_cpu_export(),
+        mock.patch.object(pl, "pallas_call", _eager_interpret),
+        jax.default_device(jax.devices("cpu")[0]),
+    ):
+        qf_ref = kernel_a3.pallas_ulysses_gate_fuse(a3_cpu, g_cpu, input_is_prescaled=True)
+        out_ref = kernel_a3.pallas_ulysses_wo_local(qf_ref, wo_cpu, ws_cpu)
+        out_fused = kernel_a3.pallas_ulysses_gate_fuse_wo(a3_cpu, g_cpu, wo_cpu, ws_cpu)
+        np.testing.assert_array_equal(
+            np.asarray(jax.lax.bitcast_convert_type(out_fused, jnp.uint16)),
+            np.asarray(jax.lax.bitcast_convert_type(out_ref, jnp.uint16)),
+        )
+
+    # 2. integration._ops routing + TPU7x 2x2x2 AOT
+    topo16 = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x=2x2x2")
+    mesh16 = Mesh(np.array(topo16.devices).reshape(16), ("model",))
+    with (
+        mock.patch.dict(
+            os.environ,
+            {
+                "SGLANG_TPU_MUSE_KERNEL_ULYSSES_ASYNC_A2A": "1",
+                "SGLANG_TPU_MUSE_KERNEL_ULYSSES_REV_BF16": "0",
+            },
+        ),
+        mock.patch("sglang_tpu.moe.pallas.fused_moe_rs_op._get_mesh", return_value=mesh16),
+        mock.patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+        tpu_info_for_cpu_export(),
+    ):
+        integration._ops.cache_clear()
+        ops = integration._ops(
+            8, 1, "v10_sp", "v16", True, 1e-5, a1_rpa_layout=True, causal_chunk_stream=True
+        )
+        fn_obj = ops.a3_ulysses_full._init_fn
+
+        def _a3_mlir(c_k_val: int) -> str:
+            f8 = getattr(torch, "float8_e4m3fn")
+            fake_args = (
+                torch.empty((16 * c_k_val, 512), dtype=torch.bfloat16),
+                torch.empty((c_k_val, 8192), dtype=torch.bfloat16),
+                torch.empty((8192, 8192), dtype=f8),
+                torch.empty((1, 8192), dtype=torch.float32),
+            )
+            jargs = _jax_placeholders(
+                fake_args, mesh=fn_obj.mesh, partition_specs=fn_obj.input_partition_specs
+            )
+            with jax._src.config.export_ignore_forward_compatibility(True):
+                return fn_obj.exported(*jargs).mlir_module()
+
+        assert "pallas_ulysses_gate_wo_c1536_q512_bn1024" in _a3_mlir(1536)
+        assert "pallas_ulysses_gate_fuse_tp16_c512_q512" in _a3_mlir(512)
+        assert "pallas_ulysses_wo_p512_512_k8192_bn1024" in _a3_mlir(1024)
+
+    with (
+        mock.patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+        tpu_info_for_cpu_export(),
+    ):
+        lowered = jax.jit(
+            jax.shard_map(
+                lambda a, g, w, ws: kernel_a3.pallas_ulysses_gate_fuse_wo(
+                    a[0], g[0], w[0], ws[0]
+                )[None],
+                mesh=mesh16,
+                in_specs=(P("model"),) * 4,
+                out_specs=P("model"),
+                check_vma=False,
+            )
+        ).trace(
+            jax.ShapeDtypeStruct((16, 16, 1536, 512), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((16, 1536, 8192), jnp.bfloat16),
+            jax.ShapeDtypeStruct((16, 8192, 8192), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((16, 1, 8192), jnp.float32),
+        ).lower(lowering_platforms=("tpu",))
+        assert "pallas_ulysses_gate_wo_c1536_q512_bn1024" in lowered.as_text("stablehlo")
+        lowered.compile()
+
+    # 3. EPLB _fused_decode_bias_2d copy_ must reshape via host (never device-side 1D->2D view)
+    events: list[str] = []
+
+    class _FakeTpuTensor:
+        def __init__(self, arr: torch.Tensor, dev_type: str = "tpu"):
+            self._t = arr
+            self.device = mock.Mock(type=dev_type)
+            self.dtype = arr.dtype
+            self.shape = arr.shape
+
+        def index_select(self, dim: int, idx):
+            return _FakeTpuTensor(self._t.index_select(dim, idx._t if isinstance(idx, _FakeTpuTensor) else idx), self.device.type)
+
+        def reshape(self, *shape):
+            if self.device.type != "cpu":
+                events.append("BAD_DEVICE_RESHAPE")
+            return _FakeTpuTensor(self._t.reshape(*shape), self.device.type)
+
+        def detach(self):
+            return self
+
+        def t(self):
+            return _FakeTpuTensor(self._t.t(), self.device.type)
+
+        def float(self):
+            return _FakeTpuTensor(self._t.float(), self.device.type)
+
+        def contiguous(self):
+            return _FakeTpuTensor(self._t.contiguous(), self.device.type)
+
+        def cpu(self):
+            events.append("CPU_BOUNCE")
+            return _FakeTpuTensor(self._t.cpu(), "cpu")
+
+        def to(self, dev):
+            events.append(f"TO_{getattr(dev, 'type', dev)}")
+            return _FakeTpuTensor(self._t, getattr(dev, "type", "tpu"))
+
+        def copy_(self, src):
+            self._t.copy_(src._t if isinstance(src, _FakeTpuTensor) else src)
+            return self
+
+    class _P:
+        def __init__(self, arr: torch.Tensor):
+            self.data = _FakeTpuTensor(arr)
+
+    fake_dev = mock.Mock(type="tpu")
+    bias_1d = torch.arange(16, dtype=torch.float32)
+    bias_2d = _FakeTpuTensor(torch.zeros((1, 16), dtype=torch.float32))
+    moe = mock.Mock()
+    moe.gate = mock.Mock(weight=_P(torch.zeros((16, 8), dtype=torch.float32)))
+    moe.e_score_correction_bias = _P(bias_1d.clone())
+    moe.experts = mock.Mock(
+        w13_weight=_P(torch.zeros((4, 16, 8), dtype=torch.bfloat16)),
+        w2_weight=_P(torch.zeros((4, 8, 16), dtype=torch.bfloat16)),
+    )
+    moe._buffers = {"_fused_decode_bias_2d": bias_2d}
+    lw = mock.Mock(_buffers={}, wrouter=_FakeTpuTensor(torch.zeros((8, 16), dtype=torch.float32)))
+    from sglang_tpu.muse_prefill_kernels.eplb import PrefillEplbManager
+
+    mgr = PrefillEplbManager.__new__(PrefillEplbManager)
+    mgr.decoder = mock.Mock(layers=[mock.Mock(mlp=moe)])
+    mgr.start = 0
+    mgr.weights_list = [lw]
+    mgr._EXPERT_ATTRS = ()
+    mgr._DECODE_SHADOW_FP4_ATTRS = ()
+    mgr._gather_selected_slots = lambda *a, **k: _FakeTpuTensor(torch.zeros((1,)))
+
+    with (
+        mock.patch("torch.tensor", lambda data, **kw: _FakeTpuTensor(torch.as_tensor(data, dtype=kw.get("dtype")))),
+        mock.patch("sglang_tpu.expert_loading._wait_for", lambda *a, **k: None),
+        mock.patch("sglang_tpu.muse_prefill_kernels.integration._router_weight", None),
+    ):
+        mgr._apply_layer_perm_indices(0, np.arange(16, dtype=np.int64)[::-1].copy(), np.arange(4, dtype=np.int64), fake_dev)
+
+    assert "BAD_DEVICE_RESHAPE" not in events
+    assert "CPU_BOUNCE" in events
+    np.testing.assert_allclose(bias_2d._t.numpy(), bias_1d.numpy()[::-1].reshape(1, 16))
