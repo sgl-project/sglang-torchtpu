@@ -895,3 +895,97 @@ def test_fori_part_b_ep16_and_ep8_parity_and_tpu7x_aot():
         1, sortfree_prefill=True, topk=8, ep_size=16, t_local=64,
         n_loc_eff=18, has_pad_sentinel=True, eff_hoist_routing=True, eff_cm_pipe=True,
     )
+
+
+def test_w19_inv_perm_zax1_and_qblock_macro32_64_parity_and_aot():
+    """Verify Wave-19 0-axis1-reduce inv_perm (incl. duplicate ties) and macro32/64 q_block."""
+    jax = pytest.importorskip("jax")
+    import jax.numpy as jnp
+    from jax import export
+    from jax.experimental import topologies
+    from jax.experimental.pallas import tpu as pltpu
+
+    from sglang_tpu.muse_prefill_kernels.eplb import remap_zeroglue_virtual_ids
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.routing_pallas import (
+        pallas_local_inv_perm_and_counts,
+        pallas_qblock_remap_virtual_ids,
+    )
+
+    eager_interp = pltpu.InterpretParams(
+        dma_execution_mode="eager",
+        detect_races=True,
+        uninitialized_memory="nan",
+    )
+    rng = np.random.default_rng(20261137)
+    with _tpu7x_cpu_context(interpret=False):
+        # 1. pallas_qblock_remap_virtual_ids macro32 (tg=4096) & macro64 (tg=2048) 0-ULP parity.
+        for ep_sz, base_loc, t_tot, n_rep, rk, add_pad in (
+            (16, 16, 2048, 6, 3, True),
+            (16, 16, 4096, 6, 11, True),
+            (8, 32, 4096, 4, 5, False),
+        ):
+            e_loc = base_loc + n_rep
+            g_np = rng.integers(0, ep_sz * base_loc, size=(t_tot, 8), dtype=np.int32)
+            if add_pad:
+                g_np[-128:, :] = ep_sz * base_loc
+            g_j, rk_j = jnp.asarray(g_np), jnp.int32(rk)
+            with mock.patch.dict(
+                os.environ, {"SGLANG_TPU_MUSE_KERNEL_PALLAS_SORTFREE_ROUTING": "0"}
+            ):
+                ref_g, ref_l = remap_zeroglue_virtual_ids(
+                    g_j, rk_j, ep_size=ep_sz, num_local_experts=e_loc,
+                    num_base_local=base_loc, mode="q_block", quantum=128,
+                )
+            got_g, got_l = pallas_qblock_remap_virtual_ids(
+                g_j, rk_j, ep_size=ep_sz, num_local_experts=e_loc,
+                num_base_local=base_loc, quantum=128, interpret=eager_interp,
+            )
+            assert np.array_equal(np.asarray(got_g), np.asarray(ref_g))
+            assert np.array_equal(np.asarray(got_l), np.asarray(ref_l))
+
+        for tg, ep_sz, bl, el, topo_name in (
+            (2048, 16, 16, 22, "tpu7x=2x2x2"),
+            (4096, 16, 16, 22, "tpu7x=2x2x2"),
+            (4096, 8, 32, 36, "tpu7x=2x2x1"),
+        ):
+            exp_qb = export.export(
+                jax.jit(
+                    lambda g, me, _ep=ep_sz, _bl=bl, _el=el: pallas_qblock_remap_virtual_ids(
+                        g, me, ep_size=_ep, num_local_experts=_el, num_base_local=_bl, quantum=128
+                    )
+                ),
+                platforms=("tpu",),
+            )(jax.ShapeDtypeStruct((tg, 8), jnp.int32), jax.ShapeDtypeStruct((), jnp.int32))
+            assert f"pallas_qblock_eplb_remap_tg{tg}_ep{ep_sz}_el{el}_nb64_q128" in exp_qb.mlir_module()
+            topo = topologies.get_topology_desc(platform="tpu", topology_name=topo_name)
+            shd = jax.sharding.SingleDeviceSharding(topo.devices[0])
+            comp_qb = (
+                jax.jit(
+                    lambda g, me, _ep=ep_sz, _bl=bl, _el=el: pallas_qblock_remap_virtual_ids(
+                        g, me, ep_size=_ep, num_local_experts=_el, num_base_local=_bl, quantum=128
+                    )
+                )
+                .trace(
+                    jax.ShapeDtypeStruct((tg, 8), jnp.int32, sharding=shd),
+                    jax.ShapeDtypeStruct((), jnp.int32, sharding=shd),
+                )
+                .lower()
+                .compile()
+            )
+            assert comp_qb is not None
+
+        # 2. pallas_local_inv_perm_and_counts zax1 duplicate-slot adversarial parity (has_pad=False).
+        g_dup = np.full((16 * 128, 8), 5 * 22 + 3, dtype=np.int32)
+        g_dup[:64, 0] = 0
+        g_dup[5 * 128 + 10, :] = 5 * 22 + 3
+        l_dup = g_dup[5 * 128 : 6 * 128]
+        ip_d, gs_d, gst_d, tr_d = pallas_local_inv_perm_and_counts(
+            jnp.asarray(l_dup), jnp.asarray(g_dup), jnp.int32(5 * 22), jnp.int32(5),
+            ep_size=16, num_local_experts=22, total_id_buckets=16 * 22,
+            has_pad_sentinel=False, zero_local_start=True, native_pack=True,
+            interpret=eager_interp,
+        )
+        exp_dup = np.argsort(np.argsort(l_dup.reshape(-1), kind="stable")).reshape(128, 8).astype(np.int32)
+        assert np.array_equal(np.asarray(ip_d), exp_dup)
+        assert int(tr_d) == int(gst_d[1])
+        assert int(gs_d[5 * 22 + 3]) == int(np.sum(g_dup == (5 * 22 + 3)))
