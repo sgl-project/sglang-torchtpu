@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Optional
@@ -26,6 +27,7 @@ from sglang_tpu.pp_attention_capacity import (
 from sglang_tpu.pp_chunks import (
     StepCostModel,
     chunk_granularity,
+    is_step_target_ms,
     longest_prompt,
     profile_points,
     uses_dynamic_chunks,
@@ -200,6 +202,36 @@ class TpuPipelinePrefillAdder(PrefillAdder):
         return self.budget_state() if len(self.can_run_list) > before else result
 
 
+def _agreed_target_ms(*, world_group: Any) -> float | None:
+    """The fixed chunk step target, checked on every rank before profiling so
+    that a bad or rank-local value fails every rank instead of stranding peers."""
+    field = envs.SGLANG_TPU_PP_CHUNK_TARGET_MS
+    raw = os.getenv(field.name)
+    target_ms, error = None, None
+    # Parsed here, not with get(), which warns and falls back to the default.
+    # An empty value and "None" (the env API's explicit unset) mean unset.
+    try:
+        unset = raw is None or not raw.strip() or raw == str(None)
+        target_ms = None if unset else field.parse(raw)
+    except ValueError as exc:
+        error = str(exc)
+    if target_ms is not None and not is_step_target_ms(target_ms):
+        error = f"{target_ms} is not a positive number of ms"
+    views = [None] * world_group.world_size
+    torch.distributed.all_gather_object(
+        views, (target_ms, error), group=world_group.cpu_group
+    )
+    errors = sorted({error for _, error in views if error is not None})
+    if errors:
+        raise ValueError(f"SGLANG_TPU_PP_CHUNK_TARGET_MS: {'; '.join(errors)}")
+    if len({ms for ms, _ in views}) > 1:
+        raise ValueError(
+            "SGLANG_TPU_PP_CHUNK_TARGET_MS differs across ranks: "
+            f"{sorted({str(ms) for ms, _ in views})}"
+        )
+    return target_ms
+
+
 def profile_and_install_cost_model(scheduler: Scheduler) -> None:
     """Profile every stage after compilation and share the slowest cost curve."""
     runner = scheduler.tp_worker.model_runner
@@ -207,7 +239,10 @@ def profile_and_install_cost_model(scheduler: Scheduler) -> None:
         return
     if not get_exec().graph.enable_torch_compile:
         raise ValueError("TPU pipeline dynamic chunks require --enable-torch-compile.")
-    if envs.SGLANG_TPU_PP_CHUNK_SLACK.get() < 0:
+    # Agreed before the rank-local slack check below, so a bad target fails
+    # every rank; the slack itself is still read per rank.
+    target_ms = _agreed_target_ms(world_group=scheduler.world_group)
+    if target_ms is None and envs.SGLANG_TPU_PP_CHUNK_SLACK.get() < 0:
         raise ValueError("SGLANG_TPU_PP_CHUNK_SLACK must be nonnegative.")
     policy = runner.compile_policy
     granularity = chunk_granularity(
@@ -250,9 +285,10 @@ def profile_and_install_cost_model(scheduler: Scheduler) -> None:
     schedules = [report[1] for report in reports if report[1] is not None]
     cost = StepCostModel.fit(
         [report[0] for report in reports],
-        envs.SGLANG_TPU_PP_CHUNK_SLACK.get(),
-        granularity,
-        min(schedules) if schedules else None,
+        slack=envs.SGLANG_TPU_PP_CHUNK_SLACK.get(),
+        granularity=granularity,
+        schedule=min(schedules) if schedules else None,
+        target_ms=target_ms,
     )
     context_len = runner.model_config.context_len
     if cost.schedule is not None:
@@ -265,6 +301,14 @@ def profile_and_install_cost_model(scheduler: Scheduler) -> None:
                 f"{granularity}-token chunk of prompts up to {longest} tokens; "
                 f"lower --context-length from {context_len} to {longest}."
             )
+    if target_ms is not None and cost.target_ms > target_ms:
+        logger.warning(
+            "SGLANG_TPU_PP_CHUNK_TARGET_MS=%s is below the modeled prefix-free "
+            "top-bucket step (slowest ladder entry plus largest attention slope "
+            "over the stages); the step target is %.1f ms.",
+            target_ms,
+            cost.target_ms,
+        )
     scheduler._tpu_pp_chunk_cost = cost
     # Cached prefix tokens of each waiting request, matched once.
     scheduler._tpu_pp_cached_prefix = {}
