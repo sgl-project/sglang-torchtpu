@@ -158,17 +158,29 @@ class PrefillDramPrefixPuller:
 
     # ----- bootstrap-queue hooks (scheduler thread) ----------------------------
 
-    def advance(self, reqs: List[Any], *, waiting_reqs: Sequence[Any]) -> None:
+    def advance(
+        self,
+        reqs: List[Any],
+        *,
+        waiting_reqs: Sequence[Any],
+        push_under_pressure: Optional[bool] = None,
+    ) -> bool:
         """One scheduler step over the bootstrap queue, in queue order on every
-        rank. ``waiting_reqs`` is the scheduler's waiting queue."""
+        rank. ``waiting_reqs`` is the scheduler's waiting queue. With a push
+        pressure vote, also return whether all ranks must check for a victim.
+        READY can reserve pages after the vote, so it requires a fresh check."""
         self.free_settled_host_landings()
         self._unpin_departed(queued_reqs=[*reqs, *waiting_reqs])
         log_offload_stats(self.stats, "recall", self._last_log)
-        if not reqs:
-            return
+        if not reqs and push_under_pressure is None:
+            return False
         rooms = [req.bootstrap_room for req in reqs]
-        agreed = self._lockstep.reduce(
-            [self._local_recall_flags(room) for room in rooms], dist.ReduceOp.MIN
+        rows = [self._local_recall_flags(room) for room in rooms]
+        if push_under_pressure is not None:
+            rows.append([int(push_under_pressure), 0, 0, 0])
+        agreed = self._lockstep.reduce(rows, dist.ReduceOp.MIN)
+        select_push = (
+            bool(agreed.pop()[0]) if push_under_pressure is not None else False
         )
         proposals = {}
         ready = []
@@ -190,6 +202,7 @@ class PrefillDramPrefixPuller:
             self._ask_decode_for_agreed_ranges(proposals)
         if ready:
             self._start_agreed_reads(ready)
+        return select_push or bool(ready)
 
     def _local_recall_flags(self, room: int) -> List[int]:
         """[offer to take, read settled, read done, READY in] on this rank."""
@@ -371,6 +384,8 @@ class PrefillDramPrefixPuller:
         )
         inserted = node is not None
         if inserted:
+            if hasattr(req, "__dict__"):
+                req._pd_recalled_node = node
             swa_tokens = len(plan.swa_remote) * self._page_size
             self._pins[req.bootstrap_room] = _RecalledPrefixPin(
                 req=req,

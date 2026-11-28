@@ -9,13 +9,20 @@ the raiden manager is a fake.
 """
 
 import heapq
+import os
+import tempfile
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch.distributed as dist
+import torch.multiprocessing as mp
+
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams, MatchPrefixParams
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -28,6 +35,9 @@ from sglang_tpu.disaggregation.decode_dram_offload import (
 from sglang_tpu.disaggregation.decode_dram_offload.dram_offload_hooks import (
     DecodeDramOffloadExtension,
     PrefillDramOffloadExtension,
+)
+from sglang_tpu.disaggregation.decode_dram_offload.prefill_dram_prefix_puller import (
+    PrefillDramPrefixPuller,
 )
 from sglang_tpu.disaggregation.raiden.serde import VictimAck, VictimPush
 from sglang_tpu.testing.decode_dram_offload import (
@@ -57,6 +67,41 @@ class TestPrefillPusher(PrefillPusherFixture, CustomTestCase):
         self.pusher.retire_settled_pushes()
         self.assertFalse(self.pusher.has_pushes_in_flight())
         self.assertEqual(self.pusher.stats["declined"], 1)
+
+    def test_pushed_length_uses_current_path_and_preserves_other_candidates(self):
+        """A completed push excludes only that length; a longer current path
+        must remain eligible, and other routes must still be considered."""
+        _, first, tokens, pages, swa = self.pusher._pick_coldest_host_leaf()
+        self.pusher._pushed_len[first] = len(tokens)
+        _, second, second_tokens, _, _ = self.pusher._pick_coldest_host_leaf()
+        self.assertIsNot(first, second)
+        self.pusher._pushed_len[second] = len(second_tokens)
+        self.assertIsNone(self.pusher._pick_coldest_host_leaf())
+        # The remembered push was shorter than the current path. The length
+        # guard must not exclude it solely because this route was pushed before.
+        self.pusher._pushed_len[first] = len(tokens) - 4
+        result = self.pusher._pick_coldest_host_leaf()
+        self.assertIs(result[1], first)
+        self.assertEqual(result[2:], (tokens, pages, swa))
+
+    def test_path_count_matches_raw_tokens_for_capped_and_bigram_keys(self):
+        """Using logical RadixKey lengths would misclassify already-pushed
+        paths when a key has a limit or encodes bigrams."""
+        root = self.cache.tree_core.root_node
+        parent = SimpleNamespace(
+            parent=root,
+            key=RadixKey(token_ids=array("q", [10, 11, 12]), is_bigram=True),
+        )
+        leaf = SimpleNamespace(
+            parent=parent,
+            key=RadixKey(token_ids=array("q", [13, 14, 15]), limit=2),
+        )
+        self.assertNotEqual(len(parent.key) + len(leaf.key), 6)
+        self.assertEqual(
+            radix_host_ops.path_tokens(self.cache, leaf), [10, 11, 12, 13, 14, 15]
+        )
+        self.assertEqual(radix_host_ops.path_token_count(self.cache, leaf), 6)
+        self.assertEqual(radix_host_ops.path_token_count(self.cache, root), 0)
 
     def test_stored_victim_path_evicts_in_the_same_order_on_every_rank(self):
         """A stored victim's path must take unique access stamps, each older
@@ -326,7 +371,10 @@ class TestPrefillQueueHooks(CustomTestCase):
     def test_queue_step_is_driven_before_and_settled_after(self):
         calls = []
         extension = _prefill_end()
-        extension.recall.advance.side_effect = lambda *a, **k: calls.append("recall")
+        extension.recall.advance.side_effect = lambda *a, **k: (
+            calls.append("recall") or True
+        )
+        extension.push.can_select_victim.return_value = True
         extension.push.advance.side_effect = lambda **k: calls.append("push")
         extension.recall.insert_recalled_host_prefix.side_effect = lambda req: (
             calls.append("insert") or True
@@ -340,9 +388,11 @@ class TestPrefillQueueHooks(CustomTestCase):
         self.assertEqual(result, ["a"])
         self.assertEqual(calls, ["recall", "push", "pop", "insert", "note", "drop"])
         extension.recall.advance.assert_called_once_with(
-            queue.queue, waiting_reqs=["waiting"]
+            queue.queue, waiting_reqs=["waiting"], push_under_pressure=True
         )
-        extension.push.advance.assert_called_once_with(serving=True)
+        extension.push.advance.assert_called_once_with(
+            serving=True, selection_agreed=True
+        )
         extension.recall.insert_recalled_host_prefix.assert_called_once_with("a")
         extension.push.note_decode_of.assert_called_once_with("a", recalled=True)
         extension.recall.drop_departed.assert_called_once_with(queue.queue)
@@ -357,7 +407,9 @@ class TestPrefillQueueHooks(CustomTestCase):
                     dram_offload_hooks._move_bootstrapped(
                         MagicMock(return_value=[]), queue, []
                     )
-                extension.push.advance.assert_called_once_with(serving=running)
+                extension.push.advance.assert_called_once_with(
+                    serving=running, selection_agreed=None
+                )
 
     def test_memory_release_first_lets_go_of_the_pages_of_the_prefill_end(self):
         calls = []
@@ -820,6 +872,234 @@ class TestEvictionWalkSkipsDeletedLeaves(CustomTestCase):
             ),
             dram_offload_hooks._patch_targets(),
         )
+
+
+class TestActiveDirtyGate(CustomTestCase):
+    def test_empty_bootstrap_active_spin_runs_zero_extra_collectives(self):
+        cache, allocator = full_cache(kv_size=64, host_capacity=64)
+        channel = push_channel(cache.cache_controller.host)
+        channel.take_prefix_offer.return_value = None
+        channel.prefix_ready.return_value = None
+        ctx = offload_context(cache=cache, channel=channel)
+        extension = PrefillDramOffloadExtension(
+            recall=PrefillDramPrefixPuller(ctx),
+            push=prefill_dram_victim_pusher.PrefillDramVictimPusher(ctx),
+        )
+        cache.cache_controller.decode_dram_extension = extension
+        queue = SimpleNamespace(
+            queue=[],
+            scheduler=SimpleNamespace(
+                tree_cache=cache,
+                waiting_queue=[],
+                running_batch=SimpleNamespace(is_empty=lambda: False),
+            ),
+        )
+        with patch.object(
+            ctx.lockstep, "min_max", wraps=ctx.lockstep.min_max
+        ) as min_max:
+            # First active empty-bootstrap poll checks selection once and clears dirty.
+            dram_offload_hooks._move_bootstrapped(lambda q, *a, **k: [], queue, [])
+            self.assertEqual(min_max.call_count, 1)
+            # 50 subsequent empty-bootstrap active polls do 0 collectives.
+            for _ in range(50):
+                dram_offload_hooks._move_bootstrapped(lambda q, *a, **k: [], queue, [])
+            self.assertEqual(min_max.call_count, 1)
+            # A rank-synchronized eviction re-arms _selection_dirty.
+            dram_offload_hooks._evict_cache(lambda c, *a, **k: None, cache)
+            dram_offload_hooks._move_bootstrapped(lambda q, *a, **k: [], queue, [])
+            self.assertEqual(min_max.call_count, 2)
+
+    def test_deferred_match_routes_exact_page_multiple_leaf_in_one_match(self):
+        cache, allocator = full_cache(kv_size=64, host_capacity=32)
+        host = cache.cache_controller.host
+        channel = push_channel(host)
+        channel.decode_peer.return_value = ("10.0.0.9", 5009)
+        channel.take_prefix_offer.return_value = None
+        channel.prefix_ready.return_value = None
+        extension = PrefillDramOffloadExtension(
+            recall=PrefillDramPrefixPuller(
+                offload_context(cache=cache, channel=channel)
+            ),
+            push=prefill_dram_victim_pusher.PrefillDramVictimPusher(
+                offload_context(cache=cache, channel=channel)
+            ),
+        )
+        cache.cache_controller.decode_dram_extension = extension
+        session = list(range(400, 416))
+        insert_tokens(cache, allocator, session)
+        cache.evict(EvictParams(num_tokens=16))
+        req = pushed_req(room=4, tokens=session)
+        req.session = None
+        queue = SimpleNamespace(
+            queue=[req],
+            scheduler=SimpleNamespace(
+                tree_cache=cache,
+                waiting_queue=[],
+                running_batch=SimpleNamespace(is_empty=lambda: False),
+            ),
+        )
+        with (
+            patch.object(dram_offload_hooks, "_is_installed", True),
+            patch.object(prefill_dram_victim_pusher, "_PUSH_FULL_FREE_TOKENS", 0),
+            patch.object(
+                cache.tree_core,
+                "match_prefix",
+                wraps=cache.tree_core.match_prefix,
+            ) as core_match,
+        ):
+            dram_offload_hooks._move_bootstrapped(
+                lambda q, *a, **k: [q.queue.pop(0)], queue, []
+            )
+            core_match.assert_not_called()
+            dram_offload_hooks._match_prefix(
+                UnifiedRadixCache.match_prefix,
+                cache,
+                MatchPrefixParams(
+                    key=RadixKey(array("q", session), limit=len(session) - 1),
+                    req=req,
+                ),
+            )
+            self.assertEqual(core_match.call_count, 1)
+        extension.push.advance(serving=True)
+        self.assertEqual(channel.send_victim_push.call_args.kwargs["tokens"], session)
+
+    def test_writing_check_wrapper_marks_dirty_only_when_non_wb_acks_complete(self):
+        cache, allocator = full_cache(kv_size=64, host_capacity=32)
+        cache.tree_core.is_write_back = cache.is_write_back = False
+        cache.cache_controller.write_policy = "write_through"
+        cache.write_through_threshold = 1
+        channel = push_channel(cache.cache_controller.host)
+        extension = PrefillDramOffloadExtension(
+            recall=PrefillDramPrefixPuller(
+                offload_context(cache=cache, channel=channel)
+            ),
+            push=prefill_dram_victim_pusher.PrefillDramVictimPusher(
+                offload_context(cache=cache, channel=channel)
+            ),
+        )
+        cache.cache_controller.decode_dram_extension = extension
+        extension.push._selection_dirty = False
+        dram_offload_hooks._writing_check(UnifiedRadixCache.writing_check, cache)
+        self.assertFalse(extension.push._selection_dirty)
+        insert_tokens(cache, allocator, list(range(10, 18)))
+        cache.cache_controller.start_writing()
+        # write_back=True must not mutate rank-replicated dirty flag.
+        extension.push._selection_dirty = False
+        dram_offload_hooks._writing_check(
+            lambda c, write_back=False: None, cache, write_back=True
+        )
+        self.assertFalse(extension.push._selection_dirty)
+        dram_offload_hooks._writing_check(UnifiedRadixCache.writing_check, cache)
+        self.assertTrue(extension.push._selection_dirty)
+
+
+def _two_rank_active_dirty_gate_worker(rank: int, store_path: str) -> None:
+    store = dist.FileStore(store_path, 2)
+    dist.init_process_group(backend="gloo", store=store, rank=rank, world_size=2)
+    try:
+        from sglang_tpu.disaggregation.decode_dram_offload.rank_lockstep import (
+            DramOffloadWorkerContext,
+            RankLockstep,
+        )
+
+        group = dist.new_group(ranks=[0, 1], backend="gloo")
+        cache, allocator = full_cache(kv_size=64, host_capacity=32)
+        cache.tree_core.is_write_back = cache.is_write_back = False
+        cache.cache_controller.write_policy = "write_through"
+        cache.write_through_threshold = 1
+        host = cache.cache_controller.host
+        channel = push_channel(host)
+        channel.decode_peer.return_value = ("10.0.0.9", 5009)
+        channel.take_prefix_offer.return_value = None
+        channel.prefix_ready.return_value = None
+        lockstep = RankLockstep(group)
+        ctx = DramOffloadWorkerContext(
+            cache=cache,
+            channel=channel,
+            page_size=1,
+            host_pool=host,
+            lockstep=lockstep,
+        )
+        extension = PrefillDramOffloadExtension(
+            recall=PrefillDramPrefixPuller(ctx),
+            push=prefill_dram_victim_pusher.PrefillDramVictimPusher(ctx),
+        )
+        cache.cache_controller.decode_dram_extension = extension
+        queue = SimpleNamespace(
+            queue=[],
+            scheduler=SimpleNamespace(
+                tree_cache=cache,
+                waiting_queue=[],
+                running_batch=SimpleNamespace(is_empty=lambda: False),
+            ),
+        )
+        with patch.object(lockstep, "min_max", wraps=lockstep.min_max) as min_max:
+            # 1. Empty-bootstrap active spins: 1 collective to clear dirty, then 0.
+            dram_offload_hooks._move_bootstrapped(lambda q, *a, **k: [], queue, [])
+            assert min_max.call_count == 1
+            for _ in range(20):
+                dram_offload_hooks._move_bootstrapped(lambda q, *a, **k: [], queue, [])
+            assert min_max.call_count == 1
+
+            # 2. Rank-synchronized _writing_check re-arms _selection_dirty on both ranks.
+            session = list(range(500, 516))
+            insert_tokens(cache, allocator, session)
+            cache.cache_controller.start_writing()
+            dram_offload_hooks._writing_check(
+                UnifiedRadixCache.writing_check, cache, finish_count=1
+            )
+            assert extension.push._selection_dirty
+            dram_offload_hooks._move_bootstrapped(lambda q, *a, **k: [], queue, [])
+            assert min_max.call_count == 2
+            assert not extension.push._selection_dirty
+
+            # 3. Rank-synchronized _evict re-arms _selection_dirty on both ranks.
+            dram_offload_hooks._evict_cache(
+                lambda c, *a, **k: c.evict(EvictParams(num_tokens=16)), cache
+            )
+            assert extension.push._selection_dirty
+            dram_offload_hooks._move_bootstrapped(lambda q, *a, **k: [], queue, [])
+            assert min_max.call_count == 3
+
+        # 4. Deferred match_prefix routes the leaf and pushes in lockstep on both ranks.
+        req = pushed_req(room=7, tokens=session)
+        req.session = None
+        queue.queue.append(req)
+        with (
+            patch.object(dram_offload_hooks, "_is_installed", True),
+            patch.object(prefill_dram_victim_pusher, "_PUSH_FULL_FREE_TOKENS", 0),
+        ):
+            dram_offload_hooks._move_bootstrapped(
+                lambda q, *a, **k: [q.queue.pop(0)], queue, []
+            )
+            assert getattr(req, "_pd_defer_leaf_match", False)
+            dram_offload_hooks._match_prefix(
+                UnifiedRadixCache.match_prefix,
+                cache,
+                MatchPrefixParams(
+                    key=RadixKey(array("q", session), limit=len(session) - 1),
+                    req=req,
+                ),
+            )
+            assert not getattr(req, "_pd_defer_leaf_match", False)
+            assert extension.push._selection_dirty
+        dram_offload_hooks._move_bootstrapped(lambda q, *a, **k: [], queue, [])
+        assert channel.send_victim_push.call_count == 1
+        assert channel.send_victim_push.call_args.kwargs["tokens"] == session
+    finally:
+        dist.destroy_process_group()
+
+
+class TestActiveDirtyGateMultiRank(CustomTestCase):
+    def test_two_rank_gloo_active_dirty_gate_lockstep(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store_path = os.path.join(tmpdir, "gloo_dirty_gate_store")
+            mp.spawn(
+                _two_rank_active_dirty_gate_worker,
+                args=(store_path,),
+                nprocs=2,
+                join=True,
+            )
 
 
 if __name__ == "__main__":

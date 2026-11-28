@@ -23,6 +23,7 @@ import msgspec
 import torch.distributed as dist
 
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+from sglang.srt.mem_cache.common import page_align_floor
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang_tpu.disaggregation.decode_dram_offload.radix_host_ops import (
     host_pages,
@@ -30,6 +31,7 @@ from sglang_tpu.disaggregation.decode_dram_offload.radix_host_ops import (
     leaf_of,
     lock_host_path,
     mark_next_victim,
+    path_token_count,
     path_tokens,
     unlock_host_path,
     window_host_pages,
@@ -111,16 +113,68 @@ class PrefillDramVictimPusher:
         # restarts cannot alias push labels on one decode.
         epoch = self._lockstep.reduce([[secrets.randbits(62)]], dist.ReduceOp.MIN)[0][0]
         self._namespace = f"{epoch:x}"
-        # Exact cached leaf -> (decode peer, semantic fingerprint). Weak keys
-        # disappear with eviction and retain independent shared-prefix branches.
+        # Exact cached leaf -> (decode peer, lazy semantic fingerprint). Weak
+        # keys disappear with eviction and retain independent shared-prefix
+        # branches.
         self._routes = weakref.WeakKeyDictionary()
         self._pushes: Dict[int, _PushInFlight] = {}
         # Path length last pushed, or found unpushable, per session.
         self._pushed_len = weakref.WeakKeyDictionary()
+        # Strictly rank-replicated gate for active steps with an empty bootstrap
+        # queue: cleared when victim selection does not exhaust MAX_INFLIGHT,
+        # re-armed only by rank-synchronized cache and push transitions.
+        self._selection_dirty = True
+        self._was_serving = False
         self._next_seq = 1
         self._victim_stamp = _VICTIM_STAMP_BASE
         self.stats = dict.fromkeys(("started", "stored", "declined"), 0)
         self._last_log = [0.0]
+
+    def mark_selection_dirty(self) -> None:
+        """Re-arm victim selection on a rank-synchronized cache transition."""
+        self._selection_dirty = True
+
+    def can_select_victim(self) -> bool:
+        """Rank-local vote piggybacked onto a non-empty bootstrap step."""
+        return (
+            len(self._pushes) < MAX_INFLIGHT
+            and bool(self._routes)
+            and self._under_host_pressure()
+        )
+
+    def _prompt_radix_key(self, req: Any) -> RadixKey:
+        raw = req.origin_input_ids
+        if isinstance(raw, array) and raw.typecode == "q":
+            token_ids = raw
+        else:
+            fill_ids = getattr(req, "full_untruncated_fill_ids", None)
+            if (
+                isinstance(fill_ids, array)
+                and fill_ids.typecode == "q"
+                and len(fill_ids) >= len(raw)
+            ):
+                token_ids = fill_ids
+            else:
+                token_ids = array("q", raw)
+        return RadixKey(
+            token_ids,
+            extra_key=req.extra_key,
+            limit=page_align_floor(len(raw), self._page_size),
+            cache_salt=req.cache_salt,
+        )
+
+    def _record_leaf_route(
+        self, node_id: Any, peer: Any, *, on_decode: bool = False
+    ) -> None:
+        node = leaf_of(self._cache, node_id)
+        if node is None or peer is None:
+            return
+        existing = self._routes.get(node)
+        fingerprint = existing[1] if existing is not None else None
+        self._routes[node] = (peer, fingerprint)
+        if on_decode:
+            # Not pushed back at the length it was recalled at.
+            self._pushed_len[node] = path_token_count(self._cache, node)
 
     def note_decode_of(self, req: Any, *, recalled: bool) -> None:
         """Carry the actual decode peer to the request's cache checkpoint.
@@ -129,40 +183,86 @@ class PrefillDramVictimPusher:
         peer = self._channel.decode_peer(req.bootstrap_room)
         if peer is not None:
             req._pd_victim_decode_peer = peer
+        if (
+            not recalled
+            and getattr(req, "_pd_defer_leaf_match", False)
+            and req.last_node is None
+        ):
+            return
         self.track_host_leaf(req, on_decode=recalled)
 
+    def track_matched_leaf(self, req: Any, best_match_node: Any) -> None:
+        """Route the leaf reached by admission's rank-consensus prefix match."""
+        self._selection_dirty = True
+        peer = getattr(req, "_pd_victim_decode_peer", None)
+        if peer is None or best_match_node is None:
+            return
+        node = self._cache.tree_core.node_by_id(best_match_node)
+        if node.children:
+            prompt_len = len(req.origin_input_ids)
+            page = self._page_size
+            # Admission caps its match at len(prompt) - 1; when the prompt is an
+            # exact page multiple and its final page is a cached leaf child, step
+            # onto that leaf without mutating the tree.
+            if (
+                prompt_len >= page
+                and prompt_len % page == 0
+                and path_token_count(self._cache, node) == prompt_len - page
+            ):
+                key = self._prompt_radix_key(req)
+                child = node.children.get(key.child_key_at(prompt_len - page, page))
+                if (
+                    child is not None
+                    and not child.children
+                    and len(child.key) == page
+                    and child.key.match_at(
+                        key, offset=prompt_len - page, page_size=page
+                    )
+                    == page
+                ):
+                    best_match_node = child.id
+        self._record_leaf_route(best_match_node, peer)
+
     def track_host_leaf(self, req: Any, *, on_decode: bool = False) -> None:
+        self._selection_dirty = True
         # Set by note_decode_of(); a request that never reached its commit has none.
         peer = getattr(req, "_pd_victim_decode_peer", None)
-        node_id = req.last_node
+        recalled_node = getattr(req, "_pd_recalled_node", None) if on_decode else None
+        if recalled_node is not None and hasattr(req, "__dict__"):
+            delattr(req, "_pd_recalled_node")
+        node_id = req.last_node if recalled_node is None else recalled_node
         if node_id is None:
             # Matching can split a node, so every rank matches, with a peer or
             # not: the listener thread can drop a room's peer on one rank.
-            key = RadixKey(
-                array("q", req.origin_input_ids),
-                extra_key=req.extra_key,
-                cache_salt=req.cache_salt,
-            ).page_aligned(self._page_size)
+            key = self._prompt_radix_key(req)
             match = self._cache.match_prefix(MatchPrefixParams(key=key))
             node_id = match.best_match_node
-        node = leaf_of(self._cache, node_id)
-        if node is not None and peer is not None:
-            tokens = path_tokens(self._cache, node)
-            self._routes[node] = (
-                peer,
-                push_manifest(tokens, node.key.extra_key, node.key.cache_salt),
-            )
-            if on_decode:
-                # Not pushed back at the length it was recalled at.
-                self._pushed_len[node] = len(tokens)
+        self._record_leaf_route(node_id, peer, on_decode=on_decode)
 
-    def advance(self, *, serving: bool) -> None:
+    def advance(
+        self, *, serving: bool, selection_agreed: Optional[bool] = True
+    ) -> None:
         """Every bootstrap step, every rank; no tree decision uses a local
         clock. Pushes start only while the engine serves requests: an engine
         left alone settles the pushes in flight and goes idle, so that it can
-        be flushed."""
-        self.retire_settled_pushes()
-        self._start_push_if_agreed(serving=serving)
+        be flushed. ``serving`` comes from replicated scheduler queues;
+        ``selection_agreed`` is True/False when piggybacked onto a non-empty
+        bootstrap collective, or None on empty-bootstrap steps."""
+        settled = self.retire_settled_pushes()
+        if not serving:
+            self._was_serving = False
+        else:
+            if not self._was_serving:
+                self._was_serving = True
+                self._selection_dirty = True
+            if (
+                selection_agreed is True
+                or settled
+                or (selection_agreed is None and self._selection_dirty)
+            ):
+                self._start_push_if_agreed(serving=serving)
+            else:
+                self._selection_dirty = False
         log_offload_stats(self.stats, "push", self._last_log)
 
     def _under_host_pressure(self) -> bool:
@@ -183,11 +283,13 @@ class PrefillDramVictimPusher:
             raise RuntimeError("victim pushes are in flight; the engine is not idle")
         self._routes.clear()
         self._pushed_len.clear()
+        self._selection_dirty = True
+        self._was_serving = False
 
-    def retire_settled_pushes(self) -> None:
-        """Retire the pushes whose outcome every rank has."""
+    def retire_settled_pushes(self) -> bool:
+        """Retire the pushes whose outcome every rank has; whether any settled."""
         if not self._pushes:
-            return
+            return False
         self._channel.drain_host_reads()
         now = time.monotonic()
         pushes = list(self._pushes.values())
@@ -208,10 +310,15 @@ class PrefillDramVictimPusher:
         # A rank that failed makes every rank treat the push as declined, so
         # no tree diverges.
         agreed = self._lockstep.reduce(rows, dist.ReduceOp.MIN)
+        any_settled = False
         for push, (settled, ok) in zip(pushes, agreed):
             if settled:
+                any_settled = True
                 self.stats["stored" if ok else "declined"] += 1
                 self._finish_push(push, stored=bool(ok))
+        if any_settled:
+            self._selection_dirty = True
+        return any_settled
 
     def _finish_push(self, push: _PushInFlight, *, stored: bool) -> None:
         self._channel.forget_host_reads(push.read_ids)
@@ -232,6 +339,7 @@ class PrefillDramVictimPusher:
             self._pick_coldest_host_leaf()
             if serving
             and len(self._pushes) < MAX_INFLIGHT
+            and bool(self._routes)
             and self._under_host_pressure()
             else None
         )
@@ -249,6 +357,7 @@ class PrefillDramVictimPusher:
             ]
         low, high = self._lockstep.min_max(row)
         if not low[0] or low != high:
+            self._selection_dirty = False
             return
         # Not again at this length, stored or not.
         self._pushed_len[leaf] = len(path)
@@ -262,6 +371,7 @@ class PrefillDramVictimPusher:
             sent_at=time.monotonic(),
         )
         self._pushes[seq] = push
+        self._selection_dirty = len(self._pushes) < MAX_INFLIGHT
         self.stats["started"] += 1
         # Snapshot under the same host pin as the KV read. A metadata owner may
         # need to resolve an outstanding seal before the page can leave.
@@ -323,8 +433,15 @@ class PrefillDramVictimPusher:
                 self._routes.pop(node, None)
             if not pushable or node in busy:
                 continue
+            pushed_tokens = self._pushed_len.get(node)
+            # Revisited routes commonly have no new tokens to push. Check
+            # current ancestor metadata before copying their whole token path.
+            if pushed_tokens is not None and pushed_tokens == path_token_count(
+                self._cache, node
+            ):
+                continue
             path = path_tokens(self._cache, node)
-            if self._pushed_len.get(node) == len(path):
+            if pushed_tokens == len(path):
                 continue
             pages = host_pages(self._cache, self._host_pool, node)
             if pages is None:
@@ -338,6 +455,11 @@ class PrefillDramVictimPusher:
             )
             if swa_pages is None:
                 continue
+            if fingerprint is None:
+                fingerprint = push_manifest(
+                    path, node.key.extra_key, node.key.cache_salt
+                )
+                self._routes[node] = (peer, fingerprint)
             candidates.append(
                 (node.last_access_time, fingerprint, peer, node, path, pages, swa_pages)
             )
