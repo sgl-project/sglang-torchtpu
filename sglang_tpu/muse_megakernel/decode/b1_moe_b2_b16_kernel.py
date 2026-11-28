@@ -1657,7 +1657,12 @@ def b1_moe_b2_rpad_replicated_b16_jax(
             + run_cfg.num_slots
             + max(4 * max(max_num_seqs * max_blks_4k, 0), sh_smem_words)
         )
-        state_rows = q_heads * sh_grp if sh_grp > 0 else q_heads
+        rg_grp = (
+            run_cfg.ring_group_size
+            if (run_grp_vec and run_cfg.loop_kind == "ring4k")
+            else 1
+        )
+        state_rows = q_heads * max(sh_grp, rg_grp)
         scope2_vmem = (
             vmem((rows, qkv_cols), jnp.bfloat16),  # qkv_vmem_slice
             vmem((rows, 16, 128), jnp.bfloat16),  # rpad_q_vmem

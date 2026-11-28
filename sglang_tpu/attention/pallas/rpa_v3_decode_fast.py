@@ -66,6 +66,9 @@ class DecodeFastConfig:
     no_mask0: bool = False
     swabatch_group_size: int = 1
     dense2_group: bool = False
+    ring_group_size: int = 1
+    priv_group_size: int = 1
+    priv_blk_pages: int = 0
 
 
 def _uses_swabatch_group(
@@ -152,6 +155,77 @@ def _resolve_swabatch_group_flag(
             "use_grp_vec=True requires sized bkv, init_sv, and valid swabatch_group_size"
         )
     return bool(use_grp_vec)
+
+
+def _uses_ring4k_group(
+    cfg: DecodeFastConfig,
+    *,
+    decode_query_size: int,
+    kv_pack_dense2: bool,
+    kv_pack_bd4: bool,
+    probe: str | None,
+    b_tokens: int,
+    max_num_seqs: int,
+) -> bool:
+    return (
+        cfg.ring_group_size > 1
+        and cfg.loop_kind == "ring4k"
+        and decode_query_size == 1
+        and (kv_pack_bd4 or kv_pack_dense2)
+        and probe is None
+        and b_tokens >= 32
+        and b_tokens % cfg.ring_group_size == 0
+        and max_num_seqs == b_tokens
+    )
+
+
+def can_use_ring4k_group_runtime(
+    cfg: DecodeFastConfig,
+    *,
+    decode_query_size: int,
+    kv_pack_dense2: bool,
+    kv_pack_bd4: bool,
+    probe: str | None,
+    b_tokens: int,
+    max_num_seqs: int,
+    bkv_slot_pages: int,
+    has_init_sv: bool,
+) -> bool:
+    """Single source of truth for group-vectorized ``ring4k`` across Step (b) and Step (c)."""
+    return (
+        _uses_ring4k_group(
+            cfg,
+            decode_query_size=decode_query_size,
+            kv_pack_dense2=kv_pack_dense2,
+            kv_pack_bd4=kv_pack_bd4,
+            probe=probe,
+            b_tokens=b_tokens,
+            max_num_seqs=max_num_seqs,
+        )
+        and bkv_slot_pages >= cfg.ring_group_size * cfg.max_ring_pages
+        and has_init_sv
+    )
+
+
+def _priv_group_plan(
+    cfg: DecodeFastConfig,
+    *,
+    kv_pack_dense2: bool,
+    kv_pack_bd4: bool,
+    bkv_slot_pages: int | None = None,
+) -> tuple[int, int]:
+    """Return ``(priv_group_size, priv_blk_pages)`` for vectorized ``shared*`` private tail."""
+    if (
+        cfg.priv_group_size <= 1
+        or cfg.priv_blk_pages <= 0
+        or cfg.shared_group_size < 64
+        or cfg.shared_group_size % cfg.priv_group_size != 0
+        or not (kv_pack_bd4 or kv_pack_dense2)
+    ):
+        return 1, cfg.max_ring_pages
+    if bkv_slot_pages is not None and bkv_slot_pages < cfg.priv_group_size * cfg.priv_blk_pages:
+        return 1, cfg.max_ring_pages
+    return cfg.priv_group_size, cfg.priv_blk_pages
 
 
 def get_shared_group_size(mode_str: str) -> int:
@@ -353,6 +427,7 @@ def parse_decode_fast_config(
     shared_group: int = 0,
     kv_pack_dense2: bool = False,
     kv_pack_bd4: bool = False,
+    b_tokens: int | None = None,
 ) -> DecodeFastConfig:
     if kv_pack_bd4:
         kv_pack_dense2 = False
@@ -457,20 +532,49 @@ def parse_decode_fast_config(
             loop_kind = "swabatch"
         elif shared_group > 0 and decode_query_size == 1:
             loop_kind = f"shared{shared_group}"
-            use_sh8_8k = (
-                shared_group == 8
+            use_sh_8k = (
+                (shared_group == 8 or (shared_group in (16, 32) and page_size >= 512))
                 and kv_cap_tokens > 16384
                 and "c2048" not in toks_cfg
             )
-            chunk_sz = 8192 if use_sh8_8k else 2048
-            num_slots = 3 if use_sh8_8k else 4
+            chunk_sz = 8192 if use_sh_8k else 2048
+            num_slots = (4 if shared_group == 16 else 3) if use_sh_8k else 4
             coalesce_dma = True
-        elif explicit_ring4k or (raw == "shared16_host" and kv_cap_tokens > 16384) or (use_w7 and kv_cap_tokens > 20480 and decode_query_size == 1):
+        elif (
+            explicit_ring4k
+            or (raw == "shared16_host" and kv_cap_tokens > 16384)
+            or (use_w7 and kv_cap_tokens > 20480 and decode_query_size == 1)
+            or (
+                b_tokens is not None
+                and b_tokens >= 32
+                and (kv_pack_bd4 or kv_pack_dense2)
+                and 4096 < kv_cap_tokens <= 20480
+                and decode_query_size == 1
+                and "b1" not in toks_cfg
+                and "nobatch4" not in toks_cfg
+                and "noringgrp" not in toks_cfg
+                and "dyn2k" not in toks_cfg
+                and not explicit_streamdyn
+                and (explicit_dyn_chunk >= 4096 or use_w7 or batch_full)
+            )
+        ):
             loop_kind = "ring4k"
-            num_slots = 3 if explicit_ring8k else 4
-            chunk_sz = 8192 if explicit_ring8k else 4096
-            if use_w7 or explicit_ring4k or raw == "shared16_host":
-                coalesce_dma = True
+            use_bd4_8k = (
+                kv_pack_bd4
+                and not explicit_ring4k
+                and b_tokens is not None
+                and 32 <= b_tokens <= 64
+                and 4096 < kv_cap_tokens <= 20480
+                and "c4096" not in toks_cfg
+            )
+            use_ring8k = explicit_ring8k or use_bd4_8k
+            num_slots = 3 if (use_ring8k or (kv_pack_bd4 and b_tokens is not None and b_tokens > 64)) else 4
+            chunk_sz = 8192 if use_ring8k else 4096
+            coalesce_dma = (
+                False
+                if (b_tokens is not None and b_tokens >= 32 and (kv_pack_bd4 or kv_pack_dense2))
+                else (use_w7 or explicit_ring4k or raw == "shared16_host")
+            )
         elif explicit_dyn_chunk and decode_query_size == 1 and 4096 < kv_cap_tokens <= 20480:
             loop_kind = "streamdyn"
             chunk_sz = explicit_dyn_chunk
@@ -520,6 +624,9 @@ def parse_decode_fast_config(
                 "batch2",
                 "b2",
                 "nobatch4",
+                "noringgrp",
+                "noprivgrp",
+                "b1",
             ):
                 continue
             if tok.startswith("s") and tok[1:].isdigit():
@@ -540,9 +647,12 @@ def parse_decode_fast_config(
                         (parsed_c == 1024 and ("w8" in toks_cfg or "w7" in toks_cfg or loop_kind == "shared16"))
                         or (
                             parsed_c == 4096
-                            and loop_kind == "shared8"
+                            and (
+                                loop_kind == "shared8"
+                                or (loop_kind in ("shared16", "shared32") and page_size >= 512)
+                            )
                             and kv_cap_tokens > 16384
-                            and "shared8" not in toks_cfg
+                            and loop_kind not in toks_cfg
                             and "shc4096" not in toks_cfg
                         )
                     )
@@ -638,6 +748,25 @@ def parse_decode_fast_config(
         if (loop_kind == "swabatch" and decode_query_size == 1 and (not kv_pack_dense2 or dense2_group) and not fp8_dots)
         else 1
     )
+    disable_rg_grp = "b1" in toks_cfg or "nobatch4" in toks_cfg or "noringgrp" in toks_cfg
+    if (
+        loop_kind == "ring4k"
+        and decode_query_size == 1
+        and (kv_pack_bd4 or kv_pack_dense2)
+        and not disable_rg_grp
+    ):
+        eff_ring_grp = (
+            2
+            if ("batch2" in toks_cfg or "b2" in toks_cfg)
+            else (4 if ("batch4" in toks_cfg or "b4" in toks_cfg or batch_full or use_w7) else 1)
+        )
+    else:
+        eff_ring_grp = 1
+    if loop_kind == "ring4k" and eff_ring_grp > 1 and not no_fold:
+        fold_col = True
+        fold_128 = True
+    if loop_kind == "shared32" and chunk_sz == 8192 and kv_pack_dense2 and shared_q_tile > 512:
+        shared_q_tile = 512
 
     if sliding_window is not None:
         if loop_kind in ("stream0b", "swabatch", "swafast", "swafast2", "stream2h", "stream1p", "stream2ld", "clean1p"):
@@ -701,6 +830,29 @@ def parse_decode_fast_config(
         no_mask0=no_mask0,
         swabatch_group_size=eff_swabatch_grp,
         dense2_group=dense2_group,
+        ring_group_size=eff_ring_grp,
+        priv_group_size=(
+            4
+            if (
+                eff_shared_group >= 64
+                and decode_query_size == 1
+                and (kv_pack_bd4 or kv_pack_dense2)
+                and not disable_rg_grp
+                and "noprivgrp" not in toks_cfg
+            )
+            else 1
+        ),
+        priv_blk_pages=(
+            min(8 if kv_pack_bd4 else 4, max_ring_pages)
+            if (
+                eff_shared_group >= 64
+                and decode_query_size == 1
+                and (kv_pack_bd4 or kv_pack_dense2)
+                and not disable_rg_grp
+                and "noprivgrp" not in toks_cfg
+            )
+            else 0
+        ),
     )
 
 
@@ -1618,7 +1770,7 @@ def _run_rpad_vmem_core(
     max_ring_rows = max_ring_pages * page_size
     use_branchless_sanitize = cfg.loop_kind in ("stream0b", "swabatch", "swafast")
     can_grp_vec = _resolve_swabatch_group_flag(
-        use_grp_vec,
+        use_grp_vec if cfg.loop_kind == "swabatch" else None,
         cfg=cfg,
         one_block_per_seq=one_block_per_seq,
         decode_query_size=decode_query_size,
@@ -1629,7 +1781,26 @@ def _run_rpad_vmem_core(
         bkv_slot_pages=bkv_slot_pages,
         has_init_sv=(init_sv_vmem_ref is not None),
     )
-    use_hoist_kv = (cfg.hoist_new_kv or can_grp_vec) and decode_query_size == 1
+    can_rg_runtime = can_use_ring4k_group_runtime(
+        cfg,
+        decode_query_size=decode_query_size,
+        kv_pack_dense2=kv_pack_dense2,
+        kv_pack_bd4=kv_pack_bd4,
+        probe=probe,
+        b_tokens=max_num_tokens,
+        max_num_seqs=max_num_seqs,
+        bkv_slot_pages=bkv_slot_pages,
+        has_init_sv=(init_sv_vmem_ref is not None),
+    )
+    if cfg.loop_kind == "ring4k" and use_grp_vec is not None:
+        if bool(use_grp_vec) and not can_rg_runtime:
+            raise ValueError(
+                "use_grp_vec=True on ring4k requires sized bkv, init_sv, state_vmem, and valid ring_group_size"
+            )
+        can_rg_grp = bool(use_grp_vec)
+    else:
+        can_rg_grp = can_rg_runtime
+    use_hoist_kv = (cfg.hoist_new_kv or can_grp_vec or can_rg_grp) and decode_query_size == 1
 
     s_scale = float(sm_scale * (k_scale if k_scale is not None else 1.0))
     exp2_scale = float(s_scale * _LOG2_E)
@@ -1638,6 +1809,10 @@ def _run_rpad_vmem_core(
     dq = decode_query_size
     q_head_rows = q_vmem_ref.shape[1]
     q_out_head_rows = o_vmem_ref.shape[1]
+    if can_rg_grp and state_vmem_ref.shape[1] < q_out_head_rows * cfg.ring_group_size:
+        raise ValueError(
+            f"ring4k group size {cfg.ring_group_size} requires state_vmem rows >= {q_out_head_rows * cfg.ring_group_size}, got {state_vmem_ref.shape[1]}"
+        )
     q_rows = q_head_rows * dq
     q_out_rows = q_out_head_rows * dq
     n_active = jnp.clip(distribution_ref[0], 0, max_num_seqs)
@@ -1742,9 +1917,11 @@ def _run_rpad_vmem_core(
         slot=jnp.int32(0),
         prev_loc_tok=jnp.int32(0),
         slot_pg_off=jnp.int32(0),
+        slot_pg_cap: int | None = None,
     ):
         if skip_kv_write or probe == "nokvwrite":
             return
+        eff_pg_cap = max_ring_pages if slot_pg_cap is None else slot_pg_cap
 
         @pl.when(active)
         def _():
@@ -1789,7 +1966,7 @@ def _run_rpad_vmem_core(
                     def _w_bd4_rmw():
                         loc_clamped = jnp.maximum(prev_loc_tok, 0)
                         slot_pg = slot_pg_off + jnp.clip(
-                            loc_clamped // page_size, 0, max_ring_pages - 1
+                            loc_clamped // page_size, 0, eff_pg_cap - 1
                         )
                         old_u32 = _read_bkv_row_u32(slot, slot_pg, phys_r)
                         keep_lo = jnp.where(
@@ -1819,7 +1996,7 @@ def _run_rpad_vmem_core(
                 s0 = cache_kv & 3
                 loc_clamped = jnp.maximum(prev_loc_tok, 0)
                 slot_pg = slot_pg_off + jnp.clip(
-                    loc_clamped // page_size, 0, max_ring_pages - 1
+                    loc_clamped // page_size, 0, eff_pg_cap - 1
                 )
                 phys_r0 = ((jnp.maximum(cache_kv - 1, 0)) % page_size) // 4
                 old_u32_0 = jnp.where(
@@ -1932,7 +2109,7 @@ def _run_rpad_vmem_core(
                     prev_u16 = jnp.zeros((1, 128), jnp.uint32)
                 elif interpret_mode:
                     loc_clamped = jnp.maximum(prev_loc_tok, 0)
-                    slot_pg = slot_pg_off + jnp.clip(loc_clamped // page_size, 0, max_ring_pages - 1)
+                    slot_pg = slot_pg_off + jnp.clip(loc_clamped // page_size, 0, eff_pg_cap - 1)
                     pg_u32 = _get_page_u32(slot, slot_pg)
                     r_io = lax.broadcasted_iota(jnp.int32, (phys_page_rows, 128), 0)
                     prev_u16 = jnp.sum(
@@ -1946,7 +2123,7 @@ def _run_rpad_vmem_core(
                     ).astype(jnp.uint32)
                 else:
                     loc_clamped = jnp.maximum(prev_loc_tok, 0)
-                    slot_pg = slot_pg_off + jnp.clip(loc_clamped // page_size, 0, max_ring_pages - 1)
+                    slot_pg = slot_pg_off + jnp.clip(loc_clamped // page_size, 0, eff_pg_cap - 1)
                     sub_base = (pair_r0 // 8) * 8
                     sub_off = pair_r0 & 7
                     u32_ref = (
@@ -3880,6 +4057,331 @@ def _run_rpad_vmem_core(
             None,
         )
 
+    def _run_grouped_ring_attn(
+        *,
+        grp_sz: int,
+        blk_pg: int,
+        n_seqs,
+        base_seq=0,
+        base_q_row=0,
+        shared_pgs=0,
+        init_from_hoist: bool = False,
+        meta_base_off: int = 0,
+    ):
+        """Grouped-sequence blocked ring attention for ``ring4k`` and ``shared*`` private tails."""
+        short_pg = 2 if (init_from_hoist and blk_pg > 2 and page_size == 512) else 0
+        ahead_rg = num_slots - 1
+        q_grp_out_rows = q_out_head_rows * dq
+        n_grp = cdiv(n_seqs, grp_sz)
+        written_cnt_smem_ref[1] = 0
+
+        if not init_from_hoist:
+            @pl.loop(0, n_seqs)
+            def _handle_sh_trivial(i):
+                seq = base_seq + i
+                q_r, act, kvl, _, rel_end, total_pgs, _ = seq_info(seq)
+                @pl.when(~act)
+                def _():
+                    o_vmem_ref[q_r] = jnp.zeros((q_out_head_rows, 128), jnp.bfloat16)
+                @pl.when(act & (total_pgs <= shared_pgs))
+                def _():
+                    lanes = pl.ds(i * q_out_head_rows, q_out_head_rows)
+                    o_vmem_ref[q_r] = finalize_out(
+                        state_vmem_ref[1, lanes, :], state_vmem_ref[2, lanes, :]
+                    )
+                    sh_n_b = cdiv(shared_pgs, max_ring_pages)
+                    sh_last_slot = jnp.maximum(sh_n_b - 1, 0) % num_slots
+                    sh_last_loc = jnp.maximum(rel_end - 1, 0) % max_ring_rows
+                    enqueue_kv_write(seq, q_r, act, kvl, sh_last_slot, sh_last_loc)
+
+        @pl.loop(0, n_grp)
+        def _build_grp_steps(g_i):
+            mx_pg = jnp.int32(0)
+            for sub in range(grp_sz):
+                idx_g = grp_sz * g_i + sub
+                seq = base_seq + idx_g
+                _, act_raw, _, _, _, tpg_raw, _ = seq_info(seq)
+                eff_pg = (
+                    jnp.where((idx_g < n_seqs) & act_raw, tpg_raw, jnp.int32(0))
+                    if init_from_hoist
+                    else jnp.where((idx_g < n_seqs) & act_raw & (tpg_raw > shared_pgs), tpg_raw - shared_pgs, jnp.int32(0))
+                )
+                mx_pg = jnp.maximum(mx_pg, eff_pg)
+
+            @pl.when(mx_pg > 0)
+            def _emit_grp_blk():
+                n_b = cdiv(mx_pg, blk_pg)
+                @pl.loop(0, n_b)
+                def _push_gb(b_i):
+                    cur_idx = written_cnt_smem_ref[1]
+                    written_cnt_smem_ref[1] = cur_idx + 1
+                    off_m = meta_base_off + 2 * cur_idx
+                    fl = jnp.where(b_i == 0, jnp.int32(1 << 0), jnp.int32(0))
+                    if short_pg > 0:
+                        fl = fl | jnp.where((b_i == 0) & (mx_pg <= short_pg), jnp.int32(1 << 2), jnp.int32(0))
+                    written_cnt_smem_ref[off_m + 0] = (g_i << 16) | b_i
+                    written_cnt_smem_ref[off_m + 1] = fl
+
+        total_grp_steps = written_cnt_smem_ref[1]
+
+        def _start_grp_dmas(g_idx, b_idx, slot, fl_val):
+            sem = bkv_sems.at[slot]
+            n_phys_pages = kv_cache_hbm_ref.shape[0]
+
+            def _issue_dmas(w_pg: int):
+                safe_pg = jnp.int32(0)
+                sub_info = []
+                for sub in range(grp_sz):
+                    idx_g = grp_sz * g_idx + sub
+                    seq = base_seq + idx_g
+                    _, act_raw, _, _, _, tpg_raw, pb = seq_info(seq)
+                    eff_pg = (
+                        jnp.where((idx_g < n_seqs) & act_raw, tpg_raw, jnp.int32(0))
+                        if init_from_hoist
+                        else jnp.where((idx_g < n_seqs) & act_raw & (tpg_raw > shared_pgs), tpg_raw - shared_pgs, jnp.int32(0))
+                    )
+                    cur_pg = jnp.clip(eff_pg - b_idx * blk_pg, 0, w_pg)
+                    pb_blk = jnp.where(
+                        cur_pg > 0,
+                        jnp.clip(pb + shared_pgs + b_idx * blk_pg, 0, num_page_indices - 1),
+                        jnp.int32(0),
+                    )
+                    pg0 = jnp.clip(page_indices_ref[pb_blk], 0, n_phys_pages - 1)
+                    safe_pg = jnp.where(cur_pg > 0, pg0, safe_pg)
+                    sub_info.append((cur_pg, pb_blk, pg0))
+                for sub, (cur_pg, pb_blk, pg0) in enumerate(sub_info):
+                    sub_fallback = jnp.where(cur_pg > 0, pg0, safe_pg)
+                    for p_i in range(w_pg):
+                        pg_idx = jnp.clip(pb_blk + p_i, 0, num_page_indices - 1)
+                        pg = jnp.where(
+                            p_i < cur_pg,
+                            jnp.clip(page_indices_ref[pg_idx], 0, n_phys_pages - 1),
+                            sub_fallback,
+                        )
+                        pltpu.make_async_copy(
+                            kv_cache_hbm_ref.at[pl.ds(pg, 1)],
+                            bkv_vmem_ref.at[slot, pl.ds(sub * w_pg + p_i, 1)],
+                            sem,
+                        ).start()
+
+            if short_pg > 0:
+                is_s = (fl_val & jnp.int32(1 << 2)) != 0
+                @pl.when(is_s)
+                def _():
+                    _issue_dmas(short_pg)
+                @pl.when(~is_s)
+                def _():
+                    _issue_dmas(blk_pg)
+            else:
+                _issue_dmas(blk_pg)
+
+        for st_init in range(ahead_rg):
+            @pl.when(st_init < total_grp_steps)
+            def _(si=st_init):
+                om = meta_base_off + 2 * si
+                gb = written_cnt_smem_ref[om + 0]
+                _start_grp_dmas(gb >> 16, gb & jnp.int32(0xFFFF), si, written_cnt_smem_ref[om + 1])
+
+        if init_from_hoist:
+            precompute_hoisted_new_kv()
+            @pl.loop(0, n_seqs)
+            def _handle_rg_trivial(seq):
+                q_r, act, kvl, _, _, tpg_raw, _ = seq_info(seq)
+                @pl.when(act & (tpg_raw <= 0))
+                def _():
+                    enqueue_kv_write(seq, q_r, act, kvl)
+                    _, l0, a0 = init_new_token_state(q_vmem_ref[q_r], q_r)
+                    o_vmem_ref[q_r] = finalize_out(l0, a0)
+                @pl.when(~act)
+                def _():
+                    o_vmem_ref[q_r] = jnp.zeros((q_out_rows, 128), jnp.bfloat16)
+        l0_g = jnp.full((grp_sz * q_grp_out_rows, 128), 1.0 / 128.0, jnp.float32)
+
+        @pl.loop(0, total_grp_steps)
+        def _exec_grp_ring(st_i):
+            sl = st_i % num_slots
+            fut_st = st_i + ahead_rg
+            @pl.when(fut_st < total_grp_steps)
+            def _pf_grp():
+                fom = meta_base_off + 2 * fut_st
+                fgb = written_cnt_smem_ref[fom + 0]
+                _start_grp_dmas(
+                    fgb >> 16,
+                    fgb & jnp.int32(0xFFFF),
+                    fut_st % num_slots,
+                    written_cnt_smem_ref[fom + 1],
+                )
+
+            om = meta_base_off + 2 * st_i
+            gb = written_cnt_smem_ref[om + 0]
+            g_i = gb >> 16
+            b_i = gb & jnp.int32(0xFFFF)
+            fl_val = written_cnt_smem_ref[om + 1]
+            is_first = (fl_val & jnp.int32(1 << 0)) != 0
+
+            def _run_blk(w_pg: int):
+                blk_tok = w_pg * page_size
+                half_w = blk_tok // 2
+                col_sub_e = (
+                    _bd4_c_even_iota(0, half_w, q_grp_out_rows)
+                    if kv_pack_bd4
+                    else (2 * lax.broadcasted_iota(jnp.int32, (q_grp_out_rows, half_w), 1))
+                )
+                col_sub_o = col_sub_e + 1
+                dst = bkv_vmem_ref.at[sl, pl.ds(0, grp_sz * w_pg)]
+                pltpu.make_async_copy(dst, dst, bkv_sems.at[sl]).wait()
+
+                le_list, qr_list, kvl_list, sq_list, sub_last_list = [], [], [], [], []
+                for sub in range(grp_sz):
+                    idx_g = grp_sz * g_i + sub
+                    seq = base_seq + idx_g
+                    q_r, act_raw, kvl, _, re_raw, tpg_raw, _ = seq_info(seq)
+                    act = (
+                        ((idx_g < n_seqs) & act_raw & (tpg_raw > 0))
+                        if init_from_hoist
+                        else ((idx_g < n_seqs) & act_raw & (tpg_raw > shared_pgs))
+                    )
+                    eff_pg = jnp.where(act, tpg_raw - shared_pgs, jnp.int32(0))
+                    eff_re = jnp.where(act, jnp.maximum(re_raw - shared_pgs * page_size, 0), jnp.int32(0))
+                    loc_end = jnp.clip(eff_re - b_i * (blk_pg * page_size), 0, blk_tok)
+                    cur_pg = jnp.clip(eff_pg - b_i * blk_pg, 0, w_pg)
+                    sub_last_list.append(act & (b_i + 1 == cdiv(eff_pg, blk_pg)))
+                    le_list.append(loc_end)
+                    qr_list.append(q_r)
+                    kvl_list.append(kvl)
+                    sq_list.append(seq)
+
+                    @pl.when(loc_end < blk_tok)
+                    def _san_tail_sub(le=loc_end, cp=cur_pg, sb=sub, wp=w_pg):
+                        pbs = sb * wp
+                        @pl.when(cp > 0)
+                        def _sp():
+                            lp = cp - 1
+                            _sanitize_page_u32(sl, pbs + lp, 0, jnp.clip(le - lp * page_size, 0, page_size))
+                        @pl.when(cp < wp)
+                        def _zp():
+                            _zero_pages_u32(sl, pbs + cp, pbs + wp)
+
+                lanes_g = (
+                    pl.ds(0, grp_sz * q_grp_out_rows)
+                    if init_from_hoist
+                    else pl.ds(grp_sz * g_i * q_grp_out_rows, grp_sz * q_grp_out_rows)
+                )
+                q_g = q_vmem_ref[pl.ds(base_q_row + grp_sz * g_i, grp_sz)]
+                if init_from_hoist:
+                    @pl.when(is_first)
+                    def _init_rg():
+                        s_new_g = jnp.concatenate([init_sv_vmem_ref[0, grp_sz * g_i + sub] for sub in range(grp_sz)], axis=0)
+                        acc0_g = jnp.concatenate([init_sv_vmem_ref[1, grp_sz * g_i + sub] for sub in range(grp_sz)], axis=0)
+                        state_vmem_ref[0, lanes_g, :] = s_new_g
+                        state_vmem_ref[1, lanes_g, :] = l0_g
+                        state_vmem_ref[2, lanes_g, :] = acc0_g
+
+                m_prev_g = state_vmem_ref[0, lanes_g, :]
+                if kv_pack_bd4:
+                    n_u32 = blk_tok // 4
+                    k0_g, k1_g = _load_bkv_bd4_pair_parts(
+                        bkv_vmem_ref, sl, 0, grp_sz * blk_tok, kind="k", page_size=page_size, interpret_mode=interpret_mode
+                    )
+                    k0_g = k0_g.reshape(grp_sz, n_u32, 128)
+                    k1_g = k1_g.reshape(grp_sz, n_u32, 128)
+                    q_bd_g = _to_bd4_q(q_g.reshape(grp_sz * q_head_rows, 128)).reshape(grp_sz, 16, 128)
+                    se_list, so_list = [], []
+                    for sub in range(grp_sz):
+                        k_sub = jnp.concatenate([k0_g[sub], k1_g[sub]], axis=0)
+                        se_s, so_s = _bd4_logits_split(q_bd_g[sub], k_sub, 1, half_w)
+                        se_list.append(jnp.where(col_sub_e < le_list[sub], se_s, _MASK_LOGIT))
+                        so_list.append(jnp.where(col_sub_o < le_list[sub], so_s, _MASK_LOGIT))
+                    m_new_g, alpha_g, pe_flat, po_flat, l_add_g = _bd4_softmax_reduce(
+                        jnp.concatenate(se_list, axis=0), jnp.concatenate(so_list, axis=0),
+                        m_prev_g, exp2_scale, half_w, grp_sz * q_grp_out_rows, use_page_reduce=True,
+                    )
+                    v0_g, v1_g = _load_bkv_bd4_pair_parts(
+                        bkv_vmem_ref, sl, 0, grp_sz * blk_tok, kind="v", page_size=page_size, interpret_mode=interpret_mode
+                    )
+                    v0_g = v0_g.reshape(grp_sz, n_u32, 128)
+                    v1_g = v1_g.reshape(grp_sz, n_u32, 128)
+                    o_e_list, o_o_list = [], []
+                    for sub in range(grp_sz):
+                        p_bd_s = jnp.concatenate([pe_flat[sub * 8 : (sub + 1) * 8], po_flat[sub * 8 : (sub + 1) * 8]], axis=0)
+                        if cfg.pv_bf16:
+                            p_bd_s = p_bd_s.astype(jnp.bfloat16)
+                        o_bd_s = jnp.matmul(p_bd_s, jnp.concatenate([v0_g[sub], v1_g[sub]], axis=0), preferred_element_type=jnp.float32)
+                        o_e_list.append(o_bd_s[:8])
+                        o_o_list.append(o_bd_s[8:])
+                    pv_g = jnp.concatenate(o_e_list, axis=0) + _roll_lanes_fast(jnp.concatenate(o_o_list, axis=0), 64, interpret_mode=interpret_mode)
+                else:
+                    k_e_g, k_o_g = _load_bkv_fp8_split(
+                        bkv_vmem_ref, sl, 0, grp_sz * blk_tok, kind="k", page_size=page_size, interpret_mode=interpret_mode
+                    )
+                    k_e_g = k_e_g.reshape(grp_sz, half_w, 128)
+                    k_o_g = k_o_g.reshape(grp_sz, half_w, 128)
+                    se_list, so_list = [], []
+                    for sub in range(grp_sz):
+                        se_s = jnp.matmul(q_g[sub], k_e_g[sub].T, preferred_element_type=jnp.float32)
+                        so_s = jnp.matmul(q_g[sub], k_o_g[sub].T, preferred_element_type=jnp.float32)
+                        se_list.append(jnp.where(col_sub_e < le_list[sub], se_s, _MASK_LOGIT))
+                        so_list.append(jnp.where(col_sub_o < le_list[sub], so_s, _MASK_LOGIT))
+                    m_new_g, alpha_g, pe_flat, po_flat, l_add_g = _bd4_softmax_reduce(
+                        jnp.concatenate(se_list, axis=0), jnp.concatenate(so_list, axis=0),
+                        m_prev_g, exp2_scale, half_w, grp_sz * q_grp_out_rows, use_page_reduce=True,
+                    )
+                    v_e_g, v_o_g = _load_bkv_fp8_split(
+                        bkv_vmem_ref, sl, 0, grp_sz * blk_tok, kind="v", page_size=page_size, interpret_mode=interpret_mode
+                    )
+                    v_e_g = v_e_g.reshape(grp_sz, half_w, 128)
+                    v_o_g = v_o_g.reshape(grp_sz, half_w, 128)
+                    pe_dot = pe_flat.astype(jnp.bfloat16) if cfg.pv_bf16 else pe_flat
+                    po_dot = po_flat.astype(jnp.bfloat16) if cfg.pv_bf16 else po_flat
+                    pv_g = jnp.concatenate(
+                        [
+                            jnp.matmul(pe_dot[sub * q_grp_out_rows : (sub + 1) * q_grp_out_rows], v_e_g[sub], preferred_element_type=jnp.float32)
+                            + jnp.matmul(po_dot[sub * q_grp_out_rows : (sub + 1) * q_grp_out_rows], v_o_g[sub], preferred_element_type=jnp.float32)
+                            for sub in range(grp_sz)
+                        ],
+                        axis=0,
+                    )
+                if v_scale is not None and v_scale_val != 1.0:
+                    pv_g = pv_g * v_scale_val
+                l_new_g = state_vmem_ref[1, lanes_g, :] * alpha_g + l_add_g
+                a_new_g = state_vmem_ref[2, lanes_g, :] * alpha_g + pv_g
+                state_vmem_ref[0, lanes_g, :] = m_new_g
+                state_vmem_ref[1, lanes_g, :] = l_new_g
+                state_vmem_ref[2, lanes_g, :] = a_new_g
+
+                any_sub_last = sub_last_list[0]
+                for sub in range(1, grp_sz):
+                    any_sub_last = any_sub_last | sub_last_list[sub]
+
+                @pl.when(any_sub_last)
+                def _fin_grp():
+                    out_2d = finalize_out(l_new_g, a_new_g)
+                    for sub in range(grp_sz):
+                        @pl.when(sub_last_list[sub])
+                        def _fin_s(sb=sub, wp=w_pg):
+                            o_vmem_ref[qr_list[sb]] = out_2d[sb * q_grp_out_rows : (sb + 1) * q_grp_out_rows]
+                            enqueue_kv_write(
+                                sq_list[sb],
+                                qr_list[sb],
+                                jnp.bool_(True),
+                                kvl_list[sb],
+                                sl,
+                                le_list[sb] - 1,
+                                slot_pg_off=sb * wp,
+                                slot_pg_cap=wp,
+                            )
+
+            if short_pg > 0:
+                is_s = (fl_val & jnp.int32(1 << 2)) != 0
+                @pl.when(is_s)
+                def _():
+                    _run_blk(short_pg)
+                @pl.when(~is_s)
+                def _():
+                    _run_blk(blk_pg)
+            else:
+                _run_blk(blk_pg)
+
     if cfg.shared_group_size > 0 or cfg.loop_kind == "shared16":
         group = cfg.shared_group_size or 16
         ahead_sh = num_slots - 1
@@ -4427,7 +4929,24 @@ def _run_rpad_vmem_core(
                         active_heads=active_h,
                     )
 
-            if use_flat_priv:
+            priv_grp, priv_blk_pg = _priv_group_plan(
+                cfg,
+                kv_pack_dense2=kv_pack_dense2,
+                kv_pack_bd4=kv_pack_bd4,
+                bkv_slot_pages=bkv_slot_pages,
+            )
+            if use_flat_priv and priv_grp > 1:
+                _run_grouped_ring_attn(
+                    grp_sz=priv_grp,
+                    blk_pg=priv_blk_pg,
+                    n_seqs=size,
+                    base_seq=first,
+                    base_q_row=first_row,
+                    shared_pgs=shared,
+                    init_from_hoist=False,
+                    meta_base_off=meta_base_sh,
+                )
+            elif use_flat_priv:
                 written_cnt_smem_ref[1] = 0
 
                 @pl.loop(0, size)
@@ -4594,6 +5113,17 @@ def _run_rpad_vmem_core(
                         @pl.when(~active)
                         def _():
                             o_vmem_ref[row] = jnp.zeros((q_out_head_rows, 128), jnp.bfloat16)
+    elif cfg.loop_kind == "ring4k" and can_rg_grp:
+        _run_grouped_ring_attn(
+            grp_sz=cfg.ring_group_size,
+            blk_pg=max_ring_pages,
+            n_seqs=n_active,
+            base_seq=0,
+            base_q_row=0,
+            shared_pgs=0,
+            init_from_hoist=True,
+            meta_base_off=2 + num_slots,
+        )
     elif cfg.loop_kind == "ring4k":
         meta_base = 2 + num_slots
         written_cnt_smem_ref[1] = 0
@@ -5652,6 +6182,15 @@ def _decode_fast_kernel(
             b_tokens=q_vmem_ref.shape[0],
             max_num_seqs=kv_lens_ref.shape[0],
         )
+        or _uses_ring4k_group(
+            cfg,
+            decode_query_size=decode_query_size,
+            kv_pack_dense2=kv_pack_dense2,
+            kv_pack_bd4=kv_pack_bd4,
+            probe=probe,
+            b_tokens=q_vmem_ref.shape[0],
+            max_num_seqs=kv_lens_ref.shape[0],
+        )
     ) and decode_query_size == 1
     if use_hoist_kv:
         init_sv_vmem_ref = body_refs[idx_r]
@@ -5801,6 +6340,7 @@ def run_decode_fast_rpa(
         shared_group=shared_grp,
         kv_pack_dense2=kv_pack_dense2,
         kv_pack_bd4=kv_pack_bd4,
+        b_tokens=b_tokens,
     )
     use_tp16_q8 = native_tp16 and ("noq8" not in raw_toks)
     if kv_pack_bd4:
@@ -5869,8 +6409,26 @@ def run_decode_fast_rpa(
             b_tokens=b_tokens,
             max_num_seqs=max_num_seqs,
         )
+        use_rg_bkv = _uses_ring4k_group(
+            run_cfg,
+            decode_query_size=decode_query_size,
+            kv_pack_dense2=kv_pack_dense2,
+            kv_pack_bd4=kv_pack_bd4,
+            probe=probe,
+            b_tokens=b_tokens,
+            max_num_seqs=max_num_seqs,
+        )
+        priv_grp, priv_blk_pg = _priv_group_plan(
+            run_cfg,
+            kv_pack_dense2=kv_pack_dense2,
+            kv_pack_bd4=kv_pack_bd4,
+        )
         if use_grp_bkv:
             scope_name += f"-b{run_cfg.swabatch_group_size}"
+        elif use_rg_bkv:
+            scope_name += f"-b{run_cfg.ring_group_size}"
+        if priv_grp > 1:
+            scope_name += f"-pb{priv_grp}"
         if run_cfg.hoist_new_kv and decode_query_size == 1:
             scope_name += "-hkv"
         if run_cfg.fine_gears and decode_query_size == 1:
@@ -5944,12 +6502,32 @@ def run_decode_fast_rpa(
             ),
             pl.BlockSpec(memory_space=pltpu.HBM),
         ]
+        bkv_slot_pg = (
+            run_cfg.swabatch_group_size * run_cfg.max_ring_pages
+            if use_grp_bkv
+            else (
+                run_cfg.ring_group_size * run_cfg.max_ring_pages
+                if use_rg_bkv
+                else (
+                    max(run_cfg.max_ring_pages, priv_grp * priv_blk_pg)
+                    if priv_grp > 1
+                    else run_cfg.max_ring_pages
+                )
+            )
+        )
+        state_rows = (
+            (o_head_rows * (run_cfg.shared_group_size or 16))
+            if (run_cfg.shared_group_size > 0 or run_cfg.loop_kind == "shared16")
+            else (
+                o_head_rows
+                * (run_cfg.ring_group_size if use_rg_bkv else decode_query_size)
+            )
+        )
         scratch_shapes = [
             pltpu.VMEM(
                 (
                     run_cfg.num_slots,
-                    (run_cfg.swabatch_group_size if use_grp_bkv else 1)
-                    * run_cfg.max_ring_pages,
+                    bkv_slot_pg,
                     phys_page_rows,
                     1,
                     4,
@@ -5958,13 +6536,7 @@ def run_decode_fast_rpa(
                 kv_cache_fused.dtype,
             ),
             pltpu.VMEM(
-                (
-                    3,
-                    (o_head_rows * (run_cfg.shared_group_size or 16))
-                    if (run_cfg.shared_group_size > 0 or run_cfg.loop_kind == "shared16")
-                    else (o_head_rows * decode_query_size),
-                    128,
-                ),
+                (3, state_rows, 128),
                 jnp.float32,
             ),
         ]
@@ -5977,7 +6549,7 @@ def run_decode_fast_rpa(
             scratch_shapes.append(
                 pltpu.VMEM((max_pair_writes, 8, 1, 4, 128), kv_cache_fused.dtype)
             )
-        if (run_cfg.hoist_new_kv or use_grp_bkv) and decode_query_size == 1:
+        if (run_cfg.hoist_new_kv or use_grp_bkv or use_rg_bkv) and decode_query_size == 1:
             scratch_shapes.append(
                 pltpu.VMEM((2, b_pad32, o_head_rows, 128), jnp.float32)
             )

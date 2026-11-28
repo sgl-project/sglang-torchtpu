@@ -2132,6 +2132,7 @@ def b1_moe_b2_chip_sharded_jax(
 _STEP_C_BASE_MAX_BKV_ROWS = 80 * 512
 _STEP_C_GROUP_MAX_BKV_ROWS = 80 * 512
 _STEP_C_LARGE_B_MAX_BKV_ROWS = 16 * 512
+_STEP_C_LARGE_B_RING_GRP_MAX_BKV_ROWS = 24 * 512
 _STEP_C_B128_MAX_BKV_ROWS = 40 * 512
 
 
@@ -2164,7 +2165,9 @@ def resolve_step_c_rpa_plan(
 ):
     """Resolve Step (c) RPAd config, ``one_block_per_seq``, ``bkv_slot_pages``, and ``use_grp_vec``."""
     from sglang_tpu.attention.pallas.rpa_v3_decode_fast import (
+        _priv_group_plan,
         _uses_swabatch_group,
+        can_use_ring4k_group_runtime,
         get_shared_group_size,
         parse_decode_fast_config,
     )
@@ -2202,6 +2205,7 @@ def resolve_step_c_rpa_plan(
         shared_group=eff_shared_grp,
         kv_pack_dense2=kv_pack_dense2,
         kv_pack_bd4=kv_pack_bd4,
+        b_tokens=eff_b,
     )
     one_block_per_seq = (
         False
@@ -2243,7 +2247,11 @@ def resolve_step_c_rpa_plan(
         and cfg_rpa.loop_kind in ("w7auto", "ring4k", "streamdyn")
         and cfg_rpa.num_slots * cfg_rpa.max_ring_pages * phys_page_rows > max_bkv_rows
     ):
-        cand_rings = ((4, 8192), (3, 8192), (3, 4096)) if kv_pack_bd4 else ((3, 4096),)
+        cand_rings = (
+            ((3, 4096), (2, 4096), (4, 8192), (3, 8192))
+            if (kv_pack_bd4 and eff_b > 64 and cfg_rpa.ring_group_size > 1)
+            else (((4, 8192), (3, 8192), (3, 4096)) if kv_pack_bd4 else ((3, 4096),))
+        )
         for c_slots, c_chunk in cand_rings:
             if c_chunk < page_size or (c_chunk % page_size) != 0:
                 continue
@@ -2327,10 +2335,99 @@ def resolve_step_c_rpa_plan(
                 break
         if eff_b > 64 and not use_grp_vec:
             return cfg_rpa, one_block_per_seq, cfg_rpa.max_ring_pages, False, False
+    elif (
+        cfg_rpa.loop_kind == "ring4k"
+        and cfg_rpa.ring_group_size > 1
+        and eff_b == eff_seqs
+        and eff_b >= 32
+        and sh_grp == 0
+        and (kv_pack_bd4 or kv_pack_dense2)
+    ):
+        rg_limit = (
+            _STEP_C_LARGE_B_RING_GRP_MAX_BKV_ROWS
+            if (eff_b > 64 and kv_pack_bd4)
+            else _step_c_max_bkv_rows(
+                eff_b,
+                kv_pack_dense2=kv_pack_dense2,
+                kv_pack_bd4=kv_pack_bd4,
+                allow_large_b=bool(allow_large_b),
+                base_rows=_STEP_C_GROUP_MAX_BKV_ROWS,
+            )
+        )
+        ring_cands = []
+        base_chunks = (
+            (4096, 8192)
+            if (kv_pack_bd4 and eff_b > 64 and "ring8k" not in rpa_mode_str.lower())
+            else (cfg_rpa.chunk_sz,)
+        )
+        for c_chunk in base_chunks:
+            if c_chunk < page_size or (c_chunk % page_size) != 0:
+                continue
+            c_pgs = max(1, c_chunk // page_size)
+            slot_grp_pairs = (
+                ((3, 4), (cfg_rpa.num_slots, 4), (cfg_rpa.num_slots, 2), (2, 4))
+                if (kv_pack_bd4 and eff_b > 64 and cfg_rpa.num_slots == 4)
+                else (
+                    (cfg_rpa.num_slots, 4),
+                    (3, 4),
+                    (cfg_rpa.num_slots, 2),
+                    (2, 4),
+                )
+            )
+            for c_slots, c_grp in slot_grp_pairs:
+                ring_cands.append((c_slots, c_grp, c_chunk, c_pgs))
+        for cand_slots, cand_grp, cand_chunk, cand_pgs in ring_cands:
+            if (
+                cand_slots > cfg_rpa.num_slots
+                or cand_grp > cfg_rpa.ring_group_size
+                or (eff_b % cand_grp) != 0
+            ):
+                continue
+            cand_cfg = dataclasses.replace(
+                cfg_rpa,
+                num_slots=cand_slots,
+                chunk_sz=cand_chunk,
+                max_ring_pages=cand_pgs,
+                ring_group_size=cand_grp,
+                swabatch_group_size=1,
+            )
+            if (
+                can_use_ring4k_group_runtime(
+                    cand_cfg,
+                    decode_query_size=1,
+                    kv_pack_dense2=kv_pack_dense2,
+                    kv_pack_bd4=kv_pack_bd4,
+                    probe=None,
+                    b_tokens=eff_b,
+                    max_num_seqs=eff_seqs,
+                    bkv_slot_pages=cand_grp * cand_pgs,
+                    has_init_sv=True,
+                )
+                and cand_slots * cand_grp * cand_pgs * phys_page_rows <= rg_limit
+            ):
+                cfg_rpa = cand_cfg
+                eff_grp = cand_grp
+                use_grp_vec = True
+                break
     if not use_grp_vec:
-        cfg_rpa = dataclasses.replace(cfg_rpa, swabatch_group_size=1)
+        cfg_rpa = dataclasses.replace(cfg_rpa, swabatch_group_size=1, ring_group_size=1)
 
     bkv_slot_pages = eff_grp * cfg_rpa.max_ring_pages
+    priv_grp, priv_blk_pg = _priv_group_plan(
+        cfg_rpa,
+        kv_pack_dense2=kv_pack_dense2,
+        kv_pack_bd4=kv_pack_bd4,
+    )
+    if priv_grp > 1 and kv_pack_bd4:
+        need_slot_pg = max(bkv_slot_pages, priv_grp * priv_blk_pg)
+        if cfg_rpa.num_slots * need_slot_pg * phys_page_rows <= max_bkv_rows:
+            bkv_slot_pages = need_slot_pg
+        else:
+            cfg_rpa = dataclasses.replace(cfg_rpa, priv_group_size=1, priv_blk_pages=0)
+    elif priv_grp > 1:
+        # Keep DENSE2 Step (c) single-seq private loop inside the 63 MiB fused VMEM budget;
+        # Step (b) RPAd_fast retains priv_group_size=4 on DENSE2 and BD4.
+        cfg_rpa = dataclasses.replace(cfg_rpa, priv_group_size=1, priv_blk_pages=0)
     return cfg_rpa, one_block_per_seq, bkv_slot_pages, use_grp_vec, True
 
 
@@ -2557,7 +2654,12 @@ def b1_moe_b2_rpad_chip_sharded_jax(
             + run_cfg.num_slots
             + max(4 * max(max_num_seqs * max_blks_4k, 0), sh_smem_words)
         )
-        state_rows = q_heads * sh_grp if sh_grp > 0 else q_heads
+        rg_grp = (
+            run_cfg.ring_group_size
+            if (run_grp_vec and run_cfg.loop_kind == "ring4k")
+            else 1
+        )
+        state_rows = q_heads * max(sh_grp, rg_grp)
         scope2_rpad_vmem = (
             vmem((rows, 16, 128), jnp.bfloat16),  # rpad_q_vmem
             *(
