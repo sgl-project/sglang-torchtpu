@@ -3824,3 +3824,165 @@ def test_w18_pack_ulysses_qkv_u32_bit_exact_and_tm1024_aot():
         jax.ShapeDtypeStruct((16, 24576, 512), jnp.bfloat16),
         jax.ShapeDtypeStruct((16, 24576, 128), jnp.float8_e4m3fn),
     ).lower(lowering_platforms=("tpu",)).compile()
+
+
+def test_w19_d_with_next_in_gather_t1024_unsplit_xor1_auto_and_aot():
+    """Verify TP=8 t_local=1024 rows0 in (256, 384) auto-switches D_with_next_in_gather to unsplit+xor1."""
+    import functools
+
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from jax.experimental import topologies
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels import kernel_d
+    from sglang_tpu.muse_prefill_kernels.moe_bridge_kernels.pipeline import (
+        _d_with_next_in_gather,
+        _should_unsplit_d_with_next_in_gather,
+    )
+
+    base_gate = dict(
+        ep_size=8,
+        d_layout="4slab",
+        d_tok_tile=128,
+        d_fp8_unpool=True,
+        d_coal=False,
+        d_ik_ag=False,
+        has_w4_wu=False,
+        t_local=1024,
+        next_in_gather_rows=384,
+    )
+    assert _should_unsplit_d_with_next_in_gather(**base_gate)
+    assert _should_unsplit_d_with_next_in_gather(**{**base_gate, "next_in_gather_rows": 256})
+    for overrides in (
+        {"t_local": 512, "next_in_gather_rows": 128},
+        {"t_local": 1536, "next_in_gather_rows": 512},
+        {"t_local": 2048, "next_in_gather_rows": 768},
+        {"ep_size": 16},
+        {"d_tok_tile": 64},
+        {"d_fp8_unpool": False},
+    ):
+        assert not _should_unsplit_d_with_next_in_gather(**{**base_gate, **overrides})
+
+    if len(jax.devices()) < 8:
+        pytest.skip("Requires >=8 JAX devices")
+
+    topo8 = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x=2x2x1")
+    mesh8 = Mesh(np.array(topo8.devices).reshape(8), ("model",))
+
+    calls: list[tuple[int | None, int]] = []
+
+    def _fake_d(x, *, num_rows=None, row_start=0, stream_out=None):
+        calls.append((num_rows, row_start))
+        end = x.shape[0] if num_rows is None else row_start + num_rows
+        sl = x[row_start:end]
+        stream = sl if stream_out is None else jnp.concatenate([stream_out, sl], axis=0)
+        return stream, sl
+
+    def _trace(prefer: bool, env_dict: dict[str, str], rows0: int = 384) -> str:
+        calls.clear()
+        with (
+            mock.patch(
+                "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+            ),
+            tpu_info_for_cpu_export(),
+            mock.patch.dict(os.environ, env_dict),
+        ):
+            fn = jax.jit(
+                jax.shard_map(
+                    lambda x: _d_with_next_in_gather(
+                        d_fn=_fake_d,
+                        d_args=(x[0],),
+                        rows0=rows0,
+                        split=True,
+                        axis_name="model",
+                        gather_static_fp8=False,
+                        prefer_unsplit_xor1=prefer,
+                    )[2][None],
+                    mesh=mesh8,
+                    in_specs=(P("model", None, None),),
+                    out_specs=P("model", None, None, None),
+                    check_vma=False,
+                )
+            )
+            return (
+                fn.trace(jax.ShapeDtypeStruct((8, 1024, 128), jnp.float8_e4m3fn))
+                .lower(lowering_platforms=("tpu",))
+                .as_text("stablehlo")
+            )
+
+    for rows0 in (256, 384):
+        hlo_auto = _trace(True, {}, rows0=rows0)
+        assert calls == [(None, 0)]
+        assert "xor1_xytorus_ag_tp8" in hlo_auto
+
+    for env_override in (
+        {"SGLANG_TPU_MUSE_KERNEL_XOR1_BRIDGE_AG": "4"},
+        {"SGLANG_TPU_MUSE_KERNEL_XOR1_AG_MOE": "3"},
+    ):
+        hlo_keep = _trace(True, env_override, rows0=384)
+        assert calls == [(384, 0), (None, 384)]
+        assert "all_gather" in hlo_keep and "xor1_" not in hlo_keep
+
+    # TPU7x AOT compile of pipeline callsite gating with real Kernel D (fp8_unpool + STATIC_FP8_RS=6.0)
+    with (
+        mock.patch(
+            "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+        ),
+        tpu_info_for_cpu_export(),
+        mock.patch.dict(
+            os.environ,
+            {
+                "SGLANG_TPU_MUSE_KERNEL_D_OPT": "7",
+                "SGLANG_TPU_MUSE_KERNEL_D_FP8_UNPOOL": "512",
+                "SGLANG_TPU_MUSE_KERNEL_D_T128_FAST": "1",
+                "SGLANG_TPU_MUSE_KERNEL_D_SALU_OVERLAP": "1",
+                "SGLANG_TPU_MUSE_KERNEL_D_T64_C16": "1",
+                "SGLANG_TPU_MUSE_KERNEL_D_MXU_COMBINE": "1",
+                "SGLANG_TPU_MUSE_KERNEL_PREFILL_STATIC_FP8_RS": "6.0",
+            },
+        ),
+    ):
+        def _real_d_aot(ob, inv, wt, sm, wu, v1, v2, v3, v4, v5):
+            dfn = functools.partial(
+                kernel_d.pallas_combine_unpool_residual_nextnorm_4slab,
+                tok_tile=128,
+                fp8_unpool=True,
+                fp8_unpool_qbs=512,
+                emit_static_fp8_attn_in=True,
+                salu_overlap=True,
+                scrub_mxu_nan=False,
+            )
+            ns, nr, g = _d_with_next_in_gather(
+                d_fn=dfn,
+                d_args=(ob[0], inv[0], wt[0], sm[0], wu[0], v1[0], v2[0], v3[0], v4[0], v5[0]),
+                rows0=384,
+                split=True,
+                axis_name="model",
+                gather_static_fp8=True,
+                prefer_unsplit_xor1=True,
+            )
+            return ns[None], nr[None], g[None]
+
+        lowered = jax.jit(
+            jax.shard_map(
+                _real_d_aot,
+                mesh=mesh8,
+                in_specs=(P("model"),) * 10,
+                out_specs=(P("model"),) * 3,
+                check_vma=False,
+            )
+        ).trace(
+            jax.ShapeDtypeStruct((8, 1024 * 8, 32, 128), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((8, 1024, 8), jnp.int32),
+            jax.ShapeDtypeStruct((8, 1024, 8), jnp.float32),
+            jax.ShapeDtypeStruct((8, 1024, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((8, 4096, 8192), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((8, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((8, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((8, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((8, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((8, 8192), jnp.float32),
+        ).lower(lowering_platforms=("tpu",))
+        assert "xor1_xytorus_ag_tp8" in lowered.as_text("stablehlo")
+        lowered.compile()
