@@ -2459,6 +2459,20 @@ def _stationary_q_v2_process(
             and mask_lt_ref is not None
             and ring_covers_all
         )
+        can_fuse_sw9_512 = (
+            use_fuse_qe
+            and bq_sz == 512
+            and allow_sw_fuse
+            and use_causal_mask
+            and sliding_window_chunk_skip
+            and mask_ut_ref is not None
+            and mask_lt_ref is not None
+            and ring_covers_all
+            and use_mk128
+            and use_a3_out
+            and not use_fp8_qk_dyn
+            and not use_staged_qo
+        )
 
         def _send_fused_bo(valid_rows=None):
             if use_a3_out:
@@ -2976,6 +2990,212 @@ def _stationary_q_v2_process(
             def _advance_unpacked_cursor():
                 sem_ids_ref[3] = end_bkv_idx
 
+            if can_fuse_sw9_512 and probe != "nocompute":
+                wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
+                wait_send_bo(bo_sem_idx)
+                q_u32_512 = (
+                    None
+                    if interpret
+                    else bq_x2_ref.bitcast(jnp.uint32)
+                    .at[bq_sem_idx, 0]
+                    .reshape(512 * sq_pairs, 128)
+                )
+                g0_w = cu_q_lens_ref[seq_idx] + bq_idx * 512
+                is_al_full_w = jnp.logical_and(
+                    valid_bq_rows == 512,
+                    jnp.logical_and(
+                        (g0_w & 15) == 0,
+                        jnp.logical_and(
+                            (processed_q_len & 255) == 0,
+                            processed_q_len + 512 <= kv_len,
+                        ),
+                    ),
+                )
+                is_sw9_all_w = jnp.logical_and(is_al_full_w, processed_q_len >= 2048)
+                is_sw_short_all_w = (
+                    jnp.logical_and(is_al_full_w, processed_q_len + 512 <= 2048)
+                    if (use_sw_short_fuse and use_sw_short_v2)
+                    else jnp.bool_(False)
+                )
+
+                @pl.when(is_sw9_all_w)
+                def _sw9_512_fast():
+                    bo_carry_ref[...] = jnp.zeros_like(bo_carry_ref)
+                    for tq_i in range(2):
+                        tq_off = tq_i * 256
+                        s_lo_i = (processed_q_len + tq_off - 2048) // 256
+                        r_sl_i = pl.ds(tq_off, 256)
+                        for kv_h in range(sq_kv_heads):
+                            for gp in range(4):
+                                s_pair = kv_h * 4 + gp
+                                u_s = _bq_pair_u32(
+                                    q_u32_512, bq_sem_idx, tq_off, s_pair
+                                )
+                                pair_q_t = _decode_q_pair(u_s, kv_h * 4, is_lo_ep)
+                                ac0, lc0 = _eval_mk128_head(
+                                    kv_h,
+                                    pair_q_t[:64, :][None, :, :],
+                                    None,
+                                    2 * s_lo_i,
+                                    9,
+                                    ("ut",) + ("none",) * 7 + ("lt",),
+                                )
+                                ac1, lc1 = _eval_mk128_head(
+                                    kv_h,
+                                    pair_q_t[64:, :][None, :, :],
+                                    None,
+                                    2 * s_lo_i,
+                                    9,
+                                    ("ut",) + ("none",) * 7 + ("lt",),
+                                )
+                                c_sl_i = pl.ds(
+                                    pl.multiple_of(s_pair * 128, 128), 128
+                                )
+                                bo_x2_ref[bo_sem_idx, r_sl_i, c_sl_i] = (
+                                    _pair_col_bf16(
+                                        ac0[0], ac1[0], lc0[0], lc1[0]
+                                    )
+                                )
+                    start_send_bo_a3(g0_w, 512, bo_sem_idx)
+
+                if use_sw_short_fuse and use_sw_short_v2:
+
+                    @pl.when(is_sw_short_all_w)
+                    def _sw_short_512_fast():
+                        bo_carry_ref[...] = jnp.zeros_like(bo_carry_ref)
+                        t_sl0 = pl.ds(0, 256)
+
+                        @pl.loop(0, 2, unroll=False)
+                        def _sws_tq_loop(tq_i):
+                            tq_off = tq_i * 256
+                            r_sl_i = pl.ds(pl.multiple_of(tq_off, 256), 256)
+                            q_u32_sub = (
+                                None
+                                if interpret
+                                else bq_x2_ref.bitcast(jnp.uint32)
+                                .at[bq_sem_idx, 0, r_sl_i]
+                                .reshape(256 * sq_pairs, 128)
+                            )
+                            for s_u in range(sq_pairs):
+                                u_s = _bq_pair_u32(
+                                    q_u32_sub,
+                                    bq_sem_idx,
+                                    tq_off if interpret else 0,
+                                    s_u,
+                                )
+                                _store_qt_pair(
+                                    _decode_q_pair(
+                                        u_s, (s_u // 4) * 4, is_lo_ep
+                                    ),
+                                    s_u,
+                                    t_sl0,
+                                )
+                            n_unm_i = (processed_q_len + tq_off) // 256
+                            has4_s = (n_unm_i & 4) != 0
+                            has2_s = (n_unm_i & 2) != 0
+                            has1_s = (n_unm_i & 1) != 0
+
+                            @pl.when(has4_s)
+                            def _sws_4():
+                                _run_ring_chunk(
+                                    0,
+                                    4,
+                                    jnp.bool_(True),
+                                    ("none",) * 4,
+                                    t_sl0,
+                                    static_first=True,
+                                )
+
+                            s_a4 = jnp.where(has4_s, jnp.int32(4), jnp.int32(0))
+
+                            @pl.when(has2_s)
+                            def _sws_2():
+                                _run_ring_chunk(
+                                    s_a4, 2, s_a4 == 0, ("none",) * 2, t_sl0
+                                )
+
+                            s_a2 = s_a4 + jnp.where(
+                                has2_s, jnp.int32(2), jnp.int32(0)
+                            )
+
+                            @pl.when(has1_s)
+                            def _sws_1():
+                                _run_ring_chunk(
+                                    s_a2, 2, s_a2 == 0, ("none", "lt"), t_sl0
+                                )
+
+                            @pl.when(jnp.logical_not(has1_s))
+                            def _sws_lt():
+                                _run_ring_chunk(
+                                    n_unm_i, 1, n_unm_i == 0, ("lt",), t_sl0
+                                )
+
+                            for s_p in range(sq_pairs):
+                                c_sl_i = pl.ds(
+                                    pl.multiple_of(s_p * 128, 128), 128
+                                )
+                                bo_x2_ref[bo_sem_idx, r_sl_i, c_sl_i] = (
+                                    _pair_col_bf16(
+                                        acc_ref[2 * s_p, :, t_sl0],
+                                        acc_ref[2 * s_p + 1, :, t_sl0],
+                                        l_ref[2 * s_p, :, t_sl0],
+                                        l_ref[2 * s_p + 1, :, t_sl0],
+                                    )
+                                )
+
+                        start_send_bo_a3(g0_w, 512, bo_sem_idx)
+
+                @pl.when(
+                    jnp.logical_not(
+                        jnp.logical_or(is_sw9_all_w, is_sw_short_all_w)
+                    )
+                )
+                def _sw_512_fb():
+                    unpack_bq_to_qt_v2(bq_sem_idx)
+
+                    @pl.loop(0, 2, unroll=False)
+                    def _fb_tq_loop(tq_i):
+                        tq_s = tq_i * 256
+                        t_sl_i = pl.ds(pl.multiple_of(tq_s, 256), 256)
+
+                        @pl.when(tq_s < valid_bq_rows)
+                        def _fb_tqi():
+                            qf_i = processed_q_len + tq_s
+                            s_hi_i = cdiv(jnp.minimum(kv_len, qf_i + 256), 256)
+                            s_lo_i = jnp.minimum(
+                                jnp.maximum(qf_i - sliding_window + 1, 0)
+                                // 256,
+                                s_hi_i,
+                            )
+                            s_ul_i = jnp.clip(
+                                cdiv(
+                                    jnp.maximum(qf_i + 256 - sliding_window, 0),
+                                    256,
+                                ),
+                                s_lo_i,
+                                s_hi_i,
+                            )
+                            s_uh_i = jnp.clip(
+                                jnp.minimum(kv_len, qf_i + 1) // 256,
+                                s_ul_i,
+                                s_hi_i,
+                            )
+                            _run_slice_range(
+                                qf_i,
+                                s_lo_i,
+                                s_hi_i,
+                                s_ul_i,
+                                s_uh_i,
+                                s_lo_i,
+                                0,
+                                kv_len,
+                                t_sl_i,
+                            )
+
+                    _emit_unfused_epilogue_and_send()
+
+                return
+
             if can_fuse_sw9 and probe != "nocompute":
                 wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
                 wait_send_bo(bo_sem_idx)
@@ -3345,7 +3565,7 @@ def _stationary_q_v2_process(
 
                 return
 
-            if can_fuse_sw9:
+            if can_fuse_sw9 or can_fuse_sw9_512:
                 wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
             else:
                 _wait_and_unpack_cur_bq(bq_sem_idx)

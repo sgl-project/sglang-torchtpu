@@ -920,6 +920,24 @@ def _invoke_v3_kernel(
             extra["_a3_out_layout"] = True
         else:
             fused_out_pack = a3_out_layout
+    if (
+        use_stationary_q_prefill
+        and not stationary_q_blocks
+        and prefill_mode in _STATIONARY_Q_V2_MODES
+        and use_w9_preset
+        and sliding_window == 2048
+        and num_q_tokens >= 512
+        and extra.get("_a3_out_layout", False)
+        and "sw2048_fuse" in prefill_opts
+        and "mk128" in prefill_opts
+        and "fp8_qk_dyn" not in prefill_opts
+        and "staged_qo" not in prefill_opts
+        and "nosw_bq512" not in raw_all_toks
+        and extra.get("m_block_sizes") is not None
+        and extra["m_block_sizes"][0] == 256
+    ):
+        _, _bkv_sw, _bq_csz_sw, _bkv_csz_sw = extra["m_block_sizes"]
+        extra["m_block_sizes"] = (512, _bkv_sw, _bq_csz_sw, _bkv_csz_sw)
     if prefill_opts:
         extra["_prefill_opts"] = frozenset(prefill_opts)
     if fused_out_pack != 1:
