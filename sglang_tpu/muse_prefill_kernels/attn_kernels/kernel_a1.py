@@ -5636,7 +5636,7 @@ def pallas_pack_ulysses_qkv_for_rpa(
     assert q_size == h_q_local * HEAD_DIM and kv_2d.shape == (c_tok, kv_cols)
     num_q_slices = q_size // 128
     tm_eff = next(
-        t for t in (512, 256, 128, 64, 32, 16, 8) if t <= tm and c_tok % t == 0
+        t for t in (1024, 512, 256, 128, 64, 32, 16, 8) if t <= tm and c_tok % t == 0
     )
 
     def _pack_kernel(q_in_ref, kv_in_ref, q_out_ref, kv_out_ref):
@@ -5659,21 +5659,16 @@ def pallas_pack_ulysses_qkv_for_rpa(
             )
 
         if h_kv_local == 1:
-            kv_f32 = kv_in_ref[...].astype(jnp.float32)
-            k8 = jnp.clip(
-                jnp.where(is_lo, kv_f32, 0.0), -FP8_MAX, FP8_MAX
-            ).astype(jnp.float8_e4m3fn)
-            v8 = jnp.clip(
-                jnp.where(is_lo, pltpu.roll(kv_f32, shift=64, axis=1), 0.0),
-                -FP8_MAX,
-                FP8_MAX,
-            ).astype(jnp.float8_e4m3fn)
+            kv_u32 = _f8_code_u32(kv_in_ref[...])
+            zero_u32 = jnp.uint32(0)
+            k_code = jnp.where(is_lo, kv_u32, zero_u32)
+            v_code = jnp.where(is_lo, pltpu.roll(kv_u32, shift=64, axis=1), zero_u32)
+            kv_word = k_code | (v_code << 8)
         else:
             k8 = kv_in_ref[:, 0:128]
             v8 = kv_in_ref[:, 128:256]
-        kv_out_ref.bitcast(jnp.uint32).at[0].reshape(tm_eff, 128)[...] = (
-            _f8_code_u32(k8) | (_f8_code_u32(v8) << 8)
-        )
+            kv_word = _f8_code_u32(k8) | (_f8_code_u32(v8) << 8)
+        kv_out_ref.bitcast(jnp.uint32).at[0].reshape(tm_eff, 128)[...] = kv_word
 
     q_5d, kv_buf = pl.pallas_call(
         _pack_kernel,

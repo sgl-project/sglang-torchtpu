@@ -2753,31 +2753,24 @@ def fused_moe_full_bridge_and_ffn(
                     local_topk_ids_u8_b, global_topk_u8_b, local_topk_weights, hs_4d
                 )
                 if _b2_direct_fp8_2half:
-                    if _use_b2_pow2:
-                        k_grp = he_dim // 128
-                        hs_buf = jnp.empty(
-                            (ep_size, t_local * k_grp, 128),
-                            dtype=ag_i8_0.dtype,
-                        )
-                        hs_buf = jax.lax.dynamic_update_slice(
-                            hs_buf,
-                            ag_i8_0.reshape(ep_size, c0_tok * k_grp, 128),
-                            (0, 0, 0),
-                        )
-                        hs_buf = jax.lax.dynamic_update_slice(
-                            hs_buf,
-                            ag_i8_1.reshape(ep_size, c1_tok * k_grp, 128),
-                            (0, c0_tok * k_grp, 0),
-                        )
-                        hidden_states = hs_buf.reshape(ep_size * t_local, k_grp, 128)
-                    else:
-                        hidden_states = jnp.concatenate(
-                            [
-                                ag_i8_0.reshape(ep_size, c0_tok, he_dim // 128, 128),
-                                ag_i8_1.reshape(ep_size, c1_tok, he_dim // 128, 128),
-                            ],
-                            axis=1,
-                        ).reshape(ep_size * t_local, he_dim // 128, 128)
+                    # Use 3D DUS even when c0_tok == c1_tok: XLA lowers FP8 jnp.concatenate
+                    # on axis=1 to pad_maximum_fusion (pad(-448)->f32->max->fp8).
+                    k_grp = he_dim // 128
+                    hs_buf = jnp.empty(
+                        (ep_size, t_local * k_grp, 128),
+                        dtype=ag_i8_0.dtype,
+                    )
+                    hs_buf = jax.lax.dynamic_update_slice(
+                        hs_buf,
+                        ag_i8_0.reshape(ep_size, c0_tok * k_grp, 128),
+                        (0, 0, 0),
+                    )
+                    hs_buf = jax.lax.dynamic_update_slice(
+                        hs_buf,
+                        ag_i8_1.reshape(ep_size, c1_tok * k_grp, 128),
+                        (0, c0_tok * k_grp, 0),
+                    )
+                    hidden_states = hs_buf.reshape(ep_size * t_local, k_grp, 128)
                 elif _use_pq_lhs_fp8:
                     hidden_states, hidden_states_scale = (
                         _convert_both_halves_fp8_gmm_layout(

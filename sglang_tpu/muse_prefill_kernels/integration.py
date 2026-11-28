@@ -1688,7 +1688,11 @@ def _ops(
                 kv_3d, _AXIS, split_axis=0, concat_axis=0, tiled=True
             ).reshape(c_tok, kv_3d.shape[-1])
             return kernel_a1.pallas_pack_ulysses_qkv_for_rpa(
-                q_2d, kv_2d, h_q_local=h_q_local, h_kv_local=h_kv_local, tm=512
+                q_2d,
+                kv_2d,
+                h_q_local=h_q_local,
+                h_kv_local=h_kv_local,
+                tm=1024 if c_tok >= 16384 else 512,
             )
 
         def a1_ul_gate_body(x_k, w_gate, w_gate_sc):
@@ -1760,7 +1764,7 @@ def _ops(
                     kv_3d.reshape(c_tok, kv_3d.shape[-1]),
                     h_q_local=h_q_local,
                     h_kv_local=h_kv_local,
-                    tm=512,
+                    tm=1024 if c_tok >= 16384 else 512,
                 )
                 return q_k, kv_k, gate_k
             q_3d, kv_3d, x_fp8_k = a1_ul_qkv_body(
