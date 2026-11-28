@@ -23,13 +23,16 @@ import msgspec
 import torch.distributed as dist
 
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+from sglang.srt.mem_cache.common import page_align_floor
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang_tpu.disaggregation.decode_dram_offload.radix_host_ops import (
     host_pages,
     is_live_host_backed_leaf,
     leaf_of,
     lock_host_path,
     mark_next_victim,
+    path_nodes,
     path_tokens,
     unlock_host_path,
     window_host_pages,
@@ -38,6 +41,7 @@ from sglang_tpu.disaggregation.decode_dram_offload.rank_lockstep import (
     DramOffloadWorkerContext,
     push_manifest,
 )
+from sglang_tpu.envs import envs as tpu_envs
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +118,8 @@ class PrefillDramVictimPusher:
         # Exact cached leaf -> (decode peer, semantic fingerprint). Weak keys
         # disappear with eviction and retain independent shared-prefix branches.
         self._routes = weakref.WeakKeyDictionary()
+        self._completed_leaves = weakref.WeakSet()
+        self._covered = weakref.WeakSet()
         self._pushes: Dict[int, _PushInFlight] = {}
         # Path length last pushed, or found unpushable, per session.
         self._pushed_len = weakref.WeakKeyDictionary()
@@ -121,6 +127,42 @@ class PrefillDramVictimPusher:
         self._victim_stamp = _VICTIM_STAMP_BASE
         self.stats = dict.fromkeys(("started", "stored", "declined"), 0)
         self._last_log = [0.0]
+
+    def _mark_covered(self, node: Any) -> None:
+        """Remember nodes the decode already holds so eviction remnants of a
+        stored or recalled path are not re-pushed. On hybrid SWA models, keep
+        completed ancestor turn-ends uncovered because an equal-TP push carries
+        only the branch-end window."""
+        self._covered.add(node)
+        ancestors = path_nodes(self._cache, node)[1:]
+        if not self._window_tokens:
+            self._covered.update(ancestors)
+            return
+        for ancestor in ancestors:
+            if ancestor not in self._completed_leaves:
+                self._covered.add(ancestor)
+
+    def _host_only_push_only(self) -> bool:
+        """Under write-through, skip device-resident leaves whenever host DRAM
+        exceeds device full KV: host LRU only evicts host-only leaves, so
+        pushing HBM-resident turns or mid-prefill chunks churns decode DRAM."""
+        if self._cache.is_write_back:
+            return False
+        allocator = getattr(self._cache, "token_to_kv_pool_allocator", None)
+        dev_size = None
+        for candidate in (
+            getattr(allocator, "size_full", None),
+            getattr(allocator, "_size_full", None),
+            getattr(getattr(allocator, "full_attn_allocator", None), "size", None),
+            getattr(allocator, "size", None),
+        ):
+            if isinstance(candidate, int) and candidate > 0:
+                dev_size = candidate
+                break
+        host_size = getattr(self._host_pool, "size", None)
+        return (
+            dev_size is not None and isinstance(host_size, int) and host_size > dev_size
+        )
 
     def note_decode_of(self, req: Any, *, recalled: bool) -> None:
         """Carry the actual decode peer to the request's cache checkpoint.
@@ -152,9 +194,14 @@ class PrefillDramVictimPusher:
                 peer,
                 push_manifest(tokens, node.key.extra_key, node.key.cache_salt),
             )
+            if len(tokens) >= page_align_floor(
+                len(req.origin_input_ids) - 1, self._page_size
+            ):
+                self._completed_leaves.add(node)
             if on_decode:
                 # Not pushed back at the length it was recalled at.
                 self._pushed_len[node] = len(tokens)
+                self._mark_covered(node)
 
     def advance(self, *, serving: bool) -> None:
         """Every bootstrap step, every rank; no tree decision uses a local
@@ -166,8 +213,11 @@ class PrefillDramVictimPusher:
         log_offload_stats(self.stats, "push", self._last_log)
 
     def _under_host_pressure(self) -> bool:
+        lead = (
+            tpu_envs.SGLANG_PD_OFFLOAD_PUSH_FREE_TOKENS.get() or _PUSH_FULL_FREE_TOKENS
+        )
         host_free = self._cache.cache_controller.mem_pool_host.available_size()
-        return host_free < _PUSH_FULL_FREE_TOKENS or (
+        return host_free < lead or (
             self._swa_host_pool is not None
             and self._swa_host_pool.available_size()
             < _PUSH_SWA_FREE_WINDOWS * self._window_tokens
@@ -182,6 +232,8 @@ class PrefillDramVictimPusher:
         if self._pushes:
             raise RuntimeError("victim pushes are in flight; the engine is not idle")
         self._routes.clear()
+        self._completed_leaves.clear()
+        self._covered.clear()
         self._pushed_len.clear()
 
     def retire_settled_pushes(self) -> None:
@@ -219,11 +271,17 @@ class PrefillDramVictimPusher:
         unlock_host_path(self._cache, push.locks)
         self._channel.forget_victim(push.seq)
         if stored:
-            # The decode holds the session now: its path here goes first in
-            # every eviction order.
-            self._victim_stamp = mark_next_victim(
-                self._cache, push.leaf.id, self._victim_stamp
-            )
+            try:
+                live = self._cache.tree_core.node_by_id(push.leaf.id) is push.leaf
+            except KeyError:
+                live = False
+            if live:
+                self._mark_covered(push.leaf)
+                if tpu_envs.SGLANG_PD_OFFLOAD_EVICT_STORED_FIRST.get():
+                    # Opt-in: stamp the stored branch as the next eviction victim.
+                    self._victim_stamp = mark_next_victim(
+                        self._cache, push.leaf.id, self._victim_stamp
+                    )
 
     def _start_push_if_agreed(self, *, serving: bool) -> None:
         """Start a push in a step where every rank serves requests, is under
@@ -316,12 +374,15 @@ class PrefillDramVictimPusher:
         and window, is in host RAM now. A leaf whose backup is still pending
         is a candidate again once it completed."""
         busy = {push.leaf for push in self._pushes.values()}
+        host_only = self._host_only_push_only()
         candidates = []
         for node, (peer, fingerprint) in list(self._routes.items()):
             pushable = is_live_host_backed_leaf(self._cache, node)
             if pushable is None:
                 self._routes.pop(node, None)
-            if not pushable or node in busy:
+            if not pushable or node in busy or node in self._covered:
+                continue
+            if host_only and node.component_data[ComponentType.FULL].value is not None:
                 continue
             path = path_tokens(self._cache, node)
             if self._pushed_len.get(node) == len(path):
@@ -339,9 +400,20 @@ class PrefillDramVictimPusher:
             if swa_pages is None:
                 continue
             candidates.append(
-                (node.last_access_time, fingerprint, peer, node, path, pages, swa_pages)
+                (
+                    node not in self._completed_leaves,
+                    node.last_access_time,
+                    fingerprint,
+                    peer,
+                    node,
+                    path,
+                    pages,
+                    swa_pages,
+                )
             )
         if not candidates:
             return None
-        _, _, peer, node, path, pages, swa_pages = min(candidates, key=lambda x: x[:2])
+        _, _, _, peer, node, path, pages, swa_pages = min(
+            candidates, key=lambda x: x[:3]
+        )
         return peer, node, path, pages, swa_pages
