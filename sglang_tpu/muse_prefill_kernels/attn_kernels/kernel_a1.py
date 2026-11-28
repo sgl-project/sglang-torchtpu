@@ -5789,15 +5789,21 @@ def pallas_a1_ulysses_qkv_gate_async_a2a(
     assert q_size <= 512 and c_k >= 128 and c_k % 128 == 0
 
     num_q_slices = q_size // 128
-    if c_k >= 1536 and c_k % 768 == 0:
+    # Single-block c_k=1536 with ns=8 (48 MiB <= 62 MiB VMEM) eliminates 151 MB weight reloads
+    # and the second barrier sync (-47.8 us/L = -2.96 ms/step on TP=16 8K/1).
+    if c_k == 1536 and q_size <= 512 and h_kv_local == 1 and tp_deg <= 16:
+        t_blk = 1536
+        num_q_slots = min(max_q_slots, 8, tp_deg)
+    elif c_k >= 1536 and c_k % 768 == 0:
         t_blk = 768
+        num_q_slots = min(max_q_slots, tp_deg)
     else:
         t_blk = next(
             t for t in range(min(1024, c_k), 0, -64) if c_k % t == 0 and t % 128 == 0
         )
+        num_q_slots = min(max_q_slots, tp_deg)
     num_blk = c_k // t_blk
     tm_eff = next(t for t in (256, 128) if t_blk % t == 0)
-    num_q_slots = min(max_q_slots, tp_deg)
 
     q_eff_scale = (
         QUERY_SCALE * SM_SCALE * k_scale * LOG2E if fold_q_scale else QUERY_SCALE

@@ -3800,7 +3800,11 @@ def test_w18_pack_ulysses_qkv_u32_bit_exact_and_tm1024_aot():
                 with jax._src.config.export_ignore_forward_compatibility(True):
                     return fn_obj.exported(*jargs).mlir_module()
 
-            assert "pallas_pack_ulysses_rpa_c24576_q512_kv128_tm1024" in _mlir_for_ck(1536)
+            mlir_1536 = _mlir_for_ck(1536)
+            assert "pallas_pack_ulysses_rpa_c24576_q512_kv128_tm1024" in mlir_1536
+            assert "pallas_a1_ulysses_qkvg_async_a2a_c1536_q512_kv128_tb1536_ns8" in mlir_1536
+            mlir_1024 = _mlir_for_ck(1024)
+            assert "pallas_a1_ulysses_qkvg_async_a2a_c1024_q512_kv128_tb1024_ns16" in mlir_1024
             assert "pallas_pack_ulysses_rpa_c8192_q512_kv128_tm512" in _mlir_for_ck(512)
 
     from jax.sharding import PartitionSpec as P
@@ -3986,3 +3990,130 @@ def test_w19_d_with_next_in_gather_t1024_unsplit_xor1_auto_and_aot():
         ).lower(lowering_platforms=("tpu",))
         assert "xor1_xytorus_ag_tp8" in lowered.as_text("stablehlo")
         lowered.compile()
+
+
+def test_w19_a1_ulysses_qkvg_c1536_tb1536_ns8_interpret_and_aot():
+    """Verify c_k=1536 single-block tb=1536 ns=8 selection, slot-recycling parity, and TP=16 AOT."""
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from jax.experimental import pallas as pl
+    from jax.experimental import topologies
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    from sglang_tpu.muse_prefill_kernels.attn_kernels import kernel_a1
+
+    if len(jax.devices()) < 16:
+        pytest.skip("Requires >=16 JAX devices")
+
+    # Mosaic eager+detect_races+nan CPU interpret parity for max_q_slots < tp_deg (4 < 8 vs 8 == 8).
+    mesh8 = Mesh(np.array(jax.devices("cpu")[:8]), ("model",))
+    rng = np.random.default_rng(196)
+    c_k_cpu, k_dim_cpu, h_q_cpu, h_kv_cpu = 128, 256, 2, 1
+    q_sz_cpu, kv_sz_cpu = h_q_cpu * 64, 2 * h_kv_cpu * 64
+    x_cpu = jnp.array(rng.standard_normal((8, c_k_cpu, k_dim_cpu)) * 0.2, jnp.float8_e4m3fn)
+    wqkv_cpu = jnp.array(
+        rng.standard_normal((8, 8, k_dim_cpu, q_sz_cpu + kv_sz_cpu)) * 0.05, jnp.float8_e4m3fn
+    )
+    wqkv_sc_cpu = jnp.full((8, 8, 1, q_sz_cpu + kv_sz_cpu), 0.02, jnp.float32)
+    wg_cpu = jnp.array(rng.standard_normal((8, k_dim_cpu, 8 * q_sz_cpu)) * 0.05, jnp.float8_e4m3fn)
+    wg_sc_cpu = jnp.full((8, 1, 8 * q_sz_cpu), 0.02, jnp.float32)
+    cos_cpu = jnp.ones((8, c_k_cpu, 128), jnp.float32)
+    sin_cpu = jnp.zeros((8, c_k_cpu, 128), jnp.float32)
+
+    real_pallas = pl.pallas_call
+
+    def _eager_interpret(*args, **kwargs):
+        kwargs["interpret"] = pltpu.InterpretParams(
+            dma_execution_mode="eager", detect_races=True, uninitialized_memory="nan"
+        )
+        return real_pallas(*args, **kwargs)
+
+    def _run_cpu(max_slots: int):
+        def _b(x, wqkv, wsc, wg, wgsc, c, s):
+            q3, kv3, g = kernel_a1.pallas_a1_ulysses_qkv_gate_async_a2a(
+                x[0],
+                wqkv[0],
+                wsc[0],
+                wg[0],
+                wgsc[0],
+                c[0],
+                s[0],
+                h_q_local=h_q_cpu,
+                h_kv_local=h_kv_cpu,
+                tp_axis="model",
+                max_q_slots=max_slots,
+            )
+            return q3[None], kv3[None], g[None]
+
+        return jax.shard_map(
+            _b,
+            mesh=mesh8,
+            in_specs=(P("model"),) * 7,
+            out_specs=(P("model"),) * 3,
+            check_vma=False,
+        )(x_cpu, wqkv_cpu, wqkv_sc_cpu, wg_cpu, wg_sc_cpu, cos_cpu, sin_cpu)
+
+    with (
+        mock.patch("sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"),
+        tpu_info_for_cpu_export(),
+        mock.patch("sglang_tpu.attention.pallas.util.get_tpu_version", return_value=7),
+        mock.patch.object(pl, "pallas_call", _eager_interpret),
+        jax.default_device(jax.devices("cpu")[0]),
+    ):
+        q_full, kv_full, g_full = jax.block_until_ready(_run_cpu(8))
+        q_rec, kv_rec, g_rec = jax.block_until_ready(_run_cpu(4))
+        np.testing.assert_array_equal(np.asarray(q_rec, np.float32), np.asarray(q_full, np.float32))
+        np.testing.assert_array_equal(
+            np.asarray(jax.lax.bitcast_convert_type(kv_rec, jnp.uint8)),
+            np.asarray(jax.lax.bitcast_convert_type(kv_full, jnp.uint8)),
+        )
+        np.testing.assert_array_equal(np.asarray(g_rec, np.float32), np.asarray(g_full, np.float32))
+
+    topo16 = topologies.get_topology_desc(platform="tpu", topology_name="tpu7x=2x2x2")
+    mesh16 = Mesh(np.array(topo16.devices).reshape(16), ("model",))
+
+    def _compile_tp16(c_k_val: int, expect_sub: str) -> None:
+        with (
+            mock.patch(
+                "sglang_tpu.pallas_export.get_torch_tpu_device_kind", return_value="TPU v7"
+            ),
+            tpu_info_for_cpu_export(),
+        ):
+            def _b(x, wqkv, wsc, wg, wgsc, c, s):
+                q3, kv3, g = kernel_a1.pallas_a1_ulysses_qkv_gate_async_a2a(
+                    x[0],
+                    wqkv[0],
+                    wsc[0],
+                    wg[0],
+                    wgsc[0],
+                    c[0],
+                    s[0],
+                    h_q_local=8,
+                    h_kv_local=1,
+                    tp_axis="model",
+                )
+                return q3[None], kv3[None], g[None]
+
+            lowered = jax.jit(
+                jax.shard_map(
+                    _b,
+                    mesh=mesh16,
+                    in_specs=(P("model"),) * 7,
+                    out_specs=(P("model"),) * 3,
+                    check_vma=False,
+                )
+            ).trace(
+                jax.ShapeDtypeStruct((16, c_k_val, 8192), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((16, 16, 8192, 640), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((16, 16, 1, 640), jnp.float32),
+                jax.ShapeDtypeStruct((16, 8192, 8192), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((16, 1, 8192), jnp.float32),
+                jax.ShapeDtypeStruct((16, c_k_val, 128), jnp.float32),
+                jax.ShapeDtypeStruct((16, c_k_val, 128), jnp.float32),
+            ).lower(lowering_platforms=("tpu",))
+            assert expect_sub in lowered.as_text("stablehlo")
+            lowered.compile()
+
+    _compile_tp16(1536, "pallas_a1_ulysses_qkvg_async_a2a_c1536_q512_kv128_tb1536_ns8")
+    _compile_tp16(3072, "pallas_a1_ulysses_qkvg_async_a2a_c3072_q512_kv128_tb768_ns16")
