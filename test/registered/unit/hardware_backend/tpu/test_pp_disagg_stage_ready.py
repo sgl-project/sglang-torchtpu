@@ -244,11 +244,13 @@ def test_result_point_keeps_pages_exposed_before_it_out_of_the_radix_cache():
     pipeline = SimpleNamespace(stage_parts=False, early_close=False)
     sender = _raiden_sender(5)
     sender.kv_mgr = SimpleNamespace(_pipeline=pipeline)
-    final, middle = (_req(sender, 16, end, pending_bootstrap=False) for end in (16, 8))
+    final, middle = (
+        _req(sender, 16, end, pending_bootstrap=False, prefix_len=0) for end in (16, 8)
+    )
     scheduler = SimpleNamespace(tree_cache=Mock())
     checkpointed = []
     with patch.object(
-        prefill, "checkpoint_kv_cache", lambda r, c: checkpointed.append(r)
+        prefill, "checkpoint_kv_cache", lambda r, c, **kw: checkpointed.append(r)
     ):
         for stage_parts, early_close in ((False, False), (True, False), (False, True)):
             pipeline.stage_parts, pipeline.early_close = stage_parts, early_close

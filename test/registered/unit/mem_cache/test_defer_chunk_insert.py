@@ -13,6 +13,10 @@ from unittest.mock import Mock
 import torch
 from swa_cache_world import PAGE, WINDOW, KVWorld
 
+from sglang.srt.disaggregation.prefill import (
+    SchedulerDisaggregationPrefillMixin,
+    clamp_kv_send_end,
+)
 from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import Req
@@ -72,6 +76,55 @@ class TestDeferChunkInsert(unittest.TestCase):
     def test_cache_that_declines_still_inserts(self):
         calls = _run(16384, mid_prefill=True, tree=_Tree(defers=False))
         self.assertEqual(calls, [("defer", 8192), ("checkpoint", 8192)])
+
+
+def _run_disagg(stride, start, end, prompt_len, free_slots=True, keep_windows=False):
+    req = SimpleNamespace(
+        rid="r",
+        finished=lambda: False,
+        skip_radix_cache_insert=False,
+        pending_bootstrap=False,
+        disagg_kv_sender=None,
+        origin_input_ids=list(range(prompt_len)),
+        prefix_len=start,
+        extend_end=end,
+    )
+    scheduler = SimpleNamespace(tree_cache=_Tree())
+    with (
+        envs.SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE.override(stride),
+        envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(free_slots),
+        envs.SGLANG_OPT_SWA_KEEP_PREFILL_CHUNK_WINDOWS.override(keep_windows),
+    ):
+        SchedulerDisaggregationPrefillMixin.checkpoint_disagg_prefill(scheduler, req)
+    return scheduler.tree_cache.calls, req.prefix_len
+
+
+class TestDisaggPrefillChunkInsert(unittest.TestCase):
+    """A disaggregated prefill checkpoints each chunk through
+    checkpoint_disagg_prefill, which marks every chunk before the prompt end
+    mid-prefill."""
+
+    def test_chunk_before_prompt_end_is_deferred(self):
+        calls, prefix_len = _run_disagg(16384, 4096, 8192, prompt_len=20000)
+        self.assertEqual(calls, [("defer", 8192)])
+        self.assertEqual(prefix_len, 8192)
+
+    def test_last_chunk_inserts(self):
+        # [16K, 20000) reaches no 16K multiple but ends the prompt.
+        calls, _ = _run_disagg(16384, 16384, 20000, prompt_len=20000)
+        self.assertEqual(calls, [("checkpoint", 20000)])
+
+    def test_chunk_inserts_when_the_request_cannot_free_its_swa(self):
+        for flags in (dict(free_slots=False), dict(keep_windows=True)):
+            with self.subTest(**flags):
+                calls, _ = _run_disagg(16384, 4096, 8192, prompt_len=20000, **flags)
+                self.assertEqual(calls, [("checkpoint", 8192)])
+
+    def test_bootstrap_finalize_publishes_held_chunks(self):
+        # Chunks advanced unpublished while bootstrap was pending leave
+        # prefix_len == extend_end; the finalize call must insert them.
+        calls, _ = _run_disagg(16384, 8192, 8192, prompt_len=20000)
+        self.assertEqual(calls, [("checkpoint", 8192)])
 
 
 def _swa_cache(**overrides):
@@ -196,6 +249,75 @@ class TestSwaBranchCheckpoint(unittest.TestCase):
                     sibling = w.match(earlier + _tokens(4, PAGE))
                     self.assertEqual(sibling.device_prefix_len, branch)
                     w.cache.sanity_check()
+
+
+class _DisaggPrefillWorld(KVWorld):
+    """A real hybrid-SWA UnifiedRadixCache chunk-prefilled the way a disaggregated
+    prefill server does it: checkpoint_disagg_prefill after every chunk, then the
+    end of the send range that clamp_kv_send_end allows for that chunk."""
+
+    def prefill(self, prompt: list[int], *, chunk: int) -> list[int]:
+        req = Req(
+            rid=f"r{self.rid}",
+            origin_input_text="",
+            origin_input_ids=array("q", prompt),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        self.rid += 1
+        req.pending_bootstrap = False
+        req.disagg_kv_sender = None
+        self.req_to_token_pool.alloc([req])
+        req.init_next_round_input(tree_cache=self.cache)
+        req.lock = self.cache.lock(req.last_node)
+        assert req.prefix_len == 0, "expects an empty cache"
+        scheduler = SimpleNamespace(tree_cache=self.cache)
+        row = req.kv.req_pool_idx
+        send_ends = []
+        # The checkpoint advances prefix_len, as the scheduler relies on.
+        while (pos := req.prefix_len) < len(prompt):
+            end = req.extend_end = min(pos + chunk, len(prompt))
+            self.req_to_token_pool.write(
+                (row, slice(pos, end)), self._alloc(prompt[pos:end], pos)
+            )
+            req.kv.kv_committed_len = req.kv.kv_allocated_len = end
+            SchedulerDisaggregationPrefillMixin.checkpoint_disagg_prefill(
+                scheduler, req
+            )
+            last = end == len(prompt)
+            send_ends.append(
+                clamp_kv_send_end(req, self.cache, last_chunk=last, end_idx=end)
+            )
+            if not last:
+                req.init_next_round_input()
+        req.output_ids.append(self._next_token(req))
+        req.finished_reason = FINISH_LENGTH(length=0)
+        release_kv_cache(req, self.cache, checkpoint=True)
+        return send_ends
+
+
+class TestDisaggDeferredChunkSend(unittest.TestCase):
+    CHUNK = 8 * PAGE
+
+    def test_deferred_chunks_are_sent_at_the_next_published_point(self):
+        """A deferred chunk is not protected from deduplication, so no non-final
+        send may cover it. Its KV goes out with the chunk that reaches the next
+        stride multiple, or with the last chunk."""
+        prompt = _tokens(5, 10 * self.CHUNK + 3 * PAGE)  # 1328 tokens, 128-token chunks
+        every_chunk = [128, 256, 384, 512, 640, 768, 896, 1024, 1152, 1280, 1328]
+        at_crossings = [0, 0, 0, 512, 512, 512, 512, 1024, 1024, 1024, 1328]
+        for stride, want in ((0, every_chunk), (4 * self.CHUNK, at_crossings)):
+            with (
+                self.subTest(stride=stride),
+                envs.SGLANG_OPT_UNIFIED_CACHE_CHUNK_INSERT_STRIDE.override(stride),
+                envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True),
+                envs.SGLANG_OPT_SWA_KEEP_PREFILL_CHUNK_WINDOWS.override(False),
+            ):
+                w = _DisaggPrefillWorld(full_tokens=8192, swa_tokens=4096)
+                self.assertEqual(w.prefill(prompt, chunk=self.CHUNK), want)
+                self.assertEqual(
+                    w.match(prompt + _tokens(6, PAGE)).device_prefix_len, len(prompt)
+                )
+                w.cache.sanity_check()
 
 
 if __name__ == "__main__":

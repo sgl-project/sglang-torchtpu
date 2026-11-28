@@ -519,6 +519,7 @@ class TestAllocationIntegration(CustomTestCase):
                             to_finish=None,
                             prefix_len=0,
                             extend_end=64,
+                            origin_input_ids=list(range(128)),
                             inflight_steps=inflight_steps,
                         )
                         scheduler = _ChunkedSlot(
@@ -652,6 +653,8 @@ class TestAllocationIntegration(CustomTestCase):
         req = FakeReq(
             rid="parked",
             disagg_kv_sender=sender,
+            origin_input_ids=list(range(8)),
+            extend_end=8,
             pending_bootstrap=True,
             prefill_attempt_count=1,
             skip_radix_cache_insert=False,
