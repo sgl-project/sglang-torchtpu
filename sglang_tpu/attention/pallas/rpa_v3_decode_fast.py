@@ -498,6 +498,10 @@ def parse_decode_fast_config(
         and "b2" not in toks_cfg
         and "batch4" not in toks_cfg
         and "b4" not in toks_cfg
+        and "batch8" not in toks_cfg
+        and "b8" not in toks_cfg
+        and "batch16" not in toks_cfg
+        and "b16" not in toks_cfg
     )
     auto_swa_b2b4 = (
         b_tokens is not None
@@ -507,6 +511,10 @@ def parse_decode_fast_config(
         and decode_query_size == 1
         and ("batch4" in toks_cfg or "b4" in toks_cfg)
         and ("batch2" in toks_cfg or "b2" in toks_cfg)
+        and "batch8" not in toks_cfg
+        and "b8" not in toks_cfg
+        and "batch16" not in toks_cfg
+        and "b16" not in toks_cfg
     )
     swabatch_group_size = (
         1
@@ -619,7 +627,7 @@ def parse_decode_fast_config(
                 kv_pack_bd4
                 and not explicit_ring4k
                 and b_tokens is not None
-                and 32 <= b_tokens <= 64
+                and b_tokens >= 32
                 and 4096 < kv_cap_tokens <= 20480
                 and "c4096" not in toks_cfg
             )
@@ -851,18 +859,6 @@ def parse_decode_fast_config(
     ):
         fold_col = True
         fold_128 = True
-    if (
-        eff_shared_group > 0
-        and page_size >= 512
-        and chunk_sz >= 4096
-        and shared_q_tile < 512
-        and "q128" not in toks_cfg
-        and "forceq256" not in toks_cfg
-    ):
-        shared_q_tile = 512
-    if loop_kind == "shared32" and chunk_sz == 8192 and kv_pack_dense2 and shared_q_tile > 512:
-        shared_q_tile = 512
-
     if "noshsub" in toks_cfg:
         sh_sub_chunk = 0
     elif "shsub1k" in toks_cfg:
@@ -875,6 +871,30 @@ def parse_decode_fast_config(
         sh_sub_chunk = 2048 if (not kv_pack_bd4 or not (shared_fp8_qkpv or shared_fp8_pv_only)) else (4096 if chunk_sz >= 8192 else 0)
     else:
         sh_sub_chunk = 0
+
+    if (
+        eff_shared_group > 0
+        and page_size >= 512
+        and chunk_sz >= 4096
+        and shared_q_tile < 512
+        and "q128" not in toks_cfg
+        and "forceq256" not in toks_cfg
+    ):
+        shared_q_tile = 512
+    if (
+        loop_kind == "shared64"
+        and kv_pack_dense2
+        and page_size >= 512
+        and chunk_sz >= 8192
+        and sh_sub_chunk == 2048
+        and shared_q_tile < 1024
+        and "q128" not in toks_cfg
+        and "q512" not in toks_cfg
+        and "forceq256" not in toks_cfg
+    ):
+        shared_q_tile = 1024
+    if loop_kind == "shared32" and chunk_sz == 8192 and kv_pack_dense2 and shared_q_tile > 512:
+        shared_q_tile = 512
 
     if sliding_window is not None:
         if loop_kind in ("stream0b", "swabatch", "swafast", "swafast2", "stream2h", "stream1p", "stream2ld", "clean1p"):

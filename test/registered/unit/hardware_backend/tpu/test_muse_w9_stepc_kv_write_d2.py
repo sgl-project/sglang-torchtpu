@@ -2461,7 +2461,7 @@ def test_wave18_step_c_d2_swa_g4_and_shared64_shsub_aot():
         has_shared_prefix=True,
     )
     assert (ok_sh_d2, cfg_sh_d2.chunk_sz, cfg_sh_d2.shared_q_tile, cfg_sh_d2.sh_sub_chunk, cfg_sh_d2.fold_col, cfg_sh_d2.priv_group_size, cfg_sh_d2.hoist_new_kv) == (
-        True, 8192, 512, 2048, True, 1, True
+        True, 8192, 1024, 2048, True, 1, True
     )
 
     cfg_sh_bd4, _, slot_sh_bd4, _, ok_sh_bd4 = resolve_step_c_rpa_plan(
